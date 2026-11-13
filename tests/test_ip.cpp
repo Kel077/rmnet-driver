@@ -37,5 +37,8 @@ TEST(udp4_checksum_validates) {                    // a UDP datagram with the ch
   uint8_t u[12] = {0x00, 0x43, 0x00, 0x44, 0x00, 0x0c, 0, 0, 0xde, 0xad, 0xbe, 0xef};
   const uint8_t s[4] = {10, 0, 0, 1}, d[4] = {255, 255, 255, 255};
   uint16_t c = rmnet::udp4_checksum(s, d, u, sizeof u); u[6] = (uint8_t)(c >> 8); u[7] = (uint8_t)c;
+  // Known answer: pseudo-header 0a00 0001 ffff ffff 0011 000c plus UDP 0043 0044 000c 0000 dead beef
+  // sums to 0x3a84b, folds to 0xa84e, complements to 0x57b1.
+  CHECK_EQ(c, 0x57b1);
   CHECK_EQ(rmnet::udp4_checksum(s, d, u, sizeof u), 0);
 }
