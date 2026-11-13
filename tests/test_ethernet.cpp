@@ -32,6 +32,16 @@ TEST(tx_ipv4_unicast_is_forwarded) {
   auto t = e.handle_tx(f.data(), f.size(), r, sizeof r);
   CHECK(t.action == rmnet::TxAction::Forward); CHECK(t.ip.data == f.data() + 14); CHECK_EQ(t.ip.len, f.size() - 14);
 }
+TEST(tx_ipv4_dropped_on_ipv6_only_link) {          // the Mac's link-local IPv4 must not reach the modem
+  rmnet::EthernetEmulator e(rmnet::derive_macs("bfeed1a5")); auto s = link_settings(); s.has_v4 = false; e.set_link(&s);
+  uint8_t r[128];
+  for (const char* src : {"169.254.12.34", "10.102.246.230"}) {
+    auto f = ipv4_udp(src, "1.1.1.1", 5000, 53, hex("aa bb"));
+    CHECK(e.handle_tx(f.data(), f.size(), r, sizeof r).action == rmnet::TxAction::Drop);
+  }
+  auto echo = icmp6("2001:db8:8af4:b260:1111:2222:3333:4444", "2400:3200::1", 128, hex("12 34 00 01"));
+  CHECK(e.handle_tx(echo.data(), echo.size(), r, sizeof r).action == rmnet::TxAction::Forward);  // IPv6 still goes
+}
 TEST(tx_drops_what_cannot_go_upstream) {
   rmnet::EthernetEmulator e(rmnet::derive_macs("bfeed1a5")); auto s = link_settings(); e.set_link(&s); uint8_t r[128];
   auto lldp = eth("01 80 c2 00 00 0e", "02 68 7a 43 12 f6", 0x88cc, hex("00 00"));

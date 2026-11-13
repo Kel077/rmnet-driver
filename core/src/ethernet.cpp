@@ -85,10 +85,10 @@ TxResult EthernetEmulator::handle_tx(const uint8_t* frame, size_t len, uint8_t* 
 }
 
 // Answers DHCP itself and forwards unicast IPv4, trimmed to the header's total
-// length (Ethernet may pad).
+// length (Ethernet may pad). Drops everything when the link has no IPv4.
 TxResult EthernetEmulator::tx_ipv4(const uint8_t* frame, const uint8_t* p, size_t len, uint8_t* reply,
                                    size_t cap) {
-  if (len < kIpv4HeaderLen || (p[0] >> 4) != 4) return drop();
+  if (!link_.has_v4 || len < kIpv4HeaderLen || (p[0] >> 4) != 4) return drop();
   size_t total = get16(p + 2);
   if (total < kIpv4HeaderLen || total > len) return drop();
   if (is_dhcp_client(p, total)) return tx_dhcp(frame, p, total, reply, cap);
