@@ -41,7 +41,8 @@ constexpr const char* kProfileKey = "RMNetProfile";
 constexpr uint32_t kTxBatch = 32;
 constexpr uint32_t kTxHold = 256;  // sent packets the completion queue has not taken yet
 constexpr uint32_t kRxHold = 256;  // filled packets the completion queue has not taken yet
-constexpr uint32_t kRxBatch = 64;  // filled packets handed up in one EnqueuePackets at most
+constexpr uint32_t kRxBatch = 64;  // filled packets that trigger a hand-up (a hand-up after a
+                                   // refusal passes all of rxOut, up to kRxHold)
 constexpr uint32_t kRxStock = 32;  // empty receive packets taken from the RX submission queue at once
 constexpr uint8_t kLinkHeaderLen = 14;  // Ethernet
 constexpr uint32_t kCounterTicks = 10;  // counters are published once a second
@@ -194,7 +195,7 @@ struct RxBridge final : RxSink {
 };
 
 // What PublishCounters last published, in its order.
-enum : uint32_t { kCounterCount = 40 };
+enum : uint32_t { kCounterCount = 41 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -246,9 +247,13 @@ struct RMNetDriver_IVars {
   uint32_t ticks;
   uint64_t rxLagMaxUs;  // the longest a successful bulk read waited between completing and its handler
   // The longest and the summed time of the handler of a successful bulk read (BulkInComplete_Impl
-  // up to the return of UsbIo::bulk_in_complete, the re-post included), while not stopping.
+  // up to the return of UsbIo::bulk_in_complete, the re-post included), while not stopping. Not
+  // counted until the receive path's first-call log lines are behind it: rxReadSeen (a successful
+  // read was handled, so "BulkInComplete" and UsbIo's "first bulk read" are logged) and the
+  // "first rx packet" line.
   uint64_t rxHandlerMaxNs;
   uint64_t rxHandlerTotalNs;
+  bool rxReadSeen;
   bool countersPublished;
   uint64_t counters[kCounterCount];
 };
@@ -557,7 +562,9 @@ void RMNetDriver::OnControl(const uint8_t* data, size_t len) {
 void RMNetDriver::OnUsbFatal(const char* what) {
   LOG("usb failed: %{public}s", what);
   ivars->usbFailed = true;
-  if (ivars->stopping || !ivars->core || ivars->coreStopped) return;
+  if (ivars->stopping || !ivars->core) return;
+  ivars->core->drop_kept_replies();  // they will never find an uplink buffer (not the Session)
+  if (ivars->coreStopped) return;
   ivars->coreStopped = true;
   ivars->core->stop();
   ApplyCore();
@@ -733,8 +740,15 @@ IOReturn RMNetDriver::setPowerState(unsigned long powerState, IOService* whatDev
 
 // --- Packet queues -------------------------------------------------------------------------------
 
+// During a hold (txWaitUplink) a drain would only be refused again: the frame it waits with is
+// first in txPending. Only sent packets are completed then; the next successful uplink completion
+// (OnBulkOutDone) or the timer tick restarts the drain.
 void RMNetDriver::TxPacketsAvailable_Impl(OSAction*) {
   LOG_FIRST(kLogTxAvailable, "TxPacketsAvailable");
+  if (ivars->txWaitUplink) {
+    FlushTxDone();
+    return;
+  }
   DrainTx();
 }
 
@@ -873,6 +887,7 @@ void RMNetDriver::OnBulkIn(const uint8_t* data, size_t len) {
 }
 
 // A completed uplink transfer frees its buffer: a drain that stopped for want of one restarts.
+// CoreHost runs first, so a QMAP command reply it kept takes the freed buffer before the drain.
 // Only after a success: UsbIo reports a failed transfer before it starts a stall recovery, so a
 // drain then could submit to a halted pipe; the timer tick restarts it instead.
 void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
@@ -888,7 +903,9 @@ void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
 // frames alone; RMNetTxHolds counts the hold episodes, from the drain stopping for want of an
 // uplink buffer to a drain that ends without stopping so. RMNetRxHandlerMaxUs and
 // RMNetRxHandlerTotalUs are the longest and the summed bulk read handler time; divided by
-// RMNetRxTransfers, the total gives the mean.
+// RMNetRxTransfers, the total gives the mean (the transfers handled before the receive path's
+// first log lines are not timed). RMNetQmapCommandRepliesKept is the command replies CoreHost
+// keeps now for want of an uplink buffer, from 0 to kKeptReplies.
 void RMNetDriver::PublishCounters() {
   const DataCounters& c = ivars->core->counters();
   uint32_t txPending = ivars->txPendingCount - ivars->txPendingNext;
@@ -941,6 +958,7 @@ void RMNetDriver::PublishCounters() {
       {"RMNetRxStock", ivars->rxStockCount},
       {"RMNetRxHandlerMaxUs", ivars->rxHandlerMaxNs / 1000},
       {"RMNetRxHandlerTotalUs", ivars->rxHandlerTotalNs / 1000},
+      {"RMNetQmapCommandRepliesKept", ivars->core->kept_replies()},
   };
   bool changed = !ivars->countersPublished;
   for (uint32_t i = 0; i < kCounterCount; i++) {
@@ -971,23 +989,28 @@ void RMNetDriver::PublishCounters() {
 // --- USB and timer -------------------------------------------------------------------------------
 
 // Completions go to UsbIo even while stopping: it counts the aborted ones before releasing.
-// A successful read while not stopping is timed from here to the return of bulk_in_complete
-// (parsing, handing packets up, re-posting the read): two clock reads per transfer.
+// A successful read while not stopping is timed from after the first-call log line to the return
+// of bulk_in_complete (parsing, handing packets up, re-posting the read); not until the receive
+// path's first-call lines are logged (rxReadSeen and "first rx packet"), so no log line is timed.
+// The lag uses the clock read taken on entry.
 void RMNetDriver::BulkInComplete_Impl(OSAction* action, IOReturn status, uint32_t actualByteCount,
                                      uint64_t completionTimestamp) {
   uint64_t now = NowNs();
   LOG_FIRST(kLogBulkIn, "BulkInComplete 0x%x, %u bytes, completion timestamp %llu, uptime %llu ns", status,
             actualByteCount, completionTimestamp, now);
   if (!ivars || !ivars->usb) return;
-  bool timed = status == kIOReturnSuccess && !ivars->stopping;
-  if (timed) NoteRxLag(completionTimestamp, now);
+  bool handled = status == kIOReturnSuccess && !ivars->stopping;
+  if (handled) NoteRxLag(completionTimestamp, now);
+  bool timed = handled && ivars->rxReadSeen && (ivars->logged & kLogRxPacket);
+  uint64_t start = timed ? NowNs() : 0;
   uint32_t slot = *static_cast<uint32_t*>(action->GetReference());
   ivars->usb->bulk_in_complete(slot, status, actualByteCount);
   if (timed) {
-    uint64_t ns = NowNs() - now;
+    uint64_t ns = NowNs() - start;
     if (ns > ivars->rxHandlerMaxNs) ivars->rxHandlerMaxNs = ns;
     ivars->rxHandlerTotalNs += ns;
   }
+  if (handled) ivars->rxReadSeen = true;
   if (ivars->stopping) AdvanceStop();
 }
 

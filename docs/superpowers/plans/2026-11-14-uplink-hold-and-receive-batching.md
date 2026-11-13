@@ -25,7 +25,7 @@
 ## Review Focus
 
 - A frame the driver could not place is offered again unchanged and in order: none lost, none sent twice, when a hold begins in the middle of a batch.
-- A hold always ends: every event that can free an uplink buffer (a bulk OUT completion, good or bad; the end of a recovery; a link down; the modem resuming the uplink) restarts the drain, so frames never sit held while buffers are free and nothing is due to wake the drain.
+- A hold always ends: a successful bulk OUT completion and the modem resuming the uplink restart the drain at once; a failed completion, the end of a recovery and a link down are covered by the 100 ms timer tick, which restarts the drain while it is held. So frames never sit held with buffers free for longer than one tick, and there is always something due to wake the drain. *(Amended 2026-11-14 after the whole-stage review: this line first said every event that can free a buffer restarts the drain at once. The code drains at once only after a success or a resume, because draining from a failed completion would send into a pipe about to be recovered; an "uplink usable" callback that would remove the 100 ms is in the follow-ups file.)*
 - Link down, a fatal USB error or `Stop` while frames are kept: each kept packet is completed once (dropped and counted) or, at `Stop` only, abandoned with the queues; `RMNetPacketsHeld` counts them.
 - Empty receive packets taken in a batch and not yet used are not lost or handed up twice when the link bounces or the completion queue refuses packets; the `kRxHold` limit still holds.
 - Timing the handler adds no per-packet work and no per-packet log line.

@@ -88,6 +88,11 @@ CoreHost::CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t p
       counters_(),
       logged_first_command_(false),
       logged_bad_qmap_(false),
+      logged_reply_kept_(false),
+      kept_reply_(),
+      kept_reply_len_(),
+      kept_head_(0),
+      kept_count_(0),
       reply_(),
       logged_state_(rmnet::SessionState::Idle),
       link_(),
@@ -104,6 +109,7 @@ void CoreHost::start(uint64_t now_ms) {
 void CoreHost::stop() {
   session_.stop();
   note_state();
+  drop_kept_replies();
 }
 
 void CoreHost::tick(uint64_t now_ms) {
@@ -236,6 +242,7 @@ void CoreHost::data_link_down() {
   data_up_ = false;
   data_v6_ = false;
   set_paused(false);
+  drop_kept_replies();
 }
 
 void CoreHost::data_link_up(uint64_t now_ms) {
@@ -264,6 +271,7 @@ void CoreHost::data_link_up(uint64_t now_ms) {
 }
 
 void CoreHost::data_tick(uint64_t now_ms) {
+  send_kept_replies();  // the backstop: a completion normally sends them first
   if (!data_up_ || !data_v6_) return;
   if (now_ms - last_advert_ms_ < kRouterAdvertMs) return;
   send_router_advert();
@@ -342,7 +350,8 @@ void CoreHost::deliver_frame(const uint8_t* frame, size_t len) {
 }
 
 // A command request is answered on the uplink from its own buffer (the reply is built there, not
-// in the read buffer the request sits in). Acks and other non-requests are only counted.
+// in the read buffer the request sits in). Acks and other non-requests are only counted. With no
+// uplink buffer free, or replies already kept (they go first), the reply is kept.
 void CoreHost::on_command(const rmnet::QmapFrame& f) {
   counters_.commands++;
   rmnet::QmapCommand cmd;
@@ -360,9 +369,10 @@ void CoreHost::on_command(const rmnet::QmapFrame& f) {
     counters_.flow_enable++;
     set_paused(false);
   }
-  int slot = usb_.acquire_uplink();
+  send_kept_replies();
+  int slot = kept_count_ == 0 ? usb_.acquire_uplink() : -1;
   if (slot < 0) {
-    counters_.command_reply_drops++;
+    keep_reply(f);
     return;
   }
   size_t n = rmnet::qmap_build_command_reply(usb_.uplink_buffer(slot), kMaxUplink, f.mux_id, f.payload);
@@ -371,9 +381,56 @@ void CoreHost::on_command(const rmnet::QmapFrame& f) {
     counters_.command_reply_drops++;
     return;
   }
+  send_reply(slot, n);
+}
+
+// Builds the reply into the next free kept slot. A full store, or a reply larger than a slot,
+// drops it (counted).
+void CoreHost::keep_reply(const rmnet::QmapFrame& f) {
+  if (kept_count_ >= kKeptReplies) {
+    counters_.command_reply_drops++;
+    return;
+  }
+  uint32_t i = (kept_head_ + kept_count_) % kKeptReplies;
+  size_t n = rmnet::qmap_build_command_reply(kept_reply_[i], kKeptReplyBytes, f.mux_id, f.payload);
+  if (n == 0) {
+    counters_.command_reply_drops++;
+    return;
+  }
+  kept_reply_len_[i] = static_cast<uint32_t>(n);
+  kept_count_++;
+  if (!logged_reply_kept_) {
+    logged_reply_kept_ = true;
+    LOG("first qmap command reply kept: no uplink buffer free%{public}s, %zu bytes",
+        usb_.uplink_recovering() ? " (bulk out recovering)" : "", n);
+  }
+}
+
+// Sends kept replies, oldest first, while uplink buffers can be had (none while bulk OUT recovers).
+void CoreHost::send_kept_replies() {
+  while (kept_count_ > 0) {
+    int slot = usb_.acquire_uplink();
+    if (slot < 0) return;
+    uint32_t i = kept_head_;
+    uint32_t n = kept_reply_len_[i];
+    memcpy(usb_.uplink_buffer(slot), kept_reply_[i], n);
+    kept_head_ = (kept_head_ + 1) % kKeptReplies;
+    kept_count_--;
+    send_reply(slot, n);
+  }
+}
+
+void CoreHost::drop_kept_replies() {
+  counters_.command_reply_drops += kept_count_;
+  kept_count_ = 0;
+  kept_head_ = 0;
+}
+
+// Sends a reply from a reserved uplink buffer; the transfer carries no IP packet.
+void CoreHost::send_reply(int slot, size_t len) {
   slot_packets_[slot] = 0;
   slot_bytes_[slot] = 0;
-  if (usb_.send_uplink(slot, static_cast<uint32_t>(n))) {
+  if (usb_.send_uplink(slot, static_cast<uint32_t>(len))) {
     counters_.command_replies++;
   } else {
     counters_.command_reply_drops++;
@@ -404,6 +461,9 @@ void CoreHost::on_bulk_out_done(int slot, bool ok) {
   }
   slot_packets_[slot] = 0;
   slot_bytes_[slot] = 0;
+  // The freed buffer goes to a kept command reply first: this runs before the driver restarts its
+  // drain (RMNetDriver::OnBulkOutDone). Not after a failure, which may start a stall recovery.
+  if (ok) send_kept_replies();
 }
 
 // handle_tx has no side effect when it answers Forward (core/src/ethernet.cpp: the IPv4 and IPv6

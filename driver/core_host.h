@@ -14,6 +14,10 @@
 // sent when it is full or when the driver says the transmit queue is empty (flush_uplink). A
 // packet that finds every uplink buffer in flight is not taken (transmit returns false); the
 // driver keeps the frame and offers it again once a transfer completes.
+// A reply to a QMAP command that finds no uplink buffer free (all in flight, or bulk OUT
+// recovering) is kept, up to kKeptReplies in order, and sent when a transfer completes
+// (on_bulk_out_done, before the driver restarts its drain) or on data_tick. Kept replies are
+// discarded, and counted as reply drops, on a link down, at stop and on drop_kept_replies.
 // No per-packet logging: counters carry it.
 #pragma once
 
@@ -68,7 +72,13 @@ struct DataCounters {
   uint64_t flow_disable;
   uint64_t flow_enable;
   uint64_t command_replies;    // replies sent
-  uint64_t command_reply_drops;  // replies not sent (no uplink buffer, or the send failed)
+  uint64_t command_reply_drops;  // replies not sent: none could be kept (store full, or too big
+                                 // for a kept slot), the send failed, or a kept one was discarded
+};
+
+enum : uint32_t {
+  kKeptReplies = 4,       // command replies kept while no uplink buffer is free
+  kKeptReplyBytes = 64,   // each: a flow control reply is 4 + 16 bytes; larger ones are not kept
 };
 
 class CoreHost final : public rmnet::SessionDelegate {
@@ -100,7 +110,8 @@ class CoreHost final : public rmnet::SessionDelegate {
   // format, starts the bulk reads, and sends a router advertisement if IPv6 is new.
   void data_link_down();
   void data_link_up(uint64_t now_ms);
-  // The periodic router advertisement, every kRouterAdvertMs while up with IPv6.
+  // Sends kept command replies a buffer is free for; then the periodic router advertisement,
+  // every kRouterAdvertMs while up with IPv6.
   void data_tick(uint64_t now_ms);
   void on_bulk_in(const uint8_t* data, size_t len);
   void on_bulk_out_done(int slot, bool ok);
@@ -114,6 +125,9 @@ class CoreHost final : public rmnet::SessionDelegate {
   // True once after the uplink was resumed (flow enable, or link down while paused).
   bool take_uplink_resumed();
   const DataCounters& counters() const { return counters_; }
+  uint32_t kept_replies() const { return kept_count_; }  // command replies waiting for a buffer
+  // Discards the kept command replies (USB failed: they will never find a buffer).
+  void drop_kept_replies();
 
   // SessionDelegate: called by the session from inside start, stop, on_qmi and tick.
   void send_qmi(const uint8_t* data, size_t len) override;
@@ -129,6 +143,9 @@ class CoreHost final : public rmnet::SessionDelegate {
   void deliver_frame(const uint8_t* frame, size_t len);
   void send_router_advert();
   void on_command(const rmnet::QmapFrame& f);
+  void keep_reply(const rmnet::QmapFrame& f);
+  void send_kept_replies();
+  void send_reply(int slot, size_t len);
   bool forward(const uint8_t* ip, size_t len);
   bool open_uplink();
   bool count_no_uplink();
@@ -153,6 +170,13 @@ class CoreHost final : public rmnet::SessionDelegate {
   DataCounters counters_;
   bool logged_first_command_;
   bool logged_bad_qmap_;
+  bool logged_reply_kept_;
+  // Kept command replies: a ring of kKeptReplies, oldest at kept_head_. Never the read buffer the
+  // request sits in, so qmap_build_command_reply's no-overlap rule holds.
+  uint8_t kept_reply_[kKeptReplies][kKeptReplyBytes];
+  uint32_t kept_reply_len_[kKeptReplies];
+  uint32_t kept_head_;
+  uint32_t kept_count_;
   uint8_t reply_[2048];  // emulator replies, before they are copied into a receive packet
   rmnet::SessionState logged_state_;
   rmnet::LinkConfig link_;

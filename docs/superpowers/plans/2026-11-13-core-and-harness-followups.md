@@ -47,22 +47,22 @@ These came from the whole-branch review and from running against the modem. Stat
 
 ## Sent here by the driver plan's final review (2026-11-14)
 
-Line references are at commit `680948c`.
+Line references were at commit `680948c`; since the code has moved, they are now given as names (changed 2026-11-14, after the uplink-hold plan's whole-stage review).
 
 Port up but passing nothing (belongs with the Up-state liveness work):
-- A bulk OUT that only ever times out is never escalated: a 5 s timeout frees the buffer and counts `RMNetTxDropUsb`, and nothing counts consecutive ones (`driver/usb_io.cpp:31, 53-56, 574-596`).
-- A QMAP flow disable never followed by an enable pauses the uplink for good (`driver/core_host.cpp:350-356`).
+- A bulk OUT that only ever times out is never escalated: a 5 s timeout frees the buffer and counts `RMNetTxDropUsb`, and nothing counts consecutive ones (`kUplinkTimeoutMs` and `Halts` in `driver/usb_io.cpp`, `UsbIo::bulk_out_complete`).
+- A QMAP flow disable never followed by an enable pauses the uplink for good (`CoreHost::on_command` and `CoreHost::set_paused`, `driver/core_host.cpp`).
 
 Carrier MTU:
-- A carrier MTU below 1500 never reaches the interface for IPv4: `setMaxTransferUnit` returns Unsupported and `getMaxTransferUnit` is read only at registration (`driver/RMNetDriver.cpp:543-550`); the router advertisement covers IPv6. Latent: every call so far had 1500.
+- A carrier MTU below 1500 never reaches the interface for IPv4: `setMaxTransferUnit` returns Unsupported and `getMaxTransferUnit` is read only at registration (`RMNetDriver::ApplyCore` and `RMNetDriver::getMaxTransferUnit`, `driver/RMNetDriver.cpp`); the router advertisement covers IPv6. Latent: every call so far had 1500.
 
 Never run on hardware (add to the list above):
-- A failed `Start` after `usb->start()` (`driver/RMNetDriver.cpp:300-304`): `Start_Impl` returns the error while the stop sequence still waits on a request through the timer; whether DriverKit can free the object first is unknown, and `free()` releases the timer without `Cancel`.
+- A failed `Start` after `usb->start()` (the failure branch at the end of `RMNetDriver::Start_Impl`): `Start_Impl` returns the error while the stop sequence still waits on a request through the timer; whether DriverKit can free the object first is unknown, and `free()` releases the timer without `Cancel`.
 
 Throughput, in the code and not yet measured:
-- Acknowledgements share the 8 uplink slots and are dropped with data under a concurrent upload, so the backpressure fix matters for downloads too; when it is built, a freed slot must drain the transmit queue (`OnBulkOutDone`, `driver/RMNetDriver.cpp:792`, triggers nothing today). **Settled in code (2026-11-14):** a successful bulk OUT completion restarts a drain that stopped for want of a buffer; acknowledgements now wait for a buffer instead of being dropped.
+- Acknowledgements share the 8 uplink slots and are dropped with data under a concurrent upload, so the backpressure fix matters for downloads too; when it is built, a freed slot must drain the transmit queue (`RMNetDriver::OnBulkOutDone` triggered nothing then). **Settled in code (2026-11-14):** a successful bulk OUT completion restarts a drain that stopped for want of a buffer; acknowledgements now wait for a buffer instead of being dropped.
 - A read is re-posted only after its whole handler, and handler time is unmeasured; a per-completion maximum of handler duration is a cheap counter. **Changed in code (2026-11-14, Task 2 of the uplink-hold plan), hardware check pending:** `RMNetRxHandlerMaxUs` and `RMNetRxHandlerTotalUs` time each successful bulk read's handler, re-post included.
-- `RxBuffer` (`driver/RMNetDriver.cpp:737-746`) dequeues one receive packet per frame, about 17 calls per transfer; batch with `DequeuePackets`. **Changed in code (2026-11-14, Task 2 of the uplink-hold plan), hardware check pending:** a stock of up to 32 empty packets is refilled with one `DequeuePackets` call (`RMNetRxStock`).
+- `RMNetDriver::RxBuffer` dequeued one receive packet per frame, about 17 calls per transfer; batch with `DequeuePackets`. **Changed in code (2026-11-14, Task 2 of the uplink-hold plan), hardware check pending:** a stock of up to 32 empty packets is refilled with one `DequeuePackets` call (`RMNetRxStock`).
 - One Default queue serialises receive and transmit, so a bulk-in handler delays acknowledgements by its duration.
 - Two paths wait for the 100 ms timer instead of a completion: frames held for lack of `txDone` room, and receive packets the completion queue refused.
 - At low rates the modem sends one packet per transfer plus a 4-byte filler, so TCP slow start pays two completions per packet, which weighs heavily in a 50 MB run.
@@ -70,6 +70,16 @@ Throughput, in the code and not yet measured:
 Before the same-day comparison with the userspace tool:
 - Add the handler-duration counter and the batched receive dequeue first, so the comparison can separate driver time from network. **Changed in code (2026-11-14, Task 2 of the uplink-hold plan), hardware check pending:** both are in build 316.19.26, which has not yet run on hardware.
 - The userspace tool runs on a `utun` outside `measure.sh`'s usage file, so its data must be added to the file by hand or the guard will be wrong.
+
+## Sent here by the uplink-hold plan's whole-stage review (2026-11-14)
+
+None of these has run on hardware.
+
+- **Empty packets held across an interface disable and enable.** The driver now holds up to 32 empty receive packets (`RMNetRxStock`) and up to 32 kept transmit frames while idle or held, where before it held 0 or 1; whether the framework reclaims driver-held packets on `SetInterfaceEnable(false)` is unknown, and if it does they would be used twice. Needs the port switched off and on with `RMNetRxStock` above 0 (the owner's step).
+- **Pool margin.** The driver alone can hold `rxOut` 256 + `rxStock` 32 + `txDone` and kept frames 256 = 544 packets against `kPacketCount` 512, with the four queues of 256 on top; no array can overflow, but during an upload the hold keeps the transmit queue full, so a download at the same time could find no empty packets (`RMNetRxDropNoPacket`), and the standing queue of about 288 frames adds latency in front of acknowledgements. If hardware shows it: raise `kPacketCount` to 1024, or give the transmit queue a smaller capacity.
+- **An "uplink usable" callback.** A failed bulk OUT completion, the end of a bulk OUT recovery (`UsbIo::end_out_recovery`) and a link down without a pause restart a held drain only on the next 100 ms tick; a `UsbIoListener` callback raised after `UsbIo::bulk_out_complete` has decided on recovery, and at the end of `UsbIo::end_out_recovery`, would remove that wait.
+- **A host harness for `CoreHost`'s hold.** No automated test covers `CoreHost::transmit` returning false, the re-offer of the kept frame, or frame order; nor the kept QMAP command replies.
+- **The burst tool's remaining signal cases.** A second signal inside the interrupt handler of `scripts/uplink-burst.py` ends with a traceback, though the usage line is written; SIGQUIT and SIGKILL leave no line.
 
 Small hardening left open:
 - The frame-length minimum tests.
@@ -105,7 +115,7 @@ There was one fix wave, so these four wording errors are still in the tree at `6
 - `README.md:18` says the link is reported up "as soon as one family has its settings". Core reports link up only after both families have been attempted, IPv4 then IPv6, and at least one has settings (`core/src/session.cpp:364-374`).
 - `README.md:23` says every run of `scripts/measure.sh`, "also a failed or interrupted one", appends a usage line. A run killed with SIGKILL leaves none.
 - `scripts/install-driver.sh:40` prints "stopping before anything is changed" on both reads of the driver listing. On the second read, after `activate`, the app has already been replaced and activated.
-- `driver/RMNetDriver.cpp:578` logs "the interface keeps the mtu it registered with" unconditionally. That is true today because `setMaxTransferUnit` returns Unsupported; it would be wrong if that call ever succeeded.
+- The link-up line in `RMNetDriver::ApplyCore` logs "the interface keeps the mtu it registered with" unconditionally. That is true today because `setMaxTransferUnit` returns Unsupported; it would be wrong if that call ever succeeded.
 
 Also open from that wave: the driver now reads `RMNetProfile` and passes it to Core, but this is proven only by reading the code. The published value is 1, which is also the fallback, and the log line that names the profile in use was lost by the log stream. Proving the read needs one install with a different value in `driver/Info.plist`.
 

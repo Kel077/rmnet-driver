@@ -12,14 +12,18 @@ The cellular data is metered. The limit is on what the cellular link carries: da
 (bytes-each + 28 bytes of IPv4 and UDP headers) must be at most 2,000,000, or the request is
 refused before anything is sent. The usage file (build/installed/measure-usage.log, shared with
 scripts/measure.sh) must exist, end with a newline, and every line other than a comment must be
-"<time> <down|up> <bytes in> <bytes out>"; otherwise the run is refused. After the burst, one line
+"<time> <down|up> <bytes in> <bytes out>"; otherwise the run is refused. The run is also refused if
+the recorded total plus this run's datagrams x (bytes-each + 28) would pass 300,000,000 bytes (the
+budget scripts/measure.sh checks too), or if the usage file cannot be opened for appending; it is
+opened before the sends and stays open until the line is written. After the burst, one line
 "<UTC time> up <bytes in> <bytes out>" is appended, from the interface's own byte counters
 (`netstat -I <interface> -b -n`) read before and 1 s after the burst. If the counters cannot be read
 at the end, or went backwards (the interface was recreated), the run is charged its payload plus
 headers instead, and that is said.
 
 An interrupt (SIGINT, SIGTERM or SIGHUP) during the sends stops them; from the end of the sends
-until the usage line is written, these signals are ignored, so what was sent is always recorded.
+(the send loop's last step) until the usage line is written, these signals are ignored, so what was
+sent is recorded.
 
 --usage-file replaces the usage file for a test. It is accepted only with the interface lo0, and
 lo0 requires it, so a loopback run never writes to the real usage file.
@@ -38,6 +42,7 @@ import time
 
 DEST = ("192.0.2.1", 9)
 MAX_TOTAL = 2_000_000
+BUDGET = 300_000_000  # all recorded use, as in scripts/measure.sh
 DEFAULT_COUNT = 1500
 DEFAULT_SIZE = 1200
 IP_BOUND_IF = 25  # <netinet/in.h>; Python's socket module does not name it
@@ -142,6 +147,14 @@ def main():
     before = counters(iface)
     if before is None:
         refuse("the byte counters of %s cannot be read" % iface)
+    carried = count * (size + IP_UDP_HEADERS)
+    if used + carried > BUDGET:
+        refuse("the recorded total %d plus this run's %d bytes would pass the %d-byte budget" %
+               (used, carried, BUDGET))
+    try:
+        record = open(usage, "a")  # before the sends: a run that cannot be recorded is not made
+    except OSError as e:
+        refuse("the usage file %s cannot be opened for appending (%s)" % (usage, e))
     print("usage file: %s, recorded total %d bytes" % (usage, used))
     print("burst: %d datagrams of %d bytes to %s port %d from %s: %d x (%d + %d) = %d bytes on the link, "
           "limit %d" % (count, size, DEST[0], DEST[1], iface, count, size, IP_UDP_HEADERS,
@@ -173,6 +186,10 @@ def main():
                     other += 1
                     if first_error is None:
                         first_error = e
+        # The last step of the sends: a signal after it must not reach the handler, which would
+        # raise inside finally and skip the record. One before it lands in the except below.
+        for sig in SIGNALS:
+            signal.signal(sig, signal.SIG_IGN)
     except KeyboardInterrupt:
         for sig in SIGNALS:
             signal.signal(sig, signal.SIG_IGN)
@@ -192,8 +209,8 @@ def main():
             rec_in, rec_out = 0, count * (size + HEADERS)
             note = " (counters unreadable or reset; charged the payload plus headers)"
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        with open(usage, "a") as f:
-            f.write("%s up %d %d\n" % (stamp, rec_in, rec_out))
+        with record:
+            record.write("%s up %d %d\n" % (stamp, rec_in, rec_out))
 
     if interrupted:
         print("uplink-burst: interrupted during the sends; what was sent is recorded", file=sys.stderr)
