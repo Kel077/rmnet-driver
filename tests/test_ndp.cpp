@@ -70,6 +70,20 @@ TEST(truncated_nd_dropped) {
   uint8_t tiny[40]; auto rs = router_solicit(kHostLL);
   CHECK(e.handle_tx(rs.data(), rs.size(), tiny, sizeof tiny).action == rmnet::TxAction::Drop);      // reply buffer too small
 }
+// `frame` (Ethernet + IPv6) cut to `icmp_len` ICMPv6 bytes, with the IPv6 payload length to match,
+// so the emulator's IPv6 length check passes and the ND length check is what drops it.
+static std::vector<uint8_t> cut_icmp6(std::vector<uint8_t> frame, size_t icmp_len) {
+  frame.resize(14 + 40 + icmp_len);
+  frame[14 + 4] = (uint8_t)(icmp_len >> 8); frame[14 + 5] = (uint8_t)icmp_len;
+  return frame;
+}
+TEST(truncated_nd_with_matching_length_dropped) {
+  rmnet::EthernetEmulator e(rmnet::derive_macs("bfeed1a5")); auto s = link_settings(); e.set_link(&s); uint8_t r[256];
+  auto ns = cut_icmp6(neighbour_solicit(kHostGlobal, "fe80::1"), 10);              // shorter than the 24-byte solicitation
+  CHECK(e.handle_tx(ns.data(), ns.size(), r, sizeof r).action == rmnet::TxAction::Drop);
+  auto rs = cut_icmp6(router_solicit(kHostLL), 4);                                  // shorter than the 8-byte solicitation
+  CHECK(e.handle_tx(rs.data(), rs.size(), r, sizeof r).action == rmnet::TxAction::Drop);
+}
 TEST(router_advert_from_network_dropped_on_rx) {
   rmnet::EthernetEmulator e(rmnet::derive_macs("bfeed1a5")); auto s = link_settings(); e.set_link(&s); uint8_t out[256];
   auto ra = icmp6("fe80::a089:88dc:137d:6253", "ff02::1", 134, hex("40 00 07 08 00 00 00 00 00 00 00 00"));

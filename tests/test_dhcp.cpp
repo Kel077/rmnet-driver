@@ -45,6 +45,36 @@ TEST(dhcp_while_link_down_dropped) {
   auto s = link_settings(); s.has_v4 = false; e.set_link(&s);
   CHECK(e.handle_tx(q.data(), q.size(), r, sizeof r).action == rmnet::TxAction::Drop);
 }
+// A dhcp_client() frame cut to `bootp_len` BOOTP bytes, with the IPv4 total length, IPv4 header
+// checksum, UDP length and UDP checksum rewritten to match, so it passes the IPv4 and UDP checks.
+static std::vector<uint8_t> refit(std::vector<uint8_t> frame, size_t bootp_len) {
+  frame.resize(14 + 20 + 8 + bootp_len);
+  uint8_t* ip = frame.data() + 14;
+  uint8_t* udp = ip + 20;
+  size_t total = 20 + 8 + bootp_len, udp_len = 8 + bootp_len;
+  ip[2] = (uint8_t)(total >> 8); ip[3] = (uint8_t)total;
+  ip[10] = ip[11] = 0;
+  uint16_t c = rmnet::fold_checksum(rmnet::sum16(ip, 20)); ip[10] = (uint8_t)(c >> 8); ip[11] = (uint8_t)c;
+  udp[4] = (uint8_t)(udp_len >> 8); udp[5] = (uint8_t)udp_len;
+  udp[6] = udp[7] = 0;
+  c = rmnet::udp4_checksum(ip + 12, ip + 16, udp, udp_len); if (c == 0) c = 0xffff;
+  udp[6] = (uint8_t)(c >> 8); udp[7] = (uint8_t)c;
+  return frame;
+}
+TEST(malformed_dhcp_with_matching_lengths_dropped) {
+  rmnet::EthernetEmulator e(rmnet::derive_macs("bfeed1a5")); auto s = link_settings(); e.set_link(&s); uint8_t r[600];
+  auto q = dhcp_client(3, 1, "10.102.246.230", "");               // options: cookie, 53 1 3, 50 4 <address>, 255
+  size_t bootp = q.size() - 14 - 20 - 8;
+  auto whole = refit(q, bootp);                                    // unchanged length: still answered
+  CHECK(e.handle_tx(whole.data(), whole.size(), r, sizeof r).action == rmnet::TxAction::Reply);
+  auto cut = refit(q, 100);                                        // cut inside BOOTP, before the cookie
+  CHECK(e.handle_tx(cut.data(), cut.size(), r, sizeof r).action == rmnet::TxAction::Drop);
+  auto overrun = refit(q, 240 + 3 + 2 + 2);                        // option 50 says 4 bytes, 2 remain
+  CHECK(e.handle_tx(overrun.data(), overrun.size(), r, sizeof r).action == rmnet::TxAction::Drop);
+  auto untyped = q; for (size_t i = 0; i < 3; ++i) untyped[14 + 20 + 8 + 240 + i] = 0;  // option 53 becomes padding
+  untyped = refit(untyped, bootp);
+  CHECK(e.handle_tx(untyped.data(), untyped.size(), r, sizeof r).action == rmnet::TxAction::Drop);
+}
 TEST(malformed_dhcp_dropped) {
   rmnet::EthernetEmulator e(rmnet::derive_macs("bfeed1a5")); auto s = link_settings(); e.set_link(&s); uint8_t r[600];
   auto q = dhcp_client(1, 1, "", "");
