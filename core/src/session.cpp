@@ -160,10 +160,7 @@ void Session::on_response(const QmiMessage& m, uint64_t now_ms) {
       }
       fam.has_client = true;
       fam.client = client;
-      uint16_t tx = next_txid();
-      size_t n = build_wds_bind_mux(buf_, sizeof buf_, client, tx, cfg_.iface_number, cfg_.mux_id);
-      expect(Step::Bind, QmiService::WDS, client, tx, kWdsBindMuxDataPort, n, now_ms,
-             kRequestTimeoutMs);
+      send_bind(now_ms);
       return;
     }
     case Step::Bind: {
@@ -182,6 +179,7 @@ void Session::on_response(const QmiMessage& m, uint64_t now_ms) {
         family_done(now_ms);
         return;
       }
+      fam.configured = true;
       send_start(now_ms);
       return;
     }
@@ -249,8 +247,15 @@ void Session::on_indication(const QmiMessage& m, uint64_t now_ms) {
   }
 
   // Up or Refreshing: only the families that carry the link matter. A family that failed during
-  // bring-up keeps its client, so a late indication from it must not take the link down.
-  if (!family_has_settings(index)) return;
+  // bring-up keeps its client, so a late indication from it must not take the link down. The one
+  // exception: if the call of the family being retried drops, its settings must not be used.
+  if (!family_has_settings(index)) {
+    if (retrying_ && index == current_ && status.status == kStatusDisconnected) {
+      fam.has_handle = false;
+      fam.live = false;
+    }
+    return;
+  }
   if (status.status == kStatusDisconnected) {
     fam.has_handle = false;  // the call is gone; nothing to stop
     fam.live = false;
@@ -323,6 +328,14 @@ void Session::begin_family(uint8_t index, uint64_t now_ms) {
          kRequestTimeoutMs);
 }
 
+void Session::send_bind(uint64_t now_ms) {
+  const Family& fam = families_[current_];
+  uint16_t tx = next_txid();
+  size_t n = build_wds_bind_mux(buf_, sizeof buf_, fam.client, tx, cfg_.iface_number, cfg_.mux_id);
+  expect(Step::Bind, QmiService::WDS, fam.client, tx, kWdsBindMuxDataPort, n, now_ms,
+         kRequestTimeoutMs);
+}
+
 void Session::send_start(uint64_t now_ms) {
   const Family& fam = families_[current_];
   uint16_t tx = next_txid();
@@ -372,13 +385,19 @@ void Session::schedule_retry(uint64_t now_ms) {
 }
 
 // Up, with the link carried by one family: starts bringing up the other. A family that kept its
-// client from bring-up goes straight to Start Network.
+// configured client from bring-up goes straight to Start Network; one whose Bind Mux or Set IP
+// Family failed starts again from Bind Mux.
 void Session::begin_retry(uint64_t now_ms) {
   retry_due_ = false;
   retrying_ = true;
   current_ = family_has_settings(0) ? 1 : 0;
-  if (families_[current_].has_client) {
+  const Family& fam = families_[current_];
+  if (fam.has_client && fam.configured) {
     send_start(now_ms);
+    return;
+  }
+  if (fam.has_client) {
+    send_bind(now_ms);
     return;
   }
   uint8_t tx = next_ctl_txid();

@@ -68,17 +68,21 @@ void bring_up_to(rmnet::Session& s, FakeModem& m, const char* last_response) {
 
 void bring_up_fully(rmnet::Session& s, FakeModem& m) { bring_up_to(s, m, kWdsSettings6Resp); }
 
-// A Start Network response on WDS `client` with transaction `txid` that failed with `error`.
-std::vector<uint8_t> start_error_frame(uint8_t client, uint16_t txid, uint16_t error) {
+// A WDS `msg_id` response on `client` with transaction `txid` that failed with `error`.
+std::vector<uint8_t> wds_error_frame(uint16_t msg_id, uint8_t client, uint16_t txid, uint16_t error) {
   std::vector<uint8_t> buf(64);
   rmnet::QmiBuilder b(buf.data(), buf.size(),
-                      {rmnet::QmiService::WDS, client, rmnet::QmiKind::Response, txid,
-                       rmnet::kWdsStartNetwork});
+                      {rmnet::QmiService::WDS, client, rmnet::QmiKind::Response, txid, msg_id});
   const uint8_t result[4] = {0x01, 0x00, static_cast<uint8_t>(error), static_cast<uint8_t>(error >> 8)};
   b.tlv(0x02, result, sizeof result);
   buf.resize(b.finish());
   buf[3] = 0x80;  // from the modem
   return buf;
+}
+
+// A Start Network response on WDS `client` with transaction `txid` that failed with `error`.
+std::vector<uint8_t> start_error_frame(uint8_t client, uint16_t txid, uint16_t error) {
+  return wds_error_frame(rmnet::kWdsStartNetwork, client, txid, error);
 }
 
 std::vector<uint8_t> failed_start_frame(uint8_t client, uint16_t txid) {
@@ -308,4 +312,32 @@ TEST(live_family_drop_during_retry_goes_to_backoff) {
   s.tick(5100);
   feed(s, kWdsDisconnected4Ind, 5200);
   CHECK_EQ(m.downs, 1); CHECK(s.state() == rmnet::SessionState::Backoff);
+}
+
+TEST(retried_call_dropping_before_settings_fails_the_retry) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_v4_only(s, m, 100);
+  s.tick(5100);
+  feed_frame(s, start6_response_with_txid(m.last_txid()), 5200);
+  CHECK_EQ(m.last()[9], 0x2d);                                                // Get Current Settings outstanding
+  uint16_t settings_txid = m.last_txid();
+  feed(s, kWdsDisconnected6Ind, 5250);                                         // the retried IPv6 call drops
+  feed_frame(s, settings6_response_with_txid(settings_txid), 5300);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1); CHECK_EQ(m.downs, 0);
+  CHECK(!m.cfg.settings.has_v6);
+  size_t sent = m.sent.size();
+  s.tick(15299); CHECK_EQ(m.sent.size(), sent);
+  s.tick(15300); CHECK_EQ(m.sent.size(), sent + 1);                           // next retry 10 s after the failure
+  CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0x20);
+}
+
+TEST(retry_binds_a_client_whose_bind_failed) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_to(s, m, kCtlGetWds6Resp);  // IPv6 Bind Mux outstanding
+  feed_frame(s, wds_error_frame(rmnet::kWdsBindMuxDataPort, 16, m.last_txid(), rmnet::kQmiErrCallFailed), 100);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1);
+  s.tick(5100);
+  CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0xa2); CHECK_EQ(m.last()[10], 0x00);   // Bind Mux on client 16
+  feed_frame(s, with_txid(kWdsBind6Resp, m.last_txid()), 5200);
+  CHECK_EQ(m.last()[9], 0x4d);                                                // Set IP Family
+  feed_frame(s, with_txid(kWdsFamily6Resp, m.last_txid()), 5300);
+  CHECK_EQ(m.last()[9], 0x20);                                                // Start Network
 }

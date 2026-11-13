@@ -12,8 +12,9 @@
 // Up with one family missing, the session retries that family while the link stays up:
 // kFamilyRetryFirstMs after link_up(), then after each failed or timed-out retry a wait twice the
 // last, capped at kFamilyRetryMaxMs. A retry reuses the family's WDS client (Start Network, Get
-// Current Settings), or, if it has none, starts from Get Client ID. A retry due while Refreshing
-// waits until the session is Up again.
+// Current Settings; first Bind Mux and Set IP Family if those failed at bring-up), or, if it has
+// none, starts from Get Client ID. A retry whose call drops before its settings arrive fails. A
+// retry due while Refreshing waits until the session is Up again.
 #pragma once
 
 #include <stddef.h>
@@ -95,6 +96,7 @@ class Session {
   struct Family {
     bool has_client;
     uint8_t client;
+    bool configured;  // the client is bound to the mux and has its IP family set
     bool has_handle;  // false also when Start Network answered NoEffect
     uint32_t handle;
     bool live;  // Start Network succeeded (or answered NoEffect) and no disconnect followed
@@ -109,6 +111,7 @@ class Session {
   void begin_sync(uint64_t now_ms);
   void send_sync(uint64_t now_ms);
   void begin_family(uint8_t index, uint64_t now_ms);
+  void send_bind(uint64_t now_ms);
   void send_start(uint64_t now_ms);
   void send_settings(uint64_t now_ms);
   void family_done(uint64_t now_ms);
