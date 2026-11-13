@@ -46,7 +46,9 @@ size_t build_wda_set_data_format(uint8_t* buf, size_t cap, uint8_t client, uint1
                                  uint32_t iface_number);
 // False unless the response succeeded. A field whose TLV is absent reads as 0.
 bool parse_wda_data_format(const QmiMessage& m, DataFormat* out);
-// Raw IP (2), QMAP (5) both ways, dl_max_size >= 2048.
+// Raw IP (2), QMAP (5) both ways, at least one datagram each way, dl_max_size from 2048 to
+// 31744 and ul_max_size from 2048 to 16384 (the sizes requested, so a response cannot make the
+// caller's buffers larger than asked for).
 bool data_format_usable(const DataFormat& f);
 
 // WDS.

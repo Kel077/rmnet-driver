@@ -39,6 +39,25 @@ rmnet::QmiMessage wds_frame(rmnet::QmiKind kind, uint16_t msg_id, const std::vec
   return decode_bytes(std::move(buf));
 }
 
+// A captured service (non-CTL) frame with TLV `type` removed and both length fields adjusted.
+// Layout: 01, u16 QMUX length, flags, service, client, flags, u16 txid, u16 msg, u16 TLV length.
+std::vector<uint8_t> without_tlv(const char* hex_text, uint8_t type) {
+  std::vector<uint8_t> f = hex(hex_text);
+  for (size_t i = 13; i + 3 <= f.size();) {
+    size_t n = 3 + (size_t)(f[i + 1] | f[i + 2] << 8);
+    if (f[i] == type) {
+      f.erase(f.begin() + (long)i, f.begin() + (long)(i + n));
+      size_t qmux = f.size() - 1, tlvs = f.size() - 13;
+      f[1] = (uint8_t)qmux; f[2] = (uint8_t)(qmux >> 8);
+      f[11] = (uint8_t)tlvs; f[12] = (uint8_t)(tlvs >> 8);
+      return f;
+    }
+    i += n;
+  }
+  ::minitest::fail(__FILE__, __LINE__, "without_tlv(): TLV not in frame");
+  return f;
+}
+
 // Start Network response that failed: result 01 00 0e 00, TLV 0x10 = 02 00, TLV 0x11 = 03 00 d0 07.
 rmnet::QmiMessage failed_start_frame() {
   return wds_frame(rmnet::QmiKind::Response, rmnet::kWdsStartNetwork,
@@ -83,6 +102,26 @@ TEST(parse_data_format) {
   CHECK_EQ(f.ul_max_datagrams, 32u); CHECK_EQ(f.ul_max_size, 16384u);
   CHECK(rmnet::data_format_usable(f));
   f.link_layer = 1; CHECK(!rmnet::data_format_usable(f));
+}
+TEST(data_format_without_uplink_size_unusable) {   // the capture's response without TLV 0x18 (uplink max size)
+  rmnet::DataFormat f{};
+  CHECK(rmnet::parse_wda_data_format(decode_bytes(without_tlv(kWdaSetFormatResp, 0x18)), &f));
+  CHECK_EQ(f.ul_max_size, 0u); CHECK(!rmnet::data_format_usable(f));
+  CHECK(rmnet::parse_wda_data_format(decode_bytes(without_tlv(kWdaSetFormatResp, 0x17)), &f));
+  CHECK_EQ(f.ul_max_datagrams, 0u); CHECK(!rmnet::data_format_usable(f));
+}
+TEST(data_format_limits) {                          // from the capture's values: 32/31744 down, 32/16384 up
+  rmnet::DataFormat ok{};
+  CHECK(rmnet::parse_wda_data_format(decode(kWdaSetFormatResp), &ok));
+  rmnet::DataFormat f = ok; f.ul_max_size = 1500;   CHECK(!rmnet::data_format_usable(f));
+  f = ok; f.ul_max_size = 2048;                     CHECK(rmnet::data_format_usable(f));
+  f = ok; f.ul_max_size = 16385;                    CHECK(!rmnet::data_format_usable(f));
+  f = ok; f.dl_max_size = 31745;                    CHECK(!rmnet::data_format_usable(f));
+  f = ok; f.dl_max_size = 2048;                     CHECK(rmnet::data_format_usable(f));
+  f = ok; f.dl_max_size = 2047;                     CHECK(!rmnet::data_format_usable(f));
+  f = ok; f.dl_max_datagrams = 0;                   CHECK(!rmnet::data_format_usable(f));
+  f = ok; f.ul_max_datagrams = 0;                   CHECK(!rmnet::data_format_usable(f));
+  f = ok; f.dl_max_datagrams = 1; f.ul_max_datagrams = 1; CHECK(rmnet::data_format_usable(f));
 }
 TEST(parse_start_network_handle) {
   uint32_t h = 0; rmnet::CallEnd e{};

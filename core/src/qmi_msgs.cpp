@@ -32,7 +32,7 @@ constexpr uint32_t kDlMaxDatagrams = 32;
 constexpr uint32_t kDlMaxSize = 31744;
 constexpr uint32_t kUlMaxDatagrams = 32;
 constexpr uint32_t kUlMaxSize = 16384;
-constexpr uint32_t kMinUsableDlSize = 2048;
+constexpr uint32_t kMinUsableSize = 2048;  // smallest aggregation buffer accepted, either way
 
 // WDS "Bind Mux Data Port".
 constexpr uint8_t kTlvWdsBindEndpoint = 0x10;   // libqmi: "Endpoint Info"
@@ -194,9 +194,14 @@ bool parse_wda_data_format(const QmiMessage& m, DataFormat* out) {
   return true;
 }
 
+// An absent TLV reads as 0, so a response missing the datagram or uplink size TLVs fails here.
+// An uplink buffer below 2048 bytes could not hold a full-size packet, so the link would come
+// up and send nothing.
 bool data_format_usable(const DataFormat& f) {
   return f.link_layer == kLinkLayerRawIp && f.ul_agg == kAggQmap && f.dl_agg == kAggQmap &&
-         f.dl_max_size >= kMinUsableDlSize;
+         f.dl_max_datagrams >= 1 && f.ul_max_datagrams >= 1 &&
+         f.dl_max_size >= kMinUsableSize && f.dl_max_size <= kDlMaxSize &&
+         f.ul_max_size >= kMinUsableSize && f.ul_max_size <= kUlMaxSize;
 }
 
 size_t build_wds_bind_mux(uint8_t* buf, size_t cap, uint8_t client, uint16_t txid,
