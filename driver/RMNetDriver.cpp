@@ -903,6 +903,7 @@ void RMNetDriver::TimerFired_Impl(OSAction*, uint64_t) {
   }
   if (!ivars->core) return;
   uint64_t now = NowMs();
+  if (ivars->usb) ivars->usb->tick();  // bounds a bulk pipe recovery; may report on_fatal
   if (!ivars->coreStopped) {
     ivars->core->tick(now);
     ApplyCore();

@@ -60,8 +60,8 @@ struct UsbIoActions {
 
 // Bulk errors since open.
 struct UsbIoStats {
-  uint64_t bulk_in_errors;   // reads that completed with an error (aborted ones included)
-  uint64_t bulk_out_errors;  // uplink transfers that failed or could not be submitted
+  uint64_t bulk_in_errors;   // reads that completed with an error; aborts a recovery caused are not counted
+  uint64_t bulk_out_errors;  // uplink transfers that failed or could not be submitted; not recovery aborts
   uint64_t recoveries;       // stall recoveries started on either bulk pipe
   uint64_t stall_clears;     // ClearStall calls on either bulk pipe (one per finished recovery)
 };
@@ -87,7 +87,8 @@ class UsbIo {
 
   // A bulk pipe whose endpoint halts is recovered without blocking: nothing new is posted on it,
   // it is aborted asynchronously, and ClearStall runs only once nothing is pending on it. While
-  // bulk OUT recovers, acquire_uplink gives no buffer (uplink_recovering() says why).
+  // bulk OUT recovers, acquire_uplink gives no buffer (uplink_recovering() says why). A failed
+  // abort, or a recovery not finished within about 1 s (tick), is fatal.
   //
   // Bulk IN: posts every idle read, each `read_len` bytes (rounded up to the endpoint's packet
   // size, at most kMaxDownlink). Later re-posts use the newest length. Reads keep being re-posted
@@ -102,6 +103,9 @@ class UsbIo {
   bool send_uplink(int slot, uint32_t len);
   void release_uplink(int slot);
   bool uplink_recovering() const { return out_recovering_; }
+  // Called by the owner every 100 ms while running: bounds a pipe recovery to about 1 s, after
+  // which it is fatal. Does nothing once finish_sending or abort has been called.
+  void tick();
   uint16_t bulk_out_packet_size() const { return bulk_out_mps_; }  // from the endpoint descriptor
   const UsbIoStats& stats() const { return stats_; }
   // Stopping, in three calls made by the owner (docs/driverkit-notes.md 3.9):
@@ -203,6 +207,8 @@ class UsbIo {
   bool out_recovering_;  // bulk OUT: the same for the uplink transfers
   uint32_t in_recoveries_;   // recoveries in a row with no successful read between
   uint32_t out_recoveries_;  // recoveries in a row with no successful transfer between
+  uint32_t in_recovery_ticks_;   // ticks since the current bulk IN recovery began
+  uint32_t out_recovery_ticks_;  // ticks since the current bulk OUT recovery began
   uint32_t head_;   // oldest queued slot
   uint32_t count_;  // queued slots, the head one in flight when out_busy_
   bool out_busy_;

@@ -27,6 +27,7 @@ constexpr uint16_t kDefaultInterruptSize = 64;
 constexpr uint16_t kDefaultBulkPacketSize = 512;  // USB 2.0 high speed, if the descriptor gives none
 constexpr uint8_t kMaxReadFailures = 5;  // aborts in a row of one bulk read outside a recovery
 constexpr uint8_t kMaxRecoveries = 5;    // stall recoveries in a row of one bulk pipe, no success between
+constexpr uint32_t kRecoveryTicks = 10;  // a recovery not finished after this many ticks (~1 s) is fatal
 constexpr uint32_t kUplinkTimeoutMs = 5000;  // a write the modem does not take frees its buffer
 // The modem answers an empty GET_ENCAPSULATED_RESPONSE with a STALL. Accept the legacy code too.
 constexpr IOReturn kLegacyPipeStalled = (IOReturn)0xe000404f;
@@ -106,6 +107,8 @@ UsbIo::UsbIo(UsbIoListener& listener)
       out_recovering_(false),
       in_recoveries_(0),
       out_recoveries_(0),
+      in_recovery_ticks_(0),
+      out_recovery_ticks_(0),
       head_(0),
       count_(0),
       out_busy_(false),
@@ -495,9 +498,14 @@ void UsbIo::begin_in_recovery() {
     return;
   }
   in_recovering_ = true;
+  in_recovery_ticks_ = 0;
   if (reads_busy_ > 0) {
-    kern_return_t ret = bulk_in_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, owner_);
-    if (ret != kIOReturnSuccess) LOG("bulk in abort for recovery: 0x%x", ret);
+    // forClient must be NULL on a non-control pipe (IOUSBHostPipe.iig, Abort).
+    kern_return_t ret = bulk_in_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, nullptr);
+    if (ret != kIOReturnSuccess) {
+      LOG("bulk in abort for recovery: 0x%x", ret);
+      fail("bulk in could not be aborted for a stall recovery");
+    }
   }
 }
 
@@ -595,9 +603,30 @@ void UsbIo::begin_out_recovery() {
     return;
   }
   out_recovering_ = true;
+  out_recovery_ticks_ = 0;
   if (uplinks_busy_ > 0) {
-    kern_return_t ret = bulk_out_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, owner_);
-    if (ret != kIOReturnSuccess) LOG("bulk out abort for recovery: 0x%x", ret);
+    // forClient must be NULL on a non-control pipe (IOUSBHostPipe.iig, Abort).
+    kern_return_t ret = bulk_out_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, nullptr);
+    if (ret != kIOReturnSuccess) {
+      LOG("bulk out abort for recovery: 0x%x", ret);
+      fail("bulk out could not be aborted for a stall recovery");
+    }
+  }
+}
+
+// The owner's 100 ms tick while running. A recovery whose aborted requests have not all returned
+// within kRecoveryTicks is fatal, so a pipe cannot stay idle with the link reported up. Nothing
+// happens once stopping has begun or after a fatal failure.
+void UsbIo::tick() {
+  if (phase_ != Phase::Running || failed_) return;
+  if (in_recovering_ && ++in_recovery_ticks_ >= kRecoveryTicks) {
+    LOG("bulk in recovery: %u reads still pending after %u ticks", reads_busy_, in_recovery_ticks_);
+    fail("bulk in recovery did not finish within 1 s");
+    return;
+  }
+  if (out_recovering_ && ++out_recovery_ticks_ >= kRecoveryTicks) {
+    LOG("bulk out recovery: %u transfers still in flight after %u ticks", uplinks_busy_, out_recovery_ticks_);
+    fail("bulk out recovery did not finish within 1 s");
   }
 }
 
@@ -634,9 +663,10 @@ void UsbIo::abort() {
     if (uplink_[i] == Uplink::Reserved) uplink_[i] = Uplink::Free;
   }
   if (opened_) {
-    if (intr_in_) intr_in_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, owner_);
-    if (bulk_in_) bulk_in_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, owner_);
-    if (bulk_out_) bulk_out_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, owner_);
+    // forClient NULL: only control endpoints may name a client (IOUSBHostPipe.iig, Abort).
+    if (intr_in_) intr_in_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, nullptr);
+    if (bulk_in_) bulk_in_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, nullptr);
+    if (bulk_out_) bulk_out_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, nullptr);
     intf_->AbortDeviceRequests(kIOUSBAbortAsynchronous, kIOReturnAborted);
   }
 }
