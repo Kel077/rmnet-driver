@@ -26,6 +26,9 @@ constexpr uint8_t kNotifyResponseAvailable = 0x01;  // CDC notification RESPONSE
 constexpr uint16_t kResponseLength = 16384;
 constexpr int kMaxDrain = 64;
 constexpr int kBulkReadsPosted = 8;
+// Consecutive failures of one posted read (each followed by a stall clear and a re-post) before
+// the path is given up and the error handler is told.
+constexpr int kMaxReadRetries = 5;
 constexpr NSTimeInterval kBulkWriteTimeout = 5.0;
 
 std::string describe(const char* what, NSError* e) {
@@ -124,6 +127,38 @@ struct UsbTransport::Impl {
   NSMutableData* interrupt_buf = nil;
   Handler on_transfer;
   std::vector<NSMutableData*> bulk_bufs;
+  std::vector<int> bulk_failures;  // consecutive failures of each posted bulk read
+  int interrupt_failures = 0;
+  ErrorHandler on_error;
+  bool failed = false;  // on_error has been called
+
+  // Reports a read path that cannot continue; once only. Runs on the main queue.
+  void fail(const std::string& what) {
+    log_error(what);
+    if (failed || closed) return;
+    failed = true;
+    if (on_error) on_error(what);
+  }
+
+  // After a failed read: clears a halt on the pipe and counts the failure. Returns false once
+  // `*failures` passes the retry limit. An abort is counted but needs no stall clear: clearing
+  // a stall aborts the other reads posted on the same pipe.
+  bool recover(IOUSBHostPipe* pipe, const char* what, IOReturn status, int* failures) {
+    char buf[96];
+    snprintf(buf, sizeof buf, "%s failed (0x%08x), attempt %d of %d", what, (unsigned)status,
+             *failures + 1, kMaxReadRetries);
+    log_error(buf);
+    if (++*failures >= kMaxReadRetries) return false;
+    if (status != kIOReturnAborted) {
+      std::string err;
+      if (!guarded("clear stall", &err, [&](NSError* __autoreleasing* e) {
+            return [pipe clearStallWithError:e];
+          })) {
+        log_error(err);
+      }
+    }
+    return true;
+  }
 
   bool control_out(uint8_t request, uint16_t value, const uint8_t* data, size_t len,
                    std::string* err) {
@@ -170,7 +205,7 @@ struct UsbTransport::Impl {
   // everything after the marker. Bytes that do not parse as a frame go out as one message.
   void deliver_messages(const std::vector<uint8_t>& r) {
     size_t off = 0;
-    while (off < r.size() && on_message) {
+    while (off < r.size() && on_message && !closed) {
       size_t rest = r.size() - off;
       size_t n = rest;
       if (rest >= 3 && r[off] == 0x01) {
@@ -182,6 +217,7 @@ struct UsbTransport::Impl {
     }
   }
 
+  // Posts the interrupt read; tells the error handler if it cannot be posted.
   void arm_interrupt(const std::shared_ptr<Impl>& self) {
     std::string err;
     IOUSBHostPipe* pipe = interrupt_pipe;
@@ -196,21 +232,24 @@ struct UsbTransport::Impl {
     bool ok = guarded("interrupt read", &err, [&](NSError* __autoreleasing* e) {
       return [pipe enqueueIORequestWithData:buf completionTimeout:0 error:e completionHandler:done];
     });
-    if (!ok) log_error(err);
+    if (!ok) fail(err + "; control reads stopped");
   }
 
   void interrupt_done(const std::shared_ptr<Impl>& self, IOReturn status, NSUInteger n) {
-    if (closed || status == kIOReturnAborted) return;
+    if (closed) return;
     if (status != kIOReturnSuccess) {
-      char buf[64];
-      snprintf(buf, sizeof buf, "interrupt read failed (0x%08x); control reads stopped",
-               (unsigned)status);
-      log_error(buf);
+      if (!recover(interrupt_pipe, "interrupt read", status, &interrupt_failures)) {
+        fail("interrupt read keeps failing; control reads stopped");
+        return;
+      }
+      arm_interrupt(self);
       return;
     }
+    interrupt_failures = 0;
     const uint8_t* p = (const uint8_t*)interrupt_buf.bytes;
     if (n >= 2 && p[0] == kInterfaceToHostClass && p[1] == kNotifyResponseAvailable) {
-      for (;;) {
+      // Same limit as the drain in open: a modem that never runs dry cannot starve the queue.
+      for (int i = 0; i < kMaxDrain; i++) {
         std::vector<uint8_t> r;
         std::string err;
         if (!read_response(&r, &err)) {
@@ -238,17 +277,20 @@ struct UsbTransport::Impl {
     bool ok = guarded("bulk read", &err, [&](NSError* __autoreleasing* e) {
       return [pipe enqueueIORequestWithData:buf completionTimeout:0 error:e completionHandler:done];
     });
-    if (!ok) log_error(err);
+    if (!ok) fail(err + "; bulk reads stopped");
   }
 
   void bulk_done(const std::shared_ptr<Impl>& self, size_t index, IOReturn status, NSUInteger n) {
-    if (closed || status == kIOReturnAborted) return;
+    if (closed) return;
     if (status != kIOReturnSuccess) {
-      char buf[64];
-      snprintf(buf, sizeof buf, "bulk read failed (0x%08x); read not reposted", (unsigned)status);
-      log_error(buf);
+      if (!recover(bulk_in_pipe, "bulk read", status, &bulk_failures[index])) {
+        fail("bulk read keeps failing; bulk reads stopped");
+        return;
+      }
+      post_bulk_read(self, index);
       return;
     }
+    bulk_failures[index] = 0;
     NSMutableData* buf = bulk_bufs[index];  // stays alive if the handler closes the transport
     if (on_transfer) on_transfer((const uint8_t*)buf.bytes, n);
     if (closed) return;
@@ -267,6 +309,9 @@ bool UsbTransport::open(std::string* error) {
   d.bulk_packet_size = d.interrupt_packet_size = 0;
   d.on_message = nullptr;
   d.on_transfer = nullptr;
+  d.bulk_failures.clear();
+  d.interrupt_failures = 0;
+  d.failed = false;
   std::string err;
 
   io_service_t svc = find_qmi_interface();
@@ -275,7 +320,12 @@ bool UsbTransport::open(std::string* error) {
     return false;
   }
   int64_t num = -1;
-  read_int_property(svc, kUSBHostMatchingPropertyInterfaceNumber, &num);
+  if (!read_int_property(svc, kUSBHostMatchingPropertyInterfaceNumber, &num) || num < 0 ||
+      num > 0xff) {
+    IOObjectRelease(svc);
+    if (error) *error = "the QMI interface has no valid bInterfaceNumber";
+    return false;
+  }
   d.interface_number = (uint8_t)num;
   d.serial = read_string_property(svc, kUSBSerialNumberString);
 
@@ -400,12 +450,23 @@ void UsbTransport::start_bulk(size_t read_size, Handler on_transfer) {
     }
     d.bulk_bufs.push_back(buf);
   }
-  for (size_t i = 0; i < d.bulk_bufs.size(); i++) d.post_bulk_read(impl_, i);
+  if (d.bulk_bufs.size() < (size_t)kBulkReadsPosted) {
+    d.fail("could not allocate every bulk read buffer");
+    return;
+  }
+  d.bulk_failures.assign(d.bulk_bufs.size(), 0);
+  for (size_t i = 0; i < d.bulk_bufs.size() && !d.closed && !d.failed; i++) {
+    d.post_bulk_read(impl_, i);
+  }
+}
+
+void UsbTransport::set_error_handler(ErrorHandler on_error) {
+  impl_->on_error = std::move(on_error);
 }
 
 bool UsbTransport::write_bulk(const uint8_t* data, size_t len) {
   Impl& d = *impl_;
-  if (d.closed) return false;
+  if (d.closed || len == 0) return false;
   IOUSBHostPipe* pipe = d.bulk_out_pipe;
   NSMutableData* buf = [NSMutableData dataWithBytes:data length:len];
   std::string err;

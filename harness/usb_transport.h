@@ -19,6 +19,7 @@
 class UsbTransport {
  public:
   using Handler = std::function<void(const uint8_t* data, size_t len)>;
+  using ErrorHandler = std::function<void(const std::string& what)>;
 
   UsbTransport();
   ~UsbTransport();
@@ -35,7 +36,10 @@ class UsbTransport {
   bool send_control(const uint8_t* data, size_t len);  // CDC SEND_ENCAPSULATED_COMMAND
   void start_control(Handler on_message);  // one call per QMUX message, on the main queue
   void start_bulk(size_t read_size, Handler on_transfer);  // keeps 8 reads posted; one call per completed transfer, on the main queue
-  bool write_bulk(const uint8_t* data, size_t len);  // returns when the transfer completes
+  // Called once, on the main queue, when the interrupt or bulk read path has failed for good:
+  // a read kept failing after clearing the stall and re-posting, or could not be posted.
+  void set_error_handler(ErrorHandler on_error);
+  bool write_bulk(const uint8_t* data, size_t len);  // len > 0; returns when the transfer completes
   void close();
 
   struct Impl;
