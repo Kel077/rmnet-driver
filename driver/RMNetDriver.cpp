@@ -165,7 +165,7 @@ struct RxBridge final : RxSink {
 };
 
 // What PublishCounters last published, in its order.
-enum : uint32_t { kCounterCount = 33 };
+enum : uint32_t { kCounterCount = 35 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -205,6 +205,7 @@ struct RMNetDriver_IVars {
   uint32_t txDoneCount;
   bool txHeld;  // frames may wait in the TX submission queue (paused, or no room in txDone)
   uint32_t ticks;
+  uint64_t rxLagMaxUs;  // the longest a successful bulk read waited between completing and its handler
   bool countersPublished;
   uint64_t counters[kCounterCount];
 };
@@ -768,6 +769,18 @@ void RMNetDriver::FlushRx() {
   ivars->rxOutCount = n - done;
 }
 
+// How long a completed read waited for its handler, which is how long the modem had one read fewer
+// posted. The completion timestamp is in absolute-time units: nanoseconds, or the 24 MHz ticks of
+// Apple silicon (timebase 125/3), told apart by size against the uptime in nanoseconds; the first
+// completion's log line shows both values.
+void RMNetDriver::NoteRxLag(uint64_t timestamp, uint64_t nowNs) {
+  if (timestamp == 0) return;
+  uint64_t tsNs = timestamp >= nowNs / 2 ? timestamp : timestamp / 3 * 125 + timestamp % 3 * 125 / 3;
+  if (tsNs > nowNs) return;
+  uint64_t lagUs = (nowNs - tsNs) / 1000;
+  if (lagUs > ivars->rxLagMaxUs) ivars->rxLagMaxUs = lagUs;
+}
+
 // One completed bulk read: frames go up in one batch, and a resumed uplink is drained.
 void RMNetDriver::OnBulkIn(const uint8_t* data, size_t len) {
   if (ivars->stopping || !ivars->core) return;
@@ -825,6 +838,8 @@ void RMNetDriver::PublishCounters() {
       {"RMNetUsbBulkOutErrors", u.bulk_out_errors},
       {"RMNetUsbRecoveries", u.recoveries},
       {"RMNetUsbStallClears", u.stall_clears},
+      {"RMNetRxLagMaxUs", ivars->rxLagMaxUs},
+      {"RMNetRxFullTransfers", u.full_reads},
       {"RMNetPacketsHeld", uint64_t{ivars->rxOutCount} + ivars->txDoneCount + (ivars->rxSpare ? 1u : 0u)},
       {"RMNetPoolPacketCount", poolCount},
       {"RMNetUplinkPaused", ivars->core->uplink_paused() ? 1u : 0u},
@@ -858,9 +873,13 @@ void RMNetDriver::PublishCounters() {
 // --- USB and timer -------------------------------------------------------------------------------
 
 // Completions go to UsbIo even while stopping: it counts the aborted ones before releasing.
-void RMNetDriver::BulkInComplete_Impl(OSAction* action, IOReturn status, uint32_t actualByteCount, uint64_t) {
-  LOG_FIRST(kLogBulkIn, "BulkInComplete 0x%x, %u bytes", status, actualByteCount);
+void RMNetDriver::BulkInComplete_Impl(OSAction* action, IOReturn status, uint32_t actualByteCount,
+                                     uint64_t completionTimestamp) {
+  uint64_t now = NowNs();
+  LOG_FIRST(kLogBulkIn, "BulkInComplete 0x%x, %u bytes, completion timestamp %llu, uptime %llu ns", status,
+            actualByteCount, completionTimestamp, now);
   if (!ivars || !ivars->usb) return;
+  if (status == kIOReturnSuccess && !ivars->stopping) NoteRxLag(completionTimestamp, now);
   uint32_t slot = *static_cast<uint32_t*>(action->GetReference());
   ivars->usb->bulk_in_complete(slot, status, actualByteCount);
   if (ivars->stopping) AdvanceStop();

@@ -64,6 +64,9 @@ struct UsbIoStats {
   uint64_t bulk_out_errors;  // uplink transfers that failed or could not be submitted; not recovery aborts
   uint64_t recoveries;       // stall recoveries started on either bulk pipe
   uint64_t stall_clears;     // ClearStall calls on either bulk pipe (one per finished recovery)
+  // Reads that came back filled to their length: the read size, not the modem's aggregation,
+  // ended the transfer.
+  uint64_t full_reads;
 };
 
 class UsbIo {

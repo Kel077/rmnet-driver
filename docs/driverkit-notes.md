@@ -932,3 +932,27 @@ From installing 316.17.10 and loading it with `AT+CFUN=1,1`. Logs: `build/logs/d
 - A neighbour solicitation for the Mac's own address was not looked for.
 
 **Calls dropped from the modem side**: `AT+CGACT=0,1` through the web console answered `ERROR` three times and changed nothing (the call that QMI started is not context 1 to the AT side, or AT may not tear it down). The IPv4 retry while up was therefore not exercised on hardware.
+
+## Runtime findings (throughput, Task 7, 2026-11-14)
+
+Measured with `scripts/measure.sh` (4 parallel HTTPS transfers bound to the port; figures from `netstat -I en33 -b -n` sampled about every 0.28 s; each download stopped at 50,000,000 bytes, the upload at 10,000,000 bytes or 6 s). The gate figure is the mean rate from 1.0 s after traffic starts to the last sample before the stop. Samples: `build/logs/measure-20261114-*.samples`; driver logs `build/logs/driver-20261114-014423.log` and `driver-20261114-014938.log`. Cell: NR5G SA band 41, as on 2026-11-13. Each modem reboot starts a new call (new /30 or /29 and /64).
+
+| Run | Driver | Direction | Gate figure | Best 1 s | Bytes in / out on `en33` | Driver CPU |
+|---|---|---|---|---|---|---|
+| 1 | 316.17.31 | down | 129.2 Mbit/s | 150.0 | 51,347,480 / 148,333 | 0.38 s |
+| 2 | 316.17.31 | up | 11.9 Mbit/s | 25.5 | 299,647 / 10,112,539 | 0.29 s |
+| 3 | 316.17.44 | down | 138.3 Mbit/s | 182.3 | 54,666,535 / 116,991 | 0.30 s |
+| 4 | 316.17.49 | down | 92.6 Mbit/s | 105.6 | 54,176,502 / 187,772 | 0.42 s |
+
+The gate (150 Mbit/s by the definition above) was not passed. The driver's own figures say it is not what limits these runs:
+
+- **Bulk reads never ran short.** `RMNetRxLagMaxUs` (316.17.49) is the longest a successful bulk read waited between completing on the bus (`completionTimestamp`) and its handler, which is how long the modem had one read fewer posted. In run 4 it was 1,051 µs at most, while a transfer arrived about every 2.4 ms (2,244 transfers in 5.3 s): at most one or two of the 32 reads were ever waiting to be re-posted. Starving the modem would need a lag of about 31 transfer times (some 70 ms).
+- **The completion timestamp is in mach ticks.** The first completion logged `completion timestamp 8136738486987, uptime 339030770332208 ns`: a ratio of 41.667, the 24 MHz tick of Apple silicon (timebase 125/3), not nanoseconds.
+- **The read size is not a limit.** `RMNetRxFullTransfers` (reads filled to their 31,744 bytes) stayed 0: the modem's aggregation ends each transfer (17 to 19 packets and 24 to 27 KB per transfer).
+- **No drops and no refusals.** Every `RMNetRxDrop*` counter stayed 0, the completion queues never refused a packet (no "took N of M" line in either log), `RMNetPacketsHeld` was 0 afterwards.
+- **CPU is small.** 0.30 to 0.42 s of driver CPU per 50 MB download: about 8 to 11 µs per received packet, about 10 % of one core at these rates.
+- **Acknowledgements were not lost.** `RMNetTxDropBusy` stayed 0 during all three downloads.
+- **The rate curve is the network's.** Run 1 sat near 50 Mbit/s for a second and climbed to 179 Mbit/s when the cap stopped it; run 3 reached 229 Mbit/s within 0.6 s and fell to about 130; run 4 climbed slowly from 40 to about 100 Mbit/s. Runs 3 and 4 have the same receive path (316.17.49 only adds a counter) and differ by 46 Mbit/s. With a 50 MB cap, 1.4 to 4 s remain after the 1.0 s mark, so the gate figure carries TCP ramp-up and cell scheduling, not the driver's capacity.
+- Batching was in place before this task: one `EnqueuePackets` per completed transfer (at most 64 packets per call), and 32 reads re-posted from their completions. `AsyncIOBundled` and a separate receive queue were not tried: with a 1 ms worst-case lag and about 10 % CPU there is no per-read overhead or queue contention for them to remove.
+
+**Uplink.** Run 2 dropped 2,343 frames because all 8 uplink buffers were in flight (`RMNetTxDropBusy`), against 5,325 sent in 1,224 transfers; the rate fell from about 17 to 25 Mbit/s in the first 3 s to under 10 once the drops began (TCP backing off). `netstat` counts dropped frames as sent, so the port's out counter (10.1 MB) exceeds the driver's `RMNetTxBytes` increase (6.7 MB). Holding frames in the TX submission queue until a buffer frees, instead of dropping them, is the change to make; it was not made here because the gate is downlink only and no drop occurred during a download.

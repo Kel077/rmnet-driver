@@ -462,6 +462,7 @@ void UsbIo::bulk_in_complete(uint32_t i, IOReturn status, uint32_t bytes) {
       logged_first_read_ = true;
       LOG("first bulk read: %u bytes", bytes);
     }
+    if (bytes >= read_len_) stats_.full_reads++;
     listener_.on_bulk_in(read_addr_[i], bytes);
     if (phase_ != Phase::Running || failed_) return;
     if (!in_recovering_) post_read(i);

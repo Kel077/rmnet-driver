@@ -75,6 +75,7 @@ public:
     uint8_t * RxBuffer(size_t * cap) LOCALONLY;
     void RxCommit(size_t len) LOCALONLY;
     void FlushRx() LOCALONLY;
+    void NoteRxLag(uint64_t timestamp, uint64_t nowNs) LOCALONLY;
     void DrainTx() LOCALONLY;
     void FlushTxDone() LOCALONLY;
     void PublishCounters() LOCALONLY;
