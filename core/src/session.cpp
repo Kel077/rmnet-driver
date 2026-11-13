@@ -188,6 +188,7 @@ void Session::on_response(const QmiMessage& m, uint64_t now_ms) {
           return;
         }
       }
+      fam.live = true;
       send_settings(now_ms);
       return;
     }
@@ -200,8 +201,9 @@ void Session::on_response(const QmiMessage& m, uint64_t now_ms) {
         finish_bring_up();
         return;
       }
-      // A reply that fails to parse leaves the settings unchanged, so this family has none.
-      (void)parse_wds_current_settings(m, &link_.settings);
+      // A reply that fails to parse leaves the settings unchanged, so this family has none. A
+      // call that dropped while the reply was outstanding gets none either.
+      if (fam.live) (void)parse_wds_current_settings(m, &link_.settings);
       family_done(now_ms);
       return;
     }
@@ -210,7 +212,10 @@ void Session::on_response(const QmiMessage& m, uint64_t now_ms) {
 }
 
 void Session::on_indication(const QmiMessage& m, uint64_t now_ms) {
-  if (state_ != SessionState::Up && state_ != SessionState::Refreshing) return;
+  if (state_ != SessionState::Connecting && state_ != SessionState::Up &&
+      state_ != SessionState::Refreshing) {
+    return;
+  }
   if (m.hdr.service != QmiService::WDS || m.hdr.msg_id != kWdsPacketServiceStatus) return;
   uint8_t index = 0;
   while (index < 2 && !(families_[index].has_client && families_[index].client == m.hdr.client)) {
@@ -220,8 +225,24 @@ void Session::on_indication(const QmiMessage& m, uint64_t now_ms) {
   PacketStatus status;
   if (!parse_wds_packet_status(m, &status)) return;
 
+  Family& fam = families_[index];
+  if (state_ == SessionState::Connecting) {
+    // A family whose call drops during bring-up no longer counts; the last family_done() then
+    // sees whether anything remains. Other indications are harmless here.
+    if (status.status == kStatusDisconnected) {
+      fam.has_handle = false;
+      fam.live = false;
+      clear_family_settings(index);
+    }
+    return;
+  }
+
+  // Up or Refreshing: only the families that carry the link matter. A family that failed during
+  // bring-up keeps its client, so a late indication from it must not take the link down.
+  if (!family_has_settings(index)) return;
   if (status.status == kStatusDisconnected) {
-    families_[index].has_handle = false;  // the call is gone; nothing to stop
+    fam.has_handle = false;  // the call is gone; nothing to stop
+    fam.live = false;
     enter_backoff(now_ms);
   } else if (status.status == kStatusConnected && status.reconfigure &&
              state_ == SessionState::Up) {

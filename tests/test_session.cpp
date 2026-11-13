@@ -199,3 +199,27 @@ TEST(stop_tears_down_in_capture_order) {
   CHECK_BYTES(m.sent[before + 2], kWdsStop4Req);    CHECK_BYTES(m.sent[before + 3], kCtlRelease4Req);
   CHECK_BYTES(m.sent[before + 4], kCtlReleaseWdaReq);
 }
+
+TEST(v4_drop_during_v6_bring_up_then_v6_failure_backs_off) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_to(s, m, kWdsFamily6Resp);  // IPv6 start outstanding
+  feed(s, kWdsDisconnected4Ind, 100);
+  feed_frame(s, failed_start_frame(16, 8), 100);
+  CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(m.ups, 0);
+}
+
+TEST(v4_drop_during_v6_bring_up_links_up_v6_only) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_to(s, m, kWdsFamily6Resp);
+  feed(s, kWdsDisconnected4Ind, 100);
+  feed(s, kWdsStart6Resp, 100); feed(s, kWdsSettings6Resp, 100);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1);
+  CHECK(m.cfg.settings.has_v6); CHECK(!m.cfg.settings.has_v4);
+}
+
+TEST(disconnect_from_failed_family_leaves_link_up) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_to(s, m, kWdsFamily6Resp);
+  feed_frame(s, failed_start_frame(16, 8), 100);                              // IPv4-only link
+  feed(s, kWdsDisconnected6Ind, 5000);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0);
+  feed(s, kWdsDisconnected4Ind, 5001);
+  CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(m.downs, 1);
+}

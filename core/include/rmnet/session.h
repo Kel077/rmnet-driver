@@ -81,6 +81,7 @@ class Session {
     uint8_t client;
     bool has_handle;  // false also when Start Network answered NoEffect
     uint32_t handle;
+    bool live;  // Start Network succeeded (or answered NoEffect) and no disconnect followed
   };
 
   uint8_t next_ctl_txid();
