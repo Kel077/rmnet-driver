@@ -1,5 +1,7 @@
 #include "minitest.h"
 
+#include <algorithm>
+
 #include "captures.h"
 #include "rmnet/qmi.h"
 #include "rmnet/qmi_msgs.h"
@@ -187,8 +189,16 @@ TEST(reconfigure_indication_refreshes_settings) {
   s.on_qmi(ind.data(), ind.size(), 5000);
   CHECK_EQ(m.downs, 1); CHECK(s.state() == rmnet::SessionState::Refreshing);
   CHECK_EQ(m.last()[9], 0x2d);                                               // get current settings on client 15
-  feed_frame(s, settings4_response_with_txid(m.last_txid()), 5010);
+  auto reply = settings4_response_with_txid(m.last_txid());
+  const uint8_t old_addr[7] = {0x1e, 0x04, 0x00, 0xe6, 0xf6, 0x66, 0x0a};    // TLV 0x1E: 10.102.246.230, u32le
+  auto at = std::search(reply.begin(), reply.end(), old_addr, old_addr + 7);
+  CHECK(at != reply.end()); at[3] = 0xea;                                     // now 10.102.246.234
+  feed_frame(s, reply, 5010);
   CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2);
+  CHECK(m.cfg.settings.has_v4); CHECK_BYTES(m.cfg.settings.v4_addr, 4, "0a 66 f6 ea");
+  CHECK(m.cfg.settings.has_v6); CHECK_EQ(m.cfg.settings.v6_prefix_len, 64);   // IPv6 untouched by the IPv4 refresh
+  CHECK_BYTES(m.cfg.settings.v6_addr, 16, "20 01 0d b8 8a f4 b2 60 61 fc 0d be 3a b2 6e 08");
+  CHECK_EQ(m.cfg.settings.v6_dns_count, 2);
 }
 
 TEST(stop_from_link_down_during_reconfigure_stays_idle) {   // a delegate that breaks the no-re-entry rule
