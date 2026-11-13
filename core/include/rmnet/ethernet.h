@@ -1,6 +1,7 @@
 // Ethernet emulation over the modem's raw-IP link. macOS sees an Ethernet
 // interface; the emulator adds and removes Ethernet headers and plays the
-// router on the other end of the link, answering ARP and DHCP itself.
+// router on the other end of the link, answering ARP, DHCP and IPv6 neighbour
+// discovery itself.
 #pragma once
 
 #include <stddef.h>
@@ -44,7 +45,8 @@ class EthernetEmulator {
   // Decides what to do with a frame the host sent.
   TxResult handle_tx(const uint8_t* frame, size_t len, uint8_t* reply, size_t reply_cap);
 
-  // Unsolicited IPv6 router advertisement. Not implemented yet: returns 0.
+  // Unsolicited IPv6 router advertisement frame to all nodes (ff02::1). Returns
+  // its length, or 0 when the link is down, has no IPv6, or `cap` is too small.
   size_t make_router_advert(uint8_t* out, size_t cap);
 
  private:
@@ -58,6 +60,16 @@ class EthernetEmulator {
   // go to tx_dhcp and never upstream, whatever their destination.
   static bool is_dhcp_client(const uint8_t* ip, size_t len);
   TxResult tx_dhcp(const uint8_t* frame, const uint8_t* ip, size_t len, uint8_t* reply, size_t cap);
+
+  // Neighbour discovery (ndp.cpp). `ip` is an IPv6 packet trimmed to its payload
+  // length. is_nd_solicit says whether it carries ICMPv6 directly (next header
+  // 58) of type router or neighbour solicitation; such packets go to tx_nd.
+  static bool is_nd_solicit(const uint8_t* ip, size_t len);
+  TxResult tx_nd(const uint8_t* ip, size_t len, uint8_t* reply, size_t cap);
+  // Router advertisement frame to eth_dst / ip_dst; 0 if `cap` is too small.
+  size_t write_router_advert(uint8_t* out, size_t cap, const uint8_t eth_dst[6], const uint8_t ip_dst[16]) const;
+  // Whether `ip` (len bytes from the modem) is a router advertisement.
+  static bool is_router_advert(const uint8_t* ip, size_t len);
 
   // Writes an Ethernet header from the router to `dst`; returns 14.
   size_t write_header(uint8_t* out, const uint8_t dst[6], uint16_t ethertype) const;

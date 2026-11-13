@@ -1,7 +1,9 @@
 // Builders for the Ethernet frames tests feed to the Ethernet emulator.
-// Addresses are given as text: IPv4 dotted ("10.102.246.230"), MAC as hex ("02 68 7a 43 12 f6").
+// Addresses are given as text: IPv4 dotted ("10.102.246.230"), IPv6 in inet_pton form ("fe80::1"),
+// MAC as hex ("02 68 7a 43 12 f6").
 #pragma once
 
+#include <arpa/inet.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -195,6 +197,160 @@ inline DhcpReply parse_dhcp_reply(const uint8_t* bytes, size_t len) {
       default: break;
     }
     i += 2 + n;
+  }
+  return d;
+}
+
+// Sixteen bytes from IPv6 text. Aborts on malformed text.
+inline std::vector<uint8_t> ipv6(const char* text) {
+  std::vector<uint8_t> a(16);
+  if (inet_pton(AF_INET6, text, a.data()) != 1) {
+    std::fprintf(stderr, "ipv6(): malformed address \"%s\"\n", text);
+    std::abort();
+  }
+  return a;
+}
+
+// IPv6 text in inet_ntop form ("fe80::1").
+inline std::string ipv6_text(const uint8_t* a) {
+  char buf[INET6_ADDRSTRLEN];
+  return inet_ntop(AF_INET6, a, buf, sizeof buf) ? buf : "";
+}
+
+// Ethernet frame from the host MAC carrying an IPv6 ICMPv6 message, hop limit 255, valid checksum.
+// `body` is everything after type, code (0) and checksum. The Ethernet destination is 33:33 plus
+// the last four address bytes for a multicast destination, the router MAC otherwise.
+inline std::vector<uint8_t> icmp6(const char* src, const char* dst, uint8_t type, const std::vector<uint8_t>& body) {
+  std::vector<uint8_t> s = ipv6(src), d = ipv6(dst);
+  std::vector<uint8_t> msg = {type, 0, 0, 0};
+  msg.insert(msg.end(), body.begin(), body.end());
+  uint16_t c = rmnet::icmp6_checksum(s.data(), d.data(), msg.data(), msg.size());
+  msg[2] = (uint8_t)(c >> 8); msg[3] = (uint8_t)c;
+  std::vector<uint8_t> pkt(40);
+  if (rmnet::build_ipv6_header(pkt.data(), pkt.size(), 58, s.data(), d.data(), msg.size(), 255) != 40) {
+    std::fprintf(stderr, "icmp6(): body too large\n");
+    std::abort();
+  }
+  pkt.insert(pkt.end(), msg.begin(), msg.end());
+  char dst_mac[18];
+  if (d[0] == 0xff) {
+    std::snprintf(dst_mac, sizeof dst_mac, "33 33 %02x %02x %02x %02x", d[12], d[13], d[14], d[15]);
+  } else {
+    std::snprintf(dst_mac, sizeof dst_mac, "%s", kRouterMac);
+  }
+  return eth(dst_mac, kHostMac, 0x86DD, pkt);
+}
+
+// Source link-layer address option with the host MAC; none when the source is "::" (RFC 4861).
+inline std::vector<uint8_t> host_lla_option(const char* src_ip) {
+  if (ipv6(src_ip) == std::vector<uint8_t>(16, 0)) return {};
+  std::vector<uint8_t> o = {1, 1};
+  std::vector<uint8_t> m = mac(kHostMac);
+  o.insert(o.end(), m.begin(), m.end());
+  return o;
+}
+
+// Router solicitation from `src_ip` to ff02::2.
+inline std::vector<uint8_t> router_solicit(const char* src_ip) {
+  std::vector<uint8_t> body(4, 0), o = host_lla_option(src_ip);
+  body.insert(body.end(), o.begin(), o.end());
+  return icmp6(src_ip, "ff02::2", 133, body);
+}
+
+// Neighbour solicitation from `src_ip` for `target_ip`, to the target's solicited-node address.
+inline std::vector<uint8_t> neighbour_solicit(const char* src_ip, const char* target_ip) {
+  std::vector<uint8_t> t = ipv6(target_ip);
+  char dst[INET6_ADDRSTRLEN];
+  std::snprintf(dst, sizeof dst, "ff02::1:ff%02x:%02x%02x", t[13], t[14], t[15]);
+  std::vector<uint8_t> body(4, 0), o = host_lla_option(src_ip);
+  body.insert(body.end(), t.begin(), t.end());
+  body.insert(body.end(), o.begin(), o.end());
+  return icmp6(src_ip, dst, 135, body);
+}
+
+// What a test needs to see of a router (134) or neighbour (136) advertisement frame. Addresses are
+// inet_ntop text, "" when absent; numbers are 0 when absent.
+struct NdReply {
+  uint8_t eth_dst[6] = {};
+  std::string ip_src, ip_dst;
+  int hop_limit = 0;
+  int type = 0;
+  bool checksum_ok = false;  // ICMPv6 checksum, pseudo-header included
+  // Router advertisement
+  int cur_hop_limit = 0, flags = 0, router_lifetime = 0;
+  uint8_t source_lla[6] = {};
+  uint32_t mtu = 0;
+  std::string prefix;
+  int prefix_len = 0, prefix_flags = 0;
+  uint32_t valid_lifetime = 0, preferred_lifetime = 0;
+  std::vector<std::string> rdnss;
+  uint32_t rdnss_lifetime = 0;
+  // Neighbour advertisement
+  std::string target;
+  int na_flags = 0;
+  uint8_t target_lla[6] = {};
+};
+
+inline uint32_t get32_be(const uint8_t* p) {
+  return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+// Parses an Ethernet frame carrying IPv6/ICMPv6 directly. Stops at the first thing out of bounds,
+// leaving the remaining fields at their defaults.
+inline NdReply parse_nd_reply(const uint8_t* bytes, size_t len) {
+  NdReply d;
+  if (len < 14 + 40) return d;
+  for (int i = 0; i < 6; ++i) d.eth_dst[i] = bytes[i];
+  const uint8_t* ip = bytes + 14;
+  size_t plen = (size_t)(ip[4] << 8 | ip[5]);
+  if (14 + 40 + plen > len || ip[6] != 58 || plen < 4) return d;
+  d.hop_limit = ip[7];
+  d.ip_src = ipv6_text(ip + 8);
+  d.ip_dst = ipv6_text(ip + 24);
+  const uint8_t* m = ip + 40;
+  d.type = m[0];
+  d.checksum_ok = rmnet::icmp6_checksum(ip + 8, ip + 24, m, plen) == 0;
+  size_t opts;
+  if (d.type == 134) {
+    if (plen < 16) return d;
+    d.cur_hop_limit = m[4];
+    d.flags = m[5];
+    d.router_lifetime = m[6] << 8 | m[7];
+    opts = 16;
+  } else if (d.type == 136) {
+    if (plen < 24) return d;
+    d.na_flags = m[4];
+    d.target = ipv6_text(m + 8);
+    opts = 24;
+  } else {
+    return d;
+  }
+  for (size_t i = opts; i + 2 <= plen;) {
+    size_t n = (size_t)m[i + 1] * 8;
+    if (n == 0 || i + n > plen) break;
+    const uint8_t* o = m + i;
+    switch (o[0]) {
+      case 1: if (n == 8) for (int k = 0; k < 6; ++k) d.source_lla[k] = o[2 + k]; break;
+      case 2: if (n == 8) for (int k = 0; k < 6; ++k) d.target_lla[k] = o[2 + k]; break;
+      case 5: if (n == 8) d.mtu = get32_be(o + 4); break;
+      case 3:
+        if (n == 32) {
+          d.prefix_len = o[2];
+          d.prefix_flags = o[3];
+          d.valid_lifetime = get32_be(o + 4);
+          d.preferred_lifetime = get32_be(o + 8);
+          d.prefix = ipv6_text(o + 16);
+        }
+        break;
+      case 25:
+        if (n >= 8) {
+          d.rdnss_lifetime = get32_be(o + 4);
+          for (size_t k = 8; k + 16 <= n; k += 16) d.rdnss.push_back(ipv6_text(o + k));
+        }
+        break;
+      default: break;
+    }
+    i += n;
   }
   return d;
 }

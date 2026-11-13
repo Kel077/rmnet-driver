@@ -2,18 +2,15 @@
 
 #include <string.h>
 
+#include "ethernet_internal.h"
+
 namespace rmnet {
+
+using namespace eth_internal;
 
 namespace {
 
-constexpr size_t kEthHeaderLen = 14;
-constexpr size_t kIpv4HeaderLen = 20;
-constexpr size_t kIpv6HeaderLen = 40;
 constexpr size_t kArpLen = 28;  // Ethernet/IPv4 ARP body
-
-constexpr uint16_t kEtherTypeIpv4 = 0x0800;
-constexpr uint16_t kEtherTypeIpv6 = 0x86DD;
-constexpr uint16_t kEtherTypeArp = 0x0806;
 
 constexpr uint16_t kArpHwEthernet = 1;
 constexpr uint16_t kArpOpRequest = 1;
@@ -21,17 +18,6 @@ constexpr uint16_t kArpOpReply = 2;
 
 constexpr uint64_t kFnvOffset = 0xcbf29ce484222325ull;
 constexpr uint64_t kFnvPrime = 0x100000001b3ull;
-
-uint16_t get16(const uint8_t* p) { return (uint16_t)(p[0] << 8 | p[1]); }
-
-void put16(uint8_t* p, uint16_t v) {
-  p[0] = (uint8_t)(v >> 8);
-  p[1] = (uint8_t)v;
-}
-
-TxResult drop() { return {TxAction::Drop, {nullptr, 0}, 0}; }
-TxResult forward(const uint8_t* ip, size_t len) { return {TxAction::Forward, {ip, len}, 0}; }
-TxResult replied(size_t len) { return {TxAction::Reply, {nullptr, 0}, len}; }
 
 }  // namespace
 
@@ -80,6 +66,7 @@ size_t EthernetEmulator::wrap_rx(const uint8_t* ip, size_t len, uint8_t* out, si
     case 6: ethertype = kEtherTypeIpv6; break;
     default: return 0;
   }
+  if (is_router_advert(ip, len)) return 0;  // the host must see only the emulated router
   write_header(out, macs_.host, ethertype);
   memcpy(out + kEthHeaderLen, ip, len);
   return kEthHeaderLen + len;
@@ -112,11 +99,14 @@ TxResult EthernetEmulator::tx_ipv4(const uint8_t* frame, const uint8_t* p, size_
   return forward(p, total);
 }
 
-// Forwards IPv6, trimmed to the header's payload length (Ethernet may pad).
-TxResult EthernetEmulator::tx_ipv6(const uint8_t*, const uint8_t* p, size_t len, uint8_t*, size_t) {
-  if (len < kIpv6HeaderLen || (p[0] >> 4) != 6) return drop();
+// Answers router and neighbour solicitations itself, drops other multicast, and
+// forwards unicast IPv6, trimmed to the header's payload length (Ethernet may pad).
+TxResult EthernetEmulator::tx_ipv6(const uint8_t*, const uint8_t* p, size_t len, uint8_t* reply, size_t cap) {
+  if (!link_.has_v6 || len < kIpv6HeaderLen || (p[0] >> 4) != 6) return drop();
   size_t total = kIpv6HeaderLen + get16(p + 4);
   if (total > len) return drop();
+  if (is_nd_solicit(p, total)) return tx_nd(p, total, reply, cap);
+  if (p[24] == 0xff) return drop();  // destination in ff00::/8
   return forward(p, total);
 }
 
@@ -157,7 +147,5 @@ TxResult EthernetEmulator::tx_arp(const uint8_t*, const uint8_t* p, size_t len, 
   memcpy(a + 24, sip, 4);
   return replied(kEthHeaderLen + kArpLen);
 }
-
-size_t EthernetEmulator::make_router_advert(uint8_t*, size_t) { return 0; }
 
 }  // namespace rmnet

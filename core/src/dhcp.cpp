@@ -5,15 +5,16 @@
 #include "rmnet/ethernet.h"
 #include "rmnet/ip.h"
 
+#include "ethernet_internal.h"
+
 namespace rmnet {
+
+using namespace eth_internal;
 
 namespace {
 
-constexpr size_t kEthHeaderLen = 14;
-constexpr size_t kIpv4HeaderLen = 20;
 constexpr size_t kUdpHeaderLen = 8;
 constexpr uint8_t kProtoUdp = 17;
-constexpr uint16_t kEtherTypeIpv4 = 0x0800;
 constexpr uint16_t kPortServer = 67;
 constexpr uint16_t kPortClient = 68;
 constexpr uint8_t kTtl = 64;
@@ -63,23 +64,6 @@ constexpr size_t kReplyBootpLen =
 constexpr size_t kReplyFrameLen = kEthHeaderLen + kIpv4HeaderLen + kUdpHeaderLen + kReplyBootpLen;
 
 const uint8_t kBroadcastIp[4] = {255, 255, 255, 255};
-
-uint16_t get16(const uint8_t* p) { return (uint16_t)(p[0] << 8 | p[1]); }
-
-void put16(uint8_t* p, uint16_t v) {
-  p[0] = (uint8_t)(v >> 8);
-  p[1] = (uint8_t)v;
-}
-
-void put32(uint8_t* p, uint32_t v) {
-  p[0] = (uint8_t)(v >> 24);
-  p[1] = (uint8_t)(v >> 16);
-  p[2] = (uint8_t)(v >> 8);
-  p[3] = (uint8_t)v;
-}
-
-TxResult drop() { return {TxAction::Drop, {nullptr, 0}, 0}; }
-TxResult replied(size_t len) { return {TxAction::Reply, {nullptr, 0}, len}; }
 
 // The fields of a client message the reply needs, copied out so the reply
 // may be written over the request.
