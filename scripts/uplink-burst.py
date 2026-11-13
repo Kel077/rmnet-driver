@@ -8,22 +8,29 @@ The datagrams (default 1,500 of 1,200 bytes) go to 192.0.2.1 port 9, a documenta
 to fill the driver's uplink buffers: a burst larger than the buffers hold shows whether the driver
 keeps the frames it cannot send at once (RMNetTxHolds) or drops them (RMNetTxDropBusy).
 
-The cellular data is metered. A request above 2,000,000 bytes in total is refused before anything
-is sent. The usage file (build/installed/measure-usage.log, shared with scripts/measure.sh) must
-exist and every line other than a comment must be "<time> <down|up> <bytes in> <bytes out>";
-otherwise the run is refused. After the burst, one line "<UTC time> up <bytes in> <bytes out>" is
-appended, from the interface's own byte counters (`netstat -I <interface> -b -n`) read before and
-1 s after the burst. If the counters cannot be read at the end, or went backwards (the interface was
-recreated), the run is charged its payload plus headers instead, and that is said.
+The cellular data is metered. The limit is on what the cellular link carries: datagrams x
+(bytes-each + 28 bytes of IPv4 and UDP headers) must be at most 2,000,000, or the request is
+refused before anything is sent. The usage file (build/installed/measure-usage.log, shared with
+scripts/measure.sh) must exist, end with a newline, and every line other than a comment must be
+"<time> <down|up> <bytes in> <bytes out>"; otherwise the run is refused. After the burst, one line
+"<UTC time> up <bytes in> <bytes out>" is appended, from the interface's own byte counters
+(`netstat -I <interface> -b -n`) read before and 1 s after the burst. If the counters cannot be read
+at the end, or went backwards (the interface was recreated), the run is charged its payload plus
+headers instead, and that is said.
 
---usage-file replaces the usage file for a test, and is accepted only with the interface lo0.
-Exit status: 0 done, 2 refused (nothing sent, nothing recorded).
+An interrupt (SIGINT, SIGTERM or SIGHUP) during the sends stops them; from the end of the sends
+until the usage line is written, these signals are ignored, so what was sent is always recorded.
+
+--usage-file replaces the usage file for a test. It is accepted only with the interface lo0, and
+lo0 requires it, so a loopback run never writes to the real usage file.
+Exit status: 0 done, 2 refused (nothing sent, nothing recorded), 130 interrupted (recorded).
 """
 
 import datetime
 import errno
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -34,7 +41,9 @@ MAX_TOTAL = 2_000_000
 DEFAULT_COUNT = 1500
 DEFAULT_SIZE = 1200
 IP_BOUND_IF = 25  # <netinet/in.h>; Python's socket module does not name it
-HEADERS = 14 + 20 + 8  # Ethernet, IPv4, UDP: what the port's counters add to each datagram
+IP_UDP_HEADERS = 20 + 8  # what the cellular link carries besides the payload; counted in the limit
+HEADERS = 14 + IP_UDP_HEADERS  # what the port's counters add to each datagram (with Ethernet)
+SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 USAGE_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "installed",
                              "measure-usage.log")
 LINE = re.compile(r"^\S+ (down|up) [0-9]+ [0-9]+$")
@@ -68,11 +77,14 @@ def parse_args(argv):
         refuse("datagrams and bytes-each must be whole numbers")
     if count < 1 or size < 1 or size > 1472:
         refuse("datagrams must be at least 1, and bytes-each from 1 to 1472 (one unfragmented frame)")
-    if count * size > MAX_TOTAL:
-        refuse("%d datagrams of %d bytes is %d bytes, above the %d-byte limit" %
-               (count, size, count * size, MAX_TOTAL))
+    carried = count * (size + IP_UDP_HEADERS)
+    if carried > MAX_TOTAL:
+        refuse("%d datagrams x (%d + %d) bytes is %d bytes on the link, above the %d-byte limit" %
+               (count, size, IP_UDP_HEADERS, carried, MAX_TOTAL))
     if usage_file is not None and iface != "lo0":
         refuse("--usage-file is accepted only with the interface lo0")
+    if usage_file is None and iface == "lo0":
+        refuse("lo0 needs --usage-file (a test run must not write to the real usage file)")
     return iface, count, size, usage_file or USAGE_DEFAULT
 
 
@@ -80,6 +92,11 @@ def check_usage(path):
     """The recorded total of the usage file; refuses if it is missing or malformed."""
     if not os.path.isfile(path):
         refuse("the usage file %s does not exist" % path)
+    with open(path, "rb") as f:
+        data = f.read()
+    if data and not data.endswith(b"\n"):
+        refuse("the usage file %s does not end with a newline; an appended line would join its last line" %
+               path)
     total = 0
     bad = []
     with open(path) as f:
@@ -126,12 +143,20 @@ def main():
     if before is None:
         refuse("the byte counters of %s cannot be read" % iface)
     print("usage file: %s, recorded total %d bytes" % (usage, used))
-    print("burst: %d datagrams of %d bytes (%d bytes) to %s port %d from %s" %
-          (count, size, count * size, DEST[0], DEST[1], iface))
+    print("burst: %d datagrams of %d bytes to %s port %d from %s: %d x (%d + %d) = %d bytes on the link, "
+          "limit %d" % (count, size, DEST[0], DEST[1], iface, count, size, IP_UDP_HEADERS,
+                        count * (size + IP_UDP_HEADERS), MAX_TOTAL))
     print("%s before: in %d, out %d" % (iface, before[0], before[1]))
 
     sent = refused = other = 0
     first_error = None
+    interrupted = False
+
+    def stop_sending(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop_sending)  # SIGINT already raises KeyboardInterrupt
+    signal.signal(signal.SIGHUP, stop_sending)
     payload = b"\0" * size
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     started = time.monotonic()
@@ -148,7 +173,14 @@ def main():
                     other += 1
                     if first_error is None:
                         first_error = e
+    except KeyboardInterrupt:
+        for sig in SIGNALS:
+            signal.signal(sig, signal.SIG_IGN)
+        interrupted = True
     finally:
+        # From here until the usage line is written, an interrupt must not cut the record short.
+        for sig in SIGNALS:
+            signal.signal(sig, signal.SIG_IGN)
         elapsed = time.monotonic() - started
         sock.close()
         time.sleep(1)  # what was in flight is counted before the record
@@ -163,13 +195,15 @@ def main():
         with open(usage, "a") as f:
             f.write("%s up %d %d\n" % (stamp, rec_in, rec_out))
 
+    if interrupted:
+        print("uplink-burst: interrupted during the sends; what was sent is recorded", file=sys.stderr)
     print("sent %d, refused by the system (ENOBUFS) %d, other errors %d%s in %.3f s" %
           (sent, refused, other, " (first: %s)" % first_error if first_error else "", elapsed))
     if after is not None:
         print("%s after:  in %d, out %d" % (iface, after[0], after[1]))
     print("recorded: in %d, out %d%s; usage file total now %d bytes" %
           (rec_in, rec_out, note, used + rec_in + rec_out))
-    return 0
+    return 130 if interrupted else 0
 
 
 if __name__ == "__main__":
