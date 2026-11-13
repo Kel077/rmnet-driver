@@ -5,6 +5,9 @@
 #include <Availability.h>
 #include <DriverKit/IOService.iig>
 #include <DriverKit/IODataQueueDispatchSource.iig>
+#include <DriverKit/IOTimerDispatchSource.iig>
+#include <USBDriverKit/IOUSBHostPipe.iig>
+#include <USBDriverKit/IOUSBHostDevice.iig>   // for the CompleteAsyncDeviceRequest type
 #include <NetworkingDriverKit/IOUserNetworkEthernet.iig>
 
 // SelectMediaType must be declared with the deprecated IOUserNetworkMediaType, and iig expands
@@ -42,10 +45,27 @@ public:
     virtual void TxPacketsAvailable(OSAction * action) TYPE(IODataQueueDispatchSource::DataAvailable);
     virtual void RxPacketsAvailable(OSAction * action) TYPE(IODataQueueDispatchSource::DataAvailable);
 
+    // USB completions, forwarded to UsbIo: the interrupt read, a control request sent, a
+    // response read. And the 100 ms timer that drives the session.
+    virtual void InterruptComplete(OSAction * action, IOReturn status, uint32_t actualByteCount,
+                                   uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
+    virtual void ControlOutComplete(OSAction * action, IOReturn status,
+                                    uint32_t bytesTransferred) TYPE(IOUSBHostDevice::CompleteAsyncDeviceRequest);
+    virtual void ControlInComplete(OSAction * action, IOReturn status,
+                                   uint32_t bytesTransferred) TYPE(IOUSBHostDevice::CompleteAsyncDeviceRequest);
+    virtual void TimerFired(OSAction * action, uint64_t time) TYPE(IOTimerDispatchSource::TimerOccurred);
+
     // Plain C++ helpers, never called across the IPC boundary.
-    kern_return_t CreateInterface() LOCALONLY;
-    void PublishState(const char * state) LOCALONLY;
-    void ReportInactive() LOCALONLY;
+    kern_return_t OpenUsb(IOService * provider) LOCALONLY;
+    kern_return_t CreateInterface(const uint8_t * hostMac) LOCALONLY;
+    kern_return_t StartTimer() LOCALONLY;
+    void ArmTimer() LOCALONLY;
+    void TearDown() LOCALONLY;
+    void OnControl(const uint8_t * data, size_t len) LOCALONLY;
+    void OnUsbFatal(const char * what) LOCALONLY;
+    void ApplyCore() LOCALONLY;
+    void PublishStatus() LOCALONLY;
+    IOReturn ReportLink() LOCALONLY;
     bool FirstCall(uint32_t flag) LOCALONLY;
 };
 #pragma clang diagnostic pop

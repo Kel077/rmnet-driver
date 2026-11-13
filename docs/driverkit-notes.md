@@ -362,7 +362,7 @@ kern_return_t GetAddressRange(IOAddressSegment * range) LOCALONLY;
 virtual kern_return_t SetLength(uint64_t length);
 ```
 
-`CreateIOBuffer` gives a buffer "optimized for use by the underlying controller hardware ... will not be bounced". Options are `kIOMemoryDirectionIn` for reads and `kIOMemoryDirectionOut` for writes. `GetAddressRange` gives the dext's own mapping, so there is no separate `CreateMapping` call. AppleUserECM imports `IOMemoryDescriptor::Map` instead.
+`CreateIOBuffer` gives a buffer "optimized for use by the underlying controller hardware ... will not be bounced". Options are `kIOMemoryDirectionIn` for reads and `kIOMemoryDirectionOut` for writes (**wrong for a buffer the dext writes: see Runtime findings, Task 5**). `GetAddressRange` gives the dext's own mapping, so there is no separate `CreateMapping` call. AppleUserECM imports `IOMemoryDescriptor::Map` instead.
 
 ```cpp
 static kern_return_t MakeBuffer(IOUSBHostInterface* intf, IOOptionBits dir, uint32_t size,
@@ -824,7 +824,7 @@ From installing the skeleton (`scripts/install-driver.sh`) several times and re-
 - Matching needed no change: the 4-key personality (`idVendor`, `idProduct`, `bConfigurationValue`, `bInterfaceNumber`) attached `RMNetDriver` to `RmNet@4` (`IOProbeScore` 90000), and the class check in `Start` passed. Interfaces 0 to 3 are untouched.
 - The interface was `en33` on each load, MAC `02:c7:bd:1f:39:58` (configd logged "Assigned unit 33 (from database)" on the load at 23:59). configd creates a network service named `RM520N-GL`. It is not listed in `scutil --nwi`.
 
-**Calls and their order** (first call of each, from the first load; the log shows only the first call of each, because every line comes from `LOG_FIRST`):
+**Calls and their order** (first call of each, from the first load; the log shows only the first call of each, because every handler logs through `LOG_FIRST`):
 `init`, `Start`, (`setMaxTransferUnit` fails with `kIOReturnUnsupported`), `started`, `SetPowerState 0x2` then `setPowerState 2`, `getMaxTransferUnit`, `setInterfaceEnable 1` then `SetInterfaceEnable 1`, `RxPacketsAvailable`, `setAllMulticastModeEnable 0` then `SetAllMulticastModeEnable 0`, `TxPacketsAvailable`, `setMulticastAddresses 3`, `getSupportedMediaArray array 1 count 0`. On re-enumeration: `Stop`, then `free`, and the new instance starts about 10 s later.
 - The order is not fixed, and neither is the multicast count: the first load logged `TxPacketsAvailable` then `setMulticastAddresses 3`, while the load at 00:15 logged `setMulticastAddresses 5` then `TxPacketsAvailable`.
 - The stack calls the **lowercase** `setInterfaceEnable` and `setAllMulticastModeEnable`; their base implementations call the deprecated uppercase ones within the same millisecond. Power is the other way round: the kernel calls uppercase `SetPowerState`, and the superclass then calls lowercase `setPowerState`. Implementing either form works; keep the superclass call in each lowercase override.
@@ -847,6 +847,35 @@ From installing the skeleton (`scripts/install-driver.sh`) several times and re-
 - `rm -rf /Applications/RMNet.app` followed by `ditto` and `activate`, with the extension active, made sysextd do nothing (no uninstall, no state change). The script still removes the old app only after checking the new build.
 - An entry left `activated disabled` (the old build, switched off while it could not stop) blocks every later activation: sysextd faults with "activateDecision found two entries ... activated_disabled ... activated_enabled" and `activate` fails with `OSSystemExtensionErrorDomain` error 4. This came from the driver being switched off in System Settings right after it was approved. The app in the next plan must guard against it (refuse to activate while such an entry exists, and say what to do), and tell the owner not to switch the driver off while the modem is attached.
 - **Deactivation is matched against the exact driver version embedded in the app that asks.** With `/Applications/RMNet.app` carrying 316.16.1 and entries 316.15.49 and 316.15.56 installed, `RMNet deactivate` failed with `OSSystemExtensionErrorDomain` error 4 (sysextd: "deactivation request could not find extension ... buildNumber: 316.16.1"). Rebuilding the app with `CURRENT_PROJECT_VERSION` set to an installed entry's version, and deactivating from that app, worked: once per entry, each time with the owner's password. So an installed driver can be removed only by an app with the same driver version. `scripts/install-driver.sh` keeps that app in `build/installed/RMNet-<version>.app` before replacing `/Applications/RMNet.app` (README, "Removing the driver").
+
+## Runtime findings (QMI session, Task 5, 2026-11-14)
+
+From installing 316.16.36, 316.16.40 and 316.16.41 and rebooting the modem with `AT+CFUN=1,1`. Logs: `build/logs/driver-20261114-003624.log` (the crash), `driver-20261114-004041.log` (first link up), `driver-20261114-004151.log` (modem reboot).
+
+**Buffers**
+- `kIOMemoryDirectionOut` means the memory is *readable* (by the device), and the dext's own mapping of such a buffer is read-only. 316.16.36 wrote a QMI message into an `CreateIOBuffer(kIOMemoryDirectionOut, ...)` buffer and crashed in `Start` with `EXC_BAD_ACCESS (SIGBUS) KERN_PROTECTION_FAILURE` in `memmove` (`/Library/Logs/DiagnosticReports/io.rmnetdriver.RMNet.driver-2026-11-14-003648.ips`). The header says it: "kIOMemoryDirectionIn memory described will be writable, kIOMemoryDirectionOut memory described will be readable". Every control buffer is now `kIOMemoryDirectionInOut`. Use `InOut` (or at least `In`) for any buffer the dext fills, including bulk OUT buffers.
+- None of that instance's `os_log` lines reached the stream (not even `init` or `Start`), although it ran for about 2 s before crashing: a crashing dext's last lines can be lost.
+
+**Control channel** (all asynchronous, on the Default queue)
+- `AsyncDeviceRequest` works for SET_CONTROL_LINE_STATE (no data buffer, `wLength` 0), SEND_ENCAPSULATED_COMMAND and GET_ENCAPSULATED_RESPONSE. `IOBufferMemoryDescriptor::SetLength` is called before each send; whether it is needed was not tested.
+- The interrupt endpoint's notification is 8 bytes (`InterruptComplete 0x0, 8 bytes`); its max packet size is read with `GetSpeed` and `IOUSBGetEndpointMaxPacketSize`.
+- The first response read after open returned eight stale CTL Sync responses (txid 0) queued by the modem from earlier hosts before the answer to the driver's own sync; Core ignored them. Reading what is waiting at start is worth keeping.
+- The modem also sends CTL Sync *indications* (kind 2) when it comes back from a reboot, before it answers a sync request.
+- `CopyDevice`, `CopyDeviceDescriptor` and `CopyStringDescriptor(iSerialNumber)` give the serial number (8 characters). The MAC is now `02:68:7a:43:12:f6`.
+
+**Session**
+- From a running modem: sync answered on the first try; link up about 0.5 s after the first sync (both calls connect; Start Network for IPv4 takes about 0.45 s). Data format: raw IP, QMAP both ways, 32 datagrams, UL 16384 and DL 31744 bytes.
+- After `AT+CFUN=1,1`: the old instance received a WDS Packet Service Status indication (disconnected) at once, went to `backoff` and sent its releases, then 4 s later its interrupt read failed with `0xe00002eb` (`kIOReturnAborted`), re-posting failed with `0xe00002d8` (`kIOReturnNotAttached`), so `usb failed` was reported, and `Stop` came 4 ms later. The new instance started about 11 s later and sent a sync every 2 s for about 18 s (10 in all) until the modem answered, then reached `link up` within 0.5 s.
+- `setMaxTransferUnit` still returns `kIOReturnUnsupported` (0xe00002c7) after link up; the carrier MTU was 1500 in every run, so the interface MTU stays 1500 from `getMaxTransferUnit`.
+
+**Stopping**
+- On a modem reboot `Stop` arrived with no USB request outstanding (the failures had already completed): "usb aborted, 0 requests outstanding", "usb objects released", `free`. No crash report. Releasing after aborted completions that are still in flight has therefore not been seen yet.
+- `Start` decisions: a failed `reportLinkStatus` or `SetProperties` is logged and does not fail `Start`. The link status is reported again whenever the stack enables the interface (and a status reported in `Start` is lost anyway); the properties are only for the app. Every other failure in `Start` tears down and fails it.
+
+**macOS and the port**
+- With the new MAC, the port kept the name `en33` and the hardware port `RM520N-GL` (`networksetup -listallhardwareports`: `Device: en33`, `Ethernet Address: 02:68:7a:43:12:f6`). No new service or interface appeared.
+- Link active: `ifconfig en33` shows `status: active`, only a link-local IPv6 address (DHCP and RAs are unanswered without a data path). `scutil --nwi` lists only `utun5` and `en0`; `en33` is not a primary or listed service. The stack counted 32 frames sent on `en33` (`netstat -I en33 -b`); the driver completed and dropped them.
+- Kernel `os_log` lines redact `%s` arguments as `<private>`; use `%{public}s`. Numbers are not redacted.
 
 ---
 
