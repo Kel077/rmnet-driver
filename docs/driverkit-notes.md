@@ -819,17 +819,18 @@ From installing the skeleton (`scripts/install-driver.sh`) several times and re-
 - Stream at the **default level**, with a narrow predicate (`senderImagePath ENDSWITH "/io.rmnetdriver.RMNet.driver" OR eventMessage BEGINSWITH "RMNet:"`). Streams with `--level info` or `--level debug` lost lines around a load: `init`, `Start`, `Stop` and `free` were missing, even though `started` (logged by `Start` a millisecond later) arrived. The default-level stream showed every line of a full reload (`Stop`, `free`, `init`, `Start`, ...) on each re-enumeration it was used for.
 
 **Packaging and signing**
-- `CFBundleVersion` must be a valid kext version (major up to 4 digits, minor and revision up to 2). A ten-digit timestamp fails `kernelmanagerd`'s `DextValidation` and activation ends with "extension category returned error (code 9)". The install script now uses `<days since 2026-01-01>.<hour>.<minute>` in UTC.
+- `CFBundleVersion` must be a valid kext version (major up to 4 digits, minor and revision up to 2). With a ten-digit timestamp, the app printed `activate failed: extension category returned error (code 9)` and `kernelmanagerd` logged, in category `DextValidation`, `Extension io.rmnetdriver.RMNet.driver is not valid, error: ... invalid properties: ["Property 'CFBundleVersion' must be a valid kext version"]` (from the controller's reading of the log). The install script now uses `<days since 2026-01-01>.<hour>.<minute>` in UTC.
 - The networking-family dext, signed with team `ABCDE12345` and automatic signing, validated and loaded (risk 9 closed). `sysextd` logs "Error checking with notarization daemon: 3" and `kernelmanagerd` "openat_authenticated_np() failed ... (errno 80)"; both are harmless.
 - Matching needed no change: the 4-key personality (`idVendor`, `idProduct`, `bConfigurationValue`, `bInterfaceNumber`) attached `RMNetDriver` to `RmNet@4` (`IOProbeScore` 90000), and the class check in `Start` passed. Interfaces 0 to 3 are untouched.
-- The interface is `en33` (unit 33 is remembered by configd across loads), MAC `02:c7:bd:1f:39:58`. configd creates a network service named `RM520N-GL`. It is not listed in `scutil --nwi`.
+- The interface was `en33` on each load, MAC `02:c7:bd:1f:39:58` (configd logged "Assigned unit 33 (from database)" on the load at 23:59). configd creates a network service named `RM520N-GL`. It is not listed in `scutil --nwi`.
 
-**Calls and their order** (first call of each, one instance):
+**Calls and their order** (first call of each, from the first load; the log shows only the first call of each, because every line comes from `LOG_FIRST`):
 `init`, `Start`, (`setMaxTransferUnit` fails with `kIOReturnUnsupported`), `started`, `SetPowerState 0x2` then `setPowerState 2`, `getMaxTransferUnit`, `setInterfaceEnable 1` then `SetInterfaceEnable 1`, `RxPacketsAvailable`, `setAllMulticastModeEnable 0` then `SetAllMulticastModeEnable 0`, `TxPacketsAvailable`, `setMulticastAddresses 3`, `getSupportedMediaArray array 1 count 0`. On re-enumeration: `Stop`, then `free`, and the new instance starts about 10 s later.
+- The order is not fixed, and neither is the multicast count: the first load logged `TxPacketsAvailable` then `setMulticastAddresses 3`, while the load at 00:15 logged `setMulticastAddresses 5` then `TxPacketsAvailable`.
 - The stack calls the **lowercase** `setInterfaceEnable` and `setAllMulticastModeEnable`; their base implementations call the deprecated uppercase ones within the same millisecond. Power is the other way round: the kernel calls uppercase `SetPowerState`, and the superclass then calls lowercase `setPowerState`. Implementing either form works; keep the superclass call in each lowercase override.
 - Never called on this load: `SetPromiscuousModeEnable`/`setPromiscuousModeEnable`, `SelectMediaType`, `handleChosenMedia`.
-- `init` and `Start` run on one thread; every later callback, both data-available handlers included, runs on a second one (the Default queue).
-- Both data-available handlers fire once as soon as the interface is enabled, with nothing to do.
+- On the first load, `init` and `Start` logged from one thread ID and every later callback, both data-available handlers included, from a different one. On the loads at 00:13 and 00:15, every line came from a single thread ID. Which dispatch queue each callback ran on was not checked.
+- Each data-available handler fired at least once, the first time right after the interface was enabled. Whether it fired again is not visible: only the first call is logged.
 - `RegisterService` after `RegisterEthernetInterface` works.
 - `setMaxTransferUnit(1500)` in `Start` returns `kIOReturnUnsupported`; the MTU is 1500 anyway. The driver now returns its MTU from `getMaxTransferUnit`.
 

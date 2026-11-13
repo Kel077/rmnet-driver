@@ -7,8 +7,9 @@
 # The first activation needs the owner's approval in System Settings.
 #
 # A driver can only be deactivated by an app that embeds that exact driver version, so a copy of
-# the app for every activated version is kept in build/installed/RMNet-<version>.app (README,
-# "Removing the driver"). Nothing here ever deactivates.
+# every app that asks for activation is kept in build/installed/RMNet-<version>.app (README,
+# "Removing the driver"): the new app is kept before it asks, and the app it replaces is kept
+# before it is removed if the system lists any entry with its version. Nothing here deactivates.
 set -eu
 
 cd "$(dirname "$0")/.." || exit 1
@@ -32,19 +33,32 @@ step() {
 }
 trap 'rc=$?; [ "$rc" -eq 0 ] || echo "install-driver: failed during: $stage" >&2' EXIT
 
-# The version of the driver the system has activated and enabled, or nothing.
-active_version() {
-  systemextensionsctl list | grep "	$DRIVER_ID (" | grep 'activated enabled' |
-    sed -n 's/.*(\([^/]*\)\/\([0-9.]*\)).*/\2/p' | head -1
+# The versions of every entry the system lists for the driver, whatever its state, one per line.
+# With "activated enabled" as $1, only that entry's version.
+listed_versions() {
+  systemextensionsctl list | grep "	$DRIVER_ID (" | grep -- "${1:-}" |
+    sed -n 's/.*(\([^/]*\)\/\([0-9.]*\)).*/\2/p'
 }
 
-# Keeps a copy of the app at $1 as build/installed/RMNet-<its version>.app.
+active_version() {
+  listed_versions 'activated enabled' | head -1
+}
+
+# The version of the driver embedded in the app at $1, or nothing.
+driver_version() {
+  /usr/bin/defaults read "$1/Contents/Library/SystemExtensions/$DRIVER_ID.dext/Info" CFBundleVersion 2>/dev/null || true
+}
+
+# Keeps a copy of the app at $1 as build/installed/RMNet-<driver version>.app. The copy is made
+# under a temporary name and renamed, so a kept app is never a partial one.
 keep_app() {
-  v=$(/usr/bin/defaults read "$1/Contents/Info" CFBundleVersion 2>/dev/null || true)
-  [ -n "$v" ] || return 0
+  v=$(driver_version "$1")
+  [ -n "$v" ] || { echo "install-driver: no driver version in $1" >&2; return 1; }
   [ -d "$KEEP/RMNet-$v.app" ] && return 0
   mkdir -p "$KEEP"
-  ditto "$1" "$KEEP/RMNet-$v.app"
+  rm -rf "$KEEP/.partial.app"
+  ditto "$1" "$KEEP/.partial.app"
+  mv "$KEEP/.partial.app" "$KEEP/RMNet-$v.app"
   echo "kept $KEEP/RMNet-$v.app"
 }
 
@@ -67,12 +81,14 @@ step "check the new build"
 built=$(/usr/bin/defaults read "$NEW/Contents/Info" CFBundleVersion 2>/dev/null || true)
 [ "$built" = "$VERSION" ] || { echo "install-driver: $NEW missing or not version $VERSION" >&2; exit 1; }
 
-step "keep the app that matches the active driver"
+step "keep the app being replaced"
+old=$(driver_version "$APP")
+if [ -n "$old" ] && listed_versions | grep -qx "$old"; then
+  keep_app "$APP"
+fi
 active=$(active_version)
 if [ -z "$active" ]; then
   echo "no active $DRIVER_ID"
-elif [ "$installed" = "$active" ]; then
-  keep_app "$APP"
 elif [ -d "$KEEP/RMNet-$active.app" ]; then
   echo "already kept: $KEEP/RMNet-$active.app"
 else
@@ -84,12 +100,12 @@ fi
 step "copy to $APP"
 rm -rf "$APP"
 ditto "$NEW" "$APP"
+keep_app "$APP"
 
 step "activate"
 "$APP/Contents/MacOS/RMNet" activate
 active=$(active_version)
 [ "$active" = "$VERSION" ] || { echo "install-driver: active driver is ${active:-none}, not $VERSION" >&2; exit 1; }
-keep_app "$APP"
 
 # A running RMNetDriver is not stopped by a replacement (its services refuse to terminate), so the
 # new build only loads when the modem re-enumerates. Say so rather than leave the old one running.
