@@ -26,7 +26,9 @@ class UsbTransport {
   UsbTransport(const UsbTransport&) = delete;
   UsbTransport& operator=(const UsbTransport&) = delete;
 
-  bool open(std::string* error);  // device 2c7c:0801, the interface with class, subclass and protocol 0xff
+  // Device 2c7c:0801, the interface with class, subclass and protocol 0xff. Fails, without
+  // opening it, unless that interface is number 4.
+  bool open(std::string* error);
   uint8_t interface_number() const;
   uint8_t bulk_in() const;
   uint8_t bulk_out() const;

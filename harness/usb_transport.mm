@@ -15,6 +15,7 @@ namespace {
 constexpr uint16_t kVendor = 0x2c7c;
 constexpr uint16_t kProduct = 0x0801;
 constexpr uint8_t kVendorSpecific = 0xff;  // interface class, subclass and protocol of QMI
+constexpr int64_t kQmiInterfaceNumber = 4;  // the only interface the harness may open
 
 // USB CDC class requests, addressed to the interface.
 constexpr uint8_t kHostToInterfaceClass = 0x21;     // host-to-device, class, interface
@@ -324,6 +325,14 @@ bool UsbTransport::open(std::string* error) {
       num > 0xff) {
     IOObjectRelease(svc);
     if (error) *error = "the QMI interface has no valid bInterfaceNumber";
+    return false;
+  }
+  if (num != kQmiInterfaceNumber) {
+    IOObjectRelease(svc);
+    if (error) {
+      *error = "the interface with class, subclass and protocol 0xff is number " +
+               std::to_string(num) + ", not 4; refusing to open it";
+    }
     return false;
   }
   d.interface_number = (uint8_t)num;
