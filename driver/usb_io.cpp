@@ -425,7 +425,7 @@ void UsbIo::start_bulk(uint32_t read_len) {
   if (len == 0 || len > kMaxDownlink) len = kMaxDownlink;
   read_len_ = len;
   if (in_recovering_) return;  // the recovery re-posts every read when it ends
-  for (uint32_t i = 0; i < kBulkReads && phase_ == Phase::Running; i++) {
+  for (uint32_t i = 0; i < kBulkReads && phase_ == Phase::Running && !failed_; i++) {
     if (!read_busy_[i]) post_read(i);
   }
 }

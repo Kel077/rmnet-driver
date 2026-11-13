@@ -238,9 +238,12 @@ stop_transfers() {
 
 # Appends this run to the usage file once, from a final reading of the counters. If that reading
 # fails, the run is charged at least its reservation in the measured direction, since the bytes
-# after the last good sample are unknown.
+# after the last good sample are unknown. Signals are ignored from here on: once recorded is set,
+# a signal before the append would exit through cleanup, whose record() would then return early
+# and leave the run unrecorded.
 record() {
   [ "$recorded" -eq 0 ] && [ "$started" -eq 1 ] || return 0
+  trap '' INT TERM HUP
   recorded=1
   advance
   rec_in=$acc_in

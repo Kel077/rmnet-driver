@@ -624,6 +624,8 @@ OSSafeReleaseNULL(s); OSSafeReleaseNULL(n); OSSafeReleaseNULL(props);
 
 **[runtime]** Whether `SetProperties` on this kernel class actually lands in the I/O registry. Kernel `IOService::setProperties` refuses by default for many classes. Check with `ioreg -l -c IOUserNetworkEthernet` on first load. Fallback 1: put static values in the personality, which is copied into the registry at match time. Fallback 2: an `IOUserClient`. The profile number can live in the personality (`RMNetProfile` in the spike plist). Read it with `CopyProperties` **[not compiled]**.
 
+**As built (final review fix wave, 316.18.48):** `Start` reads `RMNetProfile` with `CopyProperties(&dict)`, `dict->getObject("RMNetProfile")` and `OSDynamicCast(OSNumber, ...)->unsigned64BitValue()`; anything but an integer from 1 to 255 (or no key) gives 1 with a log line. The value used goes to Core as `SessionConfig.profile` and is published back as `RMNetProfile` with `SetProperties`, over the personality's value. It compiles and runs: `RMNet status` showed `RMNetProfile = 1` and the call came up on profile 1. The plist still says 1, so the published value does not by itself prove the read (the same number either way), and the `profile 1` log line was not in the stream (see the runtime findings below).
+
 ### 3.8 Power
 
 ```
@@ -810,15 +812,25 @@ Also compiled without complaint on the first try:
 ## Open risks, most serious first
 
 1. **Downlink throughput through NetworkingDriverKit.** macOS's ECM dext uses the same framework and the same queue model, and measured 38 to 62 Mbit/s here. The modem delivers one IP packet per USB transfer plus a 4-byte zero transfer, which means many completions, each an IPC round trip, plus a copy into a packet. *Settles it:* the design's throughput gate, run as soon as RX works. Levers, in order: 32 or more posted reads; batching `EnqueuePackets` per completion; `AsyncIOBundled`; a separate RX queue via `QUEUENAME`; asking the modem for larger downlink aggregation.
+   *Status at the end of the driver plan (2026-11-14):* **open.** Task 7 measured 92.6 to 138.3 Mbit/s against the 150 gate, with no drops, starvation or CPU saturation in the driver seen ("Runtime findings (throughput, Task 7)").
 2. **Which callbacks the framework actually invokes**: `SetInterfaceEnable` or `setInterfaceEnable`, the data-available handlers on the default queue, `SetPowerState` or `setPowerState`, and the MTU calls. All compile either way, and `= 0` is not enforced. The spike copies AppleUserECM's shipping pattern, which lowers but does not remove this risk. *Settles it:* the first load, with an `os_log` line in every override and handler.
+   *Status:* **closed** by the first load: every override logs its first call, and "Runtime findings (first load)" lists which ones macOS calls, in what order, and which never.
 3. **Teardown races on unplug and stop**: completions after `Stop`, synchronous `Abort` from the Default queue, and releasing actions and buffers while transfers are still in flight. *Settles it:* unplug and replug in a loop, and deactivate while traffic flows, watching for crashes in `log stream` and crash reports.
+   *Status:* **open.** Every observed `Stop` (modem reboots) found no request outstanding; a `Stop` with transfers in flight, an unplug and a deactivation while traffic flows were never run.
 4. **Personality matching on interface 4.** The 4-key form is proven on interface 3. Adding class keys is unproven. *Settles it:* the first install; `ioreg -r -n RmNet@4` shows the driver attached.
+   *Status:* **closed** by the first install: the 4-key personality attached `RMNetDriver` to `RmNet@4` ("Runtime findings (first load)").
 5. **RX and TX packet semantics**: the meaning of the data address and offset, whether `PoolFlagMapToDext` is needed, whether the RX submission queue is stocked before enable, and pool sizing at 32 posted reads. *Settles it:* the first ping, both directions, and `netstat -I` counters.
+   *Status:* **closed in part** by Task 6: the TX data offset is 0, writing at `getDataVirtualAddress()` with `setDataOffAndLen(0, len)` delivers, `PoolFlagMapToDext` is enough, and the RX submission queue is stocked once the interface is enabled. Pool sizing is shown only up to the rates measured (no receive drop for want of a packet at 144 Mbit/s).
 6. **Status publishing.** `SetProperties` may be refused for this kernel class. *Settles it:* `ioreg -l` on first load. Fallback: personality values or a user client.
+   *Status:* **closed** by the first load: `SetProperties` works; no fallback needed ("Runtime findings (first load)").
 7. **QMI over asynchronous control requests.** `Session::stop()` emits several frames back to back, so the driver needs a small ring of OUT buffers and in-order submission. There is also the interaction between the interrupt read and the STALL that answers an empty response. *Settles it:* bring-up on hardware, plus a forced `stop()` while connecting.
+   *Status:* **open in part.** Bring-up, teardown at `Stop` and reboot recovery work on hardware (Task 5); a forced `stop()` while connecting was not run.
 8. **Sleep and wake.** Whether `SetPowerState` arrives at all for a USB network dext, and in what state the pipes are on wake. *Settles it:* the sleep/wake test from the design's "Done means".
+   *Status:* **open.** Not tested.
 9. **Signing a networking-family dext.** The stub that was signed and loaded was an `IOUserService`, not an `IOUserNetworkEthernet`, though its profile already carries `family.networking`. *Settles it:* the first signed build and install.
+   *Status:* **closed** by the first signed build and install ("Runtime findings (first load)", Packaging and signing).
 10. **Zero-length packets.** These cannot be checked from the headers. Core's padding avoids the case, and the follow-ups list already asks whether the modem accepts the extra padding.
+   *Status:* **open.** Nothing counts whether the exact-multiple-of-1024 case occurred.
 
 ---
 
@@ -969,3 +981,11 @@ Only a same-day comparison with the userspace tool, run under this script and it
 **Per-stream limit (added after these runs).** `scripts/measure.sh` now limits each of the 4 downloads to 15,000,000 bytes (curl's output goes through `head -c`), so a download run cannot pass 60,000,000 bytes of payload even if its watchdog dies. A stream that reaches its own limit before the watchdog's 50,000,000-byte stop ends early, and the run then carries fewer streams. The script prints how many streams ended that way. The four runs above were made before this limit existed.
 
 **Uplink.** The 11.9 Mbit/s gate figure of run 2 is what the port's counters show, and they include the frames the driver dropped. What reached the modem is lower: the port counted 10.1 MB out, while the driver's `RMNetTxBytes` (IP bytes delivered to the modem) rose by 6.7 MB, about two thirds. Run 2 dropped 2,343 frames because all 8 uplink buffers were in flight (`RMNetTxDropBusy`), against 5,325 sent in 1,224 transfers. On the port's counters, the rate fell from about 17 to 25 Mbit/s in the first 3 s to under 10 once the drops began, as TCP backed off. Holding frames in the TX submission queue until a buffer frees, instead of dropping them, is the change to make; it was not made here because the gate is downlink only and no drop occurred during a download.
+
+## Runtime findings (final review fix wave, 2026-11-14)
+
+From installing 316.18.48 and loading it with `AT+CFUN=1,1`. Log: `build/logs/driver-20261114-024819.log`.
+
+- The stream caught the old instance (316.17.49) to the end: `usb failed`, `Stop`, the stop sequence with nothing outstanding, `free`. Of the new instance it lost every line before `getMaxTransferUnit` (`init`, `Start`, the serial and MAC line, `profile 1`, `started`), although the stream was running and at the default level. Lines around a load can still be lost; evidence that must come from `Start` should also be published as a property.
+- The reworded link-up line: `link up: ipv4 1 ipv6 1, carrier mtu 1500; the interface keeps the mtu it registered with (setMaxTransferUnit(1500) 0xe00002c7)`.
+- The new instance took about 18 s (10 syncs) for the modem to answer after the reboot, then came up dual-stack in 0.5 s, as before.

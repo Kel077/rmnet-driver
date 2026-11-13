@@ -9,7 +9,7 @@ This file records what the reviews left open, so the driver plan can pick it up.
 These came from the whole-branch review and from running against the modem. Status as of the end of the plan `2026-11-13-driver-to-throughput-gate.md` (branch `driver`, 2026-11-14): **settled** only where a commit or a task report shows it.
 
 - **Retry a family that failed while the other came up.** For about three seconds after a call is torn down, a new IPv4 Start Network often fails with call end 1008 (3GPP reason 36), and the link comes up IPv6-only. Core never retries the missing family, and a successful link-up resets the backoff, so the port stays IPv6-only until the next drop. Redial after a network drop and after wake both land inside that window, because the first backoff is 2000 ms. Retry the missing family while Up, without taking the link down. Revisit the first backoff value at the same time.
-  - **Settled in Core, open on hardware.** The retry is in Core with unit tests (`e8f6c6a`, `9c22931`). It was never seen on hardware: `AT+CGACT=0,1` answered ERROR three times (Task 6 report, Step 5), so no family was lost while up. The first backoff is still 2000 ms (`kFirstBackoffMs`); it was not revisited.
+  - **Settled in Core, open on hardware.** The retry is in Core with unit tests (`e8f6c6a`, `9c22931`); the IPv4-behind-IPv6 case itself (`missing_v4_is_retried_while_up`, `failed_v4_retry_keeps_link_up_and_backs_off`) was tested in the final review's fix wave. It was never seen on hardware: `AT+CGACT=0,1` answered ERROR three times (Task 6 report, Step 5), so no family was lost while up. The first backoff is still 2000 ms (`kFirstBackoffMs`); it was not revisited.
 - **Link Core into an empty driver target in the first task.**
   - **Settled.** `9f02d44` (Task 3 report: the nine Core files compile into the dext, 143 `rmnet` symbols in its binary); the driver has run Core on hardware since `f3ca9e7`.
 - **Send unsolicited router advertisements.** `make_router_advert` must be sent on link up and at least every 600 seconds; the router and DNS lifetimes are 1800 seconds.
@@ -43,6 +43,59 @@ These came from the whole-branch review and from running against the modem. Stat
   - **What decides it.** Only a same-day comparison with the userspace tool under `scripts/measure.sh` can separate the driver from the network, and it needs the owner.
 - **Upload.** 11.9 Mbit/s on the port's counters, which include the dropped frames; the driver delivered about two thirds of those bytes to the modem (6.7 of 10.1 MB).
 - **All hardware testing is under a data budget.** The SIM is metered: 400 MB was left on 2026-11-14 for all remaining testing, and Task 7 used about 171 MB of it (`build/installed/measure-usage.log` records each measurement). Measurements were therefore capped at 50 MB, which makes each one short and noisy.
+
+## Sent here by the driver plan's final review (2026-11-14)
+
+Line references are at commit `680948c`.
+
+Port up but passing nothing (belongs with the Up-state liveness work):
+- A bulk OUT that only ever times out is never escalated: a 5 s timeout frees the buffer and counts `RMNetTxDropUsb`, and nothing counts consecutive ones (`driver/usb_io.cpp:31, 53-56, 574-596`).
+- A QMAP flow disable never followed by an enable pauses the uplink for good (`driver/core_host.cpp:350-356`).
+
+Carrier MTU:
+- A carrier MTU below 1500 never reaches the interface for IPv4: `setMaxTransferUnit` returns Unsupported and `getMaxTransferUnit` is read only at registration (`driver/RMNetDriver.cpp:543-550`); the router advertisement covers IPv6. Latent: every call so far had 1500.
+
+Never run on hardware (add to the list above):
+- A failed `Start` after `usb->start()` (`driver/RMNetDriver.cpp:300-304`): `Start_Impl` returns the error while the stop sequence still waits on a request through the timer; whether DriverKit can free the object first is unknown, and `free()` releases the timer without `Cancel`.
+
+Throughput, in the code and not yet measured:
+- Acknowledgements share the 8 uplink slots and are dropped with data under a concurrent upload, so the backpressure fix matters for downloads too; when it is built, a freed slot must drain the transmit queue (`OnBulkOutDone`, `driver/RMNetDriver.cpp:792`, triggers nothing today).
+- A read is re-posted only after its whole handler, and handler time is unmeasured; a per-completion maximum of handler duration is a cheap counter.
+- `RxBuffer` (`driver/RMNetDriver.cpp:737-746`) dequeues one receive packet per frame, about 17 calls per transfer; batch with `DequeuePackets`.
+- One Default queue serialises receive and transmit, so a bulk-in handler delays acknowledgements by its duration.
+- Two paths wait for the 100 ms timer instead of a completion: frames held for lack of `txDone` room, and receive packets the completion queue refused.
+- At low rates the modem sends one packet per transfer plus a 4-byte filler, so TCP slow start pays two completions per packet, which weighs heavily in a 50 MB run.
+
+Before the same-day comparison with the userspace tool:
+- Add the handler-duration counter and the batched receive dequeue first, so the comparison can separate driver time from network.
+- The userspace tool runs on a `utun` outside `measure.sh`'s usage file, so its data must be added to the file by hand or the guard will be wrong.
+
+Small hardening left open:
+- The frame-length minimum tests.
+- A refresh during a retry abandons an allocated client until the next sync.
+- The Get Client ID retry path has no test.
+- `tick` could check `!pending_.active ||`.
+- An empty CDHash is reported as "older build running" by the install script.
+- The install script's stop check sees only the `activated enabled` entry.
+- `PrefixLength` is duplicated, and it and `FormatIPv6` are untested.
+- "usb failed" is published for about 4 s on re-enumeration.
+- A failed `WakeAtTime` ends all ticks, and while stopping can stall `Stop`.
+- Packets held at `Stop` are abandoned (watch the driver process's memory in the soak).
+- `acquire_uplink` ignores `failed_`.
+- `logged_bad_qmap_` is dead.
+- `Worth` is duplicated.
+- A failed `setDataOffAndLen` is ignored.
+- `RMNetPoolPacketCount` publishes a fixed total.
+- `DrainTx` also flushes when it stops for lack of `txDone` room.
+- A successful read during a recovery resets the recovery count.
+- `measure.sh`: TERM exits 130.
+- `measure.sh`: the FAILED message blames curl when the interface vanished.
+- `measure.sh`: the gate window starts up to one sample late.
+- `measure.sh`: a counter reset loses up to 0.25 s of traffic.
+- `measure.sh`: overhead can take a run a few MB past its reservation.
+- `measure.sh`: a SIGKILLed run leaves no record.
+- `measure.sh`: an empty usage file is accepted as 0.
+- `measure.sh`: a loopback run charges the real usage file unless `MEASURE_USAGE_FILE` is set.
 
 ## Observed on the modem
 

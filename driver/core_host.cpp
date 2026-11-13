@@ -41,6 +41,12 @@ uint8_t PrefixLength(const uint8_t mask[4]) {
   return n;
 }
 
+rmnet::SessionConfig ConfigWithProfile(uint8_t profile) {
+  rmnet::SessionConfig cfg{};
+  cfg.profile = profile;
+  return cfg;
+}
+
 }  // namespace
 
 const char* SessionStateName(rmnet::SessionState s) {
@@ -63,10 +69,10 @@ const char* SessionStateName(rmnet::SessionState s) {
   return "?";
 }
 
-CoreHost::CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs)
+CoreHost::CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile)
     : usb_(usb),
       rx_(rx),
-      session_(rmnet::SessionConfig{}, *this),
+      session_(ConfigWithProfile(profile), *this),
       eth_(macs),
       agg_(nullptr, 0, 0, 0),
       uplink_slot_(-1),

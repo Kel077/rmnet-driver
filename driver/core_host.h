@@ -70,7 +70,8 @@ struct DataCounters {
 
 class CoreHost final : public rmnet::SessionDelegate {
  public:
-  CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs);
+  // profile: the data profile the session asks the modem for (SessionConfig::profile).
+  CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile);
   CoreHost(const CoreHost&) = delete;
   CoreHost& operator=(const CoreHost&) = delete;
 

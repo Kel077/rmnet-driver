@@ -117,6 +117,20 @@ void bring_up_v4_only(rmnet::Session& s, FakeModem& m, uint64_t time) {
   feed_frame(s, failed_start_frame(16, m.last_txid()), time);
 }
 
+std::vector<uint8_t> start4_response_with_txid(uint16_t txid) { return with_txid(kWdsStart4Resp, txid); }
+
+// Replays the capture up to the IPv4 Start Network, fails it at `time` (as after a teardown, when the
+// network refuses IPv4 for a moment), then answers the IPv6 steps so the link comes up IPv6-only.
+void bring_up_v6_only(rmnet::Session& s, FakeModem& m, uint64_t time) {
+  bring_up_to(s, m, kWdsFamily4Resp);
+  feed_frame(s, failed_start_frame(15, m.last_txid()), time);
+  feed(s, kCtlGetWds6Resp, time);
+  feed_frame(s, with_txid(kWdsBind6Resp, m.last_txid()), time);
+  feed_frame(s, with_txid(kWdsFamily6Resp, m.last_txid()), time);
+  feed_frame(s, start6_response_with_txid(m.last_txid()), time);
+  feed_frame(s, settings6_response_with_txid(m.last_txid()), time);
+}
+
 }  // namespace
 
 TEST(happy_path_brings_link_up_dual_stack) {
@@ -340,4 +354,35 @@ TEST(retry_binds_a_client_whose_bind_failed) {
   CHECK_EQ(m.last()[9], 0x4d);                                                // Set IP Family
   feed_frame(s, with_txid(kWdsFamily6Resp, m.last_txid()), 5300);
   CHECK_EQ(m.last()[9], 0x20);                                                // Start Network
+}
+
+TEST(missing_v4_is_retried_while_up) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_v6_only(s, m, 100);          // helper: IPv4 Start Network fails at time 100
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1);
+  CHECK(m.cfg.settings.has_v6); CHECK(!m.cfg.settings.has_v4);
+  size_t sent = m.sent.size();
+  s.tick(5099); CHECK_EQ(m.sent.size(), sent);
+  s.tick(5100); CHECK_EQ(m.sent.size(), sent + 1);
+  CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x20);                     // Start Network on the IPv4 client
+  feed_frame(s, start4_response_with_txid(m.last_txid()), 5200);
+  CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);                     // Get Current Settings
+  feed_frame(s, settings4_response_with_txid(m.last_txid()), 5300);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2); CHECK_EQ(m.downs, 0);
+  CHECK(m.cfg.settings.has_v4); CHECK(m.cfg.settings.has_v6);
+  CHECK_BYTES(m.cfg.settings.v4_addr, 4, "0a 66 f6 e6");
+  sent = m.sent.size(); s.tick(200000); CHECK_EQ(m.sent.size(), sent);        // nothing left to retry
+}
+
+TEST(failed_v4_retry_keeps_link_up_and_backs_off) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_v6_only(s, m, 100);
+  const uint64_t at[] = {5100, 15200, 35300, 75400, 135500, 195600};          // waits of 5, 10, 20, 40, 60, 60 s after each failure
+  for (uint64_t t : at) {
+    size_t sent = m.sent.size();
+    s.tick(t - 1); CHECK_EQ(m.sent.size(), sent);
+    s.tick(t);     CHECK_EQ(m.sent.size(), sent + 1);
+    CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x20);                   // Start Network on the IPv4 client
+    feed_frame(s, failed_start_frame(15, m.last_txid()), t + 100);
+    CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0); CHECK_EQ(m.ups, 1);
+    CHECK(m.cfg.settings.has_v6); CHECK(!m.cfg.settings.has_v4);
+  }
 }

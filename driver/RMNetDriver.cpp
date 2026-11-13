@@ -36,6 +36,8 @@ constexpr uint32_t kPacketBufSize = 2048;  // one Ethernet frame per packet
 constexpr uint32_t kQueueCapacity = 256;
 constexpr uint32_t kMtu = 1500;
 constexpr uint32_t kMinMtu = 576;
+constexpr uint8_t kDefaultProfile = 1;
+constexpr const char* kProfileKey = "RMNetProfile";
 constexpr uint32_t kTxBatch = 32;
 constexpr uint32_t kTxHold = 256;  // sent packets the completion queue has not taken yet
 constexpr uint32_t kRxHold = 256;  // filled packets the completion queue has not taken yet
@@ -92,6 +94,31 @@ bool IsQmiInterface(IOService* provider) {
             id->bInterfaceSubClass == kVendorSpecific && id->bInterfaceProtocol == kVendorSpecific;
   IOUSBHostFreeDescriptor(cfg);
   return ok;
+}
+
+// The data profile from the service's RMNetProfile property (the personality in Info.plist sets it):
+// an integer from 1 to 255. Anything else, or no such property, gives 1, with a log line.
+uint8_t ReadProfile(IOService* service) {
+  OSDictionary* props = nullptr;
+  kern_return_t ret = service->CopyProperties(&props);
+  uint8_t profile = kDefaultProfile;
+  if (ret != kIOReturnSuccess || !props) {
+    LOG("RMNetProfile: properties not readable (0x%x); using profile %u", ret, profile);
+  } else {
+    OSObject* obj = props->getObject(kProfileKey);
+    OSNumber* num = OSDynamicCast(OSNumber, obj);
+    if (!obj) {
+      LOG("RMNetProfile: no such property; using profile %u", profile);
+    } else if (!num) {
+      LOG("RMNetProfile: not an integer; using profile %u", profile);
+    } else if (num->unsigned64BitValue() < 1 || num->unsigned64BitValue() > 255) {
+      LOG("RMNetProfile: %llu is not from 1 to 255; using profile %u", num->unsigned64BitValue(), profile);
+    } else {
+      profile = static_cast<uint8_t>(num->unsigned64BitValue());
+    }
+  }
+  OSSafeReleaseNULL(props);
+  return profile;
 }
 
 uint64_t NowNs() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
@@ -284,8 +311,11 @@ kern_return_t RMNetDriver::Start_Impl(IOService* provider) {
     }
     LOG("serial number of %zu characters, host MAC %02x:%02x:%02x:%02x:%02x:%02x", strlen(serial), macs.host[0],
         macs.host[1], macs.host[2], macs.host[3], macs.host[4], macs.host[5]);
+    uint8_t profile = ReadProfile(this);
+    LOG("profile %u", profile);
+    PublishProfile(profile);
     ivars->rxBridge = new RxBridge(this);
-    if (ivars->rxBridge) ivars->core = new CoreHost(*ivars->usb, *ivars->rxBridge, macs);
+    if (ivars->rxBridge) ivars->core = new CoreHost(*ivars->usb, *ivars->rxBridge, macs, profile);
     if (!ivars->core) ret = kIOReturnNoMemory;
   }
   if (ret == kIOReturnSuccess) ret = CreateInterface(macs.host);
@@ -546,13 +576,28 @@ void RMNetDriver::ApplyCore() {
       ivars->linkActive = true;
       ReportLink();
     }
-    LOG("link up%{public}s: ipv4 %d ipv6 %d, carrier mtu %u, interface mtu %u (setMaxTransferUnit 0x%x)",
+    LOG("link up%{public}s: ipv4 %d ipv6 %d, carrier mtu %u; the interface keeps the mtu it registered "
+        "with (setMaxTransferUnit(%u) 0x%x)",
         again ? " (family added)" : "", s.has_v4, s.has_v6, s.mtu, mtu, mret);
     ivars->core->data_link_up(NowMs());
   }
   PublishStatus();
   FlushRx();  // a router advertisement
   if (ivars->core->take_uplink_resumed()) DrainTx();
+}
+
+// Publishes the profile in use as RMNetProfile, over the personality's value, so the registry shows
+// what the session asks for. A failure is logged and does not fail Start.
+void RMNetDriver::PublishProfile(uint8_t profile) {
+  OSDictionary* props = OSDictionary::withCapacity(1);
+  OSNumber* n = OSNumber::withNumber(static_cast<uint64_t>(profile), 32);
+  if (props && n) {
+    props->setObject(kProfileKey, n);
+    kern_return_t ret = SetProperties(props);
+    if (ret != kIOReturnSuccess) LOG("SetProperties (profile) 0x%x", ret);
+  }
+  OSSafeReleaseNULL(n);
+  OSSafeReleaseNULL(props);
 }
 
 // Status for the host app: properties on this service in the I/O registry. Republished only when

@@ -33,10 +33,19 @@ step() {
 }
 trap 'rc=$?; [ "$rc" -eq 0 ] || echo "install-driver: failed during: $stage" >&2' EXIT
 
-# The versions of every entry the system lists for the driver, whatever its state, one per line.
+# Reads the system's list of extensions into $listing. A failed listing stops the script: read as
+# an empty list, it would look like "nothing installed" and let the app be replaced without a copy.
+read_listing() {
+  listing=$(systemextensionsctl list) || {
+    echo "install-driver: systemextensionsctl list failed; stopping before anything is changed" >&2
+    exit 1
+  }
+}
+
+# The versions of every entry in $listing for the driver, whatever its state, one per line.
 # With "activated enabled" as $1, only that entry's version.
 listed_versions() {
-  systemextensionsctl list | grep "	$DRIVER_ID (" | grep -- "${1:-}" |
+  printf '%s\n' "$listing" | grep "	$DRIVER_ID (" | grep -- "${1:-}" |
     sed -n 's/.*(\([^/]*\)\/\([0-9.]*\)).*/\2/p'
 }
 
@@ -82,8 +91,9 @@ built=$(/usr/bin/defaults read "$NEW/Contents/Info" CFBundleVersion 2>/dev/null 
 [ "$built" = "$VERSION" ] || { echo "install-driver: $NEW missing or not version $VERSION" >&2; exit 1; }
 
 step "keep the app being replaced"
+read_listing
 old=$(driver_version "$APP")
-if [ -n "$old" ] && listed_versions | grep -qx "$old"; then
+if [ -n "$old" ] && listed_versions | grep -qxF "$old"; then
   keep_app "$APP"
 fi
 active=$(active_version)
@@ -104,6 +114,7 @@ keep_app "$APP"
 
 step "activate"
 "$APP/Contents/MacOS/RMNet" activate
+read_listing
 active=$(active_version)
 [ "$active" = "$VERSION" ] || { echo "install-driver: active driver is ${active:-none}, not $VERSION" >&2; exit 1; }
 

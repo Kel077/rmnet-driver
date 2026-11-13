@@ -81,6 +81,7 @@ public:
     void PublishCounters() LOCALONLY;
     void ApplyCore() LOCALONLY;
     void PublishStatus() LOCALONLY;
+    void PublishProfile(uint8_t profile) LOCALONLY;
     IOReturn ReportLink() LOCALONLY;
     bool FirstCall(uint32_t flag) LOCALONLY;
 };
