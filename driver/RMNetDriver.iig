@@ -1,0 +1,52 @@
+// The driver's only DriverKit class: presents the modem's QMI interface as an Ethernet port.
+#ifndef RMNetDriver_h
+#define RMNetDriver_h
+
+#include <Availability.h>
+#include <DriverKit/IOService.iig>
+#include <DriverKit/IODataQueueDispatchSource.iig>
+#include <NetworkingDriverKit/IOUserNetworkEthernet.iig>
+
+// SelectMediaType must be declared with the deprecated IOUserNetworkMediaType, and iig expands
+// the generated method list where it chooses inside the class, so the whole class is covered.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+class RMNetDriver : public IOUserNetworkEthernet
+{
+public:
+    virtual bool init() override;
+    virtual void free() override;
+
+    virtual kern_return_t Start(IOService * provider) override;
+    virtual kern_return_t Stop(IOService * provider) override;
+    virtual kern_return_t SetPowerState(uint32_t powerFlags) override;
+
+    // Called by the network stack. The SDK marks the uppercase forms deprecated but Apple's own
+    // dexts still implement them; the lowercase forms are overridden too, log, and forward to the
+    // superclass, so the first load shows which ones macOS calls.
+    virtual kern_return_t SetInterfaceEnable(bool isEnable) override;
+    virtual kern_return_t SetPromiscuousModeEnable(bool enable) override;
+    virtual kern_return_t SetAllMulticastModeEnable(bool enable) override;
+    // iig matches overrides by the spelled type: uint32_t here fails with "does not override".
+    virtual kern_return_t SelectMediaType(IOUserNetworkMediaType mediaType) override;
+    virtual IOReturn getSupportedMediaArray(MediaWord * mediaArray, uint32_t * mediaCount) override LOCALONLY;
+    virtual IOReturn setMulticastAddresses(const ether_addr_t * addresses, uint32_t count) override LOCALONLY;
+    virtual IOReturn setInterfaceEnable(bool enable) override LOCALONLY;
+    virtual IOReturn setPromiscuousModeEnable(bool enable) override LOCALONLY;
+    virtual IOReturn setAllMulticastModeEnable(bool enable) override LOCALONLY;
+    virtual IOReturn handleChosenMedia(MediaWord chosenMedia) override LOCALONLY;
+    virtual uint32_t getMaxTransferUnit() override LOCALONLY;
+    virtual IOReturn setPowerState(unsigned long powerState, IOService * whatDevice) override LOCALONLY;
+
+    // Packet queue notifications: the stack queued frames to send; empty receive buffers arrived.
+    virtual void TxPacketsAvailable(OSAction * action) TYPE(IODataQueueDispatchSource::DataAvailable);
+    virtual void RxPacketsAvailable(OSAction * action) TYPE(IODataQueueDispatchSource::DataAvailable);
+
+    // Plain C++ helpers, never called across the IPC boundary.
+    kern_return_t CreateInterface() LOCALONLY;
+    void PublishState(const char * state) LOCALONLY;
+    bool FirstCall(uint32_t flag) LOCALONLY;
+};
+#pragma clang diagnostic pop
+
+#endif /* RMNetDriver_h */

@@ -12,7 +12,7 @@ CORE_OBJS := $(patsubst core/src/%.cpp,build/obj/core/%.o,$(CORE_SRCS))
 TEST_OBJS := $(patsubst tests/%.cpp,build/obj/tests/%.o,$(TEST_SRCS))
 HARNESS_OBJS := $(patsubst harness/%.mm,build/obj/harness/%.o,$(HARNESS_SRCS))
 
-.PHONY: test check-driverkit harness clean
+.PHONY: test check-driverkit harness driver clean
 
 test: build/tests
 	./build/tests $(FILTER)
@@ -39,6 +39,17 @@ build/obj/harness/%.o: harness/%.mm
 
 check-driverkit:
 	./scripts/check-driverkit-compile.sh
+
+# Unsigned build of the driver and the host app that embeds it. gen.rb writes RMNet.xcodeproj.
+XCODEBUILD := xcodebuild -project RMNet.xcodeproj -configuration Debug -parallelizeTargets \
+	SYMROOT="$(CURDIR)/build/xcode" OBJROOT="$(CURDIR)/build/xcode/obj" \
+	CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+driver:
+	/usr/bin/ruby gen.rb
+	$(XCODEBUILD) -target RMNetDriver build
+	$(XCODEBUILD) -target RMNet build
+	@echo "driver build ok"
 
 clean:
 	rm -rf build

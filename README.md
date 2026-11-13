@@ -7,7 +7,17 @@ A macOS driver that makes a Quectel RM520N-GL 5G modem in QMI USB mode appear as
 - `make test` builds `build/tests` and runs every test; `make test FILTER=bytes` runs only tests whose name contains `bytes`.
 - `make check-driverkit` syntax-checks every `core/src/*.cpp` against the installed DriverKit SDK.
 - `make harness` builds `build/rmnet-harness`, the command-line harness (below).
+- `make driver` generates `RMNet.xcodeproj` and builds the driver and the host app unsigned into `build/xcode/`, printing `driver build ok`.
 - `make clean` removes `build/`.
+
+## Driver
+
+The driver is a DriverKit extension (`driver/`, bundle `io.rmnetdriver.RMNet.driver`) that links Core and presents the modem's QMI interface (USB `2c7c:0801`, interface 4) as an Ethernet port. It is carried and installed by a command-line host app (`app/`, `io.rmnetdriver.RMNet`). The current driver is a skeleton: it registers an inactive Ethernet interface and drops every frame it is given, without opening the USB interface.
+
+- `gen.rb` writes `RMNet.xcodeproj` (not in git) with two targets: `RMNetDriver` (every `driver/*.cpp`, `driver/*.iig` and `core/src/*.cpp`) and `RMNet` (the app, which embeds the driver). Run it with `/usr/bin/ruby gen.rb` for an unsigned project, or `/usr/bin/ruby gen.rb TEAM_ID` for automatic signing with that team. It needs the `xcodeproj` gem.
+- `scripts/install-driver.sh` generates the project for team `ABCDE12345`, builds it signed (letting Xcode create or update the provisioning profiles) with the current time as the bundle version, copies the app to `/Applications/RMNet.app` and runs `RMNet activate`. The first activation waits for approval in System Settings, under Login Items & Extensions, Driver Extensions.
+- `scripts/driver-log.sh` follows the driver's log lines, which all start with `RMNet:`.
+- `/Applications/RMNet.app/Contents/MacOS/RMNet activate | deactivate | status`. `status` prints whether the driver extension is installed and enabled, whether the modem is attached in QMI mode, and, if the driver is attached, its `RMNet*` registry properties.
 
 ## Harness
 
