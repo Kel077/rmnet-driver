@@ -24,6 +24,9 @@ constexpr uint8_t kNotifyResponseAvailable = 0x01;  // CDC notification RESPONSE
 constexpr uint32_t kControlTimeoutMs = 5000;
 constexpr uint32_t kMaxInterruptFailures = 5;  // in a row, each followed by a stall clear
 constexpr uint16_t kDefaultInterruptSize = 64;
+constexpr uint16_t kDefaultBulkPacketSize = 512;  // USB 2.0 high speed, if the descriptor gives none
+constexpr uint8_t kMaxReadFailures = 5;  // in a row, per bulk read, each followed by a stall clear
+constexpr uint32_t kUplinkTimeoutMs = 5000;  // a write the modem does not take frees its buffer
 // The modem answers an empty GET_ENCAPSULATED_RESPONSE with a STALL. Accept the legacy code too.
 constexpr IOReturn kLegacyPipeStalled = (IOReturn)0xe000404f;
 
@@ -39,6 +42,17 @@ kern_return_t MakeBuffer(IOUSBHostInterface* intf, IOOptionBits dir, uint32_t si
   return ret;
 }
 
+// Errors are logged when their count is a power of two (1, 2, 4, 8, ...): the first ones in
+// full, then ever more rarely. The counters carry the rest.
+bool Worth(uint64_t n) { return n != 0 && (n & (n - 1)) == 0; }
+
+uint16_t PacketSize(IOUSBHostPipe* pipe, const IOUSBEndpointDescriptor* ep, uint16_t fallback) {
+  uint8_t speed = 0;
+  if (pipe->GetSpeed(&speed) != kIOReturnSuccess) return fallback;
+  uint16_t mps = IOUSBGetEndpointMaxPacketSize(speed, ep);
+  return mps > 0 ? mps : fallback;
+}
+
 }  // namespace
 
 UsbIo::UsbIo(UsbIoListener& listener)
@@ -51,6 +65,8 @@ UsbIo::UsbIo(UsbIoListener& listener)
       bulk_out_(nullptr),
       intr_in_(nullptr),
       intr_size_(kDefaultInterruptSize),
+      bulk_in_mps_(kDefaultBulkPacketSize),
+      bulk_out_mps_(kDefaultBulkPacketSize),
       intr_action_(nullptr),
       out_action_(nullptr),
       in_action_(nullptr),
@@ -61,6 +77,21 @@ UsbIo::UsbIo(UsbIoListener& listener)
       out_buf_(),
       out_addr_(),
       slots_(),
+      read_action_(),
+      read_buf_(),
+      read_addr_(),
+      read_busy_(),
+      read_failures_(),
+      reads_busy_(0),
+      read_len_(0),
+      uplink_action_(),
+      uplink_buf_(),
+      uplink_addr_(),
+      uplink_(),
+      uplinks_busy_(0),
+      stats_(),
+      logged_first_read_(false),
+      logged_first_uplink_(false),
       head_(0),
       count_(0),
       out_busy_(false),
@@ -94,6 +125,14 @@ kern_return_t UsbIo::open(IOService* owner, IOUSBHostInterface* intf, const UsbI
   intr_action_->retain();
   out_action_->retain();
   in_action_->retain();
+  for (uint32_t i = 0; i < kBulkReads; i++) {
+    read_action_[i] = actions.bulk_in[i];
+    read_action_[i]->retain();
+  }
+  for (uint32_t i = 0; i < kUplinkSlots; i++) {
+    uplink_action_[i] = actions.bulk_out[i];
+    uplink_action_[i]->retain();
+  }
 
   kern_return_t ret = intf_->Open(owner_, 0, nullptr);
   if (ret != kIOReturnSuccess) return ret;
@@ -116,15 +155,13 @@ kern_return_t UsbIo::open(IOService* owner, IOUSBHostInterface* intf, const UsbI
     uint8_t addr = IOUSBGetEndpointAddress(ep);
     if (type == kIOUSBEndpointTypeBulk && in && !bulk_in_) {
       ret = intf_->CopyPipe(addr, &bulk_in_);
+      if (ret == kIOReturnSuccess) bulk_in_mps_ = PacketSize(bulk_in_, ep, kDefaultBulkPacketSize);
     } else if (type == kIOUSBEndpointTypeBulk && !in && !bulk_out_) {
       ret = intf_->CopyPipe(addr, &bulk_out_);
+      if (ret == kIOReturnSuccess) bulk_out_mps_ = PacketSize(bulk_out_, ep, kDefaultBulkPacketSize);
     } else if (type == kIOUSBEndpointTypeInterrupt && in && !intr_in_) {
       ret = intf_->CopyPipe(addr, &intr_in_);
-      uint8_t speed = 0;
-      if (ret == kIOReturnSuccess && intr_in_->GetSpeed(&speed) == kIOReturnSuccess) {
-        uint16_t mps = IOUSBGetEndpointMaxPacketSize(speed, ep);
-        if (mps > 0) intr_size_ = mps;
-      }
+      if (ret == kIOReturnSuccess) intr_size_ = PacketSize(intr_in_, ep, kDefaultInterruptSize);
     }
   }
   IOUSBHostFreeDescriptor(cfg);
@@ -142,6 +179,20 @@ kern_return_t UsbIo::open(IOService* owner, IOUSBHostInterface* intf, const UsbI
     ret = MakeBuffer(intf_, kIOMemoryDirectionInOut, kSlotSize, &out_buf_[i], &out_addr_[i]);
     if (ret != kIOReturnSuccess) return ret;
   }
+  // Bulk buffers at the largest sizes Core accepts, so a later session granting other sizes
+  // needs no new buffers; reads and transfers use the granted sizes. InOut: the dext writes the
+  // uplink buffers, and an Out buffer is read-only to the dext (Runtime findings, Task 5).
+  for (uint32_t i = 0; i < kBulkReads; i++) {
+    ret = MakeBuffer(intf_, kIOMemoryDirectionInOut, kMaxDownlink, &read_buf_[i], &read_addr_[i]);
+    if (ret != kIOReturnSuccess) return ret;
+    *static_cast<uint32_t*>(read_action_[i]->GetReference()) = i;
+  }
+  for (uint32_t i = 0; i < kUplinkSlots; i++) {
+    ret = MakeBuffer(intf_, kIOMemoryDirectionInOut, kMaxUplink, &uplink_buf_[i], &uplink_addr_[i]);
+    if (ret != kIOReturnSuccess) return ret;
+    *static_cast<uint32_t*>(uplink_action_[i]->GetReference()) = i;
+  }
+  LOG("usb: bulk in packet %u, bulk out packet %u, interrupt %u bytes", bulk_in_mps_, bulk_out_mps_, intr_size_);
   return kIOReturnSuccess;
 }
 
@@ -302,7 +353,10 @@ void UsbIo::post_response_read() {
   kern_return_t ret = intf_->AsyncDeviceRequest(kInterfaceToHostClass, kGetEncapsulatedResponse, 0, iface_number_,
                                                 kResponseSize, in_buf_, in_action_, kControlTimeoutMs);
   if (ret != kIOReturnSuccess) {
+    // The drain ends here. A notification noted during it is dropped with it: with no read in
+    // flight, the next notification starts a fresh drain.
     LOG("response read not submitted: 0x%x", ret);
+    drain_again_ = false;
     return;
   }
   in_busy_ = true;
@@ -345,6 +399,138 @@ void UsbIo::deliver(uint32_t bytes) {
   if (off < bytes) LOG("discarded %zu bytes of a %u-byte response", bytes - off, bytes);
 }
 
+// --- Bulk IN ---------------------------------------------------------------------------------------
+
+void UsbIo::start_bulk(uint32_t read_len) {
+  if (phase_ != Phase::Running || !opened_) return;
+  uint32_t mps = bulk_in_mps_ ? bulk_in_mps_ : kDefaultBulkPacketSize;
+  uint32_t len = (read_len + mps - 1) / mps * mps;
+  if (len == 0 || len > kMaxDownlink) len = kMaxDownlink;
+  read_len_ = len;
+  for (uint32_t i = 0; i < kBulkReads && phase_ == Phase::Running; i++) {
+    if (!read_busy_[i]) post_read(i);
+  }
+}
+
+void UsbIo::post_read(uint32_t i) {
+  kern_return_t ret = bulk_in_->AsyncIO(read_buf_[i], read_len_, read_action_[i], 0);  // 0: no timeout
+  if (ret == kIOReturnSuccess) {
+    read_busy_[i] = true;
+    reads_busy_++;
+    return;
+  }
+  LOG("bulk read %u not posted: 0x%x", i, ret);
+  fail("bulk read could not be posted");
+}
+
+// Every read counts its own consecutive failures; kMaxReadFailures in a row is fatal. A failure
+// other than an abort clears the stall (synchronously: USBDriverKit has no asynchronous form),
+// which aborts the other posted reads too; they come back aborted and are re-posted.
+void UsbIo::bulk_in_complete(uint32_t i, IOReturn status, uint32_t bytes) {
+  if (i >= kBulkReads || !read_busy_[i]) return;
+  read_busy_[i] = false;
+  reads_busy_--;
+  // Not delivered or re-posted while stopping, nor after a fatal failure (the session is over).
+  if (phase_ != Phase::Running || failed_) return;
+  if (status == kIOReturnSuccess) {
+    read_failures_[i] = 0;
+    if (!logged_first_read_) {
+      logged_first_read_ = true;
+      LOG("first bulk read: %u bytes", bytes);
+    }
+    listener_.on_bulk_in(read_addr_[i], bytes);
+    if (phase_ != Phase::Running || failed_) return;
+  } else {
+    stats_.bulk_in_errors++;
+    read_failures_[i]++;
+    if (Worth(stats_.bulk_in_errors)) {
+      LOG("bulk read %u failed: 0x%x (%u in a row; %llu bulk read errors)", i, status, read_failures_[i],
+          stats_.bulk_in_errors);
+    }
+    if (read_failures_[i] >= kMaxReadFailures) {
+      fail("bulk read keeps failing");
+      return;
+    }
+    if (status != kIOReturnAborted) {
+      stats_.stall_clears++;
+      kern_return_t ret = bulk_in_->ClearStall(true);
+      if (ret != kIOReturnSuccess) LOG("bulk in ClearStall: 0x%x", ret);
+    }
+  }
+  post_read(i);
+}
+
+// --- Bulk OUT --------------------------------------------------------------------------------------
+
+int UsbIo::acquire_uplink() {
+  if (phase_ != Phase::Running || !opened_) return -1;
+  for (uint32_t i = 0; i < kUplinkSlots; i++) {
+    if (uplink_[i] == Uplink::Free) {
+      uplink_[i] = Uplink::Reserved;
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+uint8_t* UsbIo::uplink_buffer(int slot) const {
+  if (slot < 0 || slot >= static_cast<int>(kUplinkSlots)) return nullptr;
+  return uplink_addr_[slot];
+}
+
+void UsbIo::release_uplink(int slot) {
+  if (slot < 0 || slot >= static_cast<int>(kUplinkSlots)) return;
+  if (uplink_[slot] == Uplink::Reserved) uplink_[slot] = Uplink::Free;
+}
+
+bool UsbIo::send_uplink(int slot, uint32_t len) {
+  if (slot < 0 || slot >= static_cast<int>(kUplinkSlots) || uplink_[slot] != Uplink::Reserved) return false;
+  if (phase_ != Phase::Running || len == 0 || len > kMaxUplink) {
+    uplink_[slot] = Uplink::Free;
+    return false;
+  }
+  kern_return_t ret = bulk_out_->AsyncIO(uplink_buf_[slot], len, uplink_action_[slot], kUplinkTimeoutMs);
+  if (ret != kIOReturnSuccess) {
+    uplink_[slot] = Uplink::Free;
+    stats_.bulk_out_errors++;
+    if (Worth(stats_.bulk_out_errors)) {
+      LOG("uplink transfer not submitted: 0x%x (%llu bulk out errors)", ret, stats_.bulk_out_errors);
+    }
+    return false;
+  }
+  if (!logged_first_uplink_) {
+    logged_first_uplink_ = true;
+    LOG("first uplink transfer: %u bytes", len);
+  }
+  uplink_[slot] = Uplink::InFlight;
+  uplinks_busy_++;
+  return true;
+}
+
+void UsbIo::bulk_out_complete(uint32_t i, IOReturn status, uint32_t) {
+  if (i >= kUplinkSlots || uplink_[i] != Uplink::InFlight) return;
+  uplink_[i] = Uplink::Free;
+  uplinks_busy_--;
+  bool ok = status == kIOReturnSuccess;
+  if (!ok) {
+    stats_.bulk_out_errors++;
+    if (phase_ == Phase::Running && Worth(stats_.bulk_out_errors)) {
+      LOG("uplink transfer failed: 0x%x (%llu bulk out errors)", status, stats_.bulk_out_errors);
+    }
+  }
+  if (phase_ != Phase::Running) return;  // the owner is not called while stopping
+  // A halted endpoint must be cleared before it takes more; this also aborts the other uplink
+  // transfers in flight. Aborts and timeouts leave the endpoint usable.
+  if (!ok && status != kIOReturnAborted && status != kIOReturnTimeout) {
+    stats_.stall_clears++;
+    kern_return_t ret = bulk_out_->ClearStall(true);
+    if (ret != kIOReturnSuccess) LOG("bulk out ClearStall: 0x%x", ret);
+  }
+  listener_.on_bulk_out_done(static_cast<int>(i), ok);
+}
+
+// --- Stopping ----------------------------------------------------------------------------------------
+
 void UsbIo::fail(const char* what) {
   if (failed_) return;
   failed_ = true;
@@ -365,6 +551,9 @@ void UsbIo::abort() {
   uint32_t waiting = out_busy_ ? count_ - 1 : count_;
   dropped_at_stop_ += waiting;
   count_ -= waiting;
+  for (uint32_t i = 0; i < kUplinkSlots; i++) {
+    if (uplink_[i] == Uplink::Reserved) uplink_[i] = Uplink::Free;
+  }
   if (opened_) {
     if (intr_in_) intr_in_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, owner_);
     if (bulk_in_) bulk_in_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, owner_);
@@ -393,6 +582,14 @@ void UsbIo::release() {
   OSSafeReleaseNULL(intr_buf_);
   OSSafeReleaseNULL(in_buf_);
   for (uint32_t i = 0; i < kRingSlots; i++) OSSafeReleaseNULL(out_buf_[i]);
+  for (uint32_t i = 0; i < kBulkReads; i++) {
+    OSSafeReleaseNULL(read_buf_[i]);
+    OSSafeReleaseNULL(read_action_[i]);
+  }
+  for (uint32_t i = 0; i < kUplinkSlots; i++) {
+    OSSafeReleaseNULL(uplink_buf_[i]);
+    OSSafeReleaseNULL(uplink_action_[i]);
+  }
   OSSafeReleaseNULL(intr_action_);
   OSSafeReleaseNULL(out_action_);
   OSSafeReleaseNULL(in_action_);

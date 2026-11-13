@@ -46,7 +46,12 @@ public:
     virtual void RxPacketsAvailable(OSAction * action) TYPE(IODataQueueDispatchSource::DataAvailable);
 
     // USB completions, forwarded to UsbIo: the interrupt read, a control request sent, a
-    // response read. And the 100 ms timer that drives the session.
+    // response read, a bulk read, an uplink transfer (the bulk actions carry their slot index).
+    // And the 100 ms timer that drives the session.
+    virtual void BulkInComplete(OSAction * action, IOReturn status, uint32_t actualByteCount,
+                                uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
+    virtual void BulkOutComplete(OSAction * action, IOReturn status, uint32_t actualByteCount,
+                                 uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
     virtual void InterruptComplete(OSAction * action, IOReturn status, uint32_t actualByteCount,
                                    uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
     virtual void ControlOutComplete(OSAction * action, IOReturn status,
@@ -65,6 +70,14 @@ public:
     void FinishStop() LOCALONLY;
     void OnControl(const uint8_t * data, size_t len) LOCALONLY;
     void OnUsbFatal(const char * what) LOCALONLY;
+    void OnBulkIn(const uint8_t * data, size_t len) LOCALONLY;
+    void OnBulkOutDone(int slot, bool ok) LOCALONLY;
+    uint8_t * RxBuffer(size_t * cap) LOCALONLY;
+    void RxCommit(size_t len) LOCALONLY;
+    void FlushRx() LOCALONLY;
+    void DrainTx() LOCALONLY;
+    void FlushTxDone() LOCALONLY;
+    void PublishCounters() LOCALONLY;
     void ApplyCore() LOCALONLY;
     void PublishStatus() LOCALONLY;
     IOReturn ReportLink() LOCALONLY;

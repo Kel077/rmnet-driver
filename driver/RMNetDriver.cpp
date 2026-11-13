@@ -1,6 +1,6 @@
 // The driver: opens the modem's QMI interface, runs Core's QMI session over its control channel,
-// and presents an Ethernet port whose link follows the session. Packets are not carried yet:
-// transmitted frames are completed and dropped.
+// and presents an Ethernet port whose link follows the session. Frames from the stack go through
+// CoreHost to the bulk OUT pipe; bulk IN transfers come back through CoreHost as received frames.
 #include <os/log.h>
 #include <stdio.h>
 #include <string.h>
@@ -37,6 +37,11 @@ constexpr uint32_t kQueueCapacity = 256;
 constexpr uint32_t kMtu = 1500;
 constexpr uint32_t kMinMtu = 576;
 constexpr uint32_t kTxBatch = 32;
+constexpr uint32_t kTxHold = 256;  // sent packets the completion queue has not taken yet
+constexpr uint32_t kRxHold = 256;  // filled packets the completion queue has not taken yet
+constexpr uint32_t kRxBatch = 64;  // filled packets handed up in one EnqueuePackets at most
+constexpr uint8_t kLinkHeaderLen = 14;  // Ethernet
+constexpr uint32_t kCounterTicks = 10;  // counters are published once a second
 constexpr uint64_t kTickNs = 100 * 1000000ull;
 constexpr uint64_t kTickLeewayNs = 10 * 1000000ull;
 constexpr uint64_t kStopDrainMs = 1000;  // the control ring may take this long to send at Stop
@@ -68,6 +73,12 @@ enum : uint32_t {
   kLogControlOutComplete = 1u << 21,
   kLogControlInComplete = 1u << 22,
   kLogTimerFired = 1u << 23,
+  kLogBulkIn = 1u << 24,
+  kLogBulkOut = 1u << 25,
+  kLogTxPacket = 1u << 26,
+  kLogRxPacket = 1u << 27,
+  kLogRxCompleteFull = 1u << 28,
+  kLogPoolCount = 1u << 29,
 };
 
 // True if the provider is the modem's QMI interface: number 4, class, subclass and protocol 0xff.
@@ -140,8 +151,21 @@ struct UsbBridge final : UsbIoListener {
   explicit UsbBridge(RMNetDriver* d) : driver(d) {}
   void on_control(const uint8_t* data, size_t len) override { driver->OnControl(data, len); }
   void on_fatal(const char* what) override { driver->OnUsbFatal(what); }
+  void on_bulk_in(const uint8_t* data, size_t len) override { driver->OnBulkIn(data, len); }
+  void on_bulk_out_done(int slot, bool ok) override { driver->OnBulkOutDone(slot, ok); }
   RMNetDriver* driver;
 };
+
+// Gives CoreHost the driver's receive packets.
+struct RxBridge final : RxSink {
+  explicit RxBridge(RMNetDriver* d) : driver(d) {}
+  uint8_t* rx_buffer(size_t* cap) override { return driver->RxBuffer(cap); }
+  void rx_commit(size_t len) override { driver->RxCommit(len); }
+  RMNetDriver* driver;
+};
+
+// What PublishCounters last published, in its order.
+enum : uint32_t { kCounterCount = 31 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -155,6 +179,7 @@ struct RMNetDriver_IVars {
   IOTimerDispatchSource* timer;
   OSAction* timerAction;
   UsbBridge* bridge;
+  RxBridge* rxBridge;
   UsbIo* usb;       // released objects only once its aborted completions have arrived
   CoreHost* core;
   bool stopping;
@@ -165,10 +190,23 @@ struct RMNetDriver_IVars {
   uint64_t stopStartMs;
   uint64_t abortStartMs;
   bool usbFailed;
+  bool coreStopped;  // session.stop() was called; the Session is not called again
   bool linkActive;  // the link status last reported to the stack
   uint32_t mtu;     // what getMaxTransferUnit answers
   char published[256];  // the status last published, "state|ipv4|ipv6"; empty before the first
   uint32_t logged;  // kLog* bits already logged
+  // The data path's packets. A packet taken from the RX submission queue waits in rxSpare until it
+  // is filled; filled ones wait in rxOut, and sent ones in txDone, until their completion queue
+  // takes them (leftovers go first next time, so the pool does not shrink).
+  IOUserNetworkPacket* rxSpare;
+  IOUserNetworkPacket* rxOut[kRxHold];
+  uint32_t rxOutCount;
+  IOUserNetworkPacket* txDone[kTxHold];
+  uint32_t txDoneCount;
+  bool txHeld;  // frames may wait in the TX submission queue (paused, or no room in txDone)
+  uint32_t ticks;
+  bool countersPublished;
+  uint64_t counters[kCounterCount];
 };
 
 bool RMNetDriver::FirstCall(uint32_t flag) {
@@ -198,6 +236,8 @@ void RMNetDriver::free() {
     ivars->usb = nullptr;
     delete ivars->bridge;
     ivars->bridge = nullptr;
+    delete ivars->rxBridge;
+    ivars->rxBridge = nullptr;
     OSSafeReleaseNULL(ivars->timer);
     OSSafeReleaseNULL(ivars->timerAction);
     OSSafeReleaseNULL(ivars->txAvailAction);
@@ -243,7 +283,8 @@ kern_return_t RMNetDriver::Start_Impl(IOService* provider) {
     }
     LOG("serial number of %zu characters, host MAC %02x:%02x:%02x:%02x:%02x:%02x", strlen(serial), macs.host[0],
         macs.host[1], macs.host[2], macs.host[3], macs.host[4], macs.host[5]);
-    ivars->core = new CoreHost(*ivars->usb, macs);
+    ivars->rxBridge = new RxBridge(this);
+    if (ivars->rxBridge) ivars->core = new CoreHost(*ivars->usb, *ivars->rxBridge, macs);
     if (!ivars->core) ret = kIOReturnNoMemory;
   }
   if (ret == kIOReturnSuccess) ret = CreateInterface(macs.host);
@@ -277,10 +318,18 @@ kern_return_t RMNetDriver::OpenUsb(IOService* provider) {
   kern_return_t ret = CreateActionInterruptComplete(0, &actions.interrupt);
   if (ret == kIOReturnSuccess) ret = CreateActionControlOutComplete(0, &actions.control_out);
   if (ret == kIOReturnSuccess) ret = CreateActionControlInComplete(0, &actions.control_in);
+  for (uint32_t i = 0; i < kBulkReads && ret == kIOReturnSuccess; i++) {
+    ret = CreateActionBulkInComplete(sizeof(uint32_t), &actions.bulk_in[i]);
+  }
+  for (uint32_t i = 0; i < kUplinkSlots && ret == kIOReturnSuccess; i++) {
+    ret = CreateActionBulkOutComplete(sizeof(uint32_t), &actions.bulk_out[i]);
+  }
   if (ret == kIOReturnSuccess) ret = ivars->usb->open(this, intf, actions);
   OSSafeReleaseNULL(actions.interrupt);
   OSSafeReleaseNULL(actions.control_out);
   OSSafeReleaseNULL(actions.control_in);
+  for (uint32_t i = 0; i < kBulkReads; i++) OSSafeReleaseNULL(actions.bulk_in[i]);
+  for (uint32_t i = 0; i < kUplinkSlots; i++) OSSafeReleaseNULL(actions.bulk_out[i]);
   if (ret != kIOReturnSuccess) LOG("USB open failed 0x%x", ret);
   return ret;
 }
@@ -367,7 +416,9 @@ void RMNetDriver::TearDown(IOService* provider) {
   ivars->stopProvider = provider;
   provider->retain();
   ivars->stopStartMs = NowMs();
-  if (ivars->core) {
+  // Not again if OnUsbFatal already stopped the session: Core is not called after stop().
+  if (ivars->core && !ivars->coreStopped) {
+    ivars->coreStopped = true;
     ivars->core->stop();
     ivars->core->take_link_change();
   }
@@ -449,7 +500,7 @@ IOReturn RMNetDriver::ReportLink() {
 
 // One QMUX frame from the modem (UsbIo, from a response read's completion).
 void RMNetDriver::OnControl(const uint8_t* data, size_t len) {
-  if (ivars->stopping || !ivars->core) return;
+  if (ivars->stopping || !ivars->core || ivars->coreStopped) return;
   ivars->core->on_control(data, len, NowMs());
   ApplyCore();
 }
@@ -459,18 +510,22 @@ void RMNetDriver::OnControl(const uint8_t* data, size_t len) {
 void RMNetDriver::OnUsbFatal(const char* what) {
   LOG("usb failed: %{public}s", what);
   ivars->usbFailed = true;
-  if (ivars->stopping || !ivars->core) return;
+  if (ivars->stopping || !ivars->core || ivars->coreStopped) return;
+  ivars->coreStopped = true;
   ivars->core->stop();
   ApplyCore();
 }
 
 // Applies what the last Core call decided, now that it has returned: link down, then link up
 // (both, in that order, for a bounce). A second link up while the link is up means a family was
-// added: the emulator, the MTU and the properties are updated, and the link stays active.
+// added: the emulator, the MTU and the properties are updated, a router advertisement goes out if
+// IPv6 is new, and the link stays active. The data path is updated last, after the link is
+// reported, because starting the bulk reads can fail and stop the session (OnUsbFatal, which
+// applies its own link down).
 void RMNetDriver::ApplyCore() {
   CoreHost::LinkChange c = ivars->core->take_link_change();
   if (c.down) {
-    ivars->core->ethernet().set_link(nullptr);
+    ivars->core->data_link_down();
     ivars->mtu = kMtu;
     if (ivars->linkActive) {
       ivars->linkActive = false;
@@ -480,7 +535,6 @@ void RMNetDriver::ApplyCore() {
   }
   if (c.up) {
     const rmnet::RuntimeSettings& s = ivars->core->link_config().settings;
-    ivars->core->ethernet().set_link(&s);
     uint32_t mtu = s.mtu;
     if (mtu == 0 || mtu > kMtu) mtu = kMtu;
     if (mtu < kMinMtu) mtu = kMinMtu;
@@ -493,8 +547,11 @@ void RMNetDriver::ApplyCore() {
     }
     LOG("link up%{public}s: ipv4 %d ipv6 %d, carrier mtu %u, interface mtu %u (setMaxTransferUnit 0x%x)",
         again ? " (family added)" : "", s.has_v4, s.has_v6, s.mtu, mtu, mret);
+    ivars->core->data_link_up(NowMs());
   }
   PublishStatus();
+  FlushRx();  // a router advertisement
+  if (ivars->core->take_uplink_resumed()) DrainTx();
 }
 
 // Status for the host app: properties on this service in the I/O registry. Republished only when
@@ -614,28 +671,207 @@ IOReturn RMNetDriver::setPowerState(unsigned long powerState, IOService* whatDev
 
 // --- Packet queues -------------------------------------------------------------------------------
 
-// No data path yet: every queued frame is handed straight back as completed, so the pool does
-// not drain.
 void RMNetDriver::TxPacketsAvailable_Impl(OSAction*) {
   LOG_FIRST(kLogTxAvailable, "TxPacketsAvailable");
-  IOUserNetworkPacket* pkts[kTxBatch];
-  uint32_t n;
-  while ((n = ivars->txSubmit->DequeuePackets(pkts, kTxBatch)) > 0) {
-    uint32_t done = ivars->txComplete->EnqueuePackets(pkts, n);
-    if (done < n) {
-      LOG_FIRST(kLogTxCompleteFull, "tx completion queue full, %u packets not returned", n - done);
-      break;
-    }
-  }
+  DrainTx();
 }
 
+// Empty receive packets arrived; also a chance to hand up filled ones the queue refused before.
 void RMNetDriver::RxPacketsAvailable_Impl(OSAction*) {
   LOG_FIRST(kLogRxAvailable, "RxPacketsAvailable");
+  if (ivars->stopping) return;
+  FlushRx();
+}
+
+// Takes frames from the TX submission queue until it is empty, passes each to CoreHost and
+// completes it whatever happened to it (CoreHost copies what it keeps), then sends the open
+// uplink buffer: the queue is empty. Not while the modem has paused the uplink: frames stay
+// queued until it resumes. If the completion queue refuses packets, they are kept and returned
+// first next time; with no room to keep a whole batch, the rest waits for the next timer tick.
+void RMNetDriver::DrainTx() {
+  FlushTxDone();
+  if (ivars->stopping || !ivars->core || !ivars->txSubmit) return;
+  if (ivars->core->uplink_paused()) {
+    ivars->txHeld = true;
+    return;
+  }
+  ivars->txHeld = false;
+  IOUserNetworkPacket* pkts[kTxBatch];
+  for (;;) {
+    if (kTxHold - ivars->txDoneCount < kTxBatch) {
+      ivars->txHeld = true;
+      break;
+    }
+    uint32_t n = ivars->txSubmit->DequeuePackets(pkts, kTxBatch);
+    if (n == 0) break;
+    for (uint32_t i = 0; i < n; i++) {
+      IOUserNetworkPacket* p = pkts[i];
+      size_t off = p->getDataOff();
+      uint32_t len = p->getDataLength();
+      LOG_FIRST(kLogTxPacket, "first tx packet: data offset %zu, length %u", off, len);
+      const uint8_t* data = reinterpret_cast<const uint8_t*>(p->getDataVirtualAddress()) + off;
+      ivars->core->transmit(data, len);
+      ivars->txDone[ivars->txDoneCount++] = p;
+    }
+    FlushTxDone();
+  }
+  ivars->core->flush_uplink();
+  FlushRx();  // emulator replies
+}
+
+void RMNetDriver::FlushTxDone() {
+  uint32_t n = ivars->txDoneCount;
+  if (n == 0 || !ivars->txComplete) return;
+  uint32_t done = ivars->txComplete->EnqueuePackets(ivars->txDone, n);
+  if (done > n) done = n;
+  if (done < n) {
+    LOG_FIRST(kLogTxCompleteFull, "tx completion queue took %u of %u packets; the rest are kept", done, n);
+    memmove(&ivars->txDone[0], &ivars->txDone[done], (n - done) * sizeof(ivars->txDone[0]));
+  }
+  ivars->txDoneCount = n - done;
+}
+
+// CoreHost's receive buffers: one packet from the RX submission queue at a time, kept until it
+// is filled. None when kRxHold filled packets are still waiting for the completion queue.
+uint8_t* RMNetDriver::RxBuffer(size_t* cap) {
+  if (!ivars->rxSpare) {
+    if (ivars->rxOutCount >= kRxHold || !ivars->rxSubmit) return nullptr;
+    IOUserNetworkPacket* p = nullptr;
+    if (ivars->rxSubmit->DequeuePacket(&p) != kIOReturnSuccess || !p) return nullptr;
+    ivars->rxSpare = p;
+  }
+  *cap = kPacketBufSize;
+  return reinterpret_cast<uint8_t*>(ivars->rxSpare->getDataVirtualAddress());
+}
+
+void RMNetDriver::RxCommit(size_t len) {
+  IOUserNetworkPacket* p = ivars->rxSpare;
+  if (!p) return;
+  ivars->rxSpare = nullptr;
+  IOReturn ret = p->setDataOffAndLen(0, len);
+  LOG_FIRST(kLogRxPacket, "first rx packet: length %zu, setDataOffAndLen 0x%x", len, ret);
+  p->setLinkHeaderLength(kLinkHeaderLen);
+  ivars->rxOut[ivars->rxOutCount++] = p;
+  if (ivars->rxOutCount >= kRxBatch) FlushRx();
+}
+
+// Hands filled packets up in one call; what the completion queue refuses is kept, in order.
+void RMNetDriver::FlushRx() {
+  uint32_t n = ivars->rxOutCount;
+  if (n == 0 || !ivars->rxComplete) return;
+  uint32_t done = ivars->rxComplete->EnqueuePackets(ivars->rxOut, n);
+  if (done > n) done = n;
+  if (done < n) {
+    LOG_FIRST(kLogRxCompleteFull, "rx completion queue took %u of %u packets; the rest are kept", done, n);
+    memmove(&ivars->rxOut[0], &ivars->rxOut[done], (n - done) * sizeof(ivars->rxOut[0]));
+  }
+  ivars->rxOutCount = n - done;
+}
+
+// One completed bulk read: frames go up in one batch, and a resumed uplink is drained.
+void RMNetDriver::OnBulkIn(const uint8_t* data, size_t len) {
+  if (ivars->stopping || !ivars->core) return;
+  ivars->core->on_bulk_in(data, len);
+  FlushRx();
+  if (ivars->core->take_uplink_resumed()) DrainTx();
+}
+
+void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
+  if (ivars->stopping || !ivars->core) return;
+  ivars->core->on_bulk_out_done(slot, ok);
+}
+
+// The data path counters, as properties next to RMNetState, once a second when they changed.
+// RMNetPacketsHeld is what the driver holds of the pool (spare, unhanded receive packets and
+// uncompleted transmit packets); idle, it is 0 or 1 (a spare).
+void RMNetDriver::PublishCounters() {
+  const DataCounters& c = ivars->core->counters();
+  const UsbIoStats& u = ivars->usb->stats();
+  uint32_t poolCount = 0;
+  kern_return_t pret = ivars->pool ? ivars->pool->GetPacketCount(&poolCount) : kIOReturnNotReady;
+  LOG_FIRST(kLogPoolCount, "pool GetPacketCount: %u (0x%x)", poolCount, pret);
+  struct Entry {
+    const char* key;
+    uint64_t value;
+  };
+  const Entry entries[kCounterCount] = {
+      {"RMNetRxPackets", c.rx_packets},
+      {"RMNetRxBytes", c.rx_bytes},
+      {"RMNetTxPackets", c.tx_packets},
+      {"RMNetTxBytes", c.tx_bytes},
+      {"RMNetRxTransfers", c.rx_transfers},
+      {"RMNetRxEmptyTransfers", c.rx_empty_transfers},
+      {"RMNetTxTransfers", c.tx_transfers},
+      {"RMNetReplies", c.replies},
+      {"RMNetRxDropLinkDown", c.rx_drop_link_down},
+      {"RMNetRxDropNoPacket", c.rx_drop_no_packet},
+      {"RMNetRxDropFiltered", c.rx_drop_filtered},
+      {"RMNetRxDropTooBig", c.rx_drop_too_big},
+      {"RMNetRxDropOtherMux", c.rx_drop_other_mux},
+      {"RMNetRxDropBadQmap", c.rx_drop_bad_qmap},
+      {"RMNetTxDropLinkDown", c.tx_drop_link_down},
+      {"RMNetTxDropFiltered", c.tx_drop_filtered},
+      {"RMNetTxDropBusy", c.tx_drop_busy},
+      {"RMNetTxDropTooBig", c.tx_drop_too_big},
+      {"RMNetTxDropUsb", c.tx_drop_usb},
+      {"RMNetReplyDropNoPacket", c.reply_drop_no_packet},
+      {"RMNetQmapCommands", c.commands},
+      {"RMNetQmapFlowDisable", c.flow_disable},
+      {"RMNetQmapFlowEnable", c.flow_enable},
+      {"RMNetQmapCommandReplies", c.command_replies},
+      {"RMNetQmapCommandReplyDrops", c.command_reply_drops},
+      {"RMNetUsbBulkInErrors", u.bulk_in_errors},
+      {"RMNetUsbBulkOutErrors", u.bulk_out_errors},
+      {"RMNetUsbStallClears", u.stall_clears},
+      {"RMNetPacketsHeld", uint64_t{ivars->rxOutCount} + ivars->txDoneCount + (ivars->rxSpare ? 1u : 0u)},
+      {"RMNetPoolPacketCount", poolCount},
+      {"RMNetUplinkPaused", ivars->core->uplink_paused() ? 1u : 0u},
+  };
+  bool changed = !ivars->countersPublished;
+  for (uint32_t i = 0; i < kCounterCount; i++) {
+    if (entries[i].value != ivars->counters[i]) changed = true;
+  }
+  if (!changed) return;
+
+  OSDictionary* props = OSDictionary::withCapacity(kCounterCount);
+  if (!props) return;
+  bool ok = true;
+  for (uint32_t i = 0; i < kCounterCount && ok; i++) {
+    OSNumber* n = OSNumber::withNumber(entries[i].value, 64);
+    ok = n && props->setObject(entries[i].key, n);
+    OSSafeReleaseNULL(n);
+  }
+  if (ok) {
+    kern_return_t ret = SetProperties(props);
+    if (ret == kIOReturnSuccess) {
+      for (uint32_t i = 0; i < kCounterCount; i++) ivars->counters[i] = entries[i].value;
+      ivars->countersPublished = true;
+    } else {
+      LOG("SetProperties (counters) 0x%x", ret);
+    }
+  }
+  OSSafeReleaseNULL(props);
 }
 
 // --- USB and timer -------------------------------------------------------------------------------
 
 // Completions go to UsbIo even while stopping: it counts the aborted ones before releasing.
+void RMNetDriver::BulkInComplete_Impl(OSAction* action, IOReturn status, uint32_t actualByteCount, uint64_t) {
+  LOG_FIRST(kLogBulkIn, "BulkInComplete 0x%x, %u bytes", status, actualByteCount);
+  if (!ivars || !ivars->usb) return;
+  uint32_t slot = *static_cast<uint32_t*>(action->GetReference());
+  ivars->usb->bulk_in_complete(slot, status, actualByteCount);
+  if (ivars->stopping) AdvanceStop();
+}
+
+void RMNetDriver::BulkOutComplete_Impl(OSAction* action, IOReturn status, uint32_t actualByteCount, uint64_t) {
+  LOG_FIRST(kLogBulkOut, "BulkOutComplete 0x%x, %u bytes", status, actualByteCount);
+  if (!ivars || !ivars->usb) return;
+  uint32_t slot = *static_cast<uint32_t*>(action->GetReference());
+  ivars->usb->bulk_out_complete(slot, status, actualByteCount);
+  if (ivars->stopping) AdvanceStop();
+}
+
 void RMNetDriver::InterruptComplete_Impl(OSAction*, IOReturn status, uint32_t actualByteCount, uint64_t) {
   LOG_FIRST(kLogInterruptComplete, "InterruptComplete 0x%x, %u bytes", status, actualByteCount);
   if (ivars && ivars->usb) ivars->usb->interrupt_complete(status, actualByteCount);
@@ -664,7 +900,14 @@ void RMNetDriver::TimerFired_Impl(OSAction*, uint64_t) {
     return;
   }
   if (!ivars->core) return;
-  ivars->core->tick(NowMs());
-  ApplyCore();
+  uint64_t now = NowMs();
+  if (!ivars->coreStopped) {
+    ivars->core->tick(now);
+    ApplyCore();
+  }
+  ivars->core->data_tick(now);
+  FlushRx();
+  if (ivars->txHeld || ivars->txDoneCount > 0) DrainTx();
+  if (++ivars->ticks % kCounterTicks == 0) PublishCounters();
   ArmTimer();
 }

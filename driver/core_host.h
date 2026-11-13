@@ -1,22 +1,75 @@
-// Drives Core's QMI session for the driver: plain C++, run on the driver's Default queue.
+// Drives Core for the driver: plain C++, run on the driver's Default queue.
 //
-// It owns the Session and the EthernetEmulator, sends the session's QMI messages through UsbIo,
-// and logs the session's progress. Link changes are only recorded while Core is running; the
-// driver applies them after the Core call returns (take_link_change), so nothing it does can
-// re-enter the Session from a delegate callback.
+// It owns the Session, the EthernetEmulator and the QmapAggregator, sends the session's QMI
+// messages through UsbIo, and logs the session's progress. Link changes are only recorded while
+// Core is running; the driver applies them after the Core call returns (take_link_change, then
+// data_link_down / data_link_up), so nothing it does can re-enter the Session from a delegate
+// callback.
+//
+// The data path. Downlink: each bulk transfer is split into QMAP frames; a data frame on the
+// session's mux becomes an Ethernet frame in a receive packet from the RxSink; a command frame is
+// answered on the uplink, and flow disable or enable pauses or resumes the uplink. Uplink: each
+// frame the host sends goes through the emulator; a reply (ARP, DHCP, neighbour discovery) goes
+// back to the host as a received frame, an IP packet goes into the aggregator, whose buffer is
+// sent when it is full or when the driver says the transmit queue is empty (flush_uplink).
+// No per-packet logging: counters carry it.
 #pragma once
 
 #include <stddef.h>
 #include <stdint.h>
 
 #include "rmnet/ethernet.h"
+#include "rmnet/qmap.h"
 #include "rmnet/session.h"
+#include "usb_io.h"
 
-class UsbIo;
+// Where received frames go: the driver's receive packets.
+class RxSink {
+ public:
+  // The buffer of an empty receive packet and its capacity, or nullptr when none is available.
+  // Until rx_commit, the same packet is returned again.
+  virtual uint8_t* rx_buffer(size_t* cap) = 0;
+  // The buffer last returned now holds a frame of `len` bytes: hand it to the host.
+  virtual void rx_commit(size_t len) = 0;
+
+ protected:
+  ~RxSink() = default;
+};
+
+// Data path counters, published by the driver. Packets and bytes count IP packets (without the
+// Ethernet or QMAP header) that crossed between the host and the modem.
+struct DataCounters {
+  uint64_t rx_packets, rx_bytes;  // modem -> host
+  uint64_t tx_packets, tx_bytes;  // host -> modem, counted when their transfer completed
+  uint64_t rx_transfers;          // bulk reads that completed
+  uint64_t rx_empty_transfers;    // of those, ones with no frame (zero length or all-zero filler)
+  uint64_t tx_transfers;          // uplink transfers that completed
+  uint64_t replies;               // frames the emulator sent the host (ARP, DHCP, ND, adverts)
+  // Downlink drops, by cause.
+  uint64_t rx_drop_link_down;  // data frame while the link is down
+  uint64_t rx_drop_no_packet;  // no receive packet available
+  uint64_t rx_drop_filtered;   // the emulator refused it (not IPv4 or IPv6, or a router advert)
+  uint64_t rx_drop_too_big;    // larger than a receive packet
+  uint64_t rx_drop_other_mux;  // a data frame on another mux ID
+  uint64_t rx_drop_bad_qmap;   // malformed or truncated QMAP: the rest of the transfer
+  // Uplink drops, by cause.
+  uint64_t tx_drop_link_down;  // frame while the link is down
+  uint64_t tx_drop_filtered;   // the emulator dropped it (multicast, broadcast, no address family)
+  uint64_t tx_drop_busy;       // all uplink buffers in flight
+  uint64_t tx_drop_too_big;    // does not fit an empty uplink buffer
+  uint64_t tx_drop_usb;        // its transfer failed or could not be submitted
+  uint64_t reply_drop_no_packet;  // an emulator reply, with no receive packet available
+  // QMAP commands from the modem.
+  uint64_t commands;           // command frames received
+  uint64_t flow_disable;
+  uint64_t flow_enable;
+  uint64_t command_replies;    // replies sent
+  uint64_t command_reply_drops;  // replies not sent (no uplink buffer, or the send failed)
+};
 
 class CoreHost final : public rmnet::SessionDelegate {
  public:
-  CoreHost(UsbIo& usb, const rmnet::MacPair& macs);
+  CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs);
   CoreHost(const CoreHost&) = delete;
   CoreHost& operator=(const CoreHost&) = delete;
 
@@ -35,7 +88,23 @@ class CoreHost final : public rmnet::SessionDelegate {
   const rmnet::LinkConfig& link_config() const { return link_; }
 
   rmnet::SessionState state() const { return session_.state(); }
-  rmnet::EthernetEmulator& ethernet() { return eth_; }
+
+  // The data path. None of these calls the Session.
+  // Applying a link change: down clears the emulator's link and the uplink pause; up (also again
+  // while up) gives the emulator the settings, sizes the bulk transfers from the granted data
+  // format, starts the bulk reads, and sends a router advertisement if IPv6 is new.
+  void data_link_down();
+  void data_link_up(uint64_t now_ms);
+  // The periodic router advertisement, every kRouterAdvertMs while up with IPv6.
+  void data_tick(uint64_t now_ms);
+  void on_bulk_in(const uint8_t* data, size_t len);
+  void on_bulk_out_done(int slot, bool ok);
+  void transmit(const uint8_t* frame, size_t len);  // one frame from the host
+  void flush_uplink();                               // the transmit queue is empty
+  bool uplink_paused() const { return paused_; }
+  // True once after the uplink was resumed (flow enable, or link down while paused).
+  bool take_uplink_resumed();
+  const DataCounters& counters() const { return counters_; }
 
   // SessionDelegate: called by the session from inside start, stop, on_qmi and tick.
   void send_qmi(const uint8_t* data, size_t len) override;
@@ -47,10 +116,34 @@ class CoreHost final : public rmnet::SessionDelegate {
   void log_sent(const uint8_t* data, size_t len);
   void log_received(const uint8_t* data, size_t len);
   uint8_t family_of(uint8_t wds_client) const;
+  void deliver_ip(const uint8_t* ip, size_t len);
+  void deliver_frame(const uint8_t* frame, size_t len);
+  void send_router_advert();
+  void on_command(const rmnet::QmapFrame& f);
+  void forward(const uint8_t* ip, size_t len);
+  bool open_uplink();
+  void send_uplink();
+  void set_paused(bool paused);
 
   UsbIo& usb_;
+  RxSink& rx_;
   rmnet::Session session_;
   rmnet::EthernetEmulator eth_;
+  rmnet::QmapAggregator agg_;  // over the reserved uplink buffer uplink_slot_
+  int uplink_slot_;            // -1 when no buffer is being filled
+  uint32_t slot_packets_[kUplinkSlots];  // what each uplink transfer carries, for the counters
+  uint64_t slot_bytes_[kUplinkSlots];
+  uint32_t ul_size_;       // granted uplink transfer size, at most kMaxUplink
+  uint32_t ul_datagrams_;  // granted datagrams per uplink transfer
+  bool data_up_;           // the link as last applied
+  bool data_v6_;           // ... and whether it had IPv6
+  bool paused_;            // the modem sent flow disable
+  bool resumed_;
+  uint64_t last_advert_ms_;
+  DataCounters counters_;
+  bool logged_first_command_;
+  bool logged_bad_qmap_;
+  uint8_t reply_[2048];  // emulator replies, before they are copied into a receive packet
   rmnet::SessionState logged_state_;
   rmnet::LinkConfig link_;
   LinkChange change_;
@@ -61,3 +154,5 @@ class CoreHost final : public rmnet::SessionDelegate {
 };
 
 const char* SessionStateName(rmnet::SessionState s);
+
+enum : uint32_t { kRouterAdvertMs = 600 * 1000 };

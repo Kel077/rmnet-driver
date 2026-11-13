@@ -1,10 +1,14 @@
-// The control side of the modem's QMI interface: plain C++ owned by the driver, run on the
-// driver's Default queue. It knows nothing about QMI beyond finding frame boundaries.
+// The modem's QMI interface over USB: plain C++ owned by the driver, run on the driver's Default
+// queue. It knows nothing about QMI beyond finding frame boundaries, and nothing about QMAP.
 //
 // QMI control messages travel as USB CDC encapsulated commands and responses on the default
 // control pipe, addressed to the interface. The interrupt endpoint announces waiting responses
 // (A1 01, RESPONSE_AVAILABLE); the modem answers GET_ENCAPSULATED_RESPONSE with a STALL when it
-// has none waiting. Bulk pipes are copied here but carry nothing yet.
+// has none waiting.
+//
+// Data travels on the bulk pipes: kBulkReads reads stay posted on bulk IN once start_bulk is
+// called, each re-posted after its completion; uplink transfers go out on bulk OUT from
+// kUplinkSlots buffers, several in flight at once.
 //
 // Nothing here blocks: every request is asynchronous, and its completion arrives through an
 // OSAction the driver created and forwards to the matching *_complete method.
@@ -21,21 +25,44 @@ class IOUSBHostPipe;
 class IOBufferMemoryDescriptor;
 class OSAction;
 
-// What UsbIo reports to its owner. Neither is called from inside UsbIo::send.
+// What UsbIo reports to its owner. None is called from inside UsbIo::send or send_uplink, and
+// none once the owner has called finish_sending.
 class UsbIoListener {
  public:
   virtual void on_control(const uint8_t* data, size_t len) = 0;  // one QMUX frame
-  virtual void on_fatal(const char* what) = 0;  // the control channel has stopped for good
+  virtual void on_fatal(const char* what) = 0;  // USB has stopped for good (control or bulk)
+  // One completed bulk read; the bytes are valid only during the call (the read is re-posted
+  // after it returns). A zero-length or all-zero transfer is reported like any other.
+  virtual void on_bulk_in(const uint8_t* data, size_t len) = 0;
+  // The uplink transfer from `slot` completed; the slot is free again.
+  virtual void on_bulk_out_done(int slot, bool ok) = 0;
  protected:
   ~UsbIoListener() = default;
 };
 
+enum : uint32_t {
+  kBulkReads = 32,       // bulk IN reads kept posted
+  kUplinkSlots = 8,      // bulk OUT buffers
+  kMaxDownlink = 31744,  // the largest downlink transfer Core accepts (data_format_usable)
+  kMaxUplink = 16384,    // the largest uplink transfer Core accepts
+};
+
 // Completion actions made by the driver (its CreateAction* methods). UsbIo takes a reference
-// to each and releases it with the other USB objects.
+// to each and releases it with the other USB objects. Each bulk action carries its slot index
+// as a uint32_t in its reference area.
 struct UsbIoActions {
   OSAction* interrupt;    // TYPE(IOUSBHostPipe::CompleteAsyncIO)
   OSAction* control_out;  // TYPE(IOUSBHostDevice::CompleteAsyncDeviceRequest)
   OSAction* control_in;   // TYPE(IOUSBHostDevice::CompleteAsyncDeviceRequest)
+  OSAction* bulk_in[kBulkReads];      // TYPE(IOUSBHostPipe::CompleteAsyncIO)
+  OSAction* bulk_out[kUplinkSlots];   // TYPE(IOUSBHostPipe::CompleteAsyncIO)
+};
+
+// Bulk errors since open.
+struct UsbIoStats {
+  uint64_t bulk_in_errors;   // reads that completed with an error (aborted ones included)
+  uint64_t bulk_out_errors;  // uplink transfers that failed or could not be submitted
+  uint64_t stall_clears;     // ClearStall calls on either bulk pipe
 };
 
 class UsbIo {
@@ -46,7 +73,7 @@ class UsbIo {
   UsbIo& operator=(const UsbIo&) = delete;
 
   // Opens the interface for `owner`, copies its bulk in, bulk out and interrupt in pipes and
-  // creates the control buffers. Nothing is sent.
+  // creates the control and bulk buffers. Nothing is sent.
   kern_return_t open(IOService* owner, IOUSBHostInterface* intf, const UsbIoActions& actions);
   // The device's USB serial number as ASCII, or an empty string. Reads the device and string
   // descriptors (once, at start).
@@ -56,13 +83,29 @@ class UsbIo {
   // Queues one SEND_ENCAPSULATED_COMMAND; messages go out one at a time, in order. False if the
   // message is too long, the ring is full, or UsbIo is stopping.
   bool send(const uint8_t* data, size_t len);
+
+  // Bulk IN: posts every idle read, each `read_len` bytes (rounded up to the endpoint's packet
+  // size, at most kMaxDownlink). Later re-posts use the newest length. Reads keep being re-posted
+  // until finish_sending. A read that cannot be posted is fatal.
+  void start_bulk(uint32_t read_len);
+  // Bulk OUT. acquire_uplink reserves a free buffer and returns its slot, or -1 when all are in
+  // use; uplink_buffer gives its kMaxUplink bytes. send_uplink sends `len` bytes from a reserved
+  // slot (false if it could not be submitted; the slot is then free again); release_uplink frees
+  // a reserved slot unsent. Nothing is sent once finish_sending has been called.
+  int acquire_uplink();
+  uint8_t* uplink_buffer(int slot) const;
+  bool send_uplink(int slot, uint32_t len);
+  void release_uplink(int slot);
+  uint16_t bulk_out_packet_size() const { return bulk_out_mps_; }  // from the endpoint descriptor
+  const UsbIoStats& stats() const { return stats_; }
   // Stopping, in three calls made by the owner (docs/driverkit-notes.md 3.9):
-  // finish_sending: no new messages are accepted, reads are no longer re-posted or delivered, and
-  // the messages already queued keep going out in order. sending_done() says when the ring is
+  // finish_sending: no new messages or uplink transfers are accepted, reads (control and bulk)
+  // are no longer re-posted or delivered, and the messages already queued keep going out in order. sending_done() says when the ring is
   // empty or a request failed (the device is gone).
   void finish_sending();
   bool sending_done() const;
-  // abort: drops what is still queued, aborts the pipes and the control requests. The owner then
+  // abort: drops what is still queued, aborts the pipes (bulk reads and uplink transfers
+  // included) and the control requests. The owner then
   // waits until outstanding() is 0 (its completions keep arriving through the *_complete methods).
   void abort();
   // close_and_release: closes the interface and releases every USB object and action.
@@ -78,12 +121,18 @@ class UsbIo {
   void interrupt_complete(IOReturn status, uint32_t bytes);
   void control_out_complete(IOReturn status, uint32_t bytes);
   void control_in_complete(IOReturn status, uint32_t bytes);
+  void bulk_in_complete(uint32_t slot, IOReturn status, uint32_t bytes);
+  void bulk_out_complete(uint32_t slot, IOReturn status, uint32_t bytes);
 
-  // Requests posted whose completion has not arrived yet.
-  uint32_t outstanding() const { return uint32_t{intr_busy_} + in_busy_ + out_busy_; }
+  // Requests posted whose completion has not arrived yet: control, interrupt, bulk reads and
+  // uplink transfers.
+  uint32_t outstanding() const {
+    return uint32_t{intr_busy_} + in_busy_ + out_busy_ + reads_busy_ + uplinks_busy_;
+  }
 
  private:
   enum : uint32_t { kRingSlots = 8, kSlotSize = 128, kResponseSize = 4096, kMaxDrain = 64 };
+  enum class Uplink : uint8_t { Free, Reserved, InFlight };
 
   struct Slot {
     uint8_t request;  // SEND_ENCAPSULATED_COMMAND or SET_CONTROL_LINE_STATE
@@ -98,6 +147,7 @@ class UsbIo {
   void post_response_read();
   void end_drain();
   void deliver(uint32_t bytes);
+  void post_read(uint32_t slot);
   void fail(const char* what);
   void release();
 
@@ -110,6 +160,8 @@ class UsbIo {
   IOUSBHostPipe* bulk_out_;
   IOUSBHostPipe* intr_in_;
   uint16_t intr_size_;
+  uint16_t bulk_in_mps_;
+  uint16_t bulk_out_mps_;
   OSAction* intr_action_;
   OSAction* out_action_;
   OSAction* in_action_;
@@ -120,6 +172,23 @@ class UsbIo {
   IOBufferMemoryDescriptor* out_buf_[kRingSlots];
   uint8_t* out_addr_[kRingSlots];
   Slot slots_[kRingSlots];
+  // Bulk IN reads.
+  OSAction* read_action_[kBulkReads];
+  IOBufferMemoryDescriptor* read_buf_[kBulkReads];
+  uint8_t* read_addr_[kBulkReads];
+  bool read_busy_[kBulkReads];
+  uint8_t read_failures_[kBulkReads];  // consecutive failures of each read
+  uint32_t reads_busy_;
+  uint32_t read_len_;  // 0 until start_bulk
+  // Bulk OUT buffers.
+  OSAction* uplink_action_[kUplinkSlots];
+  IOBufferMemoryDescriptor* uplink_buf_[kUplinkSlots];
+  uint8_t* uplink_addr_[kUplinkSlots];
+  Uplink uplink_[kUplinkSlots];
+  uint32_t uplinks_busy_;  // in flight
+  UsbIoStats stats_;
+  bool logged_first_read_;
+  bool logged_first_uplink_;
   uint32_t head_;   // oldest queued slot
   uint32_t count_;  // queued slots, the head one in flight when out_busy_
   bool out_busy_;

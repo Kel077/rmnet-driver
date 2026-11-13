@@ -1,6 +1,7 @@
 #include "core_host.h"
 
 #include <os/log.h>
+#include <string.h>
 
 #include "rmnet/qmi.h"
 #include "rmnet/qmi_msgs.h"
@@ -13,6 +14,10 @@ namespace {
 constexpr uint8_t kTlvStartFamily = 0x19;  // WDS Start Network "IP Family Preference"
 constexpr uint8_t kFamilyV4 = 4;
 constexpr uint8_t kFamilyV6 = 6;
+constexpr size_t kEthHeaderLen = 14;
+
+// Rate limit for repeated events: true when n is a power of two.
+bool Worth(uint64_t n) { return n != 0 && (n & (n - 1)) == 0; }
 
 const char* ServiceName(rmnet::QmiService s) {
   switch (s) {
@@ -58,10 +63,26 @@ const char* SessionStateName(rmnet::SessionState s) {
   return "?";
 }
 
-CoreHost::CoreHost(UsbIo& usb, const rmnet::MacPair& macs)
+CoreHost::CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs)
     : usb_(usb),
+      rx_(rx),
       session_(rmnet::SessionConfig{}, *this),
       eth_(macs),
+      agg_(nullptr, 0, 0, 0),
+      uplink_slot_(-1),
+      slot_packets_(),
+      slot_bytes_(),
+      ul_size_(0),
+      ul_datagrams_(0),
+      data_up_(false),
+      data_v6_(false),
+      paused_(false),
+      resumed_(false),
+      last_advert_ms_(0),
+      counters_(),
+      logged_first_command_(false),
+      logged_bad_qmap_(false),
+      reply_(),
       logged_state_(rmnet::SessionState::Idle),
       link_(),
       change_{false, false},
@@ -201,3 +222,254 @@ void CoreHost::log_received(const uint8_t* data, size_t len) {
     }
   }
 }
+
+// --- Data path ---------------------------------------------------------------------------------
+
+void CoreHost::data_link_down() {
+  eth_.set_link(nullptr);
+  data_up_ = false;
+  data_v6_ = false;
+  set_paused(false);
+}
+
+void CoreHost::data_link_up(uint64_t now_ms) {
+  const rmnet::LinkConfig& cfg = link_;
+  eth_.set_link(&cfg.settings);
+  bool again = data_up_;
+  bool v6_new = cfg.settings.has_v6 && !data_v6_;
+  data_up_ = true;
+  data_v6_ = cfg.settings.has_v6;
+
+  uint32_t ul = cfg.format.ul_max_size;
+  ul_size_ = ul == 0 || ul > kMaxUplink ? static_cast<uint32_t>(kMaxUplink) : ul;
+  ul_datagrams_ = cfg.format.ul_max_datagrams ? cfg.format.ul_max_datagrams : 1;
+  uint32_t dl = cfg.format.dl_max_size;
+  if (dl == 0 || dl > kMaxDownlink) dl = kMaxDownlink;
+  if (!again) {
+    LOG("data path: %u bulk reads of %u bytes; %u uplink buffers of %u bytes, %u datagrams, usb packet %u",
+        (unsigned)kBulkReads, dl, (unsigned)kUplinkSlots, ul_size_, ul_datagrams_, usb_.bulk_out_packet_size());
+  }
+  if (v6_new) {
+    send_router_advert();
+    last_advert_ms_ = now_ms;
+  }
+  // Last: a read that cannot be posted is fatal, and the driver then stops the session.
+  usb_.start_bulk(dl);
+}
+
+void CoreHost::data_tick(uint64_t now_ms) {
+  if (!data_up_ || !data_v6_) return;
+  if (now_ms - last_advert_ms_ < kRouterAdvertMs) return;
+  send_router_advert();
+  last_advert_ms_ = now_ms;
+}
+
+void CoreHost::send_router_advert() {
+  size_t n = eth_.make_router_advert(reply_, sizeof reply_);
+  if (n) deliver_frame(reply_, n);
+}
+
+// Walks the transfer's QMAP frames. The modem sends each packet in its own transfer followed by a
+// 4-byte all-zero transfer; that one has no frame (qmap_next says End) and is counted as empty.
+void CoreHost::on_bulk_in(const uint8_t* data, size_t len) {
+  counters_.rx_transfers++;
+  rmnet::Span buf{data, len};
+  size_t off = 0;
+  bool any = false;
+  rmnet::QmapFrame f;
+  for (;;) {
+    rmnet::QmapStatus st = rmnet::qmap_next(buf, &off, &f);
+    if (st == rmnet::QmapStatus::End) break;
+    if (st != rmnet::QmapStatus::Ok) {
+      counters_.rx_drop_bad_qmap++;
+      if (Worth(counters_.rx_drop_bad_qmap)) {
+        LOG("bad qmap (%{public}s) at %zu of a %zu-byte transfer (%llu so far)",
+            st == rmnet::QmapStatus::Truncated ? "truncated" : "malformed", off, len, counters_.rx_drop_bad_qmap);
+      }
+      break;
+    }
+    any = true;
+    if (f.is_command) {
+      on_command(f);
+    } else if (f.mux_id != rmnet::SessionConfig{}.mux_id) {
+      counters_.rx_drop_other_mux++;
+    } else if (!data_up_) {
+      counters_.rx_drop_link_down++;
+    } else {
+      deliver_ip(f.payload.data, f.payload.len);
+    }
+  }
+  if (!any) counters_.rx_empty_transfers++;
+}
+
+void CoreHost::deliver_ip(const uint8_t* ip, size_t len) {
+  size_t cap = 0;
+  uint8_t* out = rx_.rx_buffer(&cap);
+  if (!out) {
+    counters_.rx_drop_no_packet++;
+    return;
+  }
+  if (cap < kEthHeaderLen || len > cap - kEthHeaderLen) {
+    counters_.rx_drop_too_big++;
+    return;
+  }
+  size_t n = eth_.wrap_rx(ip, len, out, cap);
+  if (n == 0) {
+    counters_.rx_drop_filtered++;
+    return;
+  }
+  rx_.rx_commit(n);
+  counters_.rx_packets++;
+  counters_.rx_bytes += len;
+}
+
+void CoreHost::deliver_frame(const uint8_t* frame, size_t len) {
+  size_t cap = 0;
+  uint8_t* out = rx_.rx_buffer(&cap);
+  if (!out || len > cap) {
+    counters_.reply_drop_no_packet++;
+    return;
+  }
+  memcpy(out, frame, len);
+  rx_.rx_commit(len);
+  counters_.replies++;
+}
+
+// A command request is answered on the uplink from its own buffer (the reply is built there, not
+// in the read buffer the request sits in). Acks and other non-requests are only counted.
+void CoreHost::on_command(const rmnet::QmapFrame& f) {
+  counters_.commands++;
+  rmnet::QmapCommand cmd;
+  bool parsed = rmnet::qmap_parse_command(f.payload, &cmd);
+  if (!logged_first_command_) {
+    logged_first_command_ = true;
+    LOG("first qmap command: mux 0x%02x, %zu bytes, name %u, type %u", f.mux_id, f.payload.len,
+        parsed ? cmd.name : 0, parsed ? cmd.type : 0);
+  }
+  if (!parsed || cmd.type != rmnet::kQmapCmdRequest) return;
+  if (cmd.name == rmnet::kQmapFlowDisable) {
+    counters_.flow_disable++;
+    set_paused(true);
+  } else if (cmd.name == rmnet::kQmapFlowEnable) {
+    counters_.flow_enable++;
+    set_paused(false);
+  }
+  int slot = usb_.acquire_uplink();
+  if (slot < 0) {
+    counters_.command_reply_drops++;
+    return;
+  }
+  size_t n = rmnet::qmap_build_command_reply(usb_.uplink_buffer(slot), kMaxUplink, f.mux_id, f.payload);
+  if (n == 0) {
+    usb_.release_uplink(slot);
+    counters_.command_reply_drops++;
+    return;
+  }
+  slot_packets_[slot] = 0;
+  slot_bytes_[slot] = 0;
+  if (usb_.send_uplink(slot, static_cast<uint32_t>(n))) {
+    counters_.command_replies++;
+  } else {
+    counters_.command_reply_drops++;
+  }
+}
+
+void CoreHost::set_paused(bool paused) {
+  if (paused == paused_) return;
+  paused_ = paused;
+  if (!paused) resumed_ = true;
+  LOG("uplink %{public}s", paused ? "paused (flow disable)" : "resumed");
+}
+
+bool CoreHost::take_uplink_resumed() {
+  bool r = resumed_;
+  resumed_ = false;
+  return r;
+}
+
+void CoreHost::on_bulk_out_done(int slot, bool ok) {
+  if (slot < 0 || slot >= static_cast<int>(kUplinkSlots)) return;
+  if (ok) {
+    counters_.tx_transfers++;
+    counters_.tx_packets += slot_packets_[slot];
+    counters_.tx_bytes += slot_bytes_[slot];
+  } else {
+    counters_.tx_drop_usb += slot_packets_[slot];
+  }
+  slot_packets_[slot] = 0;
+  slot_bytes_[slot] = 0;
+}
+
+void CoreHost::transmit(const uint8_t* frame, size_t len) {
+  if (!data_up_) {
+    counters_.tx_drop_link_down++;
+    return;
+  }
+  rmnet::TxResult r = eth_.handle_tx(frame, len, reply_, sizeof reply_);
+  switch (r.action) {
+    case rmnet::TxAction::Drop:
+      counters_.tx_drop_filtered++;
+      return;
+    case rmnet::TxAction::Reply:
+      deliver_frame(reply_, r.reply_len);
+      return;
+    case rmnet::TxAction::Forward:
+      forward(r.ip.data, r.ip.len);
+      return;
+  }
+}
+
+// Into the open uplink buffer; when it is full, it is sent and the packet goes into a new one.
+void CoreHost::forward(const uint8_t* ip, size_t len) {
+  uint8_t mux = rmnet::SessionConfig{}.mux_id;
+  if (uplink_slot_ < 0 && !open_uplink()) {
+    counters_.tx_drop_busy++;
+    return;
+  }
+  if (!agg_.add(mux, ip, len)) {
+    bool was_empty = agg_.count() == 0;
+    send_uplink();
+    if (was_empty) {
+      counters_.tx_drop_too_big++;
+      return;
+    }
+    if (!open_uplink()) {
+      counters_.tx_drop_busy++;
+      return;
+    }
+    if (!agg_.add(mux, ip, len)) {
+      counters_.tx_drop_too_big++;
+      return;
+    }
+  }
+  slot_packets_[uplink_slot_]++;
+  slot_bytes_[uplink_slot_] += len;
+}
+
+bool CoreHost::open_uplink() {
+  int slot = usb_.acquire_uplink();
+  if (slot < 0) return false;
+  uplink_slot_ = slot;
+  slot_packets_[slot] = 0;
+  slot_bytes_[slot] = 0;
+  agg_ = rmnet::QmapAggregator(usb_.uplink_buffer(slot), ul_size_, ul_datagrams_, usb_.bulk_out_packet_size());
+  return true;
+}
+
+void CoreHost::send_uplink() {
+  int slot = uplink_slot_;
+  if (slot < 0) return;
+  uplink_slot_ = -1;
+  size_t n = agg_.finish();
+  if (n == 0) {
+    usb_.release_uplink(slot);
+    return;
+  }
+  if (!usb_.send_uplink(slot, static_cast<uint32_t>(n))) {
+    counters_.tx_drop_usb += slot_packets_[slot];
+    slot_packets_[slot] = 0;
+    slot_bytes_[slot] = 0;
+  }
+}
+
+void CoreHost::flush_uplink() { send_uplink(); }

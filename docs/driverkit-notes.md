@@ -484,6 +484,8 @@ virtual kern_return_t ClearStall (bool withRequest);
 
 The header says: "All pending IO on the endpoint will be aborted, and the data toggle for the endpoint will also be reset ... it is recommended that the withRequest parameter is always set to true". After `ClearStall(true)`, every read on that pipe has to be posted again.
 
+`ClearStall` is the only form USBDriverKit 27.0 offers: there is no asynchronous variant, so with `withRequest` true it sends CLEAR_FEATURE synchronously on the Default queue. As built (Task 6) it is bounded: a bulk read counts its own consecutive failures and the fifth in a row is fatal (`on_fatal`), so at most four clears per read before the driver gives up; an aborted completion is re-posted without a clear. A failed uplink transfer clears the stall only when the status is neither aborted nor a timeout. None was needed on hardware so far (`RMNetUsbStallClears` stayed 0).
+
 **Aborting at stop:**
 
 ```
@@ -677,6 +679,8 @@ On any failure: `Stop(provider, SUPERDISPATCH)` and return the error. **[runtime
 3. Abort the three pipes and the control requests (`kIOUSBAbortAsynchronous`); wait until no request is outstanding, **at most 1 s**.
 4. `Close`, release the USB objects and actions, cancel the timer, then `Stop(provider, SUPERDISPATCH)`. If requests are still outstanding after the second second, the driver logs the count, closes the interface, and passes `Stop` on anyway (the objects are then released in `free()`): a termination that never completes is worse.
 Both deadlines are timed by the driver's 100 ms timer, which keeps running until step 4; each USB completion also advances the sequence at once.
+
+**As built (Task 6): the bulk side joins the same sequence.** `outstanding()` counts the 32 posted bulk reads and the uplink transfers in flight. From step 1 (`finish_sending`) no bulk read is re-posted or delivered and no uplink transfer is started; step 3 aborts both bulk pipes with the others, and their aborted completions (`BulkInComplete`, `BulkOutComplete`) advance the sequence like the control ones. After `OnUsbFatal` has stopped the session, `TearDown` no longer calls `stop()` or `take_link_change()` again, and the timer no longer ticks the Session.
 
 ---
 
@@ -877,7 +881,7 @@ From installing 316.16.36, 316.16.40 and 316.16.41 and rebooting the modem with 
 
 **Stopping**
 - `Stop` is asynchronous (section 3.9, "As built"): drain the control ring for up to 1 s, abort, wait up to 1 s for the aborted requests, then release and pass `Stop` to the superclass. The fix-round evidence is in the next bullets and the Task 5 report.
-- On a modem reboot `Stop` arrived with no USB request outstanding (the failures had already completed): "usb aborted, 0 requests outstanding", "usb objects released", `free`. No crash report. Releasing after aborted completions that are still in flight has therefore not been seen yet.
+- On a modem reboot `Stop` arrived with no USB request outstanding (the failures had already completed): "stop: control messages sent 0, dropped 0; aborted with 0 requests outstanding", "stop: usb objects released", `free`. No crash report. Releasing after aborted completions that are still in flight has therefore not been seen yet.
 - `Start` decisions: a failed `reportLinkStatus` or `SetProperties` is logged and does not fail `Start`. The link status is reported again whenever the stack enables the interface (and a status reported in `Start` is lost anyway); the properties are only for the app. Every other failure in `Start` tears down and fails it.
 
 **macOS and the port**
@@ -893,3 +897,36 @@ From installing 316.16.36, 316.16.40 and 316.16.41 and rebooting the modem with 
 - `driver/usb_io.{h,cpp}`: plain C++ held in the ivars. It holds the interface and three pipes, the posted-read slots and their buffers, the ring of QMI OUT buffers, the uplink buffer, stall recovery and abort. It knows nothing about QMI.
 - `driver/core_host.{h,cpp}`: plain C++ that implements `rmnet::SessionDelegate` and owns `Session`, `EthernetEmulator` and `QmapAggregator`. It turns USB completions into `on_qmi`, `qmap_next` and `wrap_rx` calls, turns TX packets into `handle_tx` and the aggregator, and calls `tick` and the periodic router advertisement. This is where Core is driven from, always on the Default queue, never re-entered from a delegate callback.
 - `driver/Info.plist`, `driver/Driver.entitlements`, `app/` (SwiftUI host, activation, and a status read through `IORegistryEntryCreateCFProperty`), and `gen.rb` at the root, producing the project with `$(SRCROOT)`-relative paths and `core/src/*.cpp` in the dext target.
+
+## Runtime findings (data path, Task 6, 2026-11-14)
+
+From installing 316.17.10 and loading it with `AT+CFUN=1,1`. Logs: `build/logs/driver-20261114-010952.log` (load, first link up, traffic), `driver-20261114-011304.log` (modem reboot with a ping running), `driver-20261114-011445.log` (the refused `AT+CGACT=0,1`, no driver activity).
+
+**Packets**
+- TX: `getDataOff()` is 0 on the stack's frames (`first tx packet: data offset 0, length 86`), so `getDataVirtualAddress() + getDataOff()` and `getDataVirtualAddress()` agree; the question in 1.5 is moot for this stack.
+- RX: writing at `getDataVirtualAddress()` and `setDataOffAndLen(0, len)` (returns 0), plus `setLinkHeaderLength(14)`, delivers frames the stack accepts (DHCP, ND, ping, TCP). `PoolFlagMapToDext` is enough for the dext to read and write packet data.
+- The RX submission queue is stocked once the stack enables the interface; no receive drop for want of a packet was counted, even at 144 Mbit/s (`RMNetRxDropNoPacket = 0`).
+- The completion queues never refused a packet (no "took N of M" line), and `RMNetPacketsHeld` (packets the driver holds) was 0 when idle after traffic and after the reboot.
+- `IOUserNetworkPacketBufferPool::GetPacketCount` answers 4736 throughout, idle or loaded, for a pool created with `packetCount` 512: it is a fixed total, not a free count. DriverKit offers no free count; `RMNetPacketsHeld` is the driver's own measure of leaked packets.
+- Completion handlers on the Default queue keep up: `networkQuality -I en33` reported 143.8 Mbit/s down with 32 posted `AsyncIO` reads, no bundling.
+
+**What the modem sends**
+- At low rates each packet comes in its own transfer followed by a 4-byte all-zero transfer, as in the harness (after the reboot: 92 transfers, 45 of them empty, for 47 packets).
+- Under load the modem aggregates: during `networkQuality`, 277,784 packets arrived in 16,481 transfers (about 17 per transfer), only 18 transfers empty.
+- No QMAP command frame arrived in any run (`RMNetQmapCommands = 0`): the flow-control reply path is still unproven on hardware.
+- No malformed or truncated QMAP and no frame on another mux.
+
+**Uplink**
+- The bulk OUT endpoint reports 1024 bytes (SuperSpeed), read with `GetSpeed` and `IOUSBGetEndpointMaxPacketSize`; the aggregator gets that value.
+- Bulk OUT `AsyncIO` with the transfer length as `dataBufferLength`, without `SetLength` on the buffer, works.
+- During the upload phase of `networkQuality` 12,467 frames were dropped because all 8 uplink buffers were in flight (`RMNetTxDropBusy`), against 188,645 sent; uplink measured 13.5 Mbit/s. Eight buffers flushed whenever the TX queue empties means many small transfers; holding frames in the TX queue instead of dropping, or more buffers, is the lever if uplink matters.
+
+**macOS and the port**
+- `en33` had its IPv4 address (matching `RMNetIPv4`) and two global IPv6 addresses in the modem's /64 within 9 s of `link up`. `scutil --nwi` lists `en33` last for IPv4 (after `utun5` and `en0`) and second for IPv6 (after `utun5`; Wi-Fi has no IPv6), so it is not primary.
+- The port received the modem's DNS servers (two IPv6, two IPv4) as a scoped resolver for `en33` (`scutil --dns`).
+- Idle for 60 s with the link up, macOS sent 89 packets (7,643 bytes) and received 1 (86 bytes) on `en33`.
+- Of the frames macOS sent, the emulator drops multicast and broadcast (`RMNetTxDropFiltered`, 96 by the end of the first session); frames sent before `link up` count as `RMNetTxDropLinkDown`.
+- After a modem reboot the port came back with a new /30 and a new /64; the old /64's addresses were gone (the interface is recreated with the same name, `en33`, and its byte counters restart).
+- A neighbour solicitation for the Mac's own address was not looked for.
+
+**Calls dropped from the modem side**: `AT+CGACT=0,1` through the web console answered `ERROR` three times and changed nothing (the call that QMI started is not context 1 to the AT side, or AT may not tear it down). The IPv4 retry while up was therefore not exercised on hardware.
