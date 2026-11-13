@@ -47,6 +47,13 @@ class EthernetEmulator {
 
   // Unsolicited IPv6 router advertisement frame to all nodes (ff02::1). Returns
   // its length, or 0 when the link is down, has no IPv6, or `cap` is too small.
+  //
+  // The caller must send the result to the host when the link comes up and then
+  // at least every 600 seconds while the link stays up. The advertisement gives
+  // the router and its RDNSS servers a lifetime of 1800 seconds; without a fresh
+  // one inside that time macOS drops the IPv6 default route and DNS servers.
+  // Answers to the host's router solicitations (handle_tx) do not replace this:
+  // the host solicits only when it chooses to, not before the lifetime ends.
   size_t make_router_advert(uint8_t* out, size_t cap);
 
  private:

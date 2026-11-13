@@ -292,7 +292,10 @@ void Session::send_sync(uint64_t now_ms) {
   expect(Step::Sync, QmiService::CTL, 0, tx, kCtlSync, n, now_ms, kSyncResendMs);
 }
 
+// begin_family and send_settings can run right after a delegate callback. If the delegate broke
+// the rule and stopped the session from inside it, the session is Idle and must stay so.
 void Session::begin_family(uint8_t index, uint64_t now_ms) {
+  if (state_ == SessionState::Idle) return;
   state_ = SessionState::Connecting;
   current_ = index;
   uint8_t tx = next_ctl_txid();
@@ -302,6 +305,7 @@ void Session::begin_family(uint8_t index, uint64_t now_ms) {
 }
 
 void Session::send_settings(uint64_t now_ms) {
+  if (state_ == SessionState::Idle) return;
   const Family& fam = families_[current_];
   uint16_t tx = next_txid();
   size_t n = build_wds_get_current_settings(buf_, sizeof buf_, fam.client, tx);

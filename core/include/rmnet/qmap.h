@@ -74,7 +74,8 @@ bool qmap_parse_command(Span payload, QmapCommand* out);
 // Writes a command frame answering request_payload: the same payload with the
 // type set to ACK for flow disable and flow enable, UNSUPPORTED otherwise.
 // Returns the frame length, or 0 if the request is shorter than 8 bytes or
-// the frame does not fit in cap.
+// the frame does not fit in cap. `out` must not overlap request_payload: the
+// payload is copied with memcpy, so answering in place is undefined behaviour.
 size_t qmap_build_command_reply(uint8_t* out, size_t cap, uint8_t mux_id, Span request_payload);
 
 }  // namespace rmnet

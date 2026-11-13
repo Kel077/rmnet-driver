@@ -191,6 +191,27 @@ TEST(reconfigure_indication_refreshes_settings) {
   CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2);
 }
 
+TEST(stop_from_link_down_during_reconfigure_stays_idle) {   // a delegate that breaks the no-re-entry rule
+  struct Stopper : FakeModem {
+    rmnet::Session* session = nullptr;
+    void link_down() override { FakeModem::link_down(); session->stop(); }
+  };
+  Stopper m; rmnet::Session s({}, m); m.session = &s; bring_up_fully(s, m);
+  size_t before = m.sent.size();
+  auto ind = hex(kWdsConnected4Ind); ind[17] = 0x01;                          // reconfigure flag
+  s.on_qmi(ind.data(), ind.size(), 5000);
+  CHECK(s.state() == rmnet::SessionState::Idle); CHECK_EQ(m.downs, 1);
+  CHECK_EQ(m.sent.size(), before + 5);                                         // the teardown frames only
+  CHECK_BYTES(m.last(), kCtlReleaseWdaReq);
+  // Teardown used transactions 10 and 11, so a settings request would have used 12.
+  for (uint8_t client : {0, 15}) {
+    auto reply = settings4_response_with_txid(12); reply[5] = client;
+    feed_frame(s, reply, 5010);
+  }
+  s.tick(20000);
+  CHECK(s.state() == rmnet::SessionState::Idle); CHECK_EQ(m.sent.size(), before + 5); CHECK_EQ(m.ups, 1);
+}
+
 TEST(stop_tears_down_in_capture_order) {
   FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m); size_t before = m.sent.size();
   s.stop();

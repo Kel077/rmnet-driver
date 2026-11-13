@@ -29,6 +29,11 @@ struct LinkConfig {
   DataFormat format;
 };
 
+// The session calls these from inside start(), stop(), on_qmi() and tick(). A callback must not
+// call back into the Session (start, stop, on_qmi or tick): the session is part-way through a
+// transition when it calls out. To stop from a callback, record the wish and call stop() after
+// the session call returns. (As a safeguard, a session stopped from inside link_down() stays
+// Idle, but nothing else about re-entry is defined.)
 class SessionDelegate {
  public:
   virtual void send_qmi(const uint8_t* data, size_t len) = 0;
