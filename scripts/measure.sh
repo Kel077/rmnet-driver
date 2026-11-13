@@ -5,7 +5,12 @@
 #   scripts/measure.sh --analyse down|up <samples file>    (re-prints the figures of a saved run)
 #
 # down: 4 parallel downloads from mensura.cdn-apple.com/api/v1/gm/large, stopped when 50,000,000
-#       bytes have arrived on the port since the start, or after 8 s, whichever is first.
+#       bytes have arrived on the port since the start, or after 8 s, whichever is first. Each
+#       download also stops itself at 15,000,000 bytes (curl's output goes through `head -c`), so
+#       a run cannot pass 60,000,000 bytes of payload even if the watchdog dies. A stream that
+#       reaches its own limit before the watchdog stops the run ends early, and the run then carries
+#       fewer streams; the script prints how many streams ended that way, so a figure affected by it
+#       can be recognised.
 # up:   4 parallel uploads to .../gm/slurp, stopped when 10,000,000 bytes have left the port,
 #       or after 6 s. Each upload sends one 4,000,000-byte body, so 16 MB is the most it can send.
 #
@@ -13,18 +18,27 @@
 # --interface and pinned to one server address with --resolve. Proxies are bypassed (--noproxy),
 # and /usr/bin/curl is used because the shell's default curl does not bind.
 #
-# A watchdog samples `netstat -I <interface> -b -n` every 0.25 s into build/logs/measure-<time>.samples
-# ("seconds since start, bytes in, bytes out"). The figures:
+# A watchdog samples `netstat -I <interface> -b -n` every 0.25 s. The bytes moved are accumulated
+# from sample to sample: a counter that goes down (the interface was recreated and its counters
+# restarted) counts as a reset, and what it shows after the reset is added. The samples file,
+# build/logs/measure-<time>-<dir>.samples, holds "seconds since start, bytes in, bytes out" moved
+# since the start. The figures:
 #   gate figure  the mean rate from 1.0 s after traffic starts (the first sample with more than
 #                100,000 bytes moved in the measured direction) to the last sample before the stop;
 #   best 1 s     the highest rate over any span of at least 1.0 s between two samples.
 #
 # The cellular data is metered. Every run appends "time direction bytes-in bytes-out" to the usage
 # file (build/installed/measure-usage.log, which `make clean` keeps; MEASURE_USAGE_FILE overrides
-# it). A run refuses to start if the recorded total plus this run's reservation (its stop threshold
-# plus 10,000,000 bytes for what arrives after the stop) would pass 300,000,000 bytes, and warns
-# when a run moved more than 60,000,000 bytes. The run fails if fewer than 1,000,000 bytes crossed
-# the port in the measured direction (curl did not go through it).
+# it), also when it fails or is interrupted. If the counters cannot be read at the end, the run is
+# charged at least its reservation in the measured direction. A run refuses to start (exit 2) if a
+# line of the usage file is not "<time> <down|up> <bytes in> <bytes out>" with non-negative whole
+# numbers, or if the recorded total plus this run's reservation (its stop threshold plus 10,000,000
+# bytes for what arrives after the stop) would pass 300,000,000 bytes. It warns when a run moved more
+# than 60,000,000 bytes. The run fails if fewer than 1,000,000 bytes crossed the port in the
+# measured direction (curl did not go through it).
+#
+# For testing with no network: MEASURE_TEST_PORT=<port> sends every transfer to 127.0.0.1:<port>
+# over plain HTTP (use it with the interface lo0), and MEASURE_NETSTAT=<program> replaces netstat.
 set -u
 
 cd "$(dirname "$0")/.." || exit 1
@@ -36,12 +50,14 @@ MIN_BYTES=1000000
 HOST=mensura.cdn-apple.com
 ADDR=111.132.43.41
 PORT=443
-# For testing the script with no network: MEASURE_TEST_PORT=<port> sends every transfer to
-# 127.0.0.1:<port> instead (use it with the interface lo0).
+SCHEME=https
 if [ -n "${MEASURE_TEST_PORT:-}" ]; then
   ADDR=127.0.0.1
   PORT=$MEASURE_TEST_PORT
+  SCHEME=http
 fi
+NETSTAT=${MEASURE_NETSTAT:-/usr/sbin/netstat}
+STREAM_BYTES=15000000
 USAGE=${MEASURE_USAGE_FILE:-build/installed/measure-usage.log}
 
 die() {
@@ -102,15 +118,15 @@ fi
 IFACE=$1
 DIR=$2
 case $DIR in
-  down) STOP_BYTES=50000000 STOP_SECS=8 URL="https://$HOST:$PORT/api/v1/gm/large" ;;
-  up) STOP_BYTES=10000000 STOP_SECS=6 URL="https://$HOST:$PORT/api/v1/gm/slurp" ;;
+  down) STOP_BYTES=50000000 STOP_SECS=8 URL="$SCHEME://$HOST:$PORT/api/v1/gm/large" ;;
+  up) STOP_BYTES=10000000 STOP_SECS=6 URL="$SCHEME://$HOST:$PORT/api/v1/gm/slurp" ;;
   *) die "direction must be down or up" ;;
 esac
 
 # "bytes-in bytes-out" of the interface, from its link-level line. Counted from the end of the line
 # (Ibytes Opkts Oerrs Obytes Coll), because an interface with no link address (lo0) has no Address column.
 counters() {
-  netstat -I "$IFACE" -b -n 2>/dev/null |
+  "$NETSTAT" -I "$IFACE" -b -n 2>/dev/null |
     awk -v i="$IFACE" '$1 == i && $3 ~ /^<Link#/ { print $(NF - 4), $(NF - 1); found = 1; exit } END { if (!found) exit 1 }'
 }
 
@@ -118,11 +134,36 @@ now() {
   date +%s.%N
 }
 
+# The recorded total of a usage file, on stdout. Fails, naming the lines, if any line other than a
+# comment (starting with #) is not "<time> <down|up> <bytes in> <bytes out>" with non-negative
+# whole numbers.
+usage_total() {
+  awk '
+    /^#/ { next }
+    {
+      if (NF != 4 || ($2 != "down" && $2 != "up") || $3 !~ /^[0-9]+$/ || $4 !~ /^[0-9]+$/) {
+        printf "measure: %s line %d is malformed: \"%s\"\n", FILENAME, NR, $0 > "/dev/stderr"
+        bad = 1
+        next
+      }
+      s += $3 + $4
+    }
+    END { if (bad) exit 3; printf "%.0f\n", s }' "$1"
+}
+
 # The budget check, before anything touches the network.
 mkdir -p "$(dirname "$USAGE")" || die "cannot create the directory of $USAGE"
-[ -e "$USAGE" ] || : >"$USAGE" || die "cannot create $USAGE"
-used=$(awk '$1 !~ /^#/ && NF >= 4 { s += $3 + $4 } END { printf "%d", s }' "$USAGE") ||
-  die "cannot read $USAGE"
+if [ ! -e "$USAGE" ]; then
+  echo "" >&2
+  echo "measure: NOTE: the usage file $USAGE does not exist; creating it EMPTY, so the recorded" >&2
+  echo "measure: total starts at 0. If measurements were recorded before, restore the file first." >&2
+  echo "" >&2
+  : >"$USAGE" || die "cannot create $USAGE"
+fi
+if ! used=$(usage_total "$USAGE"); then
+  echo "measure: REFUSED: the usage file $USAGE cannot be trusted (see above); fix it by hand" >&2
+  exit 2
+fi
 reserve=$((STOP_BYTES + MARGIN))
 echo "usage file: $USAGE, recorded total $used bytes; this run reserves $reserve; budget $BUDGET"
 if [ $((used + reserve)) -gt $BUDGET ]; then
@@ -130,7 +171,7 @@ if [ $((used + reserve)) -gt $BUDGET ]; then
   exit 2
 fi
 
-base=$(counters) || die "no interface $IFACE (netstat -I $IFACE -b -n shows no link line)"
+base=$(counters) || die "no interface $IFACE ($NETSTAT -I $IFACE -b -n shows no link line)"
 
 mkdir -p build/logs
 stamp=$(date +%Y%m%d-%H%M%S)
@@ -140,28 +181,69 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/measure.XXXXXX") || die "cannot create a tempo
 pids=
 recorded=0
 started=0
+signalled=0
 
+# The bytes moved since the start, accumulated from the last good sample (prev_*). A counter that
+# goes down was reset (the interface was recreated): what it shows now was all moved since.
+set -- $base
+prev_in=$1
+prev_out=$2
+acc_in=0
+acc_out=0
+resets=0
+last_ok=1 # whether the latest attempt to read the counters succeeded
+
+advance() {
+  c=$(counters) || {
+    last_ok=0
+    return 1
+  }
+  last_ok=1
+  set -- $c
+  if [ "$1" -lt "$prev_in" ] || [ "$2" -lt "$prev_out" ]; then
+    resets=$((resets + 1))
+    acc_in=$((acc_in + $1))
+    acc_out=$((acc_out + $2))
+  else
+    acc_in=$((acc_in + $1 - prev_in))
+    acc_out=$((acc_out + $2 - prev_out))
+  fi
+  prev_in=$1
+  prev_out=$2
+  return 0
+}
+
+# Kills this run's transfers: every curl whose arguments name the run's own temporary directory
+# (this also catches one started just before a signal, before its pid was kept), then waits for
+# the subshells that ran them.
 stop_transfers() {
-  for p in $pids; do kill "$p" 2>/dev/null; done
+  pkill -TERM -f "$WORK/" 2>/dev/null
   for p in $pids; do wait "$p" 2>/dev/null; done
   pids=
 }
 
-# Appends this run to the usage file once, from the counters now.
+# Appends this run to the usage file once, from a final reading of the counters. If that reading
+# fails, the run is charged at least its reservation in the measured direction, since the bytes
+# after the last good sample are unknown.
 record() {
   [ "$recorded" -eq 0 ] && [ "$started" -eq 1 ] || return 0
   recorded=1
-  after=$(counters) || after=$base
-  set -- $base $after
-  in_moved=$(($3 - $1))
-  out_moved=$(($4 - $2))
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $DIR $in_moved $out_moved" >>"$USAGE"
+  advance
+  rec_in=$acc_in
+  rec_out=$acc_out
+  if [ "$last_ok" -eq 0 ]; then
+    if [ "$DIR" = down ] && [ "$rec_in" -lt "$reserve" ]; then rec_in=$reserve; fi
+    if [ "$DIR" = up ] && [ "$rec_out" -lt "$reserve" ]; then rec_out=$reserve; fi
+    echo "measure: WARNING: the counters could not be read at the end; charging in $rec_in, out $rec_out" >&2
+  fi
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $DIR $rec_in $rec_out" >>"$USAGE"
 }
 
 cleanup() {
-  if [ -n "$pids" ]; then
+  trap '' INT TERM HUP # a second signal must not cut the usage record short
+  if [ "$started" -eq 1 ]; then
     stop_transfers
-    sleep 1 # as below: let what was in flight arrive before the usage record
+    sleep 1 # let what was in flight arrive before the usage record
   fi
   record
   rm -rf "$WORK"
@@ -173,36 +255,40 @@ if [ "$DIR" = up ]; then
   dd if=/dev/zero of="$WORK/body" bs=1000000 count=4 2>/dev/null || die "cannot write the upload body"
 fi
 
-CURL="/usr/bin/curl --noproxy * --interface $IFACE --resolve $HOST:$PORT:$ADDR -s -o /dev/null --max-time $STOP_SECS"
+CURL="/usr/bin/curl --noproxy * --interface $IFACE --resolve $HOST:$PORT:$ADDR -s --max-time $STOP_SECS"
 set -f # keep the * in $CURL from being expanded
+# A signal while the transfers start is held until all of them are known.
+trap 'signalled=1' INT TERM HUP
 started=1
 t_start=$(now)
-echo "0 $base" >"$SAMPLES"
+echo "0 0 0" >"$SAMPLES"
 for k in 1 2 3 4; do
   if [ "$DIR" = down ]; then
-    $CURL "$URL" &
+    ($CURL --stderr "$WORK/curl$k.err" -o - "$URL" | head -c $STREAM_BYTES | wc -c >"$WORK/stream$k") &
   else
-    $CURL -H 'Content-Type: application/octet-stream' --data-binary "@$WORK/body" "$URL" &
+    ($CURL --stderr "$WORK/curl$k.err" -o /dev/null -H 'Content-Type: application/octet-stream' \
+      --data-binary "@$WORK/body" "$URL") &
   fi
   pids="$pids $!"
 done
 set +f
+trap 'echo "measure: interrupted" >&2; exit 130' INT TERM HUP
+if [ "$signalled" -eq 1 ]; then
+  echo "measure: interrupted" >&2
+  exit 130
+fi
 
-set -- $base
-base_in=$1
-base_out=$2
 reason=
 t=0
 while :; do
   sleep 0.25
-  c=$(counters) || {
+  advance || {
     reason="the interface disappeared"
     break
   }
   t=$(awk -v a="$t_start" -v b="$(now)" 'BEGIN { printf "%.3f", b - a }')
-  echo "$t $c" >>"$SAMPLES"
-  set -- $c
-  if [ "$DIR" = down ]; then moved=$(($1 - base_in)); else moved=$(($2 - base_out)); fi
+  echo "$t $acc_in $acc_out" >>"$SAMPLES"
+  if [ "$DIR" = down ]; then moved=$acc_in; else moved=$acc_out; fi
   if [ "$moved" -ge "$STOP_BYTES" ]; then
     reason="byte cap ($STOP_BYTES)"
     break
@@ -220,29 +306,42 @@ while :; do
 done
 stop_transfers
 duration=$t
+at_limit=0
+if [ "$DIR" = down ]; then
+  for k in 1 2 3 4; do
+    n=$(cat "$WORK/stream$k" 2>/dev/null | tr -d ' ')
+    [ "${n:-0}" -ge $STREAM_BYTES ] && at_limit=$((at_limit + 1))
+  done
+fi
 sleep 1 # let what was in flight at the stop arrive, so the usage record includes it
-after=$(counters) || after=$base
 record
 
-set -- $base $after
-in_moved=$(($3 - $1))
-out_moved=$(($4 - $2))
+set -- $base
 echo "interface:        $IFACE ($DIR)"
 echo "before:           in $1 bytes, out $2 bytes"
-echo "after:            in $3 bytes, out $4 bytes (1 s after the stop)"
-echo "moved:            in $in_moved bytes, out $out_moved bytes"
+if [ "$last_ok" -eq 1 ]; then
+  echo "after:            in $prev_in bytes, out $prev_out bytes (1 s after the stop)"
+else
+  echo "after:            counters unreadable; last good reading in $prev_in bytes, out $prev_out bytes"
+fi
+[ "$resets" -eq 0 ] || echo "counter resets:   $resets (the interface was recreated during the run)"
+echo "moved:            in $acc_in bytes, out $acc_out bytes"
+echo "recorded:         in $rec_in bytes, out $rec_out bytes"
 echo "duration:         $duration s to the last sample; stopped by $reason"
+if [ "$DIR" = down ]; then
+  echo "streams at limit: $at_limit of 4 ended at their own $STREAM_BYTES-byte limit before the stop"
+fi
 echo "samples:          $SAMPLES"
 analyse "$DIR" "$SAMPLES"
-total=$(awk '$1 !~ /^#/ && NF >= 4 { s += $3 + $4 } END { printf "%d", s }' "$USAGE")
+total=$(usage_total "$USAGE") || total="unreadable"
 echo "recorded total:   $total of $BUDGET bytes"
 
-if [ $((in_moved + out_moved)) -gt $WARN_BYTES ]; then
+if [ $((rec_in + rec_out)) -gt $WARN_BYTES ]; then
   echo "" >&2
-  echo "measure: WARNING: this run moved $((in_moved + out_moved)) bytes, more than $WARN_BYTES" >&2
+  echo "measure: WARNING: this run moved $((rec_in + rec_out)) bytes, more than $WARN_BYTES" >&2
   echo "" >&2
 fi
-if [ "$DIR" = down ]; then measured=$in_moved; else measured=$out_moved; fi
+if [ "$DIR" = down ]; then measured=$acc_in; else measured=$acc_out; fi
 if [ "$measured" -lt $MIN_BYTES ]; then
   die "FAILED: only $measured bytes crossed $IFACE in the measured direction; curl did not go through it"
 fi

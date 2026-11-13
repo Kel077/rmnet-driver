@@ -940,19 +940,32 @@ Measured with `scripts/measure.sh` (4 parallel HTTPS transfers bound to the port
 | Run | Driver | Direction | Gate figure | Best 1 s | Bytes in / out on `en33` | Driver CPU |
 |---|---|---|---|---|---|---|
 | 1 | 316.17.31 | down | 129.2 Mbit/s | 150.0 | 51,347,480 / 148,333 | 0.38 s |
-| 2 | 316.17.31 | up | 11.9 Mbit/s | 25.5 | 299,647 / 10,112,539 | 0.29 s |
+| 2 | 316.17.31 | up | 11.9 Mbit/s (port counters, dropped frames included) | 25.5 | 299,647 / 10,112,539 | 0.29 s |
 | 3 | 316.17.44 | down | 138.3 Mbit/s | 182.3 | 54,666,535 / 116,991 | 0.30 s |
 | 4 | 316.17.49 | down | 92.6 Mbit/s | 105.6 | 54,176,502 / 187,772 | 0.42 s |
 
-The gate (150 Mbit/s by the definition above) was not passed. The driver's own figures say it is not what limits these runs:
+The gate (150 Mbit/s by the definition above) was not passed. What the runs show, and what they cannot show:
 
-- **Bulk reads never ran short.** `RMNetRxLagMaxUs` (316.17.49) is the longest a successful bulk read waited between completing on the bus (`completionTimestamp`) and its handler, which is how long the modem had one read fewer posted. In run 4 it was 1,051 µs at most, while a transfer arrived about every 2.4 ms (2,244 transfers in 5.3 s): at most one or two of the 32 reads were ever waiting to be re-posted. Starving the modem would need a lag of about 31 transfer times (some 70 ms).
+**Shown.**
+- **No sign of receive-path starvation, measured in run 4 only.** `RMNetRxLagMaxUs` (316.17.49) is the longest a successful bulk read waited between completing on the bus (`completionTimestamp`) and the entry of its handler. In run 4 (the slowest, about 92 Mbit/s) it was 1,051 µs at most, while a transfer arrived about every 2.4 ms (2,244 transfers in 5.3 s). Runs 1 and 3, the faster ones, had no such counter.
 - **The completion timestamp is in mach ticks.** The first completion logged `completion timestamp 8136738486987, uptime 339030770332208 ns`: a ratio of 41.667, the 24 MHz tick of Apple silicon (timebase 125/3), not nanoseconds.
-- **The read size is not a limit.** `RMNetRxFullTransfers` (reads filled to their 31,744 bytes) stayed 0: the modem's aggregation ends each transfer (17 to 19 packets and 24 to 27 KB per transfer).
-- **No drops and no refusals.** Every `RMNetRxDrop*` counter stayed 0, the completion queues never refused a packet (no "took N of M" line in either log), `RMNetPacketsHeld` was 0 afterwards.
-- **CPU is small.** 0.30 to 0.42 s of driver CPU per 50 MB download: about 8 to 11 µs per received packet, about 10 % of one core at these rates.
-- **Acknowledgements were not lost.** `RMNetTxDropBusy` stayed 0 during all three downloads.
-- **The rate curve is the network's.** Run 1 sat near 50 Mbit/s for a second and climbed to 179 Mbit/s when the cap stopped it; run 3 reached 229 Mbit/s within 0.6 s and fell to about 130; run 4 climbed slowly from 40 to about 100 Mbit/s. Runs 3 and 4 have the same receive path (316.17.49 only adds a counter) and differ by 46 Mbit/s. With a 50 MB cap, 1.4 to 4 s remain after the 1.0 s mark, so the gate figure carries TCP ramp-up and cell scheduling, not the driver's capacity.
-- Batching was in place before this task: one `EnqueuePackets` per completed transfer (at most 64 packets per call), and 32 reads re-posted from their completions. `AsyncIOBundled` and a separate receive queue were not tried: with a 1 ms worst-case lag and about 10 % CPU there is no per-read overhead or queue contention for them to remove.
+- **No read came back full.** `RMNetRxFullTransfers` (reads filled to their 31,744 bytes) stayed 0: the modem's aggregation ends each transfer (17 to 19 packets and 24 to 27 KB per transfer).
+- **No drops and no refusals.** Every `RMNetRxDrop*` counter stayed 0, the completion queues never refused a packet (no "took N of M" line in either log), `RMNetPacketsHeld` was 0 afterwards, and `RMNetTxDropBusy` stayed 0 during all three downloads.
+- **No CPU saturation in the driver process.** 0.30 to 0.42 s of CPU per 50 MB download: about 8 to 11 µs per received packet, about 8 to 11 % of one core at these rates.
+- **The path can carry more than 150 Mbit/s briefly.** Run 3 carried 182 Mbit/s over its first 1.1 s, with one 0.27 s sample at 229 Mbit/s.
 
-**Uplink.** Run 2 dropped 2,343 frames because all 8 uplink buffers were in flight (`RMNetTxDropBusy`), against 5,325 sent in 1,224 transfers; the rate fell from about 17 to 25 Mbit/s in the first 3 s to under 10 once the drops began (TCP backing off). `netstat` counts dropped frames as sent, so the port's out counter (10.1 MB) exceeds the driver's `RMNetTxBytes` increase (6.7 MB). Holding frames in the TX submission queue until a buffer frees, instead of dropping them, is the change to make; it was not made here because the gate is downlink only and no drop occurred during a download.
+**Not measured.**
+- Read headroom in runs 1 and 3. `RMNetRxLagMaxUs` also stops at handler entry: it leaves out the time spent in `on_bulk_in`, `FlushRx` and the re-post, so it understates how long a read is not posted. It is a maximum, not an occupancy, so it does not show how many reads were in flight at once.
+- Latency in the transmit and acknowledgement path. The 8 uplink buffers and the transmit batching affect how fast TCP ramps up, and nothing measures them.
+- What macOS does after `EnqueuePackets`, and kernel CPU outside the driver process.
+- Whether the modem's data format and aggregation match those the userspace tool negotiates.
+- Whether the rate curves come from the network. Run 1 sat near 50 Mbit/s for a second and climbed to 179 Mbit/s when the cap stopped it. Run 3 reached 229 Mbit/s within 0.6 s and fell to about 130. Run 4 climbed slowly from 40 to about 100. Runs 3 and 4 have the same receive path (316.17.49 only adds a counter), but they were different calls after a modem reboot. Their 46 Mbit/s spread therefore mixes network variation with whatever differed between the two instances.
+- The 226 Mbit/s userspace figure came from a different day and a different method (uncapped 8 s runs), so it cannot be compared with these.
+
+Only a same-day comparison with the userspace tool, run under this script and its caps, can separate the driver from the network.
+
+**Why measuring stopped at three downloads.** One 50 MB run cannot show an effect smaller than the 46 Mbit/s spread between runs of the same receive path, so more runs would not settle anything. Batching was in place before this task: one `EnqueuePackets` per completed transfer (at most 64 packets per call), and 32 reads re-posted from their completions. `AsyncIOBundled` and a separate receive queue were not tried.
+
+**Per-stream limit (added after these runs).** `scripts/measure.sh` now limits each of the 4 downloads to 15,000,000 bytes (curl's output goes through `head -c`), so a download run cannot pass 60,000,000 bytes of payload even if its watchdog dies. A stream that reaches its own limit before the watchdog's 50,000,000-byte stop ends early, and the run then carries fewer streams. The script prints how many streams ended that way. The four runs above were made before this limit existed.
+
+**Uplink.** The 11.9 Mbit/s gate figure of run 2 is what the port's counters show, and they include the frames the driver dropped. What reached the modem is lower: the port counted 10.1 MB out, while the driver's `RMNetTxBytes` (IP bytes delivered to the modem) rose by 6.7 MB, about two thirds. Run 2 dropped 2,343 frames because all 8 uplink buffers were in flight (`RMNetTxDropBusy`), against 5,325 sent in 1,224 transfers. On the port's counters, the rate fell from about 17 to 25 Mbit/s in the first 3 s to under 10 once the drops began, as TCP backed off. Holding frames in the TX submission queue until a buffer frees, instead of dropping them, is the change to make; it was not made here because the gate is downlink only and no drop occurred during a download.

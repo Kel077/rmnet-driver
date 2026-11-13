@@ -35,8 +35,13 @@ These came from the whole-branch review and from running against the modem. Stat
 ## Left open by the driver plan
 
 - **Paths never run on hardware:** a `Stop` with USB requests still in flight (every observed `Stop` found none outstanding), bulk stall recovery and its 1 s deadline, QMAP flow control (no command frame ever arrived), the IPv4 retry while up, and unplugging the modem with the driver running.
-- **Uplink drops when busy.** With all 8 uplink buffers in flight the driver drops transmit frames instead of leaving them in the TX submission queue: 12,467 drops under `networkQuality` (Task 6) and 2,343 in Task 7's 6-second upload, which reached 11.9 Mbit/s against 36 for the userspace tool. Not changed.
-- **The throughput gate was not passed by its definition**: 129.2, 138.3 and 92.6 Mbit/s against 150, with the driver's counters showing no limit of its own (bulk reads waited at most 1 ms to be re-posted, no drops, about 10 % CPU) (`docs/driverkit-notes.md`, "Runtime findings (throughput, Task 7)"). The comparison run with the userspace tool on the same day needs the owner.
+- **Uplink drops when busy.** With all 8 uplink buffers in flight the driver drops transmit frames instead of leaving them in the TX submission queue: 12,467 drops under `networkQuality` (Task 6) and 2,343 in Task 7's 6-second upload, which measured 11.9 Mbit/s on the port's counters (dropped frames included) against 36 for the userspace tool. Not changed.
+- **The throughput gate was not passed by its definition.** The download gate figures were 129.2, 138.3 and 92.6 Mbit/s, against 150 (`docs/driverkit-notes.md`, "Runtime findings (throughput, Task 7)").
+  - **What was shown.** There was no sign of receive-path starvation, drops or CPU saturation in the driver. Read lag was measured in run 4 only: at most 1.05 ms from completion to handler. There were no drops or queue refusals, and the driver process used about 10 % CPU. The path carried 182 Mbit/s for about a second in run 3.
+  - **What was not measured.** Read headroom in the faster runs; the time a read spends in its handler; latency in the transmit and acknowledgement path, which affects how TCP ramps up; macOS's work after `EnqueuePackets`; and whether the modem's data format matches the userspace tool's.
+  - **Why measuring stopped.** One 50 MB run cannot show an effect smaller than the 46 Mbit/s spread between runs of the same receive path.
+  - **What decides it.** Only a same-day comparison with the userspace tool under `scripts/measure.sh` can separate the driver from the network, and it needs the owner.
+- **Upload.** 11.9 Mbit/s on the port's counters, which include the dropped frames; the driver delivered about two thirds of those bytes to the modem (6.7 of 10.1 MB).
 - **All hardware testing is under a data budget.** The SIM is metered: 400 MB was left on 2026-11-14 for all remaining testing, and Task 7 used about 171 MB of it (`build/installed/measure-usage.log` records each measurement). Measurements were therefore capped at 50 MB, which makes each one short and noisy.
 
 ## Observed on the modem
