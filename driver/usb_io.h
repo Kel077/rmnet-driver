@@ -62,7 +62,8 @@ struct UsbIoActions {
 struct UsbIoStats {
   uint64_t bulk_in_errors;   // reads that completed with an error (aborted ones included)
   uint64_t bulk_out_errors;  // uplink transfers that failed or could not be submitted
-  uint64_t stall_clears;     // ClearStall calls on either bulk pipe
+  uint64_t recoveries;       // stall recoveries started on either bulk pipe
+  uint64_t stall_clears;     // ClearStall calls on either bulk pipe (one per finished recovery)
 };
 
 class UsbIo {
@@ -84,6 +85,10 @@ class UsbIo {
   // message is too long, the ring is full, or UsbIo is stopping.
   bool send(const uint8_t* data, size_t len);
 
+  // A bulk pipe whose endpoint halts is recovered without blocking: nothing new is posted on it,
+  // it is aborted asynchronously, and ClearStall runs only once nothing is pending on it. While
+  // bulk OUT recovers, acquire_uplink gives no buffer (uplink_recovering() says why).
+  //
   // Bulk IN: posts every idle read, each `read_len` bytes (rounded up to the endpoint's packet
   // size, at most kMaxDownlink). Later re-posts use the newest length. Reads keep being re-posted
   // until finish_sending. A read that cannot be posted is fatal.
@@ -96,6 +101,7 @@ class UsbIo {
   uint8_t* uplink_buffer(int slot) const;
   bool send_uplink(int slot, uint32_t len);
   void release_uplink(int slot);
+  bool uplink_recovering() const { return out_recovering_; }
   uint16_t bulk_out_packet_size() const { return bulk_out_mps_; }  // from the endpoint descriptor
   const UsbIoStats& stats() const { return stats_; }
   // Stopping, in three calls made by the owner (docs/driverkit-notes.md 3.9):
@@ -148,6 +154,10 @@ class UsbIo {
   void end_drain();
   void deliver(uint32_t bytes);
   void post_read(uint32_t slot);
+  void begin_in_recovery();
+  void end_in_recovery();
+  void begin_out_recovery();
+  void end_out_recovery();
   void fail(const char* what);
   void release();
 
@@ -189,6 +199,10 @@ class UsbIo {
   UsbIoStats stats_;
   bool logged_first_read_;
   bool logged_first_uplink_;
+  bool in_recovering_;   // bulk IN: aborted for a stall, waiting for its reads to return
+  bool out_recovering_;  // bulk OUT: the same for the uplink transfers
+  uint32_t in_recoveries_;   // recoveries in a row with no successful read between
+  uint32_t out_recoveries_;  // recoveries in a row with no successful transfer between
   uint32_t head_;   // oldest queued slot
   uint32_t count_;  // queued slots, the head one in flight when out_busy_
   bool out_busy_;

@@ -56,6 +56,7 @@ struct DataCounters {
   uint64_t tx_drop_link_down;  // frame while the link is down
   uint64_t tx_drop_filtered;   // the emulator dropped it (multicast, broadcast, no address family)
   uint64_t tx_drop_busy;       // all uplink buffers in flight
+  uint64_t tx_drop_recovering; // bulk OUT is recovering from a stall
   uint64_t tx_drop_too_big;    // does not fit an empty uplink buffer
   uint64_t tx_drop_usb;        // its transfer failed or could not be submitted
   uint64_t reply_drop_no_packet;  // an emulator reply, with no receive packet available
@@ -122,6 +123,7 @@ class CoreHost final : public rmnet::SessionDelegate {
   void on_command(const rmnet::QmapFrame& f);
   void forward(const uint8_t* ip, size_t len);
   bool open_uplink();
+  void count_no_uplink();
   void send_uplink();
   void set_paused(bool paused);
 

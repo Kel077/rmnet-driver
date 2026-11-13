@@ -165,7 +165,7 @@ struct RxBridge final : RxSink {
 };
 
 // What PublishCounters last published, in its order.
-enum : uint32_t { kCounterCount = 31 };
+enum : uint32_t { kCounterCount = 33 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -812,6 +812,7 @@ void RMNetDriver::PublishCounters() {
       {"RMNetTxDropLinkDown", c.tx_drop_link_down},
       {"RMNetTxDropFiltered", c.tx_drop_filtered},
       {"RMNetTxDropBusy", c.tx_drop_busy},
+      {"RMNetTxDropRecovering", c.tx_drop_recovering},
       {"RMNetTxDropTooBig", c.tx_drop_too_big},
       {"RMNetTxDropUsb", c.tx_drop_usb},
       {"RMNetReplyDropNoPacket", c.reply_drop_no_packet},
@@ -822,6 +823,7 @@ void RMNetDriver::PublishCounters() {
       {"RMNetQmapCommandReplyDrops", c.command_reply_drops},
       {"RMNetUsbBulkInErrors", u.bulk_in_errors},
       {"RMNetUsbBulkOutErrors", u.bulk_out_errors},
+      {"RMNetUsbRecoveries", u.recoveries},
       {"RMNetUsbStallClears", u.stall_clears},
       {"RMNetPacketsHeld", uint64_t{ivars->rxOutCount} + ivars->txDoneCount + (ivars->rxSpare ? 1u : 0u)},
       {"RMNetPoolPacketCount", poolCount},

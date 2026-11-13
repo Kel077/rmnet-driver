@@ -423,7 +423,7 @@ void CoreHost::transmit(const uint8_t* frame, size_t len) {
 void CoreHost::forward(const uint8_t* ip, size_t len) {
   uint8_t mux = rmnet::SessionConfig{}.mux_id;
   if (uplink_slot_ < 0 && !open_uplink()) {
-    counters_.tx_drop_busy++;
+    count_no_uplink();
     return;
   }
   if (!agg_.add(mux, ip, len)) {
@@ -434,7 +434,7 @@ void CoreHost::forward(const uint8_t* ip, size_t len) {
       return;
     }
     if (!open_uplink()) {
-      counters_.tx_drop_busy++;
+      count_no_uplink();
       return;
     }
     if (!agg_.add(mux, ip, len)) {
@@ -444,6 +444,14 @@ void CoreHost::forward(const uint8_t* ip, size_t len) {
   }
   slot_packets_[uplink_slot_]++;
   slot_bytes_[uplink_slot_] += len;
+}
+
+void CoreHost::count_no_uplink() {
+  if (usb_.uplink_recovering()) {
+    counters_.tx_drop_recovering++;
+  } else {
+    counters_.tx_drop_busy++;
+  }
 }
 
 bool CoreHost::open_uplink() {

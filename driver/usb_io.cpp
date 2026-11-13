@@ -25,7 +25,8 @@ constexpr uint32_t kControlTimeoutMs = 5000;
 constexpr uint32_t kMaxInterruptFailures = 5;  // in a row, each followed by a stall clear
 constexpr uint16_t kDefaultInterruptSize = 64;
 constexpr uint16_t kDefaultBulkPacketSize = 512;  // USB 2.0 high speed, if the descriptor gives none
-constexpr uint8_t kMaxReadFailures = 5;  // in a row, per bulk read, each followed by a stall clear
+constexpr uint8_t kMaxReadFailures = 5;  // aborts in a row of one bulk read outside a recovery
+constexpr uint8_t kMaxRecoveries = 5;    // stall recoveries in a row of one bulk pipe, no success between
 constexpr uint32_t kUplinkTimeoutMs = 5000;  // a write the modem does not take frees its buffer
 // The modem answers an empty GET_ENCAPSULATED_RESPONSE with a STALL. Accept the legacy code too.
 constexpr IOReturn kLegacyPipeStalled = (IOReturn)0xe000404f;
@@ -45,6 +46,15 @@ kern_return_t MakeBuffer(IOUSBHostInterface* intf, IOOptionBits dir, uint32_t si
 // Errors are logged when their count is a power of two (1, 2, 4, 8, ...): the first ones in
 // full, then ever more rarely. The counters carry the rest.
 bool Worth(uint64_t n) { return n != 0 && (n & (n - 1)) == 0; }
+
+// The SDK (IOUSBHostPipe.iig, ClearStall): any IO error other than a timeout halts a bulk
+// endpoint. Aborts are ours (a recovery, or stop); a device that is gone cannot be recovered.
+bool Halts(IOReturn status) {
+  return status != kIOReturnSuccess && status != kIOReturnAborted && status != kIOReturnTimeout &&
+         status != kIOReturnNotAttached && status != kIOReturnNoDevice;
+}
+
+bool Gone(IOReturn status) { return status == kIOReturnNotAttached || status == kIOReturnNoDevice; }
 
 uint16_t PacketSize(IOUSBHostPipe* pipe, const IOUSBEndpointDescriptor* ep, uint16_t fallback) {
   uint8_t speed = 0;
@@ -92,6 +102,10 @@ UsbIo::UsbIo(UsbIoListener& listener)
       stats_(),
       logged_first_read_(false),
       logged_first_uplink_(false),
+      in_recovering_(false),
+      out_recovering_(false),
+      in_recoveries_(0),
+      out_recoveries_(0),
       head_(0),
       count_(0),
       out_busy_(false),
@@ -407,6 +421,7 @@ void UsbIo::start_bulk(uint32_t read_len) {
   uint32_t len = (read_len + mps - 1) / mps * mps;
   if (len == 0 || len > kMaxDownlink) len = kMaxDownlink;
   read_len_ = len;
+  if (in_recovering_) return;  // the recovery re-posts every read when it ends
   for (uint32_t i = 0; i < kBulkReads && phase_ == Phase::Running; i++) {
     if (!read_busy_[i]) post_read(i);
   }
@@ -423,9 +438,14 @@ void UsbIo::post_read(uint32_t i) {
   fail("bulk read could not be posted");
 }
 
-// Every read counts its own consecutive failures; kMaxReadFailures in a row is fatal. A failure
-// other than an abort clears the stall (synchronously: USBDriverKit has no asynchronous form),
-// which aborts the other posted reads too; they come back aborted and are re-posted.
+// A failure that halts the endpoint starts a recovery of the pipe (begin_in_recovery): nothing
+// is re-posted, the pipe is aborted asynchronously, and once no read is pending the stall is
+// cleared and every read posted again (end_in_recovery). ClearStall is synchronous on the Default
+// queue and aborts whatever is pending on the endpoint, so it is only called with nothing pending.
+// kMaxRecoveries recoveries in a row with no successful read between them is fatal. Aborted
+// completions during a recovery are expected and not counted; outside one (no cause known) the
+// read is re-posted, and kMaxReadFailures of those in a row for one read is fatal. A device that
+// is gone is fatal at once.
 void UsbIo::bulk_in_complete(uint32_t i, IOReturn status, uint32_t bytes) {
   if (i >= kBulkReads || !read_busy_[i]) return;
   read_busy_[i] = false;
@@ -434,36 +454,67 @@ void UsbIo::bulk_in_complete(uint32_t i, IOReturn status, uint32_t bytes) {
   if (phase_ != Phase::Running || failed_) return;
   if (status == kIOReturnSuccess) {
     read_failures_[i] = 0;
+    in_recoveries_ = 0;
     if (!logged_first_read_) {
       logged_first_read_ = true;
       LOG("first bulk read: %u bytes", bytes);
     }
     listener_.on_bulk_in(read_addr_[i], bytes);
     if (phase_ != Phase::Running || failed_) return;
+    if (!in_recovering_) post_read(i);
+  } else if (status == kIOReturnAborted && in_recovering_) {
+    // Expected: the recovery aborted it.
   } else {
     stats_.bulk_in_errors++;
-    read_failures_[i]++;
     if (Worth(stats_.bulk_in_errors)) {
-      LOG("bulk read %u failed: 0x%x (%u in a row; %llu bulk read errors)", i, status, read_failures_[i],
-          stats_.bulk_in_errors);
+      LOG("bulk read %u failed: 0x%x (%llu bulk read errors)", i, status, stats_.bulk_in_errors);
     }
-    if (read_failures_[i] >= kMaxReadFailures) {
-      fail("bulk read keeps failing");
+    if (Gone(status)) {
+      fail("bulk in: device not attached");
       return;
     }
-    if (status != kIOReturnAborted) {
-      stats_.stall_clears++;
-      kern_return_t ret = bulk_in_->ClearStall(true);
-      if (ret != kIOReturnSuccess) LOG("bulk in ClearStall: 0x%x", ret);
+    if (Halts(status)) {
+      if (!in_recovering_) begin_in_recovery();
+    } else if (!in_recovering_) {
+      if (++read_failures_[i] >= kMaxReadFailures) {
+        fail("bulk read keeps failing");
+        return;
+      }
+      post_read(i);
     }
   }
-  post_read(i);
+  if (in_recovering_ && reads_busy_ == 0 && phase_ == Phase::Running && !failed_) end_in_recovery();
+}
+
+void UsbIo::begin_in_recovery() {
+  in_recoveries_++;
+  stats_.recoveries++;
+  LOG("bulk in halted: recovery %u in a row, %u reads pending", in_recoveries_, reads_busy_);
+  if (in_recoveries_ >= kMaxRecoveries) {
+    fail("bulk in keeps stalling");
+    return;
+  }
+  in_recovering_ = true;
+  if (reads_busy_ > 0) {
+    kern_return_t ret = bulk_in_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, owner_);
+    if (ret != kIOReturnSuccess) LOG("bulk in abort for recovery: 0x%x", ret);
+  }
+}
+
+void UsbIo::end_in_recovery() {
+  in_recovering_ = false;
+  stats_.stall_clears++;
+  kern_return_t ret = bulk_in_->ClearStall(true);
+  LOG("bulk in recovered: ClearStall 0x%x, reads posted again", ret);
+  for (uint32_t i = 0; i < kBulkReads && phase_ == Phase::Running && !failed_; i++) {
+    if (!read_busy_[i]) post_read(i);
+  }
 }
 
 // --- Bulk OUT --------------------------------------------------------------------------------------
 
 int UsbIo::acquire_uplink() {
-  if (phase_ != Phase::Running || !opened_) return -1;
+  if (phase_ != Phase::Running || !opened_ || out_recovering_) return -1;
   for (uint32_t i = 0; i < kUplinkSlots; i++) {
     if (uplink_[i] == Uplink::Free) {
       uplink_[i] = Uplink::Reserved;
@@ -485,7 +536,7 @@ void UsbIo::release_uplink(int slot) {
 
 bool UsbIo::send_uplink(int slot, uint32_t len) {
   if (slot < 0 || slot >= static_cast<int>(kUplinkSlots) || uplink_[slot] != Uplink::Reserved) return false;
-  if (phase_ != Phase::Running || len == 0 || len > kMaxUplink) {
+  if (phase_ != Phase::Running || out_recovering_ || len == 0 || len > kMaxUplink) {
     uplink_[slot] = Uplink::Free;
     return false;
   }
@@ -507,26 +558,54 @@ bool UsbIo::send_uplink(int slot, uint32_t len) {
   return true;
 }
 
+// A failure that halts the endpoint starts a recovery of the pipe, as for bulk IN: no uplink
+// transfer is started (acquire_uplink gives none), the pipe is aborted asynchronously, and once
+// no transfer is in flight the stall is cleared. kMaxRecoveries in a row with no successful
+// transfer between them is fatal. Aborts and timeouts leave the endpoint usable.
 void UsbIo::bulk_out_complete(uint32_t i, IOReturn status, uint32_t) {
   if (i >= kUplinkSlots || uplink_[i] != Uplink::InFlight) return;
   uplink_[i] = Uplink::Free;
   uplinks_busy_--;
   bool ok = status == kIOReturnSuccess;
-  if (!ok) {
+  bool expected_abort = status == kIOReturnAborted && out_recovering_;
+  if (!ok && !expected_abort) {
     stats_.bulk_out_errors++;
     if (phase_ == Phase::Running && Worth(stats_.bulk_out_errors)) {
       LOG("uplink transfer failed: 0x%x (%llu bulk out errors)", status, stats_.bulk_out_errors);
     }
   }
-  if (phase_ != Phase::Running) return;  // the owner is not called while stopping
-  // A halted endpoint must be cleared before it takes more; this also aborts the other uplink
-  // transfers in flight. Aborts and timeouts leave the endpoint usable.
-  if (!ok && status != kIOReturnAborted && status != kIOReturnTimeout) {
-    stats_.stall_clears++;
-    kern_return_t ret = bulk_out_->ClearStall(true);
-    if (ret != kIOReturnSuccess) LOG("bulk out ClearStall: 0x%x", ret);
-  }
+  if (phase_ != Phase::Running || failed_) return;  // the owner is not called while stopping
+  if (ok) out_recoveries_ = 0;
   listener_.on_bulk_out_done(static_cast<int>(i), ok);
+  if (phase_ != Phase::Running || failed_) return;
+  if (Gone(status)) {
+    fail("bulk out: device not attached");
+    return;
+  }
+  if (Halts(status) && !out_recovering_) begin_out_recovery();
+  if (out_recovering_ && uplinks_busy_ == 0 && phase_ == Phase::Running && !failed_) end_out_recovery();
+}
+
+void UsbIo::begin_out_recovery() {
+  out_recoveries_++;
+  stats_.recoveries++;
+  LOG("bulk out halted: recovery %u in a row, %u transfers in flight", out_recoveries_, uplinks_busy_);
+  if (out_recoveries_ >= kMaxRecoveries) {
+    fail("bulk out keeps stalling");
+    return;
+  }
+  out_recovering_ = true;
+  if (uplinks_busy_ > 0) {
+    kern_return_t ret = bulk_out_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, owner_);
+    if (ret != kIOReturnSuccess) LOG("bulk out abort for recovery: 0x%x", ret);
+  }
+}
+
+void UsbIo::end_out_recovery() {
+  out_recovering_ = false;
+  stats_.stall_clears++;
+  kern_return_t ret = bulk_out_->ClearStall(true);
+  LOG("bulk out recovered: ClearStall 0x%x, uplink open again", ret);
 }
 
 // --- Stopping ----------------------------------------------------------------------------------------
