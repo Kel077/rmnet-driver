@@ -1,0 +1,126 @@
+// The connection state machine: brings a QMI data connection up, keeps it up, tears it down.
+//
+// It does no I/O. The host hands it every received QMI frame and the current time, calls
+// tick() at least every 250 ms, and receives requests to send and link changes through a
+// SessionDelegate. It never blocks, sleeps or allocates.
+//
+// Bring-up, one request outstanding at a time: CTL Sync; CTL Get Client ID for WDA; WDA Set
+// Data Format; then for IPv4 and then IPv6: CTL Get Client ID for WDS, WDS Bind Mux Data Port,
+// Set IP Family, Start Network, Get Current Settings. link_up() follows the last family if at
+// least one family has settings. Failures and timeouts go to Backoff, which redials from Sync.
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "rmnet/qmi.h"
+#include "rmnet/qmi_msgs.h"
+
+namespace rmnet {
+
+struct SessionConfig {
+  uint32_t iface_number = 4;
+  uint8_t mux_id = 0x81;
+  uint8_t profile = 1;
+};
+
+struct LinkConfig {
+  RuntimeSettings settings;
+  DataFormat format;
+};
+
+class SessionDelegate {
+ public:
+  virtual void send_qmi(const uint8_t* data, size_t len) = 0;
+  virtual void link_up(const LinkConfig& cfg) = 0;
+  virtual void link_down() = 0;
+
+ protected:
+  ~SessionDelegate() = default;
+};
+
+enum class SessionState : uint8_t { Idle, Syncing, Configuring, Connecting, Up, Refreshing, Backoff };
+
+enum : uint32_t {
+  kSyncResendMs = 2000,
+  kSyncGiveUpMs = 60000,
+  kRequestTimeoutMs = 10000,
+  kStartNetworkTimeoutMs = 60000,
+};
+
+class Session {
+ public:
+  Session(const SessionConfig& cfg, SessionDelegate& delegate);
+
+  void start(uint64_t now_ms);  // Idle -> Syncing; ignored in any other state
+  // Stops started calls and releases clients without waiting for answers, then -> Idle.
+  // Calls link_down() if the link was up.
+  void stop();
+  void on_qmi(const uint8_t* data, size_t len, uint64_t now_ms);
+  void tick(uint64_t now_ms);  // the host calls this at least every 250 ms
+  SessionState state() const;
+
+ private:
+  // What the outstanding request is, so its response goes to the right handler.
+  enum class Step : uint8_t { Sync, GetWdaClient, SetDataFormat, GetWdsClient, Bind, IpFamily, Start, Settings };
+
+  struct Pending {
+    bool active;
+    Step step;
+    QmiService service;
+    uint8_t client;
+    uint16_t txid;
+    uint16_t msg_id;
+    uint64_t sent_ms;
+    uint32_t timeout_ms;
+  };
+
+  // One WDS client per IP family: index 0 is IPv4, index 1 is IPv6.
+  struct Family {
+    bool has_client;
+    uint8_t client;
+    bool has_handle;  // false also when Start Network answered NoEffect
+    uint32_t handle;
+  };
+
+  uint8_t next_ctl_txid();
+  uint16_t next_txid();
+  void expect(Step step, QmiService service, uint8_t client, uint16_t txid, uint16_t msg_id,
+              size_t len, uint64_t now_ms, uint32_t timeout_ms);
+  void transmit(size_t len);
+
+  void begin_sync(uint64_t now_ms);
+  void send_sync(uint64_t now_ms);
+  void begin_family(uint8_t index, uint64_t now_ms);
+  void send_settings(uint64_t now_ms);
+  void family_done(uint64_t now_ms);
+  void finish_bring_up();
+  void enter_backoff(uint64_t now_ms);
+  void teardown();
+  void reset_clients();
+  void clear_family_settings(uint8_t index);
+  bool family_has_settings(uint8_t index) const;
+
+  void on_response(const QmiMessage& m, uint64_t now_ms);
+  void on_indication(const QmiMessage& m, uint64_t now_ms);
+
+  SessionConfig cfg_;
+  SessionDelegate& delegate_;
+  SessionState state_;
+  uint8_t ctl_txid_;  // next CTL transaction ID; never 0
+  uint16_t txid_;     // next transaction ID shared by WDA and WDS; never 0
+  Pending pending_;
+  uint64_t sync_started_ms_;
+  uint64_t backoff_started_ms_;
+  uint32_t backoff_wait_ms_;  // the wait of the current Backoff
+  uint32_t next_backoff_ms_;  // the wait of the next Backoff
+  bool has_wda_client_;
+  uint8_t wda_client_;
+  Family families_[2];
+  uint8_t current_;  // family being brought up or refreshed
+  bool link_is_up_;  // link_up() was reported and link_down() has not followed
+  LinkConfig link_;
+  uint8_t buf_[128];  // every request the session builds fits
+};
+
+}  // namespace rmnet
