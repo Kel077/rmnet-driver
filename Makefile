@@ -51,7 +51,8 @@ driver:
 	$(XCODEBUILD) -target RMNet build
 	@echo "driver build ok"
 
+# build/installed keeps the apps that can deactivate an installed driver (scripts/install-driver.sh).
 clean:
-	rm -rf build
+	[ ! -d build ] || find build -mindepth 1 -maxdepth 1 ! -name installed -exec rm -rf {} +
 
 -include $(CORE_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(HARNESS_OBJS:.o=.d)

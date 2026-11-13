@@ -8,16 +8,29 @@ A macOS driver that makes a Quectel RM520N-GL 5G modem in QMI USB mode appear as
 - `make check-driverkit` syntax-checks every `core/src/*.cpp` against the installed DriverKit SDK.
 - `make harness` builds `build/rmnet-harness`, the command-line harness (below).
 - `make driver` generates `RMNet.xcodeproj` and builds the driver and the host app unsigned into `build/xcode/`, printing `driver build ok`.
-- `make clean` removes `build/`.
+- `make clean` removes `build/`, except `build/installed/` (the apps that can remove an installed driver, below).
 
 ## Driver
 
 The driver is a DriverKit extension (`driver/`, bundle `io.rmnetdriver.RMNet.driver`) that links Core and presents the modem's QMI interface (USB `2c7c:0801`, interface 4) as an Ethernet port. It is carried and installed by a command-line host app (`app/`, `io.rmnetdriver.RMNet`). The current driver is a skeleton: it registers an inactive Ethernet interface and drops every frame it is given, without opening the USB interface.
 
 - `gen.rb` writes `RMNet.xcodeproj` (not in git) with two targets: `RMNetDriver` (every `driver/*.cpp`, `driver/*.iig` and `core/src/*.cpp`) and `RMNet` (the app, which embeds the driver). Run it with `/usr/bin/ruby gen.rb` for an unsigned project, or `/usr/bin/ruby gen.rb TEAM_ID` for automatic signing with that team. It needs the `xcodeproj` gem.
-- `scripts/install-driver.sh` generates the project for team `ABCDE12345`, builds it signed (letting Xcode create or update the provisioning profiles) with the current time as the bundle version, copies the app to `/Applications/RMNet.app` and runs `RMNet activate`. The first activation waits for approval in System Settings, under Login Items & Extensions, Driver Extensions.
-- `scripts/driver-log.sh` follows the driver's log lines, which all start with `RMNet:`.
+- `scripts/install-driver.sh` generates the project for team `ABCDE12345`, builds it signed (letting Xcode create or update the provisioning profiles) with a bundle version derived from the current time (`<days since 2026-01-01>.<hour>.<minute>` in UTC, the form a dext version must take), copies the app to `/Applications/RMNet.app` and runs `RMNet activate`. The first activation waits for approval in System Settings, under Login Items & Extensions, Driver Extensions; later builds replace it without a new approval. A running driver does not stop when it is replaced, so a new build loads only when the modem re-enumerates (unplug it, or send `AT+CFUN=1,1`); the script says which build is running. Before it replaces the app it keeps the one matching the active driver in `build/installed/RMNet-<version>.app`, and it stops if there is none.
+- Do not switch the driver off in System Settings while the modem is attached: the driver cannot stop, the entry is left disabled next to later builds, and the system then refuses every activation until both entries are removed.
+- `scripts/driver-log.sh` follows the driver's log lines, which all start with `RMNet:`, and saves them in `build/logs/driver-<time>.log`. The system log does not keep a driver's lines, so start it before the event you want to see.
 - `/Applications/RMNet.app/Contents/MacOS/RMNet activate | deactivate | status`. `status` prints whether the driver extension is installed and enabled, whether the modem is attached in QMI mode, and, if the driver is attached, its `RMNet*` registry properties.
+
+### Removing the driver
+
+The system deactivates a driver only when asked by an app that embeds that exact driver version. Find the active version with `systemextensionsctl list` (`io.rmnetdriver.RMNet.driver (1.0/<version>)`), then:
+
+```sh
+rm -rf /Applications/RMNet.app
+ditto build/installed/RMNet-<version>.app /Applications/RMNet.app
+/Applications/RMNet.app/Contents/MacOS/RMNet deactivate   # asks for an administrator's password
+```
+
+If no copy exists, build one for that version: `/usr/bin/ruby gen.rb ABCDE12345`, then the `xcodebuild` command in `scripts/install-driver.sh` with `CURRENT_PROJECT_VERSION=<version>`, and deactivate from that app the same way. Each installed entry needs its own matching app.
 
 ## Harness
 

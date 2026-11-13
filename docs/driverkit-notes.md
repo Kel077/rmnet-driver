@@ -809,6 +809,46 @@ Also compiled without complaint on the first try:
 
 ---
 
+## Runtime findings (first load, 2026-11-13)
+
+From installing the skeleton (`scripts/install-driver.sh`) several times and re-enumerating the modem, with the modem attached in QMI mode.
+
+**Reading the driver's log**
+- A dext's `os_log` lines are kernel messages: process `kernel`, pid 0, `senderImagePath` the dext's executable (`.../io.rmnetdriver.RMNet.driver.dext/io.rmnetdriver.RMNet.driver`), type Default, no subsystem.
+- `log show` cannot return them afterwards. On this Mac, `log show` (as the user) returns no kernel lines older than a few seconds, at any level. The only record is a live `log stream`, so `scripts/driver-log.sh` streams and also saves to `build/logs/driver-<time>.log`. Start it before the load.
+- Stream at the **default level**, with a narrow predicate (`senderImagePath ENDSWITH "/io.rmnetdriver.RMNet.driver" OR eventMessage BEGINSWITH "RMNet:"`). Streams with `--level info` or `--level debug` lost lines around a load: `init`, `Start`, `Stop` and `free` were missing, even though `started` (logged by `Start` a millisecond later) arrived. The default-level stream showed every line of a full reload (`Stop`, `free`, `init`, `Start`, ...) on each re-enumeration it was used for.
+
+**Packaging and signing**
+- `CFBundleVersion` must be a valid kext version (major up to 4 digits, minor and revision up to 2). A ten-digit timestamp fails `kernelmanagerd`'s `DextValidation` and activation ends with "extension category returned error (code 9)". The install script now uses `<days since 2026-01-01>.<hour>.<minute>` in UTC.
+- The networking-family dext, signed with team `ABCDE12345` and automatic signing, validated and loaded (risk 9 closed). `sysextd` logs "Error checking with notarization daemon: 3" and `kernelmanagerd` "openat_authenticated_np() failed ... (errno 80)"; both are harmless.
+- Matching needed no change: the 4-key personality (`idVendor`, `idProduct`, `bConfigurationValue`, `bInterfaceNumber`) attached `RMNetDriver` to `RmNet@4` (`IOProbeScore` 90000), and the class check in `Start` passed. Interfaces 0 to 3 are untouched.
+- The interface is `en33` (unit 33 is remembered by configd across loads), MAC `02:c7:bd:1f:39:58`. configd creates a network service named `RM520N-GL`. It is not listed in `scutil --nwi`.
+
+**Calls and their order** (first call of each, one instance):
+`init`, `Start`, (`setMaxTransferUnit` fails with `kIOReturnUnsupported`), `started`, `SetPowerState 0x2` then `setPowerState 2`, `getMaxTransferUnit`, `setInterfaceEnable 1` then `SetInterfaceEnable 1`, `RxPacketsAvailable`, `setAllMulticastModeEnable 0` then `SetAllMulticastModeEnable 0`, `TxPacketsAvailable`, `setMulticastAddresses 3`, `getSupportedMediaArray array 1 count 0`. On re-enumeration: `Stop`, then `free`, and the new instance starts about 10 s later.
+- The stack calls the **lowercase** `setInterfaceEnable` and `setAllMulticastModeEnable`; their base implementations call the deprecated uppercase ones within the same millisecond. Power is the other way round: the kernel calls uppercase `SetPowerState`, and the superclass then calls lowercase `setPowerState`. Implementing either form works; keep the superclass call in each lowercase override.
+- Never called on this load: `SetPromiscuousModeEnable`/`setPromiscuousModeEnable`, `SelectMediaType`, `handleChosenMedia`.
+- `init` and `Start` run on one thread; every later callback, both data-available handlers included, runs on a second one (the Default queue).
+- Both data-available handlers fire once as soon as the interface is enabled, with nothing to do.
+- `RegisterService` after `RegisterEthernetInterface` works.
+- `setMaxTransferUnit(1500)` in `Start` returns `kIOReturnUnsupported`; the MTU is 1500 anyway. The driver now returns its MTU from `getMaxTransferUnit`.
+
+**Link status and media**
+- `reportLinkStatus(Inactive)` called in `Start` did not take effect: configd started DHCP on `en33` and gave it a 169.254 address. Reporting it again when the stack enables the interface (`SetInterfaceEnable(true)`) fixed that: configd logs "Process interface link status inactive: en33", and `en33` gets no address.
+- `getSupportedMediaArray` is first called with a non-null array and `*mediaCount == 0`: a query for the count. The first skeleton answered that with `kIOReturnBadArgument`, so the port had no media list: `ifconfig` failed with `SIOCGIFXMEDIA: Input/output error` and showed no `status:` line. Answering with `*mediaCount = 1` and success fixed it: `ifconfig en33` shows `media: autoselect` and `status: inactive`, and `IOSkywalkLegacyEthernet` has `IOLinkStatus = 1`. (AppleUserECM does not override `getSupportedMediaArray`; it calls the deprecated `ReportAvailableMediaTypes`.)
+
+**Status publishing**: `SetProperties` works. `RMNetState = "skeleton"` appears on the `RMNetDriver` entry in `ioreg` and in `RMNet status`, next to `RMNetProfile = 1` from the personality. No fallback is needed.
+
+**Lifetime and reloads**
+- `free` runs: after the modem re-enumerated (`AT+CFUN=1,1`), the log showed `Stop` then `free` and the process exited 0. The `OSAction`s held in the ivars do not keep the driver alive.
+- **A running RMNetDriver is not stopped when the extension is disabled or replaced.** `kernelmanagerd`: "services failed to terminate - 0xe00002c7", and the extension stays "terminating for disable but still running". A replacement build is staged and enabled, but the old process keeps the interface until the modem re-enumerates (unplug, or `AT+CFUN=1,1`); then the new build matches. `scripts/install-driver.sh` now compares the running driver's `IOUserServerCDHash` with the installed one and says so.
+- A replacement build needs no new approval: sysextd logs "replacing extension ... with inherited user approval". (Here the old build had been switched off in System Settings, so the replacement waited in `activated_waiting_to_upgrade` until the owner switched it on.)
+- `rm -rf /Applications/RMNet.app` followed by `ditto` and `activate`, with the extension active, made sysextd do nothing (no uninstall, no state change). The script still removes the old app only after checking the new build.
+- An entry left `activated disabled` (the old build, switched off while it could not stop) blocks every later activation: sysextd faults with "activateDecision found two entries ... activated_disabled ... activated_enabled" and `activate` fails with `OSSystemExtensionErrorDomain` error 4. This came from the driver being switched off in System Settings right after it was approved. The app in the next plan must guard against it (refuse to activate while such an entry exists, and say what to do), and tell the owner not to switch the driver off while the modem is attached.
+- **Deactivation is matched against the exact driver version embedded in the app that asks.** With `/Applications/RMNet.app` carrying 316.16.1 and entries 316.15.49 and 316.15.56 installed, `RMNet deactivate` failed with `OSSystemExtensionErrorDomain` error 4 (sysextd: "deactivation request could not find extension ... buildNumber: 316.16.1"). Rebuilding the app with `CURRENT_PROJECT_VERSION` set to an installed entry's version, and deactivating from that app, worked: once per entry, each time with the owner's password. So an installed driver can be removed only by an app with the same driver version. `scripts/install-driver.sh` keeps that app in `build/installed/RMNet-<version>.app` before replacing `/Applications/RMNet.app` (README, "Removing the driver").
+
+---
+
 ## Recommended source layout for the real driver
 
 - `driver/RMNetDriver.iig` + `.cpp`: the only DriverKit class, an `IOUserNetworkEthernet` subclass. It owns its lifecycle (`Start`, `Stop`, `SetPowerState`), the pool and the four queues, link reporting, the timer, and every `TYPE(...)` completion stub. Each stub is a few lines that forward to the classes below. Everything runs on the Default queue.

@@ -45,6 +45,7 @@ public:
     // Plain C++ helpers, never called across the IPC boundary.
     kern_return_t CreateInterface() LOCALONLY;
     void PublishState(const char * state) LOCALONLY;
+    void ReportInactive() LOCALONLY;
     bool FirstCall(uint32_t flag) LOCALONLY;
 };
 #pragma clang diagnostic pop

@@ -188,10 +188,10 @@ kern_return_t RMNetDriver::CreateInterface() {
   ret = RegisterEthernetInterface(mac, ivars->pool, queues, 4);
   if (ret != kIOReturnSuccess) return ret;
 
-  ret = setMaxTransferUnit(kMtu);
-  if (ret != kIOReturnSuccess) LOG("setMaxTransferUnit 0x%x", ret);
-  ret = reportLinkStatus(kIOUserNetworkLinkStatusInactive, kIOUserNetworkMediaEthernetAuto);
-  if (ret != kIOReturnSuccess) LOG("reportLinkStatus 0x%x", ret);
+  // setMaxTransferUnit here fails with kIOReturnUnsupported (first load); getMaxTransferUnit below
+  // gives the stack the MTU instead. A link status reported here is lost (configd ran DHCP on the
+  // port), so it is reported again once the stack enables the interface.
+  ReportInactive();
   return kIOReturnSuccess;
 }
 
@@ -212,6 +212,11 @@ kern_return_t RMNetDriver::SetPowerState_Impl(uint32_t powerFlags) {
   return SetPowerState(powerFlags, SUPERDISPATCH);  // must reach the superclass to acknowledge
 }
 
+void RMNetDriver::ReportInactive() {
+  IOReturn ret = reportLinkStatus(kIOUserNetworkLinkStatusInactive, kIOUserNetworkMediaEthernetAuto);
+  if (ret != kIOReturnSuccess) LOG("reportLinkStatus 0x%x", ret);
+}
+
 // Status for the host app: properties on this service in the I/O registry.
 void RMNetDriver::PublishState(const char* state) {
   OSDictionary* props = OSDictionary::withCapacity(1);
@@ -227,12 +232,14 @@ void RMNetDriver::PublishState(const char* state) {
 
 // --- Network stack callbacks ---------------------------------------------------------------------
 
+// Reached through the base class's setInterfaceEnable, which the stack calls first.
 kern_return_t RMNetDriver::SetInterfaceEnable_Impl(bool isEnable) {
   LOG_FIRST(kLogSetInterfaceEnable, "SetInterfaceEnable %d", isEnable);
   ivars->txSubmit->setEnable(isEnable);
   ivars->txComplete->setEnable(isEnable);
   ivars->rxSubmit->setEnable(isEnable);
   ivars->rxComplete->setEnable(isEnable);
+  if (isEnable) ReportInactive();
   return kIOReturnSuccess;
 }
 
@@ -254,11 +261,13 @@ kern_return_t RMNetDriver::SelectMediaType_Impl(IOUserNetworkMediaType mediaType
 }
 #pragma clang diagnostic pop
 
-// Replaces the deprecated ReportAvailableMediaTypes: the framework asks for the media list.
+// Replaces the deprecated ReportAvailableMediaTypes: the framework asks for the media list. A call
+// without an array, or with no room, is answered with the count alone.
 IOReturn RMNetDriver::getSupportedMediaArray(MediaWord* mediaArray, uint32_t* mediaCount) {
-  LOG_FIRST(kLogGetSupportedMedia, "getSupportedMediaArray");
-  if (!mediaArray || !mediaCount || *mediaCount < 1) return kIOReturnBadArgument;
-  mediaArray[0] = kIOUserNetworkMediaEthernetAuto;
+  LOG_FIRST(kLogGetSupportedMedia, "getSupportedMediaArray array %d count %u", mediaArray != nullptr,
+            mediaCount ? *mediaCount : 0);
+  if (!mediaCount) return kIOReturnBadArgument;
+  if (mediaArray && *mediaCount >= 1) mediaArray[0] = kIOUserNetworkMediaEthernetAuto;
   *mediaCount = 1;
   return kIOReturnSuccess;
 }
@@ -289,8 +298,8 @@ IOReturn RMNetDriver::handleChosenMedia(MediaWord chosenMedia) {
 }
 
 uint32_t RMNetDriver::getMaxTransferUnit() {
-  LOG_FIRST(kLogGetMaxTransferUnit, "getMaxTransferUnit");
-  return super::getMaxTransferUnit();
+  LOG_FIRST(kLogGetMaxTransferUnit, "getMaxTransferUnit, superclass says %u", super::getMaxTransferUnit());
+  return kMtu;
 }
 
 IOReturn RMNetDriver::setPowerState(unsigned long powerState, IOService* whatDevice) {

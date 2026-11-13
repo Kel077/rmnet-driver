@@ -21,7 +21,7 @@
 - No private macOS interfaces, no root helper, no `utun`, no SIP change, no `systemextensionsctl developer on`.
 - No code copied from qmi-darwin or any unlicensed driver source. `scratchpad/dext-spike` is this project's own throwaway code and may be reused.
 - Signing: team `ABCDE12345`, Xcode automatic signing, `-allowProvisioningUpdates`. Bundle identifiers: app `io.rmnetdriver.RMNet`, driver `io.rmnetdriver.RMNet.driver`. Entitlements exactly as in `docs/driverkit-notes.md` section 4.2.
-- The host app is installed at `/Applications/RMNet.app`. Every build that is installed gets a new `CFBundleVersion` (a timestamp), so activation replaces the running driver.
+- The host app is installed at `/Applications/RMNet.app`. Every build that is installed gets a new, increasing `CFBundleVersion`, `<days since 2026-01-01>.<hour>.<minute>` in UTC (a dext's version must be a valid kext version: major up to 4 digits, minor and revision up to 2), so activation replaces the running driver.
 - Every DriverKit override and completion logs one `os_log` line when it is first called, prefixed `RMNet:`, so the log shows which callbacks macOS really uses.
 - Everything in the driver runs on the Default dispatch queue. Core is never called from inside one of its own delegate callbacks.
 - Never use `sudo`. Steps that need the owner (an admin password, an approval in System Settings) are marked **Owner step**; stop there and report.
@@ -188,7 +188,7 @@ No hardware and no signing in this task.
 - Produces:
   - `ruby gen.rb [TEAM_ID]` writes `RMNet.xcodeproj` with targets `RMNetDriver` (product `io.rmnetdriver.RMNet.driver.dext`) and `RMNet` (the app, embedding the driver). All paths are relative to the repository. With a team ID it sets automatic signing; without one it sets none.
   - `make driver` runs `gen.rb` with no team, then builds both targets with signing off into `build/xcode/`, and prints `driver build ok`.
-  - `scripts/install-driver.sh` runs `gen.rb ABCDE12345`, builds with `-allowProvisioningUpdates -allowProvisioningDeviceRegistration` and a timestamp `CFBundleVersion`, copies the app to `/Applications/RMNet.app` with `ditto`, and runs its `activate`. It prints each stage and stops on the first failure.
+  - `scripts/install-driver.sh` runs `gen.rb ABCDE12345`, builds with `-allowProvisioningUpdates -allowProvisioningDeviceRegistration` and a time-derived `CFBundleVersion` (`<days since 2026-01-01>.<hour>.<minute>`), copies the app to `/Applications/RMNet.app` with `ditto`, and runs its `activate`. It prints each stage and stops on the first failure.
   - `scripts/driver-log.sh` follows the driver's log lines (`RMNet:` prefix) with `log stream`.
   - `RMNet activate | deactivate | status`: `status` prints whether the driver extension is installed and, if the driver's registry entry exists, its `RMNet*` properties.
 - The skeleton driver, `RMNetDriver : IOUserNetworkEthernet`:
