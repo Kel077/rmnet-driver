@@ -61,6 +61,11 @@ TEST(arp_probe_and_announcement_get_no_answer) {
   auto announce = arp_request("02 68 7a 43 12 f6", "10.102.246.230", "10.102.246.230");
   CHECK(e.handle_tx(announce.data(), announce.size(), r, sizeof r).action == rmnet::TxAction::Drop);
 }
+TEST(arp_for_own_address_gets_no_answer) {
+  rmnet::EthernetEmulator e(rmnet::derive_macs("bfeed1a5")); auto s = link_settings(); e.set_link(&s); uint8_t r[128];
+  auto q = arp_request("02 68 7a 43 12 f6", "192.168.225.141", "10.102.246.230");
+  CHECK(e.handle_tx(q.data(), q.size(), r, sizeof r).action == rmnet::TxAction::Drop);
+}
 TEST(arp_while_link_down_dropped) {
   rmnet::EthernetEmulator e(rmnet::derive_macs("bfeed1a5")); uint8_t r[128];
   auto q = arp_request("02 68 7a 43 12 f6", "10.102.246.230", "10.102.246.229");

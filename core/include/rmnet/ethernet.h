@@ -1,6 +1,6 @@
 // Ethernet emulation over the modem's raw-IP link. macOS sees an Ethernet
 // interface; the emulator adds and removes Ethernet headers and plays the
-// router on the other end of the link, answering ARP itself.
+// router on the other end of the link, answering ARP and DHCP itself.
 #pragma once
 
 #include <stddef.h>
@@ -52,6 +52,12 @@ class EthernetEmulator {
   TxResult tx_ipv4(const uint8_t* frame, const uint8_t* payload, size_t len, uint8_t* reply, size_t cap);
   TxResult tx_ipv6(const uint8_t* frame, const uint8_t* payload, size_t len, uint8_t* reply, size_t cap);
   TxResult tx_arp(const uint8_t* frame, const uint8_t* payload, size_t len, uint8_t* reply, size_t cap);
+
+  // DHCP (dhcp.cpp). `ip` is an IPv4 packet trimmed to its total length.
+  // is_dhcp_client says whether it is UDP from port 68 to port 67; such packets
+  // go to tx_dhcp and never upstream, whatever their destination.
+  static bool is_dhcp_client(const uint8_t* ip, size_t len);
+  TxResult tx_dhcp(const uint8_t* frame, const uint8_t* ip, size_t len, uint8_t* reply, size_t cap);
 
   // Writes an Ethernet header from the router to `dst`; returns 14.
   size_t write_header(uint8_t* out, const uint8_t dst[6], uint16_t ethertype) const;

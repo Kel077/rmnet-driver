@@ -97,11 +97,14 @@ TxResult EthernetEmulator::handle_tx(const uint8_t* frame, size_t len, uint8_t* 
   }
 }
 
-// Forwards unicast IPv4, trimmed to the header's total length (Ethernet may pad).
-TxResult EthernetEmulator::tx_ipv4(const uint8_t*, const uint8_t* p, size_t len, uint8_t*, size_t) {
+// Answers DHCP itself and forwards unicast IPv4, trimmed to the header's total
+// length (Ethernet may pad).
+TxResult EthernetEmulator::tx_ipv4(const uint8_t* frame, const uint8_t* p, size_t len, uint8_t* reply,
+                                   size_t cap) {
   if (len < kIpv4HeaderLen || (p[0] >> 4) != 4) return drop();
   size_t total = get16(p + 2);
   if (total < kIpv4HeaderLen || total > len) return drop();
+  if (is_dhcp_client(p, total)) return tx_dhcp(frame, p, total, reply, cap);
   const uint8_t* dst = p + 16;
   bool broadcast = dst[0] == 255 && dst[1] == 255 && dst[2] == 255 && dst[3] == 255;
   bool multicast = (dst[0] & 0xf0) == 0xe0;  // 224.0.0.0/4
@@ -118,7 +121,9 @@ TxResult EthernetEmulator::tx_ipv6(const uint8_t*, const uint8_t* p, size_t len,
 }
 
 // Answers every Ethernet/IPv4 ARP request with the router's MAC, so all
-// traffic goes to the emulated router. Probes and announcements get no answer.
+// traffic goes to the emulated router. Probes, announcements and requests for
+// the host's own address get no answer (answering those would look like an
+// address conflict to the host).
 TxResult EthernetEmulator::tx_arp(const uint8_t*, const uint8_t* p, size_t len, uint8_t* reply, size_t cap) {
   if (!link_.has_v4 || len < kArpLen) return drop();
   if (get16(p) != kArpHwEthernet || get16(p + 2) != kEtherTypeIpv4 || p[4] != 6 || p[5] != 4 ||
@@ -130,6 +135,7 @@ TxResult EthernetEmulator::tx_arp(const uint8_t*, const uint8_t* p, size_t len, 
   const uint8_t* target_ip = p + 24;
   static const uint8_t kZeroIp[4] = {0, 0, 0, 0};
   if (memcmp(sender_ip, kZeroIp, 4) == 0 || memcmp(sender_ip, target_ip, 4) == 0) return drop();
+  if (memcmp(target_ip, link_.v4_addr, 4) == 0) return drop();
   if (cap < kEthHeaderLen + kArpLen) return drop();
 
   // Copied first so the reply is correct even if the caller passes the frame's own buffer as reply.
