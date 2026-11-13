@@ -110,6 +110,9 @@ size_t EthernetEmulator::write_router_advert(uint8_t* out, size_t cap, const uin
     put32(o + 4, link_.mtu);
     o += kMtuOptLen;
   }
+  // Always a /64, whatever v6_prefix_len says: the modem's network assigns the device a /64
+  // (the recorded settings report 64), and SLAAC on Ethernet needs a 64-bit prefix to form an
+  // address, so a different length would leave the host without a global address.
   o[0] = kOptPrefix;
   o[1] = kPrefixOptLen / 8;
   o[2] = kPrefixLen;
