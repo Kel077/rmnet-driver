@@ -61,14 +61,14 @@ Never run on hardware (add to the list above):
 
 Throughput, in the code and not yet measured:
 - Acknowledgements share the 8 uplink slots and are dropped with data under a concurrent upload, so the backpressure fix matters for downloads too; when it is built, a freed slot must drain the transmit queue (`OnBulkOutDone`, `driver/RMNetDriver.cpp:792`, triggers nothing today). **Settled in code (2026-11-14):** a successful bulk OUT completion restarts a drain that stopped for want of a buffer; acknowledgements now wait for a buffer instead of being dropped.
-- A read is re-posted only after its whole handler, and handler time is unmeasured; a per-completion maximum of handler duration is a cheap counter.
-- `RxBuffer` (`driver/RMNetDriver.cpp:737-746`) dequeues one receive packet per frame, about 17 calls per transfer; batch with `DequeuePackets`.
+- A read is re-posted only after its whole handler, and handler time is unmeasured; a per-completion maximum of handler duration is a cheap counter. **Changed in code (2026-11-14, Task 2 of the uplink-hold plan), hardware check pending:** `RMNetRxHandlerMaxUs` and `RMNetRxHandlerTotalUs` time each successful bulk read's handler, re-post included.
+- `RxBuffer` (`driver/RMNetDriver.cpp:737-746`) dequeues one receive packet per frame, about 17 calls per transfer; batch with `DequeuePackets`. **Changed in code (2026-11-14, Task 2 of the uplink-hold plan), hardware check pending:** a stock of up to 32 empty packets is refilled with one `DequeuePackets` call (`RMNetRxStock`).
 - One Default queue serialises receive and transmit, so a bulk-in handler delays acknowledgements by its duration.
 - Two paths wait for the 100 ms timer instead of a completion: frames held for lack of `txDone` room, and receive packets the completion queue refused.
 - At low rates the modem sends one packet per transfer plus a 4-byte filler, so TCP slow start pays two completions per packet, which weighs heavily in a 50 MB run.
 
 Before the same-day comparison with the userspace tool:
-- Add the handler-duration counter and the batched receive dequeue first, so the comparison can separate driver time from network.
+- Add the handler-duration counter and the batched receive dequeue first, so the comparison can separate driver time from network. **Changed in code (2026-11-14, Task 2 of the uplink-hold plan), hardware check pending:** both are in build 316.19.26, which has not yet run on hardware.
 - The userspace tool runs on a `utun` outside `measure.sh`'s usage file, so its data must be added to the file by hand or the guard will be wrong.
 
 Small hardening left open:
@@ -100,7 +100,7 @@ Small hardening left open:
 
 ### Left by the re-review of the final fix wave
 
-There was one fix wave, so these four wording errors are still in the tree at `67d40c9`. None changes behaviour.
+There was one fix wave, so these four wording errors are still in the tree at `67d40c9`. None changes behaviour. **Changed in code (2026-11-14, Task 2 of the uplink-hold plan), hardware check pending:** all four are corrected; the reworded link-up line has not yet been seen in a log, because build 316.19.26 has not yet run.
 
 - `README.md:18` says the link is reported up "as soon as one family has its settings". Core reports link up only after both families have been attempted, IPv4 then IPv6, and at least one has settings (`core/src/session.cpp:364-374`).
 - `README.md:23` says every run of `scripts/measure.sh`, "also a failed or interrupted one", appends a usage line. A run killed with SIGKILL leaves none.

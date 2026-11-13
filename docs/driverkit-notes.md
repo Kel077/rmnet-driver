@@ -238,6 +238,8 @@ void NetSpike::DeliverRx(const uint8_t* frame, size_t len) {
 
 **[runtime]**: whether the RX submission queue already holds empty packets when the interface comes up, or only after `SetInterfaceEnable(true)`. What happens when it is empty: the spike drops the frame, and the real driver should count the drop. Whether `EnqueuePackets` in batches is required to be fast enough. Batch anyway: one `EnqueuePackets` per USB transfer.
 
+As built (2026-11-14): the driver takes empty packets in batches, one `DequeuePackets` call of up to 32 (`kRxStock`) whenever its stock is empty, into `rxStock`. The last packet of the stock is the buffer offered to CoreHost and stays the one offered until it is committed, so a frame rejected after its buffer was offered costs no packet. An empty RX submission queue gives no buffer and the frame is counted in `RMNetRxDropNoPacket`. Filled packets go up with `EnqueuePackets`, at most 64 per call. `RMNetRxStock` shows the stock; `RMNetPacketsHeld` does not count it.
+
 ### 1.7 Link status, speed and MTU
 
 ```
@@ -998,10 +1000,24 @@ From installing 316.19.9 and loading it with `AT+CFUN=1,1`; link up about 21 s a
 
 **Shown.**
 - Every datagram of the burst reached the modem: `RMNetTxPackets` rose by 1,504 (46 to 1,550) and `RMNetTxBytes` by 1,842,132 (1,500 × 1,228 IP bytes plus 132), in 135 transfers (about 11 frames each). `RMNetTxDropBusy`, `RMNetTxDropUsb`, `RMNetTxDropRecovering` and `RMNetUsbBulkOutErrors` stayed 0. Before this change the same situation dropped 2,343 frames of 5,325 (Task 7, run 2).
-- `RMNetTxHolds` rose from 0 to 999: the drain stopped for want of a buffer 999 times. It counts every stop, including the ones where `TxPacketsAvailable` or a tick offered a kept frame while all buffers were still in flight, so it is much larger than the number of bursts that filled the buffers. The first hold logged `first uplink hold: every uplink buffer in flight, 5 frames kept`.
+- `RMNetTxHolds` rose from 0 to 999 in 316.19.9, which counted every stop of the drain, including each re-offer of a kept frame while all buffers were still in flight. From 316.19.26 it counts hold episodes instead: once each time the drain goes from not waiting to waiting for an uplink buffer. The first hold logged `first uplink hold: every uplink buffer in flight, 5 frames kept`.
 - 1 s after the burst `RMNetTxPending` was 0 and `RMNetPacketsHeld` 0 (its idle value), and both pings worked afterwards. No crash report; `en33` first in neither `scutil --nwi` list.
 
 **Not shown.**
 - Throughput: the burst is UDP to an address that answers nothing, so it says nothing about the TCP upload rate. No upload measurement was made (data budget).
 - Holding during a link down, a fatal USB error, a stall recovery or a QMAP pause: none occurred. Those paths are as reasoned in the code (kept frames are dropped as `RMNetTxDropLinkDown` or `RMNetTxDropRecovering` on the next drain).
 - A `Stop` with frames kept: they are abandoned with the disabled queues, like other held packets.
+
+## Runtime findings (receive batching, 2026-11-14): NOT YET RUN ON HARDWARE
+
+Build 316.19.26 is installed (`scripts/install-driver.sh`, activated, replacing 316.19.9) but has not run: after `AT+CFUN=1,1` at 03:26:43 on 2026-11-14 the modem did not come back on USB (no device in `ioreg -p IOUSB`), so no instance of the new build started. Nothing below has been seen on hardware. Log: `build/logs/driver-20261114-032625.log`.
+
+**What changed in code.**
+- Receive packets: a stock of up to 32 empty packets (`kRxStock`), refilled with one `DequeuePackets` call when empty, replaces taking one packet per frame (section 1.6, "As built"). `RMNetRxStock` publishes the stock; `RMNetPacketsHeld` no longer counts it (idle value 0).
+- Handler time: `RMNetRxHandlerMaxUs` and `RMNetRxHandlerTotalUs`, from the entry of `BulkInComplete_Impl` to the return of `UsbIo::bulk_in_complete` (parsing, handing packets up, the re-post), for successful reads while not stopping; two clock reads per transfer. `RMNetRxHandlerTotalUs` divided by `RMNetRxTransfers` is the mean.
+- `RMNetTxHolds` counts hold episodes, not every refused re-offer.
+- The link-up line says the interface keeps its registered MTU only when `setMaxTransferUnit` failed.
+
+**Seen on hardware.** Only the old instance (316.19.9) stopping on the reboot: `usb failed: interrupt read could not be posted`, `Stop`, the stop sequence with 0 requests outstanding, `stop: usb objects released`, `free`. No crash report.
+
+**Still to do.** Load 316.19.26 once the modem is back on USB, and check the port, the pings and the 100-ping receive run with the new counters (Step 4); one burst with `scripts/uplink-burst.py en33` to see `RMNetTxHolds` count episodes; a second modem reboot to see this build stop with its stock abandoned (Step 5).

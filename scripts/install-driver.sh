@@ -35,9 +35,10 @@ trap 'rc=$?; [ "$rc" -eq 0 ] || echo "install-driver: failed during: $stage" >&2
 
 # Reads the system's list of extensions into $listing. A failed listing stops the script: read as
 # an empty list, it would look like "nothing installed" and let the app be replaced without a copy.
+# $1 says what has been changed by then, for the message.
 read_listing() {
   listing=$(systemextensionsctl list) || {
-    echo "install-driver: systemextensionsctl list failed; stopping before anything is changed" >&2
+    echo "install-driver: systemextensionsctl list failed; stopping $1" >&2
     exit 1
   }
 }
@@ -91,7 +92,7 @@ built=$(/usr/bin/defaults read "$NEW/Contents/Info" CFBundleVersion 2>/dev/null 
 [ "$built" = "$VERSION" ] || { echo "install-driver: $NEW missing or not version $VERSION" >&2; exit 1; }
 
 step "keep the app being replaced"
-read_listing
+read_listing "before anything is changed"
 old=$(driver_version "$APP")
 if [ -n "$old" ] && listed_versions | grep -qxF "$old"; then
   keep_app "$APP"
@@ -114,7 +115,7 @@ keep_app "$APP"
 
 step "activate"
 "$APP/Contents/MacOS/RMNet" activate
-read_listing
+read_listing "after $APP was replaced and activated; the active version is not checked"
 active=$(active_version)
 [ "$active" = "$VERSION" ] || { echo "install-driver: active driver is ${active:-none}, not $VERSION" >&2; exit 1; }
 

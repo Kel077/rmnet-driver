@@ -42,6 +42,7 @@ constexpr uint32_t kTxBatch = 32;
 constexpr uint32_t kTxHold = 256;  // sent packets the completion queue has not taken yet
 constexpr uint32_t kRxHold = 256;  // filled packets the completion queue has not taken yet
 constexpr uint32_t kRxBatch = 64;  // filled packets handed up in one EnqueuePackets at most
+constexpr uint32_t kRxStock = 32;  // empty receive packets taken from the RX submission queue at once
 constexpr uint8_t kLinkHeaderLen = 14;  // Ethernet
 constexpr uint32_t kCounterTicks = 10;  // counters are published once a second
 constexpr uint64_t kTickNs = 100 * 1000000ull;
@@ -193,7 +194,7 @@ struct RxBridge final : RxSink {
 };
 
 // What PublishCounters last published, in its order.
-enum : uint32_t { kCounterCount = 37 };
+enum : uint32_t { kCounterCount = 40 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -223,10 +224,12 @@ struct RMNetDriver_IVars {
   uint32_t mtu;     // what getMaxTransferUnit answers
   char published[256];  // the status last published, "state|ipv4|ipv6"; empty before the first
   uint32_t logged;  // kLog* bits already logged
-  // The data path's packets. A packet taken from the RX submission queue waits in rxSpare until it
-  // is filled; filled ones wait in rxOut, and sent ones in txDone, until their completion queue
+  // The data path's packets. Empty packets taken from the RX submission queue in one call wait in
+  // rxStock (the last one, rxStock[rxStockCount - 1], is the buffer CoreHost is filling) until they
+  // are filled; filled ones wait in rxOut, and sent ones in txDone, until their completion queue
   // takes them (leftovers go first next time, so the pool does not shrink).
-  IOUserNetworkPacket* rxSpare;
+  IOUserNetworkPacket* rxStock[kRxStock];
+  uint32_t rxStockCount;
   IOUserNetworkPacket* rxOut[kRxHold];
   uint32_t rxOutCount;
   IOUserNetworkPacket* txDone[kTxHold];
@@ -239,9 +242,13 @@ struct RMNetDriver_IVars {
   uint32_t txPendingCount;
   uint32_t txPendingNext;
   bool txWaitUplink;
-  uint64_t txHolds;  // times the drain stopped with no uplink buffer free
+  uint64_t txHolds;  // hold episodes: times txWaitUplink went from false to true
   uint32_t ticks;
   uint64_t rxLagMaxUs;  // the longest a successful bulk read waited between completing and its handler
+  // The longest and the summed time of the handler of a successful bulk read (BulkInComplete_Impl
+  // up to the return of UsbIo::bulk_in_complete, the re-post included), while not stopping.
+  uint64_t rxHandlerMaxNs;
+  uint64_t rxHandlerTotalNs;
   bool countersPublished;
   uint64_t counters[kCounterCount];
 };
@@ -585,9 +592,9 @@ void RMNetDriver::ApplyCore() {
       ivars->linkActive = true;
       ReportLink();
     }
-    LOG("link up%{public}s: ipv4 %d ipv6 %d, carrier mtu %u; the interface keeps the mtu it registered "
-        "with (setMaxTransferUnit(%u) 0x%x)",
-        again ? " (family added)" : "", s.has_v4, s.has_v6, s.mtu, mtu, mret);
+    LOG("link up%{public}s: ipv4 %d ipv6 %d, carrier mtu %u; setMaxTransferUnit(%u) 0x%x%{public}s",
+        again ? " (family added)" : "", s.has_v4, s.has_v6, s.mtu, mtu, mret,
+        mret == kIOReturnSuccess ? "" : ", so the interface keeps the mtu it registered with");
     ivars->core->data_link_up(NowMs());
   }
   PublishStatus();
@@ -757,6 +764,7 @@ void RMNetDriver::DrainTx() {
     return;
   }
   ivars->txHeld = false;
+  bool wasWaiting = ivars->txWaitUplink;  // a hold episode lasts until a drain ends without a hold
   ivars->txWaitUplink = false;
   for (;;) {
     if (ivars->txPendingNext == ivars->txPendingCount) {
@@ -778,7 +786,7 @@ void RMNetDriver::DrainTx() {
       const uint8_t* data = reinterpret_cast<const uint8_t*>(p->getDataVirtualAddress()) + off;
       if (!ivars->core->transmit(data, len)) {
         ivars->txWaitUplink = true;
-        ivars->txHolds++;
+        if (!wasWaiting) ivars->txHolds++;
         LOG_FIRST(kLogTxHold, "first uplink hold: every uplink buffer in flight, %u frames kept",
                   ivars->txPendingCount - ivars->txPendingNext);
         break;
@@ -805,23 +813,25 @@ void RMNetDriver::FlushTxDone() {
   ivars->txDoneCount = n - done;
 }
 
-// CoreHost's receive buffers: one packet from the RX submission queue at a time, kept until it
-// is filled. None when kRxHold filled packets are still waiting for the completion queue.
+// CoreHost's receive buffers: the last packet of the stock, which stays the one offered until
+// RxCommit takes it, so a frame rejected after its buffer was offered costs no packet. An empty
+// stock is refilled with one DequeuePackets call of up to kRxStock packets. None when the RX
+// submission queue has none, or when kRxHold filled packets are still waiting for the completion
+// queue. The stock is kept across a link down; at Stop it is abandoned with the disabled queues.
 uint8_t* RMNetDriver::RxBuffer(size_t* cap) {
-  if (!ivars->rxSpare) {
-    if (ivars->rxOutCount >= kRxHold || !ivars->rxSubmit) return nullptr;
-    IOUserNetworkPacket* p = nullptr;
-    if (ivars->rxSubmit->DequeuePacket(&p) != kIOReturnSuccess || !p) return nullptr;
-    ivars->rxSpare = p;
+  if (ivars->rxOutCount >= kRxHold || !ivars->rxSubmit) return nullptr;
+  if (ivars->rxStockCount == 0) {
+    uint32_t n = ivars->rxSubmit->DequeuePackets(ivars->rxStock, kRxStock);
+    ivars->rxStockCount = n > kRxStock ? kRxStock : n;
+    if (ivars->rxStockCount == 0) return nullptr;
   }
   *cap = kPacketBufSize;
-  return reinterpret_cast<uint8_t*>(ivars->rxSpare->getDataVirtualAddress());
+  return reinterpret_cast<uint8_t*>(ivars->rxStock[ivars->rxStockCount - 1]->getDataVirtualAddress());
 }
 
 void RMNetDriver::RxCommit(size_t len) {
-  IOUserNetworkPacket* p = ivars->rxSpare;
-  if (!p) return;
-  ivars->rxSpare = nullptr;
+  if (ivars->rxStockCount == 0) return;
+  IOUserNetworkPacket* p = ivars->rxStock[--ivars->rxStockCount];
   IOReturn ret = p->setDataOffAndLen(0, len);
   LOG_FIRST(kLogRxPacket, "first rx packet: length %zu, setDataOffAndLen 0x%x", len, ret);
   p->setLinkHeaderLength(kLinkHeaderLen);
@@ -872,10 +882,13 @@ void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
 }
 
 // The data path counters, as properties next to RMNetState, once a second when they changed.
-// RMNetPacketsHeld is what the driver holds of the pool (spare, unhanded receive packets,
-// uncompleted transmit packets and transmit frames kept for an uplink buffer); idle, it is 0 or 1
-// (a spare). RMNetTxPending is the kept frames alone; RMNetTxHolds counts the drains that stopped
-// for want of an uplink buffer.
+// RMNetPacketsHeld is what the driver holds of the pool beyond its stock of empty receive packets
+// (unhanded receive packets, uncompleted transmit packets and transmit frames kept for an uplink
+// buffer); idle, it is 0. RMNetRxStock is the stock, from 0 to kRxStock. RMNetTxPending is the kept
+// frames alone; RMNetTxHolds counts the hold episodes, from the drain stopping for want of an
+// uplink buffer to a drain that ends without stopping so. RMNetRxHandlerMaxUs and
+// RMNetRxHandlerTotalUs are the longest and the summed bulk read handler time; divided by
+// RMNetRxTransfers, the total gives the mean.
 void RMNetDriver::PublishCounters() {
   const DataCounters& c = ivars->core->counters();
   uint32_t txPending = ivars->txPendingCount - ivars->txPendingNext;
@@ -920,12 +933,14 @@ void RMNetDriver::PublishCounters() {
       {"RMNetUsbStallClears", u.stall_clears},
       {"RMNetRxLagMaxUs", ivars->rxLagMaxUs},
       {"RMNetRxFullTransfers", u.full_reads},
-      {"RMNetPacketsHeld",
-       uint64_t{ivars->rxOutCount} + ivars->txDoneCount + txPending + (ivars->rxSpare ? 1u : 0u)},
+      {"RMNetPacketsHeld", uint64_t{ivars->rxOutCount} + ivars->txDoneCount + txPending},
       {"RMNetPoolPacketCount", poolCount},
       {"RMNetUplinkPaused", ivars->core->uplink_paused() ? 1u : 0u},
       {"RMNetTxHolds", ivars->txHolds},
       {"RMNetTxPending", txPending},
+      {"RMNetRxStock", ivars->rxStockCount},
+      {"RMNetRxHandlerMaxUs", ivars->rxHandlerMaxNs / 1000},
+      {"RMNetRxHandlerTotalUs", ivars->rxHandlerTotalNs / 1000},
   };
   bool changed = !ivars->countersPublished;
   for (uint32_t i = 0; i < kCounterCount; i++) {
@@ -956,15 +971,23 @@ void RMNetDriver::PublishCounters() {
 // --- USB and timer -------------------------------------------------------------------------------
 
 // Completions go to UsbIo even while stopping: it counts the aborted ones before releasing.
+// A successful read while not stopping is timed from here to the return of bulk_in_complete
+// (parsing, handing packets up, re-posting the read): two clock reads per transfer.
 void RMNetDriver::BulkInComplete_Impl(OSAction* action, IOReturn status, uint32_t actualByteCount,
                                      uint64_t completionTimestamp) {
   uint64_t now = NowNs();
   LOG_FIRST(kLogBulkIn, "BulkInComplete 0x%x, %u bytes, completion timestamp %llu, uptime %llu ns", status,
             actualByteCount, completionTimestamp, now);
   if (!ivars || !ivars->usb) return;
-  if (status == kIOReturnSuccess && !ivars->stopping) NoteRxLag(completionTimestamp, now);
+  bool timed = status == kIOReturnSuccess && !ivars->stopping;
+  if (timed) NoteRxLag(completionTimestamp, now);
   uint32_t slot = *static_cast<uint32_t*>(action->GetReference());
   ivars->usb->bulk_in_complete(slot, status, actualByteCount);
+  if (timed) {
+    uint64_t ns = NowNs() - now;
+    if (ns > ivars->rxHandlerMaxNs) ivars->rxHandlerMaxNs = ns;
+    ivars->rxHandlerTotalNs += ns;
+  }
   if (ivars->stopping) AdvanceStop();
 }
 
