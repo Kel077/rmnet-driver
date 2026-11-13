@@ -81,6 +81,7 @@ enum : uint32_t {
   kLogRxPacket = 1u << 27,
   kLogRxCompleteFull = 1u << 28,
   kLogPoolCount = 1u << 29,
+  kLogTxHold = 1u << 30,
 };
 
 // True if the provider is the modem's QMI interface: number 4, class, subclass and protocol 0xff.
@@ -192,7 +193,7 @@ struct RxBridge final : RxSink {
 };
 
 // What PublishCounters last published, in its order.
-enum : uint32_t { kCounterCount = 35 };
+enum : uint32_t { kCounterCount = 37 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -231,6 +232,14 @@ struct RMNetDriver_IVars {
   IOUserNetworkPacket* txDone[kTxHold];
   uint32_t txDoneCount;
   bool txHeld;  // frames may wait in the TX submission queue (paused, or no room in txDone)
+  // Frames of a batch taken from the TX submission queue that are not yet placed: txPending[txPendingNext]
+  // up to txPendingCount, offered first, in order, before a new batch is taken. txWaitUplink: the
+  // drain stopped because every uplink buffer was in flight; a completed transfer restarts it.
+  IOUserNetworkPacket* txPending[kTxBatch];
+  uint32_t txPendingCount;
+  uint32_t txPendingNext;
+  bool txWaitUplink;
+  uint64_t txHolds;  // times the drain stopped with no uplink buffer free
   uint32_t ticks;
   uint64_t rxLagMaxUs;  // the longest a successful bulk read waited between completing and its handler
   bool countersPublished;
@@ -734,6 +743,12 @@ void RMNetDriver::RxPacketsAvailable_Impl(OSAction*) {
 // uplink buffer: the queue is empty. Not while the modem has paused the uplink: frames stay
 // queued until it resumes. If the completion queue refuses packets, they are kept and returned
 // first next time; with no room to keep a whole batch, the rest waits for the next timer tick.
+// When every uplink buffer is in flight, the frame CoreHost did not take and the rest of its batch
+// stay in txPending and the drain stops (txWaitUplink); the next completed uplink transfer, or the
+// timer tick, restarts it, and those frames are offered first, in order, before a new batch is
+// taken. The frames behind them stay in the TX submission queue, which is the backpressure.
+// A taken batch always fits txDone: it is taken only with kTxBatch free there, and nothing else
+// adds to txDone until all of it is placed.
 void RMNetDriver::DrainTx() {
   FlushTxDone();
   if (ivars->stopping || !ivars->core || !ivars->txSubmit) return;
@@ -742,24 +757,37 @@ void RMNetDriver::DrainTx() {
     return;
   }
   ivars->txHeld = false;
-  IOUserNetworkPacket* pkts[kTxBatch];
+  ivars->txWaitUplink = false;
   for (;;) {
-    if (kTxHold - ivars->txDoneCount < kTxBatch) {
-      ivars->txHeld = true;
-      break;
+    if (ivars->txPendingNext == ivars->txPendingCount) {
+      ivars->txPendingNext = 0;
+      ivars->txPendingCount = 0;
+      if (kTxHold - ivars->txDoneCount < kTxBatch) {
+        ivars->txHeld = true;
+        break;
+      }
+      ivars->txPendingCount = ivars->txSubmit->DequeuePackets(ivars->txPending, kTxBatch);
+      if (ivars->txPendingCount > kTxBatch) ivars->txPendingCount = kTxBatch;
+      if (ivars->txPendingCount == 0) break;
     }
-    uint32_t n = ivars->txSubmit->DequeuePackets(pkts, kTxBatch);
-    if (n == 0) break;
-    for (uint32_t i = 0; i < n; i++) {
-      IOUserNetworkPacket* p = pkts[i];
+    while (ivars->txPendingNext < ivars->txPendingCount) {
+      IOUserNetworkPacket* p = ivars->txPending[ivars->txPendingNext];
       size_t off = p->getDataOff();
       uint32_t len = p->getDataLength();
       LOG_FIRST(kLogTxPacket, "first tx packet: data offset %zu, length %u", off, len);
       const uint8_t* data = reinterpret_cast<const uint8_t*>(p->getDataVirtualAddress()) + off;
-      ivars->core->transmit(data, len);
+      if (!ivars->core->transmit(data, len)) {
+        ivars->txWaitUplink = true;
+        ivars->txHolds++;
+        LOG_FIRST(kLogTxHold, "first uplink hold: every uplink buffer in flight, %u frames kept",
+                  ivars->txPendingCount - ivars->txPendingNext);
+        break;
+      }
       ivars->txDone[ivars->txDoneCount++] = p;
+      ivars->txPendingNext++;
     }
     FlushTxDone();
+    if (ivars->txWaitUplink) break;
   }
   ivars->core->flush_uplink();
   FlushRx();  // emulator replies
@@ -834,16 +862,23 @@ void RMNetDriver::OnBulkIn(const uint8_t* data, size_t len) {
   if (ivars->core->take_uplink_resumed()) DrainTx();
 }
 
+// A completed uplink transfer frees its buffer: a drain that stopped for want of one restarts.
+// Only after a success: UsbIo reports a failed transfer before it starts a stall recovery, so a
+// drain then could submit to a halted pipe; the timer tick restarts it instead.
 void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
   if (ivars->stopping || !ivars->core) return;
   ivars->core->on_bulk_out_done(slot, ok);
+  if (ok && ivars->txWaitUplink) DrainTx();
 }
 
 // The data path counters, as properties next to RMNetState, once a second when they changed.
-// RMNetPacketsHeld is what the driver holds of the pool (spare, unhanded receive packets and
-// uncompleted transmit packets); idle, it is 0 or 1 (a spare).
+// RMNetPacketsHeld is what the driver holds of the pool (spare, unhanded receive packets,
+// uncompleted transmit packets and transmit frames kept for an uplink buffer); idle, it is 0 or 1
+// (a spare). RMNetTxPending is the kept frames alone; RMNetTxHolds counts the drains that stopped
+// for want of an uplink buffer.
 void RMNetDriver::PublishCounters() {
   const DataCounters& c = ivars->core->counters();
+  uint32_t txPending = ivars->txPendingCount - ivars->txPendingNext;
   const UsbIoStats& u = ivars->usb->stats();
   uint32_t poolCount = 0;
   kern_return_t pret = ivars->pool ? ivars->pool->GetPacketCount(&poolCount) : kIOReturnNotReady;
@@ -885,9 +920,12 @@ void RMNetDriver::PublishCounters() {
       {"RMNetUsbStallClears", u.stall_clears},
       {"RMNetRxLagMaxUs", ivars->rxLagMaxUs},
       {"RMNetRxFullTransfers", u.full_reads},
-      {"RMNetPacketsHeld", uint64_t{ivars->rxOutCount} + ivars->txDoneCount + (ivars->rxSpare ? 1u : 0u)},
+      {"RMNetPacketsHeld",
+       uint64_t{ivars->rxOutCount} + ivars->txDoneCount + txPending + (ivars->rxSpare ? 1u : 0u)},
       {"RMNetPoolPacketCount", poolCount},
       {"RMNetUplinkPaused", ivars->core->uplink_paused() ? 1u : 0u},
+      {"RMNetTxHolds", ivars->txHolds},
+      {"RMNetTxPending", txPending},
   };
   bool changed = !ivars->countersPublished;
   for (uint32_t i = 0; i < kCounterCount; i++) {
@@ -974,7 +1012,7 @@ void RMNetDriver::TimerFired_Impl(OSAction*, uint64_t) {
   }
   ivars->core->data_tick(now);
   FlushRx();
-  if (ivars->txHeld || ivars->txDoneCount > 0) DrainTx();
+  if (ivars->txHeld || ivars->txWaitUplink || ivars->txDoneCount > 0) DrainTx();
   if (++ivars->ticks % kCounterTicks == 0) PublishCounters();
   ArmTimer();
 }

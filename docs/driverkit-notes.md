@@ -989,3 +989,19 @@ From installing 316.18.48 and loading it with `AT+CFUN=1,1`. Log: `build/logs/dr
 - The stream caught the old instance (316.17.49) to the end: `usb failed`, `Stop`, the stop sequence with nothing outstanding, `free`. Of the new instance it lost every line before `getMaxTransferUnit` (`init`, `Start`, the serial and MAC line, `profile 1`, `started`), although the stream was running and at the default level. Lines around a load can still be lost; evidence that must come from `Start` should also be published as a property.
 - The reworded link-up line: `link up: ipv4 1 ipv6 1, carrier mtu 1500; the interface keeps the mtu it registered with (setMaxTransferUnit(1500) 0xe00002c7)`.
 - The new instance took about 18 s (10 syncs) for the modem to answer after the reboot, then came up dual-stack in 0.5 s, as before.
+
+## Runtime findings (uplink hold, 2026-11-14)
+
+From installing 316.19.9 and loading it with `AT+CFUN=1,1`; link up about 21 s after the new instance started (`started` 03:09:55, `link up` 03:10:16 local). Log: `build/logs/driver-20261114-030928.log`. One burst with `scripts/uplink-burst.py en33` (1,500 UDP datagrams of 1,200 bytes to 192.0.2.1 port 9, sent by the stack in 0.018 s with no `ENOBUFS`).
+
+**What changed.** `CoreHost::transmit` returns false, consuming and counting nothing, when a frame needs an uplink buffer and all 8 are in flight; while bulk OUT recovers, frames are still dropped (`RMNetTxDropRecovering`). `DrainTx` then keeps the rest of its batch (`txPending`) and stops (`txWaitUplink`); the frames behind it stay in the TX submission queue. A successful bulk OUT completion (`OnBulkOutDone`) restarts the drain, and so does the timer tick; kept frames are offered first, in order. `EthernetEmulator::handle_tx` has no side effect for a `Forward` result (its IPv4 and IPv6 paths only read the frame), so a refused frame is simply offered again.
+
+**Shown.**
+- Every datagram of the burst reached the modem: `RMNetTxPackets` rose by 1,504 (46 to 1,550) and `RMNetTxBytes` by 1,842,132 (1,500 × 1,228 IP bytes plus 132), in 135 transfers (about 11 frames each). `RMNetTxDropBusy`, `RMNetTxDropUsb`, `RMNetTxDropRecovering` and `RMNetUsbBulkOutErrors` stayed 0. Before this change the same situation dropped 2,343 frames of 5,325 (Task 7, run 2).
+- `RMNetTxHolds` rose from 0 to 999: the drain stopped for want of a buffer 999 times. It counts every stop, including the ones where `TxPacketsAvailable` or a tick offered a kept frame while all buffers were still in flight, so it is much larger than the number of bursts that filled the buffers. The first hold logged `first uplink hold: every uplink buffer in flight, 5 frames kept`.
+- 1 s after the burst `RMNetTxPending` was 0 and `RMNetPacketsHeld` 0 (its idle value), and both pings worked afterwards. No crash report; `en33` first in neither `scutil --nwi` list.
+
+**Not shown.**
+- Throughput: the burst is UDP to an address that answers nothing, so it says nothing about the TCP upload rate. No upload measurement was made (data budget).
+- Holding during a link down, a fatal USB error, a stall recovery or a QMAP pause: none occurred. Those paths are as reasoned in the code (kept frames are dropped as `RMNetTxDropLinkDown` or `RMNetTxDropRecovering` on the next drain).
+- A `Stop` with frames kept: they are abandoned with the disabled queues, like other held packets.

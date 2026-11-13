@@ -11,7 +11,9 @@
 // answered on the uplink, and flow disable or enable pauses or resumes the uplink. Uplink: each
 // frame the host sends goes through the emulator; a reply (ARP, DHCP, neighbour discovery) goes
 // back to the host as a received frame, an IP packet goes into the aggregator, whose buffer is
-// sent when it is full or when the driver says the transmit queue is empty (flush_uplink).
+// sent when it is full or when the driver says the transmit queue is empty (flush_uplink). A
+// packet that finds every uplink buffer in flight is not taken (transmit returns false); the
+// driver keeps the frame and offers it again once a transfer completes.
 // No per-packet logging: counters carry it.
 #pragma once
 
@@ -55,7 +57,8 @@ struct DataCounters {
   // Uplink drops, by cause.
   uint64_t tx_drop_link_down;  // frame while the link is down
   uint64_t tx_drop_filtered;   // the emulator dropped it (multicast, broadcast, no address family)
-  uint64_t tx_drop_busy;       // all uplink buffers in flight
+  uint64_t tx_drop_busy;       // all uplink buffers in flight; nothing counts it now (such a frame
+                               // waits in the driver: transmit returns false)
   uint64_t tx_drop_recovering; // bulk OUT is recovering from a stall
   uint64_t tx_drop_too_big;    // does not fit an empty uplink buffer
   uint64_t tx_drop_usb;        // its transfer failed or could not be submitted
@@ -101,8 +104,12 @@ class CoreHost final : public rmnet::SessionDelegate {
   void data_tick(uint64_t now_ms);
   void on_bulk_in(const uint8_t* data, size_t len);
   void on_bulk_out_done(int slot, bool ok);
-  void transmit(const uint8_t* frame, size_t len);  // one frame from the host
-  void flush_uplink();                               // the transmit queue is empty
+  // One frame from the host. False only when it needs an uplink buffer and all are in flight:
+  // nothing is consumed or counted then, and offering the same frame again later gives the same
+  // result as offering it once. True in every other case (forwarded, answered, dropped and
+  // counted, link down, bulk OUT recovering).
+  bool transmit(const uint8_t* frame, size_t len);
+  void flush_uplink();  // the transmit queue is empty, or the driver stopped taking frames from it
   bool uplink_paused() const { return paused_; }
   // True once after the uplink was resumed (flow enable, or link down while paused).
   bool take_uplink_resumed();
@@ -122,9 +129,9 @@ class CoreHost final : public rmnet::SessionDelegate {
   void deliver_frame(const uint8_t* frame, size_t len);
   void send_router_advert();
   void on_command(const rmnet::QmapFrame& f);
-  void forward(const uint8_t* ip, size_t len);
+  bool forward(const uint8_t* ip, size_t len);
   bool open_uplink();
-  void count_no_uplink();
+  bool count_no_uplink();
   void send_uplink();
   void set_paused(bool paused);
 

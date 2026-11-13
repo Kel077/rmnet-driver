@@ -406,58 +406,61 @@ void CoreHost::on_bulk_out_done(int slot, bool ok) {
   slot_bytes_[slot] = 0;
 }
 
-void CoreHost::transmit(const uint8_t* frame, size_t len) {
+// handle_tx has no side effect when it answers Forward (core/src/ethernet.cpp: the IPv4 and IPv6
+// paths only read the frame and return a span into it; neither the emulator's state nor reply_
+// changes), so a frame refused for want of a buffer can be offered again with the same result.
+bool CoreHost::transmit(const uint8_t* frame, size_t len) {
   if (!data_up_) {
     counters_.tx_drop_link_down++;
-    return;
+    return true;
   }
   rmnet::TxResult r = eth_.handle_tx(frame, len, reply_, sizeof reply_);
   switch (r.action) {
     case rmnet::TxAction::Drop:
       counters_.tx_drop_filtered++;
-      return;
+      return true;
     case rmnet::TxAction::Reply:
       deliver_frame(reply_, r.reply_len);
-      return;
+      return true;
     case rmnet::TxAction::Forward:
-      forward(r.ip.data, r.ip.len);
-      return;
+      return forward(r.ip.data, r.ip.len);
   }
+  return true;
 }
 
 // Into the open uplink buffer; when it is full, it is sent and the packet goes into a new one.
-void CoreHost::forward(const uint8_t* ip, size_t len) {
+// False, with nothing added or counted, when no buffer can be opened because all are in flight;
+// the buffer sent to make room stays in flight, and the packet goes into a new one next time.
+bool CoreHost::forward(const uint8_t* ip, size_t len) {
   uint8_t mux = rmnet::SessionConfig{}.mux_id;
-  if (uplink_slot_ < 0 && !open_uplink()) {
-    count_no_uplink();
-    return;
-  }
+  if (uplink_slot_ < 0 && !open_uplink()) return count_no_uplink();
   if (!agg_.add(mux, ip, len)) {
     bool was_empty = agg_.count() == 0;
     send_uplink();
     if (was_empty) {
       counters_.tx_drop_too_big++;
-      return;
+      return true;
     }
-    if (!open_uplink()) {
-      count_no_uplink();
-      return;
-    }
+    if (!open_uplink()) return count_no_uplink();
     if (!agg_.add(mux, ip, len)) {
       counters_.tx_drop_too_big++;
-      return;
+      return true;
     }
   }
   slot_packets_[uplink_slot_]++;
   slot_bytes_[uplink_slot_] += len;
+  return true;
 }
 
-void CoreHost::count_no_uplink() {
+// No uplink buffer could be had: what transmit returns then. While bulk OUT recovers, the frame is
+// dropped and counted (true: taken). Otherwise every buffer is in flight and the frame waits for
+// one (false: not taken, nothing counted).
+bool CoreHost::count_no_uplink() {
   if (usb_.uplink_recovering()) {
     counters_.tx_drop_recovering++;
-  } else {
-    counters_.tx_drop_busy++;
+    return true;
   }
+  return false;
 }
 
 bool CoreHost::open_uplink() {
