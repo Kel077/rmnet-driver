@@ -7,6 +7,7 @@ namespace {
 constexpr uint8_t kQmuxMarker = 0x01;
 constexpr uint8_t kQmuxFlagsHost = 0x00;
 constexpr size_t kQmuxLengthOffset = 1;  // u16le after the marker, counting itself onward
+constexpr size_t kQmuxHeaderLen = 5;     // what the length counts first: length, flags, service, client
 constexpr uint8_t kTlvResult = 0x02;     // libqmi: "Result"
 
 // Wire values of the QMI header's kind byte.
@@ -52,6 +53,16 @@ bool next_tlv(Reader* r, uint8_t* type, Span* value) {
 }
 
 }  // namespace
+
+size_t qmi_frame_length(Span buf) {
+  Reader r(buf.data, buf.len);
+  uint8_t marker = r.u8();
+  uint16_t qmux_len = r.u16le();  // counts itself and everything after it
+  if (!r.ok() || marker != kQmuxMarker || qmux_len < kQmuxHeaderLen || buf.len - 1 < qmux_len) {
+    return 0;
+  }
+  return 1 + static_cast<size_t>(qmux_len);
+}
 
 bool qmi_decode(Span frame, QmiMessage* out) {
   Reader r(frame.data, frame.len);

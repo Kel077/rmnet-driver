@@ -1,5 +1,7 @@
 #include "usb_transport.h"
 
+#include "rmnet/qmi.h"
+
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/usb/IOUSBHostFamilyDefinitions.h>
@@ -202,17 +204,14 @@ struct UsbTransport::Impl {
     return true;
   }
 
-  // Delivers each QMUX frame of a response separately. A frame is 0x01 then a u16le length of
-  // everything after the marker. Bytes that do not parse as a frame go out as one message.
+  // Delivers each QMUX frame of a response separately. Bytes that do not start with a complete
+  // frame go out as one message.
   void deliver_messages(const std::vector<uint8_t>& r) {
     size_t off = 0;
     while (off < r.size() && on_message && !closed) {
       size_t rest = r.size() - off;
-      size_t n = rest;
-      if (rest >= 3 && r[off] == 0x01) {
-        size_t frame = 1 + (size_t)(r[off + 1] | (r[off + 2] << 8));
-        if (frame >= 3 && frame <= rest) n = frame;
-      }
+      size_t n = rmnet::qmi_frame_length({r.data() + off, rest});
+      if (n == 0) n = rest;
       on_message(r.data() + off, n);
       off += n;
     }

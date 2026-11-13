@@ -36,6 +36,11 @@ struct QmiMessage {
   Span tlvs;  // points into the decoded frame
 };
 
+// Total length of the QMUX frame at the start of buf (1 + its declared length), or 0 if buf does not
+// start with a complete frame. Checks only the marker, that the declared length covers the QMUX
+// header, and that buf holds the whole frame; qmi_decode checks the rest.
+size_t qmi_frame_length(Span buf);
+
 // Decodes one QMUX frame. Returns false if the frame is malformed, shorter than its length
 // field says, or its TLV chain does not exactly fill the TLV length. Bytes after the length
 // the frame declares are ignored.

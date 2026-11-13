@@ -27,6 +27,15 @@ TEST(decode_rejects_truncated) {
   auto h = f; h[13] = 0x09; CHECK(!rmnet::qmi_decode({h.data(), h.size()}, &m));  // TLV length 9 overruns
   CHECK(!rmnet::qmi_decode({f.data(), 3}, &m));
 }
+TEST(frame_length_splits_a_read) {
+  auto a = hex(kCtlSyncResp), b = hex(kWdsConnected4Ind);
+  std::vector<uint8_t> both(a); both.insert(both.end(), b.begin(), b.end());
+  CHECK_EQ(rmnet::qmi_frame_length({both.data(), both.size()}), a.size());
+  CHECK_EQ(rmnet::qmi_frame_length({both.data() + a.size(), both.size() - a.size()}), b.size());
+  CHECK_EQ(rmnet::qmi_frame_length({a.data(), a.size() - 1}), 0u);
+  CHECK_EQ(rmnet::qmi_frame_length({a.data(), 2}), 0u);
+  auto bad = a; bad[0] = 0x02; CHECK_EQ(rmnet::qmi_frame_length({bad.data(), bad.size()}), 0u);
+}
 TEST(build_matches_capture_ctl) {
   uint8_t buf[64]; uint8_t svc = 0x1a;
   rmnet::QmiBuilder b(buf, sizeof buf, {rmnet::QmiService::CTL, 0, rmnet::QmiKind::Request, 2, 0x0022});
