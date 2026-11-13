@@ -29,7 +29,7 @@
 #
 # The cellular data is metered. Every run appends "time direction bytes-in bytes-out" to the usage
 # file (build/installed/measure-usage.log, which `make clean` keeps; MEASURE_USAGE_FILE overrides
-# it), also when it fails or is interrupted. If the counters cannot be read at the end, the run is
+# it on lo0 only), also when it fails or is interrupted. If the counters cannot be read at the end, the run is
 # charged at least its reservation in the measured direction. A run refuses to start (exit 2) if a
 # line of the usage file is not "<time> <down|up> <bytes in> <bytes out>" with non-negative whole
 # numbers, or if the recorded total plus this run's reservation (its stop threshold plus 10,000,000
@@ -38,7 +38,9 @@
 # measured direction (curl did not go through it).
 #
 # For testing with no network: MEASURE_TEST_PORT=<port> sends every transfer to 127.0.0.1:<port>
-# over plain HTTP (use it with the interface lo0), and MEASURE_NETSTAT=<program> replaces netstat.
+# over plain HTTP, MEASURE_NETSTAT=<program> replaces netstat, and MEASURE_USAGE_FILE=<file> replaces
+# the usage file. Each is accepted only with the interface lo0 (any other interface: exit 2 before
+# anything is touched), and the script prints a line naming each one that is active.
 set -u
 
 cd "$(dirname "$0")/.." || exit 1
@@ -122,6 +124,18 @@ case $DIR in
   up) STOP_BYTES=10000000 STOP_SECS=6 URL="$SCHEME://$HOST:$PORT/api/v1/gm/slurp" ;;
   *) die "direction must be down or up" ;;
 esac
+
+# The test settings change where the bytes are counted, sent or recorded, so they are refused on any
+# interface but lo0, before the usage file is touched or anything is sent.
+for v in MEASURE_NETSTAT MEASURE_TEST_PORT MEASURE_USAGE_FILE; do
+  eval "val=\${$v:-}"
+  [ -n "$val" ] || continue
+  if [ "$IFACE" != lo0 ]; then
+    echo "measure: REFUSED: $v is set ($v=$val); test settings are accepted only with the interface lo0" >&2
+    exit 2
+  fi
+  echo "test setting:     $v=$val"
+done
 
 # "bytes-in bytes-out" of the interface, from its link-level line. Counted from the end of the line
 # (Ibytes Opkts Oerrs Obytes Coll), because an interface with no link address (lo0) has no Address column.
