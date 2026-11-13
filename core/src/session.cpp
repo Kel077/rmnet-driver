@@ -43,6 +43,11 @@ Session::Session(const SessionConfig& cfg, SessionDelegate& delegate)
       current_(0),
       link_is_up_(false),
       link_(),
+      retry_due_(false),
+      retrying_(false),
+      retry_from_ms_(0),
+      retry_wait_ms_(0),
+      next_retry_wait_ms_(kFamilyRetryFirstMs),
       buf_() {}
 
 SessionState Session::state() const { return state_; }
@@ -55,6 +60,7 @@ void Session::start(uint64_t now_ms) {
 void Session::stop() {
   if (state_ == SessionState::Idle) return;
   pending_.active = false;
+  cancel_retry();
   state_ = SessionState::Idle;
   if (link_is_up_) {
     link_is_up_ = false;
@@ -66,7 +72,16 @@ void Session::stop() {
 void Session::tick(uint64_t now_ms) {
   switch (state_) {
     case SessionState::Idle:
+      return;
     case SessionState::Up:
+      if (retrying_) {
+        if (pending_.active && elapsed(now_ms, pending_.sent_ms) >= pending_.timeout_ms) {
+          pending_.active = false;
+          retry_done(now_ms);
+        }
+      } else if (retry_due_ && elapsed(now_ms, retry_from_ms_) >= retry_wait_ms_) {
+        begin_retry(now_ms);
+      }
       return;
     case SessionState::Backoff:
       if (elapsed(now_ms, backoff_started_ms_) >= backoff_wait_ms_) begin_sync(now_ms);
@@ -167,11 +182,7 @@ void Session::on_response(const QmiMessage& m, uint64_t now_ms) {
         family_done(now_ms);
         return;
       }
-      uint16_t tx = next_txid();
-      size_t n = build_wds_start_network(buf_, sizeof buf_, fam.client, tx, cfg_.profile,
-                                         kFamilyValues[current_]);
-      expect(Step::Start, QmiService::WDS, fam.client, tx, kWdsStartNetwork, n, now_ms,
-             kStartNetworkTimeoutMs);
+      send_start(now_ms);
       return;
     }
     case Step::Start: {
@@ -246,6 +257,14 @@ void Session::on_indication(const QmiMessage& m, uint64_t now_ms) {
     enter_backoff(now_ms);
   } else if (status.status == kStatusConnected && status.reconfigure &&
              state_ == SessionState::Up) {
+    if (retrying_) {
+      // The refresh takes over the one outstanding request. The abandoned retry is due again as
+      // soon as the session is back Up, with the same next wait.
+      retrying_ = false;
+      retry_due_ = true;
+      retry_from_ms_ = now_ms;
+      retry_wait_ms_ = 0;
+    }
     link_is_up_ = false;
     state_ = SessionState::Refreshing;
     current_ = index;
@@ -304,6 +323,15 @@ void Session::begin_family(uint8_t index, uint64_t now_ms) {
          kRequestTimeoutMs);
 }
 
+void Session::send_start(uint64_t now_ms) {
+  const Family& fam = families_[current_];
+  uint16_t tx = next_txid();
+  size_t n = build_wds_start_network(buf_, sizeof buf_, fam.client, tx, cfg_.profile,
+                                     kFamilyValues[current_]);
+  expect(Step::Start, QmiService::WDS, fam.client, tx, kWdsStartNetwork, n, now_ms,
+         kStartNetworkTimeoutMs);
+}
+
 void Session::send_settings(uint64_t now_ms) {
   if (state_ == SessionState::Idle) return;
   const Family& fam = families_[current_];
@@ -314,8 +342,12 @@ void Session::send_settings(uint64_t now_ms) {
 }
 
 // The current family is finished, with or without settings. A failed family keeps its client
-// (and any handle) until teardown releases them.
+// (and any handle) until teardown releases them. During a retry, the retry is finished instead.
 void Session::family_done(uint64_t now_ms) {
+  if (retrying_) {
+    retry_done(now_ms);
+    return;
+  }
   if (current_ == 0) {
     begin_family(1, now_ms);
     return;
@@ -324,7 +356,52 @@ void Session::family_done(uint64_t now_ms) {
     enter_backoff(now_ms);
     return;
   }
+  next_retry_wait_ms_ = kFamilyRetryFirstMs;
+  schedule_retry(now_ms);
   finish_bring_up();
+}
+
+// Schedules a retry of the missing family, if one is missing, with the next wait.
+void Session::schedule_retry(uint64_t now_ms) {
+  retry_due_ = !family_has_settings(0) || !family_has_settings(1);
+  if (!retry_due_) return;
+  retry_from_ms_ = now_ms;
+  retry_wait_ms_ = next_retry_wait_ms_;
+  next_retry_wait_ms_ = next_retry_wait_ms_ >= kFamilyRetryMaxMs / 2 ? kFamilyRetryMaxMs
+                                                                       : next_retry_wait_ms_ * 2;
+}
+
+// Up, with the link carried by one family: starts bringing up the other. A family that kept its
+// client from bring-up goes straight to Start Network.
+void Session::begin_retry(uint64_t now_ms) {
+  retry_due_ = false;
+  retrying_ = true;
+  current_ = family_has_settings(0) ? 1 : 0;
+  if (families_[current_].has_client) {
+    send_start(now_ms);
+    return;
+  }
+  uint8_t tx = next_ctl_txid();
+  size_t n = build_ctl_get_client_id(buf_, sizeof buf_, tx, QmiService::WDS);
+  expect(Step::GetWdsClient, QmiService::CTL, 0, tx, kCtlGetClientId, n, now_ms,
+         kRequestTimeoutMs);
+}
+
+// The retry finished, answered or timed out. With settings for the family, the link gains it and
+// stays up; otherwise the next retry is scheduled and nothing else changes.
+void Session::retry_done(uint64_t now_ms) {
+  retrying_ = false;
+  if (family_has_settings(current_)) {
+    retry_due_ = false;
+    delegate_.link_up(link_);
+    return;
+  }
+  schedule_retry(now_ms);
+}
+
+void Session::cancel_retry() {
+  retry_due_ = false;
+  retrying_ = false;
 }
 
 void Session::finish_bring_up() {
@@ -336,6 +413,7 @@ void Session::finish_bring_up() {
 
 void Session::enter_backoff(uint64_t now_ms) {
   pending_.active = false;
+  cancel_retry();
   state_ = SessionState::Backoff;
   backoff_started_ms_ = now_ms;
   backoff_wait_ms_ = next_backoff_ms_;

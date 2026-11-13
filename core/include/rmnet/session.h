@@ -8,6 +8,12 @@
 // Data Format; then for IPv4 and then IPv6: CTL Get Client ID for WDS, WDS Bind Mux Data Port,
 // Set IP Family, Start Network, Get Current Settings. link_up() follows the last family if at
 // least one family has settings. Failures and timeouts go to Backoff, which redials from Sync.
+//
+// Up with one family missing, the session retries that family while the link stays up:
+// kFamilyRetryFirstMs after link_up(), then after each failed or timed-out retry a wait twice the
+// last, capped at kFamilyRetryMaxMs. A retry reuses the family's WDS client (Start Network, Get
+// Current Settings), or, if it has none, starts from Get Client ID. A retry due while Refreshing
+// waits until the session is Up again.
 #pragma once
 
 #include <stddef.h>
@@ -34,6 +40,9 @@ struct LinkConfig {
 // transition when it calls out. To stop from a callback, record the wish and call stop() after
 // the session call returns. (As a safeguard, a session stopped from inside link_down() stays
 // Idle, but nothing else about re-entry is defined.)
+//
+// link_up() can be called again while the link is up, without link_down() between: the settings
+// gained a family that a retry brought up, and cfg holds both families.
 class SessionDelegate {
  public:
   virtual void send_qmi(const uint8_t* data, size_t len) = 0;
@@ -52,6 +61,8 @@ enum : uint32_t {
   kRequestTimeoutMs = 10000,
   kStartNetworkTimeoutMs = 60000,
 };
+
+enum : uint32_t { kFamilyRetryFirstMs = 5000, kFamilyRetryMaxMs = 60000 };   // 5 s, 10 s, 20 s, 40 s, then 60 s
 
 class Session {
  public:
@@ -98,8 +109,13 @@ class Session {
   void begin_sync(uint64_t now_ms);
   void send_sync(uint64_t now_ms);
   void begin_family(uint8_t index, uint64_t now_ms);
+  void send_start(uint64_t now_ms);
   void send_settings(uint64_t now_ms);
   void family_done(uint64_t now_ms);
+  void schedule_retry(uint64_t now_ms);
+  void begin_retry(uint64_t now_ms);
+  void retry_done(uint64_t now_ms);
+  void cancel_retry();
   void finish_bring_up();
   void enter_backoff(uint64_t now_ms);
   void teardown();
@@ -126,6 +142,12 @@ class Session {
   uint8_t current_;  // family being brought up or refreshed
   bool link_is_up_;  // link_up() was reported and link_down() has not followed
   LinkConfig link_;
+  // Retrying the missing family while Up. At most one of retry_due_ and retrying_ is true.
+  bool retry_due_;               // a retry starts once retry_wait_ms_ has passed since retry_from_ms_
+  bool retrying_;                // a retry request is outstanding; current_ is the missing family
+  uint64_t retry_from_ms_;
+  uint32_t retry_wait_ms_;
+  uint32_t next_retry_wait_ms_;  // the wait after the next failed retry
   uint8_t buf_[128];  // every request the session builds fits
 };
 

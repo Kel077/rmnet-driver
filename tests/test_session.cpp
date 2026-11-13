@@ -101,6 +101,18 @@ std::vector<uint8_t> settings4_response_with_txid(uint16_t txid) {
   return with_txid(kWdsSettings4Resp, txid);
 }
 
+std::vector<uint8_t> start6_response_with_txid(uint16_t txid) { return with_txid(kWdsStart6Resp, txid); }
+
+std::vector<uint8_t> settings6_response_with_txid(uint16_t txid) {
+  return with_txid(kWdsSettings6Resp, txid);
+}
+
+// Replays the capture so IPv4 comes up, then fails the IPv6 Start Network at `time`.
+void bring_up_v4_only(rmnet::Session& s, FakeModem& m, uint64_t time) {
+  bring_up_to(s, m, kWdsFamily6Resp);
+  feed_frame(s, failed_start_frame(16, m.last_txid()), time);
+}
+
 }  // namespace
 
 TEST(happy_path_brings_link_up_dual_stack) {
@@ -253,4 +265,47 @@ TEST(disconnect_from_failed_family_leaves_link_up) {
   CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0);
   feed(s, kWdsDisconnected4Ind, 5001);
   CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(m.downs, 1);
+}
+
+TEST(missing_family_is_retried_while_up) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_v4_only(s, m, 100);          // helper: IPv6 Start Network fails at time 100
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1);
+  size_t sent = m.sent.size();
+  s.tick(5099); CHECK_EQ(m.sent.size(), sent);
+  s.tick(5100); CHECK_EQ(m.sent.size(), sent + 1);
+  CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0x20);                     // Start Network on the IPv6 client
+  feed_frame(s, start6_response_with_txid(m.last_txid()), 5200);
+  CHECK_EQ(m.last()[9], 0x2d);                                                // Get Current Settings
+  feed_frame(s, settings6_response_with_txid(m.last_txid()), 5300);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2); CHECK_EQ(m.downs, 0);
+  CHECK(m.cfg.settings.has_v4); CHECK(m.cfg.settings.has_v6);
+  sent = m.sent.size(); s.tick(200000); CHECK_EQ(m.sent.size(), sent);        // nothing left to retry
+}
+
+TEST(failed_retry_keeps_link_up_and_backs_off) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_v4_only(s, m, 100);
+  const uint64_t at[] = {5100, 15200, 35300, 75400, 135500, 195600};          // waits of 5, 10, 20, 40, 60, 60 s after each failure
+  for (uint64_t t : at) {
+    size_t sent = m.sent.size();
+    s.tick(t - 1); CHECK_EQ(m.sent.size(), sent);
+    s.tick(t);     CHECK_EQ(m.sent.size(), sent + 1);
+    feed_frame(s, failed_start_frame(16, m.last_txid()), t + 100);
+    CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0); CHECK_EQ(m.ups, 1);
+  }
+}
+
+TEST(retry_timeout_keeps_link_up) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_v4_only(s, m, 100);
+  s.tick(5100); size_t sent = m.sent.size();
+  s.tick(65099); CHECK(s.state() == rmnet::SessionState::Up);
+  s.tick(65100); CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0);   // Start Network timed out
+  CHECK_EQ(m.sent.size(), sent);
+  s.tick(75100); CHECK_EQ(m.sent.size(), sent + 1);                           // next retry 10 s after the timeout
+}
+
+TEST(live_family_drop_during_retry_goes_to_backoff) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_v4_only(s, m, 100);
+  s.tick(5100);
+  feed(s, kWdsDisconnected4Ind, 5200);
+  CHECK_EQ(m.downs, 1); CHECK(s.state() == rmnet::SessionState::Backoff);
 }
