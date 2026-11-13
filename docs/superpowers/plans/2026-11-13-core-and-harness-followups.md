@@ -97,6 +97,17 @@ Small hardening left open:
 - `measure.sh`: an empty usage file is accepted as 0.
 - `measure.sh`: a loopback run charges the real usage file unless `MEASURE_USAGE_FILE` is set.
 
+### Left by the re-review of the final fix wave
+
+There was one fix wave, so these four wording errors are still in the tree at `67d40c9`. None changes behaviour.
+
+- `README.md:18` says the link is reported up "as soon as one family has its settings". Core reports link up only after both families have been attempted, IPv4 then IPv6, and at least one has settings (`core/src/session.cpp:364-374`).
+- `README.md:23` says every run of `scripts/measure.sh`, "also a failed or interrupted one", appends a usage line. A run killed with SIGKILL leaves none.
+- `scripts/install-driver.sh:40` prints "stopping before anything is changed" on both reads of the driver listing. On the second read, after `activate`, the app has already been replaced and activated.
+- `driver/RMNetDriver.cpp:578` logs "the interface keeps the mtu it registered with" unconditionally. That is true today because `setMaxTransferUnit` returns Unsupported; it would be wrong if that call ever succeeded.
+
+Also open from that wave: the driver now reads `RMNetProfile` and passes it to Core, but this is proven only by reading the code. The published value is 1, which is also the fallback, and the log line that names the profile in use was lost by the log stream. Proving the read needs one install with a different value in `driver/Info.plist`.
+
 ## Observed on the modem
 
 - Each downlink packet arrived in its own USB transfer, followed by a separate 4-byte all-zero transfer.
