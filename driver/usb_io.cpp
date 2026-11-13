@@ -69,16 +69,18 @@ UsbIo::UsbIo(UsbIoListener& listener)
       drain_reads_(0),
       drain_again_(false),
       intr_failures_(0),
-      stopping_(false),
+      phase_(Phase::Running),
       failed_(false),
-      released_(false) {}
+      send_failed_(false),
+      sent_at_stop_(0),
+      dropped_at_stop_(0) {}
 
 UsbIo::~UsbIo() {
   if (opened_) {
     intf_->Close(owner_, 0);
     opened_ = false;
   }
-  if (!released_ && outstanding() > 0) LOG("usb freed with %u requests outstanding", outstanding());
+  if (phase_ != Phase::Released && outstanding() > 0) LOG("usb freed with %u requests outstanding", outstanding());
   release();
 }
 
@@ -186,7 +188,7 @@ bool UsbIo::send(const uint8_t* data, size_t len) {
 }
 
 bool UsbIo::queue(uint8_t request, uint16_t value, const uint8_t* data, size_t len) {
-  if (stopping_ || !opened_) return false;
+  if (phase_ != Phase::Running || !opened_) return false;
   if (len > kSlotSize) {
     LOG("control message of %zu bytes dropped: longer than %u", len, (unsigned)kSlotSize);
     return false;
@@ -204,9 +206,10 @@ bool UsbIo::queue(uint8_t request, uint16_t value, const uint8_t* data, size_t l
 }
 
 // Sends the oldest queued message unless one is already in flight. A message that cannot be
-// submitted is dropped (the session's timeout recovers), and the next one is tried.
+// submitted is dropped (the session's timeout recovers), and the next one is tried; while
+// draining at stop, a failure ends the drain instead (abort drops the rest).
 void UsbIo::submit_next() {
-  while (!out_busy_ && count_ > 0 && !stopping_) {
+  while (!out_busy_ && count_ > 0 && (phase_ == Phase::Running || phase_ == Phase::Draining)) {
     uint32_t i = head_;
     const Slot& s = slots_[i];
     kern_return_t ret = kIOReturnSuccess;
@@ -222,6 +225,11 @@ void UsbIo::submit_next() {
     LOG("control request 0x%02x not submitted: 0x%x", s.request, ret);
     head_ = (head_ + 1) % kRingSlots;
     count_--;
+    if (phase_ == Phase::Draining) {
+      dropped_at_stop_++;
+      send_failed_ = true;
+      return;
+    }
   }
 }
 
@@ -231,12 +239,20 @@ void UsbIo::control_out_complete(IOReturn status, uint32_t) {
     uint8_t request = slots_[head_].request;
     head_ = (head_ + 1) % kRingSlots;
     count_--;
-    if (status != kIOReturnSuccess && !stopping_) LOG("control request 0x%02x failed: 0x%x", request, status);
+    if (status != kIOReturnSuccess && phase_ != Phase::Aborted) LOG("control request 0x%02x failed: 0x%x", request, status);
+    if (phase_ == Phase::Draining) {
+      if (status == kIOReturnSuccess) {
+        sent_at_stop_++;
+      } else {
+        dropped_at_stop_++;
+        send_failed_ = true;
+      }
+    } else if (phase_ == Phase::Aborted) {
+      if (status == kIOReturnSuccess) sent_at_stop_++;
+      else dropped_at_stop_++;
+    }
   }
-  if (stopping_) {
-    release_if_idle();
-    return;
-  }
+  if (phase_ == Phase::Draining && send_failed_) return;
   submit_next();
 }
 
@@ -248,10 +264,7 @@ kern_return_t UsbIo::post_interrupt() {
 
 void UsbIo::interrupt_complete(IOReturn status, uint32_t bytes) {
   intr_busy_ = false;
-  if (stopping_) {
-    release_if_idle();
-    return;
-  }
+  if (phase_ != Phase::Running) return;  // not re-posted while stopping
   if (status != kIOReturnSuccess) {
     intr_failures_++;
     LOG("interrupt read failed: 0x%x (%u in a row)", status, intr_failures_);
@@ -285,7 +298,7 @@ void UsbIo::begin_drain() {
 }
 
 void UsbIo::post_response_read() {
-  if (stopping_) return;
+  if (phase_ != Phase::Running) return;
   kern_return_t ret = intf_->AsyncDeviceRequest(kInterfaceToHostClass, kGetEncapsulatedResponse, 0, iface_number_,
                                                 kResponseSize, in_buf_, in_action_, kControlTimeoutMs);
   if (ret != kIOReturnSuccess) {
@@ -298,13 +311,10 @@ void UsbIo::post_response_read() {
 
 void UsbIo::control_in_complete(IOReturn status, uint32_t bytes) {
   in_busy_ = false;
-  if (stopping_) {
-    release_if_idle();
-    return;
-  }
+  if (phase_ != Phase::Running) return;  // Core is not called once stopping
   if (status == kIOReturnSuccess && bytes > 0) {
     deliver(bytes);
-    if (stopping_) return;
+    if (phase_ != Phase::Running) return;
     if (drain_reads_ < kMaxDrain) {
       post_response_read();
       return;
@@ -329,7 +339,7 @@ void UsbIo::deliver(uint32_t bytes) {
     size_t n = rmnet::qmi_frame_length(rmnet::Span{in_addr_ + off, bytes - off});
     if (n == 0) break;
     listener_.on_control(in_addr_ + off, n);
-    if (stopping_) return;
+    if (phase_ != Phase::Running) return;
     off += n;
   }
   if (off < bytes) LOG("discarded %zu bytes of a %u-byte response", bytes - off, bytes);
@@ -341,32 +351,42 @@ void UsbIo::fail(const char* what) {
   listener_.on_fatal(what);
 }
 
+void UsbIo::finish_sending() {
+  if (phase_ == Phase::Running) phase_ = Phase::Draining;
+}
+
+bool UsbIo::sending_done() const { return count_ == 0 || send_failed_ || !opened_; }
+
 void UsbIo::abort() {
-  if (stopping_) return;
-  stopping_ = true;
-  // Messages queued behind the one in flight are dropped; its completion pops it.
-  count_ = out_busy_ ? 1 : 0;
+  if (phase_ == Phase::Aborted || phase_ == Phase::Released) return;
+  phase_ = Phase::Aborted;
+  // Messages queued behind the one in flight are dropped; the in-flight one is counted when its
+  // completion pops it.
+  uint32_t waiting = out_busy_ ? count_ - 1 : count_;
+  dropped_at_stop_ += waiting;
+  count_ -= waiting;
   if (opened_) {
     if (intr_in_) intr_in_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, owner_);
     if (bulk_in_) bulk_in_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, owner_);
     if (bulk_out_) bulk_out_->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, owner_);
     intf_->AbortDeviceRequests(kIOUSBAbortAsynchronous, kIOReturnAborted);
+  }
+}
+
+void UsbIo::close() {
+  if (opened_) {
     intf_->Close(owner_, 0);
     opened_ = false;
   }
-  LOG("usb aborted, %u requests outstanding", outstanding());
-  release_if_idle();
 }
 
-void UsbIo::release_if_idle() {
-  if (stopping_ && outstanding() == 0 && !released_) {
-    release();
-    LOG("usb objects released");
-  }
+void UsbIo::close_and_release() {
+  close();
+  release();
 }
 
 void UsbIo::release() {
-  released_ = true;
+  phase_ = Phase::Released;
   OSSafeReleaseNULL(bulk_in_);
   OSSafeReleaseNULL(bulk_out_);
   OSSafeReleaseNULL(intr_in_);

@@ -60,7 +60,9 @@ public:
     kern_return_t CreateInterface(const uint8_t * hostMac) LOCALONLY;
     kern_return_t StartTimer() LOCALONLY;
     void ArmTimer() LOCALONLY;
-    void TearDown() LOCALONLY;
+    void TearDown(IOService * provider) LOCALONLY;
+    void AdvanceStop() LOCALONLY;
+    void FinishStop() LOCALONLY;
     void OnControl(const uint8_t * data, size_t len) LOCALONLY;
     void OnUsbFatal(const char * what) LOCALONLY;
     void ApplyCore() LOCALONLY;

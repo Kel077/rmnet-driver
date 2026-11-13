@@ -56,9 +56,23 @@ class UsbIo {
   // Queues one SEND_ENCAPSULATED_COMMAND; messages go out one at a time, in order. False if the
   // message is too long, the ring is full, or UsbIo is stopping.
   bool send(const uint8_t* data, size_t len);
-  // Stops: aborts the pipes and the control requests and closes the interface. USB objects are
-  // released once every aborted completion has arrived (at once if none is outstanding).
+  // Stopping, in three calls made by the owner (docs/driverkit-notes.md 3.9):
+  // finish_sending: no new messages are accepted, reads are no longer re-posted or delivered, and
+  // the messages already queued keep going out in order. sending_done() says when the ring is
+  // empty or a request failed (the device is gone).
+  void finish_sending();
+  bool sending_done() const;
+  // abort: drops what is still queued, aborts the pipes and the control requests. The owner then
+  // waits until outstanding() is 0 (its completions keep arriving through the *_complete methods).
   void abort();
+  // close_and_release: closes the interface and releases every USB object and action.
+  void close_and_release();
+  // close: closes the interface only, when the owner gives up waiting for aborted requests; the
+  // objects are then released by the destructor.
+  void close();
+  uint32_t queued() const { return count_; }  // messages in the ring, the one in flight included
+  uint32_t sent_at_stop() const { return sent_at_stop_; }
+  uint32_t dropped_at_stop() const { return dropped_at_stop_; }
 
   // Completions, forwarded by the driver.
   void interrupt_complete(IOReturn status, uint32_t bytes);
@@ -85,7 +99,6 @@ class UsbIo {
   void end_drain();
   void deliver(uint32_t bytes);
   void fail(const char* what);
-  void release_if_idle();
   void release();
 
   UsbIoListener& listener_;
@@ -115,7 +128,10 @@ class UsbIo {
   uint32_t drain_reads_;  // response reads in the current drain
   bool drain_again_;      // a notification arrived during the drain
   uint32_t intr_failures_;
-  bool stopping_;
+  enum class Phase : uint8_t { Running, Draining, Aborted, Released };
+  Phase phase_;
   bool failed_;
-  bool released_;
+  bool send_failed_;         // a control request failed while draining
+  uint32_t sent_at_stop_;    // messages sent after finish_sending
+  uint32_t dropped_at_stop_; // messages not sent after finish_sending
 };

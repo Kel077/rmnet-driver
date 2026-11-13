@@ -671,6 +671,13 @@ On any failure: `Stop(provider, SUPERDISPATCH)` and return the error. **[runtime
 
 **[runtime]** Completions arriving after step 8 would touch released actions and buffers. The safer pattern is to release USB objects in `free()`, or after the last aborted completion has been counted.
 
+**As built (Task 5, fix round 1): `Stop` is asynchronous.** `IOService.iig` says "Stop should quiesce all activity and when complete, pass the call to super. After calling super ... this object will likely be freed." So `Stop_Impl` starts the sequence and returns without calling the superclass; `Stop(provider, SUPERDISPATCH)` is called later, on the Default queue, with the provider retained until then. A failed `Start` uses the same path.
+1. `stopping`; `session.stop()` queues its releases; report inactive; disable the queues. Core is not called again; reads are no longer re-posted or delivered.
+2. Drain: the control ring keeps sending, one request at a time, until it is empty, a request fails (the device is gone), or **1 s after `Stop` began**.
+3. Abort the three pipes and the control requests (`kIOUSBAbortAsynchronous`); wait until no request is outstanding, **at most 1 s**.
+4. `Close`, release the USB objects and actions, cancel the timer, then `Stop(provider, SUPERDISPATCH)`. If requests are still outstanding after the second second, the driver logs the count, closes the interface, and passes `Stop` on anyway (the objects are then released in `free()`): a termination that never completes is worse.
+Both deadlines are timed by the driver's 100 ms timer, which keeps running until step 4; each USB completion also advances the sequence at once.
+
 ---
 
 ## 4. Packaging
@@ -869,6 +876,7 @@ From installing 316.16.36, 316.16.40 and 316.16.41 and rebooting the modem with 
 - `setMaxTransferUnit` still returns `kIOReturnUnsupported` (0xe00002c7) after link up; the carrier MTU was 1500 in every run, so the interface MTU stays 1500 from `getMaxTransferUnit`.
 
 **Stopping**
+- `Stop` is asynchronous (section 3.9, "As built"): drain the control ring for up to 1 s, abort, wait up to 1 s for the aborted requests, then release and pass `Stop` to the superclass. The fix-round evidence is in the next bullets and the Task 5 report.
 - On a modem reboot `Stop` arrived with no USB request outstanding (the failures had already completed): "usb aborted, 0 requests outstanding", "usb objects released", `free`. No crash report. Releasing after aborted completions that are still in flight has therefore not been seen yet.
 - `Start` decisions: a failed `reportLinkStatus` or `SetProperties` is logged and does not fail `Start`. The link status is reported again whenever the stack enables the interface (and a status reported in `Start` is lost anyway); the properties are only for the app. Every other failure in `Start` tears down and fails it.
 

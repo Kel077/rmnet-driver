@@ -39,6 +39,8 @@ constexpr uint32_t kMinMtu = 576;
 constexpr uint32_t kTxBatch = 32;
 constexpr uint64_t kTickNs = 100 * 1000000ull;
 constexpr uint64_t kTickLeewayNs = 10 * 1000000ull;
+constexpr uint64_t kStopDrainMs = 1000;  // the control ring may take this long to send at Stop
+constexpr uint64_t kStopAbortMs = 1000;  // and the aborted requests this long to come back
 
 // One bit per override and handler, set the first time it runs.
 enum : uint32_t {
@@ -156,6 +158,12 @@ struct RMNetDriver_IVars {
   UsbIo* usb;       // released objects only once its aborted completions have arrived
   CoreHost* core;
   bool stopping;
+  // The stop sequence (TearDown, AdvanceStop): Draining sends what the session queued, Aborting
+  // waits for the aborted requests, Done has passed Stop to the superclass.
+  enum StopPhase : uint8_t { kStopNone, kStopDraining, kStopAborting, kStopDone } stopPhase;
+  IOService* stopProvider;  // retained from TearDown until Stop is passed to the superclass
+  uint64_t stopStartMs;
+  uint64_t abortStartMs;
   bool usbFailed;
   bool linkActive;  // the link status last reported to the stack
   uint32_t mtu;     // what getMaxTransferUnit answers
@@ -249,8 +257,7 @@ kern_return_t RMNetDriver::Start_Impl(IOService* provider) {
   }
   if (ret != kIOReturnSuccess) {
     LOG("Start failed 0x%x", ret);
-    TearDown();
-    Stop(provider, SUPERDISPATCH);
+    TearDown(provider);  // passes Stop to the superclass, at once or once USB has quiesced
     return ret;
   }
   LOG("started");
@@ -343,30 +350,85 @@ void RMNetDriver::ArmTimer() {
   if (ret != kIOReturnSuccess) LOG("timer not armed: 0x%x", ret);
 }
 
-// Quiesces everything, in the order of docs/driverkit-notes.md 3.9: the session first, while USB
-// is still open (it sends releases), then the timer, the link, the queues, and USB. UsbIo releases
-// its objects once the aborted completions have arrived; the rest is released in free().
-void RMNetDriver::TearDown() {
+// The stop sequence, shared by Stop and a failed Start (docs/driverkit-notes.md 3.9):
+// 1. stopping; the session stops and queues its releases; the link is reported inactive and the
+//    queues are disabled. Core is not called again.
+// 2. Draining: the control ring keeps sending, until it is empty, a request fails, or
+//    kStopDrainMs after the start.
+// 3. Aborting: the pipes and control requests are aborted; wait until none is outstanding, or
+//    kStopAbortMs.
+// 4. Close the interface, release the USB objects, pass Stop to the superclass.
+// Nothing blocks: AdvanceStop runs after every USB completion and on every timer tick (the timer
+// is kept running until step 4 and is the clock for both deadlines). Stop always finishes: past
+// the second deadline it is passed on with requests still outstanding, and that is logged.
+void RMNetDriver::TearDown(IOService* provider) {
   if (ivars->stopping) return;
   ivars->stopping = true;
+  ivars->stopProvider = provider;
+  provider->retain();
+  ivars->stopStartMs = NowMs();
   if (ivars->core) {
     ivars->core->stop();
     ivars->core->take_link_change();
   }
-  if (ivars->timer) ivars->timer->Cancel(^{});
+  if (ivars->usb) LOG("stop: %u control messages queued", ivars->usb->queued());
   ivars->linkActive = false;
   if (ivars->txSubmit) ReportLink();
   if (ivars->txSubmit) ivars->txSubmit->setEnable(false);
   if (ivars->txComplete) ivars->txComplete->setEnable(false);
   if (ivars->rxSubmit) ivars->rxSubmit->setEnable(false);
   if (ivars->rxComplete) ivars->rxComplete->setEnable(false);
-  if (ivars->usb) ivars->usb->abort();
+  ivars->stopPhase = RMNetDriver_IVars::kStopDraining;
+  if (ivars->usb) ivars->usb->finish_sending();
+  AdvanceStop();
 }
 
+void RMNetDriver::AdvanceStop() {
+  uint64_t now = NowMs();
+  UsbIo* usb = ivars->usb;
+  if (ivars->stopPhase == RMNetDriver_IVars::kStopDraining) {
+    bool late = now - ivars->stopStartMs >= kStopDrainMs;
+    // Without the timer there is no clock for the deadline; nothing was ever posted then.
+    if (usb && !usb->sending_done() && !late && ivars->timer) return;
+    if (usb) {
+      usb->abort();
+      LOG("stop: control messages sent %u, dropped %u%{public}s; aborted with %u requests outstanding",
+          usb->sent_at_stop(), usb->dropped_at_stop(), late ? " (drain deadline)" : "", usb->outstanding());
+    }
+    ivars->stopPhase = RMNetDriver_IVars::kStopAborting;
+    ivars->abortStartMs = now;
+  }
+  if (ivars->stopPhase == RMNetDriver_IVars::kStopAborting) {
+    if (usb && usb->outstanding() > 0) {
+      if (now - ivars->abortStartMs < kStopAbortMs && ivars->timer) return;
+      // Close also aborts; the objects are left to free(), which may run before they return.
+      LOG("stop: %u aborted requests still outstanding after %llu ms; passing Stop on anyway",
+          usb->outstanding(), now - ivars->abortStartMs);
+      usb->close();
+    } else if (usb) {
+      usb->close_and_release();
+      LOG("stop: usb objects released");
+    }
+    FinishStop();
+  }
+}
+
+void RMNetDriver::FinishStop() {
+  ivars->stopPhase = RMNetDriver_IVars::kStopDone;
+  if (ivars->timer) ivars->timer->Cancel(^{});
+  IOService* provider = ivars->stopProvider;
+  ivars->stopProvider = nullptr;
+  LOG("stop: passing Stop to the superclass");
+  kern_return_t ret = Stop(provider, SUPERDISPATCH);
+  if (ret != kIOReturnSuccess) LOG("super Stop 0x%x", ret);
+  OSSafeReleaseNULL(provider);
+}
+
+// Starts the stop sequence and returns; the superclass gets Stop when USB has quiesced.
 kern_return_t RMNetDriver::Stop_Impl(IOService* provider) {
   LOG_FIRST(kLogStop, "Stop");
-  TearDown();
-  return Stop(provider, SUPERDISPATCH);
+  TearDown(provider);
+  return kIOReturnSuccess;
 }
 
 kern_return_t RMNetDriver::SetPowerState_Impl(uint32_t powerFlags) {
@@ -577,21 +639,31 @@ void RMNetDriver::RxPacketsAvailable_Impl(OSAction*) {
 void RMNetDriver::InterruptComplete_Impl(OSAction*, IOReturn status, uint32_t actualByteCount, uint64_t) {
   LOG_FIRST(kLogInterruptComplete, "InterruptComplete 0x%x, %u bytes", status, actualByteCount);
   if (ivars && ivars->usb) ivars->usb->interrupt_complete(status, actualByteCount);
+  if (ivars && ivars->stopping) AdvanceStop();
 }
 
 void RMNetDriver::ControlOutComplete_Impl(OSAction*, IOReturn status, uint32_t bytesTransferred) {
   LOG_FIRST(kLogControlOutComplete, "ControlOutComplete 0x%x, %u bytes", status, bytesTransferred);
   if (ivars && ivars->usb) ivars->usb->control_out_complete(status, bytesTransferred);
+  if (ivars && ivars->stopping) AdvanceStop();
 }
 
 void RMNetDriver::ControlInComplete_Impl(OSAction*, IOReturn status, uint32_t bytesTransferred) {
   LOG_FIRST(kLogControlInComplete, "ControlInComplete 0x%x, %u bytes", status, bytesTransferred);
   if (ivars && ivars->usb) ivars->usb->control_in_complete(status, bytesTransferred);
+  if (ivars && ivars->stopping) AdvanceStop();
 }
 
 void RMNetDriver::TimerFired_Impl(OSAction*, uint64_t) {
   LOG_FIRST(kLogTimerFired, "TimerFired");
-  if (!ivars || ivars->stopping || !ivars->core) return;
+  if (!ivars) return;
+  if (ivars->stopping) {
+    // The timer is the clock of the stop sequence until it passes Stop on.
+    AdvanceStop();
+    if (ivars->stopPhase != RMNetDriver_IVars::kStopDone) ArmTimer();
+    return;
+  }
+  if (!ivars->core) return;
   ivars->core->tick(NowMs());
   ApplyCore();
   ArmTimer();
