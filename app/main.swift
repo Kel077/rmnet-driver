@@ -1,5 +1,7 @@
-// RMNet host app: installs, removes and reports on the RMNet driver extension.
+// RMNet host app: installs, removes and reports on the RMNet driver extension, and reads and sends
+// the modem's text messages.
 // Usage: RMNet activate | deactivate | status [--json]
+//        RMNet sms list [--json] | sms send <number> <text> | sms delete <index>...
 //        RMNet (no argument, or opened from the Finder): the status window.
 // It must run from /Applications/RMNet.app for activate and deactivate (scripts/install-driver.sh).
 // With a verb it prints exactly the lines it always has (scripts read them), opens no window and
@@ -137,6 +139,111 @@ func runStatus(_ manager: ExtensionManager, json: Bool) {
     }
 }
 
+// MARK: - Text messages
+// The sms verbs take no part in the system-extension machinery: they talk to the modem's spare AT
+// port off the main thread, print, and exit. Message text and numbers go only to standard output.
+
+enum SmsCommand {
+    case list(json: Bool)
+    case send(number: String, text: String)
+    case delete(indices: [Int])
+}
+
+// The words after "sms"; nil for wrong usage.
+func parseSms(_ words: [String]) -> SmsCommand? {
+    guard let verb = words.first else { return nil }
+    let rest = Array(words.dropFirst())
+    switch verb {
+    case "list":
+        if rest.isEmpty { return .list(json: false) }
+        return rest == ["--json"] ? .list(json: true) : nil
+    case "send":
+        guard rest.count >= 2 else { return nil }
+        return .send(number: rest[0], text: rest.dropFirst().joined(separator: " "))
+    case "delete":
+        let indices = rest.compactMap { Int($0) }.filter { $0 >= 0 }
+        return !rest.isEmpty && indices.count == rest.count ? .delete(indices: indices) : nil
+    default:
+        return nil
+    }
+}
+
+func localTime(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.timeZone = .current
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    return formatter.string(from: date)
+}
+
+func printMessages(_ messages: [SmsMessage]) {
+    print(messages.isEmpty ? "sms: no messages" : "sms: \(messages.count) message(s)")
+    for m in messages {
+        let indices = "[" + m.indices.map(String.init).joined(separator: ",") + "]"
+        guard m.readable else {
+            print("\(indices) not readable")
+            continue
+        }
+        var head = "\(indices) \(m.unread ? "unread" : "read") \(m.sender) \(m.timestamp.map(localTime) ?? "no time")"
+        if m.missingParts > 0 { head += " (\(m.missingParts) part(s) missing)" }
+        print(head)
+        if m.text.isEmpty { continue }
+        for line in m.text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
+            print("  \(line)")
+        }
+    }
+}
+
+func printMessagesJSON(_ messages: [SmsMessage]) {
+    let iso = ISO8601DateFormatter()
+    iso.timeZone = .current
+    let array: [[String: Any]] = messages.map { m in
+        ["indices": m.indices, "unread": m.unread, "sender": m.sender,
+         "time": m.timestamp.map { iso.string(from: $0) } ?? NSNull(), "text": m.text,
+         "missingParts": m.missingParts, "readable": m.readable]
+    }
+    if array.isEmpty {
+        print("[]")
+        return
+    }
+    let data = try! JSONSerialization.data(withJSONObject: array, options: [.prettyPrinted, .sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+}
+
+// Runs on a background queue; returns the exit code.
+func runSms(_ command: SmsCommand, service: SmsServing) -> Int32 {
+    switch command {
+    case .list(let json):
+        switch service.list() {
+        case .success(let messages):
+            if json { printMessagesJSON(messages) } else { printMessages(messages) }
+            return 0
+        case .failure(let failure):
+            print("sms: \(failure.message)")
+            return 1
+        }
+    case .send(let number, let text):
+        switch service.send(to: number, text: text) {
+        case .success(let parts):
+            print("sms: sent to \(number) in \(parts) part(s)")
+            return 0
+        case .failure(let failure):
+            print("sms: \(failure.message)")
+            return 1
+        }
+    case .delete(let indices):
+        switch service.delete(indices: indices) {
+        case .success(let count):
+            print("sms: deleted \(count) stored part(s)")
+            return 0
+        case .failure(let failure):
+            print("sms: \(failure.message)")
+            return 1
+        }
+    }
+}
+
 // MARK: - Entry point
 
 let args = CommandLine.arguments
@@ -148,9 +255,24 @@ if verbs.isEmpty {
     exit(0)
 }
 
+let usage = "usage: RMNet activate | deactivate | status [--json] | sms list [--json] | sms send <number> <text> | sms delete <index>..."
+
+if verbs.first == "sms" {
+    guard let smsCommand = parseSms(Array(verbs.dropFirst())) else {
+        print(usage)
+        exit(2)
+    }
+    DispatchQueue.global(qos: .userInitiated).async {
+        let code = runSms(smsCommand, service: SmsService())
+        fflush(stdout)
+        exit(code)
+    }
+    dispatchMain()
+}
+
 guard let command = Command(rawValue: verbs.first!),
       verbs.count == 1 || (command == .status && verbs.count == 2 && verbs.last == "--json") else {
-    print("usage: RMNet activate | deactivate | status [--json]")
+    print(usage)
     exit(2)
 }
 
