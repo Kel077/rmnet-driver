@@ -217,7 +217,9 @@ struct RMNetDriver_IVars {
   bool linkActive;  // the link status last reported to the stack
   uint32_t mtu;     // what getMaxTransferUnit answers
   char published[256];  // the status last published, "state|ipv4|ipv6"; empty before the first
-  uint32_t logged;  // kLog* bits already logged
+  // kLog* bits already logged. Nearly full: every bit is a kLog* flag except 1u << 4 (freed when
+  // its line was removed); a line beyond that needs a wider field, kLog* enum and FirstCall.
+  uint32_t logged;
   // The data path's packets. Empty packets taken from the RX submission queue in one call wait in
   // rxStock (the last one, rxStock[rxStockCount - 1], is the buffer CoreHost is filling) until they
   // are filled; filled ones wait in rxOut, and sent ones in txDone, until their completion queue
@@ -238,8 +240,8 @@ struct RMNetDriver_IVars {
   // Frames of a batch taken from the TX submission queue that are not yet placed: txPending[txPendingNext]
   // up to txPendingCount, offered first, in order, before a new batch is taken. txWaitUplink: the
   // drain stopped because every uplink buffer was in flight; a transfer that frees one (a success,
-  // or a failure UsbIo reports as uplink usable), the end of a recovery, a link down or the tick
-  // restarts it.
+  // or a failure UsbIo reports as uplink usable), the end of a recovery whose ClearStall succeeded,
+  // a link down or the tick restarts it.
   IOUserNetworkPacket* txPending[kTxBatch];
   uint32_t txPendingCount;
   uint32_t txPendingNext;
@@ -1002,17 +1004,17 @@ void RMNetDriver::RxPacketsAvailable_Impl(OSAction*) {
 // first next time; with no room to keep a whole batch, the rest waits for the next timer tick.
 // When every uplink buffer is in flight, the frame CoreHost did not take and the rest of its batch
 // stay in txPending and the drain stops (txWaitUplink); the next successful uplink transfer
-// (OnBulkOutDone), a failed one that started no recovery or the end of a recovery
-// (OnUplinkUsable), a link down (ApplyCore), or the timer tick, restarts it, and those frames are
-// offered first, in order, before a new batch is taken. The frames behind them stay in the TX
-// submission queue, which is the backpressure.
+// (OnBulkOutDone), a failed one that started no recovery or the end of a recovery whose ClearStall
+// succeeded (OnUplinkUsable), a link down (ApplyCore), or the timer tick, restarts it, and those
+// frames are offered first, in order, before a new batch is taken. The frames behind them stay in
+// the TX submission queue, which is the backpressure.
 // A taken batch always fits txDone: it is taken only with kTxBatch free there, and nothing else
 // adds to txDone until all of it is placed.
 void RMNetDriver::DrainTx() {
   FlushTxDone();
   if (ivars->stopping || !ivars->core || !ivars->txSubmit) return;
   // Core is not called while asleep or while the wake's resume is pending; the first tick after the
-  // resume drains (or, sooner, OnUplinkUsable, when the resume ends a bulk OUT recovery).
+  // resume drains.
   if (ivars->asleep || ivars->resumePending) {
     ivars->txHeld = true;
     return;
@@ -1155,7 +1157,8 @@ void RMNetDriver::OnUplinkStuck() {
 // CoreHost runs first, so a QMAP command reply it kept takes the freed buffer before the drain.
 // Only after a success: UsbIo reports a failed transfer before it starts a stall recovery, so a
 // drain then could submit to a halted pipe; once UsbIo has decided on the recovery, its
-// on_uplink_usable (OnUplinkUsable) restarts it instead.
+// on_uplink_usable (OnUplinkUsable) restarts it instead (the tick does after a failed ClearStall,
+// and the session restart after a stuck uplink).
 void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
   if (ivars->stopping || !ivars->core) return;
   ivars->core->on_bulk_out_done(slot, ok);
@@ -1163,17 +1166,24 @@ void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
 }
 
 // UsbIo says a held uplink may go on (UsbIoListener::on_uplink_usable): a failed transfer freed its
-// buffer and started no recovery, or a bulk OUT recovery ended. Raised from inside
-// UsbIo::bulk_out_complete, or from inside UsbIo::resume when the wake ends a recovery; only while
-// UsbIo runs, is not held, has not failed and is not recovering, so the drain cannot submit to a
-// halted pipe. A drain held for want of a buffer (txWaitUplink) or for another reason (txHeld)
-// restarts at once instead of on the next tick; DrainTx itself still holds while asleep, while
-// the wake's resume is pending and while the modem pauses the uplink.
+// buffer and started no recovery, or a bulk OUT recovery ended with a successful ClearStall. Raised
+// only from inside UsbIo::bulk_out_complete (never from UsbIo::resume), while UsbIo runs, is not
+// held, has not failed and is not recovering, so the drain cannot submit to a halted pipe.
+// Nothing happens when the same completion found the uplink stuck (uplinkStuck): the session
+// restart that follows it (BulkOutComplete_Impl) takes the link down, and ApplyCore's drain then
+// drops the kept frames as link down, where a drain now would put another transfer on the stuck
+// endpoint, which would count as a stall of the restarted session. Otherwise, as OnBulkOutDone
+// does, CoreHost first gives the free buffers to kept QMAP command replies, then a drain held for
+// want of a buffer (txWaitUplink) or for another reason (txHeld) restarts at once instead of on
+// the next tick; DrainTx itself still holds while asleep, while the wake's resume is pending and
+// while the modem pauses the uplink.
 void RMNetDriver::OnUplinkUsable() {
   ivars->uplinkUsable++;
   LOG_FIRST(kLogUplinkUsable, "first uplink usable callback: drain %{public}s",
             ivars->txWaitUplink ? "waiting for a buffer" : (ivars->txHeld ? "held" : "not held"));
   if (ivars->stopping || !ivars->core) return;
+  if (ivars->uplinkStuck) return;
+  ivars->core->uplink_usable();
   if (ivars->txWaitUplink || ivars->txHeld) DrainTx();
 }
 
@@ -1203,7 +1213,8 @@ void RMNetDriver::OnUplinkUsable() {
 // not up. RMNetFlowControlRefused also becomes 1 when the driver gives flow control up after a pause
 // that reached kPauseMaxMs.
 // The waits for the timer: RMNetUplinkUsable counts UsbIo's uplink-usable callbacks (a failed
-// transfer that started no recovery, or the end of a recovery); RMNetTxCompleteRefused and
+// transfer that started no recovery, or the end of a recovery whose ClearStall succeeded; also
+// those ignored because the uplink was found stuck); RMNetTxCompleteRefused and
 // RMNetRxCompleteRefused the packets the TX and RX completion queues refused, each packet once
 // however often it is offered again; RMNetTickTxDrains the ticks that drained because the drain
 // was held (txHeld, which a QMAP pause also sets), waited for an uplink buffer, or had sent packets

@@ -271,6 +271,40 @@ TEST(at_most_four_replies_are_kept_and_the_fifth_counts_as_a_reply_drop) {
   CHECK_EQ(r.core.counters().command_reply_drops, 1u);
 }
 
+TEST(kept_replies_go_out_oldest_first_on_uplink_usable_after_failed_transfers) {
+  Rig r;
+  r.usb.occupy_all();
+  for (uint8_t tag = 1; tag <= 3; tag++) r.bulk_in(flow_request(rmnet::kQmapFlowDisable, tag));
+  REQUIRE(r.core.kept_replies() == 3u);
+
+  // Two transfers fail (timeouts, say): their buffers are free, and on_bulk_out_done gives them to
+  // no kept reply, since a failure may start a stall recovery.
+  r.fail(4);
+  r.fail(1);
+  CHECK_EQ(r.core.kept_replies(), 3u);
+  CHECK(r.usb.uplinks.empty());
+
+  // USB then says the uplink is usable (no recovery started): the two oldest replies take the two
+  // free buffers, in order, and the third stays kept.
+  r.core.uplink_usable();
+  CHECK_EQ(r.core.kept_replies(), 1u);
+  REQUIRE(r.usb.uplinks.size() == 2u);
+  CHECK_EQ(r.usb.uplinks[0].slot, 1);
+  CHECK_BYTES(r.usb.uplinks[0].bytes, "80 81 00 08 01 01 00 00 00 00 00 01");  // the oldest one's ACK
+  CHECK_EQ(r.usb.uplinks[1].slot, 4);
+  CHECK_BYTES(r.usb.uplinks[1].bytes, "80 81 00 08 01 01 00 00 00 00 00 02");
+  CHECK_EQ(r.core.counters().command_replies, 2u);
+  CHECK_EQ(r.core.counters().command_reply_drops, 0u);
+
+  // With no buffer free it sends nothing; the next completion sends the last one.
+  r.core.uplink_usable();
+  CHECK_EQ(r.usb.uplinks.size(), 2u);
+  r.complete(6);
+  CHECK_EQ(r.core.kept_replies(), 0u);
+  REQUIRE(r.usb.uplinks.size() == 3u);
+  CHECK_EQ(r.usb.uplinks[2].bytes.back(), 3u);
+}
+
 TEST(kept_replies_are_dropped_and_counted_on_link_down) {
   Rig r;
   r.usb.occupy_all();

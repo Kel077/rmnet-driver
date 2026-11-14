@@ -16,8 +16,10 @@
 // driver keeps the frame and offers it again once a transfer completes.
 // A reply to a QMAP command that finds no uplink buffer free (all in flight, or bulk OUT
 // recovering) is kept, up to kKeptReplies in order, and sent when a transfer completes
-// (on_bulk_out_done, before the driver restarts its drain) or on data_tick. Kept replies are
-// discarded, and counted as reply drops, on a link down, at stop and on drop_kept_replies.
+// successfully (on_bulk_out_done) or the uplink is usable again after a failed transfer or a
+// recovery (uplink_usable), in both cases before the driver restarts its drain, or on data_tick.
+// Kept replies are discarded, and counted as reply drops, on a link down, at stop and on
+// drop_kept_replies.
 // A pause that no flow enable lifts within kPauseMaxMs of link-up time (timed by data_tick) makes CoreHost ask the
 // driver for a session restart (take_restart_wanted); it never restarts the session itself.
 // No per-packet logging: counters carry it. A WDS Get Current Settings reply (the liveness probe's,
@@ -147,6 +149,10 @@ class CoreHost final : public rmnet::SessionDelegate {
   bool take_restart_wanted();
   void on_bulk_in(const uint8_t* data, size_t len);
   void on_bulk_out_done(int slot, bool ok);
+  // USB says the uplink is usable again: a failed transfer freed its buffer and started no stall
+  // recovery, or a recovery ended (UsbIoListener::on_uplink_usable). Sends the kept command replies
+  // the free buffers allow, oldest first, and nothing else; the driver calls it before its drain.
+  void uplink_usable();
   // One frame from the host. False only when it needs an uplink buffer and all are in flight:
   // nothing is consumed or counted then, and offering the same frame again later gives the same
   // result as offering it once. True in every other case (forwarded, answered, dropped and

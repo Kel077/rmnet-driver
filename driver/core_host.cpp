@@ -534,9 +534,12 @@ void CoreHost::on_bulk_out_done(int slot, bool ok) {
   slot_packets_[slot] = 0;
   slot_bytes_[slot] = 0;
   // The freed buffer goes to a kept command reply first: this runs before the driver restarts its
-  // drain (RMNetDriver::OnBulkOutDone). Not after a failure, which may start a stall recovery.
+  // drain (RMNetDriver::OnBulkOutDone). Not after a failure, which may start a stall recovery; once
+  // USB has decided it did not, or a recovery has ended, uplink_usable does it instead.
   if (ok) send_kept_replies();
 }
+
+void CoreHost::uplink_usable() { send_kept_replies(); }
 
 // handle_tx has no side effect when it answers Forward (core/src/ethernet.cpp: the IPv4 and IPv6
 // paths only read the frame and return a span into it; neither the emulator's state nor reply_

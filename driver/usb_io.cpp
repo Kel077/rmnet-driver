@@ -627,10 +627,11 @@ bool UsbIo::send_uplink(int slot, uint32_t len) {
 // (on_uplink_stuck) and the count starts again; stuck again with no successful transfer since that
 // (StuckAgain) is fatal. A success resets both.
 //
-// Once the recovery is decided, the owner hears that the uplink is usable (on_uplink_usable): from
-// end_out_recovery when a recovery ended here, or, for a failed transfer that left no recovery
-// under way (a timeout or a stray abort: neither halts the endpoint), from here, since its buffer
-// is free. Never after a fatal failure, and not for a success (on_bulk_out_done tells the owner).
+// Once the recovery is decided, the owner hears that the uplink is usable (on_uplink_usable): when
+// a recovery ended here and its ClearStall succeeded (a failed one leaves the drain to the owner's
+// tick), or, for a failed transfer that left no recovery under way (a timeout or a stray abort:
+// neither halts the endpoint), since its buffer is free. Never after a fatal failure, and not for
+// a success (on_bulk_out_done tells the owner).
 void UsbIo::bulk_out_complete(uint32_t i, IOReturn status, uint32_t) {
   if (i >= kUplinkSlots || uplink_[i] != Uplink::InFlight) return;
   uplink_[i] = Uplink::Free;
@@ -685,7 +686,7 @@ void UsbIo::bulk_out_complete(uint32_t i, IOReturn status, uint32_t) {
   }
   if (Halts(status) && !timed_out && !out_recovering_) begin_out_recovery();
   if (out_recovering_) {
-    if (uplinks_busy_ == 0 && phase_ == Phase::Running && !failed_) end_out_recovery();  // reports usable
+    if (uplinks_busy_ == 0 && phase_ == Phase::Running && !failed_ && end_out_recovery()) report_uplink_usable();
   } else if (!ok) {
     report_uplink_usable();  // a timeout or a stray abort; nothing if begin_out_recovery failed (fatal)
   }
@@ -728,18 +729,20 @@ void UsbIo::tick() {
 }
 
 // Ends a bulk OUT recovery whose transfers have all returned (from bulk_out_complete, or from resume
-// once the hold has ended), and tells the owner the uplink is usable again.
-void UsbIo::end_out_recovery() {
+// once the hold has ended): one ClearStall. True if it succeeded. Reports nothing to the owner: its
+// caller decides (bulk_out_complete raises on_uplink_usable on success; resume never does).
+bool UsbIo::end_out_recovery() {
   out_recovering_ = false;
   stats_.stall_clears++;
   kern_return_t ret = bulk_out_->ClearStall(true);
   LOG("bulk out recovered: ClearStall 0x%x, uplink open again", ret);
-  report_uplink_usable();
+  return ret == kIOReturnSuccess;
 }
 
 // on_uplink_usable, only while running, not held, not failed and with no bulk OUT recovery under
-// way, so a drain the owner starts from it cannot submit to a halted pipe. Its two callers,
-// bulk_out_complete and end_out_recovery, are never reached from send or send_uplink.
+// way. Called only from the end of bulk_out_complete: for a failed transfer that left the endpoint
+// usable, and after a recovery whose ClearStall succeeded; so a drain the owner starts from it
+// cannot submit to a halted pipe. Never from resume, send or send_uplink.
 void UsbIo::report_uplink_usable() {
   if (phase_ != Phase::Running || failed_ || held_ || out_recovering_) return;
   listener_.on_uplink_usable();
@@ -815,6 +818,7 @@ UsbIo::Resume UsbIo::resume(bool last_try) {
   }
   held_ = false;
   bool out_was_recovering = out_recovering_;
+  // No on_uplink_usable from inside resume: the owner restarts the session after a wake.
   if (out_recovering_ && uplinks_busy_ == 0) end_out_recovery();
   uint32_t queued = count_;
   bool response_pending = in_busy_;
