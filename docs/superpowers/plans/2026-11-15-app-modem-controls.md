@@ -490,19 +490,19 @@ final class ModemController: ObservableObject {
     func applyProfile()                            // form, with redial
     func putBack()                                 // undo, then undo becomes nil on success
     func revertForm()
-    func enterPin(_ pin: String)                   // shownAttempts = sim!.pinAttempts!
+    func enterPin(_ pin: String, shownAttempts: Int)   // the count the confirmation showed (ruling R13)
     func quitWhenFinished() -> Bool
     func resumeAfterCancelledQuit()
 }
 ```
 
 Rules the tests pin:
-- One call at a time on `queue`; results applied on the main thread. While the Network tab is shown and the window visible, `networkInfo()` at once and every 5 s; while the SIM & APN tab is, `profiles()` then `sim()` in one queued block at once and every 30 s; nothing while neither is shown, the window is hidden, or a confirmation is open (ticks skip). A tick while a call runs skips its turn.
+- One call at a time on `queue`; results applied on the main thread. A change asked for while a read runs waits and starts when the read finishes (one pending change at most; dropped if the app quits before it starts); reads never disable the change buttons (ruling R12). While the Network tab is shown and the window visible, `networkInfo()` at once and every 5 s; while the SIM & APN tab is, `profiles()` then `sim()` in one queued block at once and every 30 s; nothing while neither is shown, the window is hidden, or a confirmation is open (ticks skip). A tick while a call runs skips its turn.
 - A failed read keeps the last good values and sets `infoFailure`/`settingsFailure`; a good read clears it.
-- `form` is filled from the driver's profile settings when it is nil, after `applyProfile`/`putBack` finish, and on `revertForm()`; a periodic refresh never overwrites an edited form. `pickedMode` is set from `info.mode` when nil and after `changeMode`/`putBack`; a refresh never overwrites a different pick.
+- `form` is filled from the driver's profile settings when it is nil, after `applyProfile`/`putBack` succeed (a failed one keeps the owner's edit, ruling R11), and on `revertForm()`; a periodic refresh never overwrites an edited form. `pickedMode` is set from `info.mode` when nil and after `changeMode`/`putBack`; a refresh never overwrites a different pick.
 - `changeMode()` success: `undo = .mode(before)`, result `modeSentence`; `applyProfile()` success: `undo = .profile(id: profileID, before)` (the old password stays in memory only), result `profileSentence`, failure sentence otherwise. `putBack()` applies the undo the same way (a profile put back redials) and clears it on success. After a change, the shown tab is read again.
 - `setRadio(on:)`: result `radioSentence`; no undo.
-- `enterPin(pin)`: calls `enterPin(pin, shownAttempts: sim.pinAttempts)`; result `pinSentence` or the failure; the controller keeps no copy of the PIN (no stored property holds it; check with `Mirror(reflecting: controller)` that no child's value contains it after the call).
+- `enterPin(pin, shownAttempts:)`: passes the count the view's confirmation showed to the service unchanged (R13); applies `PinOutcome.sim` when present; result `pinSentence` or the failure; the controller keeps no copy of the PIN (no stored property holds it; check with `Mirror(reflecting: controller)` that no child's value contains it after the call).
 - Quitting, as `SmsController`: `quitWhenFinished()` stops the timers and new calls; returns false with nothing running; otherwise true, `quitNotice.line` is "RMNet quits when the radio has been switched back on." for `.profile` (and for `.radio`), "RMNet quits when the network mode has been changed." for `.mode`, "RMNet quits when the PIN has been checked." for `.pin`, "RMNet quits when the current request to the modem has finished." for `.reading`; when the call ends `replyToQuit(true)` after a read or a change that succeeded, and after one that failed `replyToQuit(false)`, `requestAttention()` and the controller works again. `resumeAfterCancelledQuit()` (the app delegate calls it when the Messages controller cancels the quit) makes it work again and restarts the timer if a tab is shown.
 
 - [ ] **Step 1: Write the failing tests** in `tests/app/ModemControllerTests.swift` (prints `modem controller: <n> checks passed`), with a blocking fake service in the style of `tests/app/SmsControllerTests.swift` (calls block until released; the main run loop is pumped), covering each rule above.
