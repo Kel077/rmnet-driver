@@ -107,6 +107,11 @@ struct ModemSettingsTests {
               "ModemServing: a service answers with a ModemFailure")
         let failure: Error = ModemFailure(message: "x")
         check((failure as? ModemFailure)?.message == "x", "ModemFailure: is an Error")
+        let notAttached: Error = ModemFailure(message: "The modem is not attached.")
+        expectEqual(notAttached.localizedDescription, "The modem is not attached.",
+                    "ModemFailure: localizedDescription is the owner's sentence")
+        expectEqual((notAttached as? LocalizedError)?.errorDescription ?? "", "The modem is not attached.",
+                    "ModemFailure: is a LocalizedError")
 
         // --- canonicalMode ---------------------------------------------------------------------
         for (argument, want) in [
@@ -190,8 +195,8 @@ struct ModemSettingsTests {
         // --- profileProblem --------------------------------------------------------------------
         let idRule = { (id: Int) in "Profile \(id) cannot be changed by RMNet: AT+QICSGP takes profiles 1 to 16." }
         let apnRule = "An APN is at most 100 characters of ASCII letters, digits, dots, hyphens and underscores, and does not start or end with a dot."
-        let userRule = "A user name is at most 127 characters of printable ASCII, without a double quote (\")."
-        let passwordRule = "A password is at most 127 characters of printable ASCII, without a double quote (\")."
+        let userRule = "A user name is at most 127 characters of printable ASCII, without a double quote (\") or a backslash (\\)."
+        let passwordRule = "A password is at most 127 characters of printable ASCII, without a double quote (\") or a backslash (\\)."
         check(profileProblem(1, cmnetPap) == nil, "profileProblem: a good profile 1")
         check(profileProblem(16, cmnetPap) == nil, "profileProblem: profile 16")
         check(profileProblem(1, profile1) == nil, "profileProblem: an empty APN is allowed (the network chooses)")
@@ -217,12 +222,13 @@ struct ModemSettingsTests {
         }
         func withUser(_ user: String) -> ProfileSettings { ProfileSettings(type: .ipv4v6, apn: "x", user: user, password: "", auth: .pap) }
         func withPassword(_ p: String) -> ProfileSettings { ProfileSettings(type: .ipv4v6, apn: "x", user: "u", password: p, auth: .pap) }
-        for value in [" ", "a b", "~!@#$%^&*()_+{}|:<>?`-=[]\\;',./", String(repeating: "x", count: 127)] {
+        for value in [" ", "a b", "~!@#$%^&*()_+{}|:<>?`-=[];',./", String(repeating: "x", count: 127)] {
             check(profileProblem(1, withUser(value)) == nil, "profileProblem: user \"\(value)\" is allowed")
             check(profileProblem(1, withPassword(value)) == nil, "profileProblem: a password of printable ASCII is allowed")
         }
         for (value, name) in [
             (String(repeating: "x", count: 128), "128 characters"), ("a\"b", "a double quote"), ("a\tb", "a tab"),
+            ("a\\41", "a backslash (V.250 may read \\hh as an escape)"), ("\\", "a backslash alone"),
             ("a\nb", "a line feed"), ("\u{7F}", "DEL"), ("\u{1F}", "a control character"), ("caf\u{E9}", "an accent"),
             ("e\u{301}", "a combining mark"), ("\u{202E}", "a bidirectional override"),
         ] {
@@ -297,6 +303,25 @@ struct ModemSettingsTests {
             check(parsePinLock(lines) == want, "parsePinLock: \(lines)", "\(String(describing: parsePinLock(lines)))")
         }
 
+        // --- one rule for text from the modem: Task 1's modemTextSafe --------------------------
+        expectEqual(modemTextSafe("\u{0}\u{1B}\u{7F}\u{85}\u{61C}\u{200E}\u{200F}\u{2028}\u{2029}\u{202A}\u{202E}\u{2066}\u{2069}"),
+                    String(repeating: "\u{FFFD}", count: 13), "modemTextSafe: each unsafe class becomes U+FFFD")
+        expectEqual(modemTextSafe("CMNET \u{4E2D}\u{56FD} e\u{301} \u{200D}"), "CMNET \u{4E2D}\u{56FD} e\u{301} \u{200D}",
+                    "modemTextSafe: other text is kept")
+        // Every scalar up to U+3000 inside a value (not `"` or `,`, which the AT fields split on): the APN that
+        // parseProfiles gives, the text of an unknown SIM state, and the APN in profileWords all follow it.
+        var drifted: [String] = []
+        for v in UInt32(0)...0x3000 {
+            guard let c = Unicode.Scalar(v), c != "\"", c != "," else { continue }
+            let raw = "a" + String(c) + "b"
+            let safe = modemTextSafe(raw)
+            if parseProfiles(["+CGDCONT: 1,\"IP\",\"\(raw)\""]).first?.apn != safe { drifted.append("CGDCONT U+\(String(v, radix: 16))") }
+            if parseSimState(["+CPIN: \(raw)"]) != .other(safe) { drifted.append("CPIN U+\(String(v, radix: 16))") }
+            if profileWords(ProfileSettings(type: .ipv4, apn: raw, user: "", password: "", auth: .none))
+                != "IPV4, APN \"\(safe)\", no authentication" { drifted.append("profileWords U+\(String(v, radix: 16))") }
+        }
+        check(drifted.isEmpty, "modemTextSafe: ModemSettings shows modem text by Task 1's rule", "\(drifted.prefix(10))")
+
         // --- profileWords ----------------------------------------------------------------------
         expectEqual(profileWords(cmnetPap), cmnetPapWords, "profileWords: the brief's example")
         expectEqual(profileWords(profile1), "IPV4V6, APN \"\" (the network chooses), no authentication",
@@ -313,19 +338,19 @@ struct ModemSettingsTests {
         expectEqual(cmnetPap.debugDescription, cmnetPapWords, "ProfileSettings.debugDescription is profileWords")
 
         // --- profileRestoreArguments -----------------------------------------------------------
-        expectEqual(profileRestoreArguments(profile1), "--apn '' --type ipv4v6 --user '' --auth none",
-                    "profileRestoreArguments: profile 1")
+        expectEqual(profileRestoreArguments(profile1), "--apn '' --type ipv4v6 --user '' --auth none --no-password",
+                    "profileRestoreArguments: profile 1 (no password) ends --no-password")
         expectEqual(profileRestoreArguments(cmnetPap), "--apn 'cmnet' --type ipv4v6 --user 'u' --auth pap --password",
                     "profileRestoreArguments: a password set ends --password")
         expectEqual(profileRestoreArguments(ProfileSettings(type: .ipv4, apn: "CMNET", user: "o'brien", password: "", auth: .chap)),
-                    "--apn 'CMNET' --type ipv4 --user 'o'\\''brien' --auth chap", "profileRestoreArguments: a quote inside")
+                    "--apn 'CMNET' --type ipv4 --user 'o'\\''brien' --auth chap --no-password", "profileRestoreArguments: a quote inside")
         expectEqual(profileRestoreArguments(ProfileSettings(type: .ipv6, apn: "x", user: "''", password: "", auth: .papOrChap)),
-                    "--apn 'x' --type ipv6 --user ''\\'''\\''' --auth pap-or-chap", "profileRestoreArguments: two quotes")
+                    "--apn 'x' --type ipv6 --user ''\\'''\\''' --auth pap-or-chap --no-password", "profileRestoreArguments: two quotes")
         let combined = profileRestoreArguments(ProfileSettings(type: .ipv4, apn: "", user: "a'\u{301}", password: "", auth: .none))
-        check(Array(combined.unicodeScalars) == Array("--apn '' --type ipv4 --user 'a'\\''\u{301}' --auth none".unicodeScalars),
+        check(Array(combined.unicodeScalars) == Array("--apn '' --type ipv4 --user 'a'\\''\u{301}' --auth none --no-password".unicodeScalars),
               "profileRestoreArguments: a quote joined to a combining mark is still escaped", combined)
         expectEqual(profileRestoreArguments(ProfileSettings(type: .ipv4, apn: "", user: "a\nrm", password: "", auth: .none)),
-                    "--apn '' --type ipv4 --user 'a\u{FFFD}rm' --auth none", "profileRestoreArguments: made safe to show")
+                    "--apn '' --type ipv4 --user 'a\u{FFFD}rm' --auth none --no-password", "profileRestoreArguments: made safe to show")
 
         // --- redaction --------------------------------------------------------------------------
         let secretProfile = DataProfile(id: 1, pdpType: "IPV4V6", apn: "a", settings: secretSettings)
@@ -356,9 +381,13 @@ struct ModemSettingsTests {
             (printed, "print and debugPrint"),
             (profileWords(secretSettings), "profileWords"),
             (profileRestoreArguments(secretSettings), "profileRestoreArguments"),
+            (profileRestoreArguments(otherChange.before), "profileRestoreArguments, --no-password form"),
             (Mirror(reflecting: secretSettings).children.map { "\($0.label ?? ""): \($0.value)" }.joined(), "the mirror's children"),
         ]
         for (text, name) in forms { expectNoSecret(text, name) }
+        check(profileRestoreArguments(otherChange.before).hasSuffix(" --no-password")
+                && profileRestoreArguments(secretChange.before).hasSuffix(" --password"),
+              "redaction: putting back a change that added the password clears it; one that kept it asks for it")
         let labels = Mirror(reflecting: secretSettings).children.compactMap { $0.label }
         check(labels == ["type", "apn", "user", "passwordSet", "auth"], "redaction: the mirror has passwordSet, no password", "\(labels)")
         check(dumped(secretSettings).contains("passwordSet: true"), "redaction: dump shows that a password is set",
@@ -459,9 +488,12 @@ struct ModemSettingsTests {
         let fromBoth = modeQuestion(from: "LTE:NR5G", to: "NR5G")
         check(fromBoth.message.contains("`RMNet mode lte:nr5g`") && fromBoth.message.contains("5G and LTE"),
               "modeQuestion: the way back is the earlier mode, lowercased", fromBoth.message)
-        let fromOdd = modeQuestion(from: "NR5G:LTE", to: "LTE")
+        let fromReordered = modeQuestion(from: "NR5G:LTE", to: "LTE")
+        check(fromReordered.message.contains("`RMNet mode nr5g:lte`") && fromReordered.message.contains("Put Back"),
+              "modeQuestion: the modem's own order (NR5G:LTE) is offered as the way back (R8)", fromReordered.message)
+        let fromOdd = modeQuestion(from: "GSM:LTE", to: "LTE")
         check(!fromOdd.message.contains("RMNet mode") && !fromOdd.message.contains("Put Back")
-                && fromOdd.message.contains("cannot set NR5G:LTE again"),
+                && fromOdd.message.contains("RMNet cannot set GSM:LTE again"),
               "modeQuestion: a mode RMNet cannot set is not offered as the way back", fromOdd.message)
         let fromUnknown = modeQuestion(from: nil, to: "LTE")
         check(!fromUnknown.message.contains("RMNet mode") && fromUnknown.message.contains("could not be read")
@@ -502,9 +534,11 @@ struct ModemSettingsTests {
                     "The radio is off. The driver's connection is down until the radio is switched on again.",
                     "radioSentence: off")
         expectEqual(radioSentence(RadioChange(on: true, registration: homeSA, secondsToRegister: 12)),
-                    "The radio is on; registered (registered, home network (5GS)) after 12 s.", "radioSentence: registered")
+                    "The radio is on; registered, home network (5GS) after 12 s.", "radioSentence: registered")
         expectEqual(radioSentence(RadioChange(on: true, registration: Registration(status: .roaming, domain: "EPS"), secondsToRegister: 0)),
-                    "The radio is on; registered (registered, roaming (EPS)) after 0 s.", "radioSentence: roaming at once")
+                    "The radio is on; registered, roaming (EPS) after 0 s.", "radioSentence: roaming at once")
+        expectEqual(radioSentence(RadioChange(on: true, registration: homeSA, secondsToRegister: nil)),
+                    "The radio is on; registered, home network (5GS).", "radioSentence: registered, no time")
         expectEqual(radioSentence(RadioChange(on: true, registration: Registration(status: .searching, domain: "5GS"),
                                               secondsToRegister: nil)),
                     "The radio is on, but the modem has not registered yet (searching).", "radioSentence: not registered")
@@ -530,7 +564,7 @@ struct ModemSettingsTests {
                     "profileSentence: the radio was off")
         expectEqual(profileSentence(toCmnet(.done(RadioChange(on: true, registration: homeSA, secondsToRegister: 12)))),
                     "Profile 1 is now \(cmnetPapWords). The radio was switched off and on again. " +
-                    "The radio is on; registered (registered, home network (5GS)) after 12 s.", "profileSentence: redialled")
+                    "The radio is on; registered, home network (5GS) after 12 s.", "profileSentence: redialled")
         let leftOff = profileSentence(toCmnet(.radioLeftOff("The modem did not answer in time.")))
         check(leftOff.hasPrefix("The profile was changed, but the radio is still off: ")
                 && leftOff.hasSuffix("Run `RMNet radio on`, or press Radio On in the window."),
@@ -542,6 +576,19 @@ struct ModemSettingsTests {
                     "The profile was changed, but the radio is still off: AT+CFUN=1 was refused. " +
                     "Profile 1 is now \(cmnetPapWords). Run `RMNet radio on`, or press Radio On in the window.",
                     "profileSentence: a reason without a full stop")
+        for (why, name) in [("", "empty"), ("  \n", "only spaces")] {
+            expectEqual(profileSentence(toCmnet(.radioLeftOff(why))),
+                        "The profile was changed, but the radio is still off: the radio could not be switched on. " +
+                        "Profile 1 is now \(cmnetPapWords). Run `RMNet radio on`, or press Radio On in the window.",
+                        "profileSentence: a reason that is \(name)")
+        }
+        for (why, shownWhy) in [("Is the modem attached?", "is the modem attached?"), ("AT+CFUN=1 failed!", "AT+CFUN=1 failed!"),
+                                ("The modem did not answer in time. ", "the modem did not answer in time.")] {
+            expectEqual(profileSentence(toCmnet(.radioLeftOff(why))),
+                        "The profile was changed, but the radio is still off: \(shownWhy) " +
+                        "Profile 1 is now \(cmnetPapWords). Run `RMNet radio on`, or press Radio On in the window.",
+                        "profileSentence: a reason ending \"\(why.last.map { String($0) } ?? "")\" gets no second stop")
+        }
 
         expectEqual(pinSentence(PinOutcome(accepted: false, sim: SimInfo(state: .pin, pinLock: true, pinAttempts: 2, pukAttempts: 10))),
                     "The SIM refused the PIN. 2 attempts left.", "pinSentence: refused, 2 left")

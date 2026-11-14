@@ -111,31 +111,33 @@ private func finite(_ d: Double) -> Double? {
 /// `-`; otherwise display-safe.
 private func textField(_ f: [String], _ i: Int) -> String? {
     guard let s = field(f, i), !s.isEmpty, s != "-" else { return nil }
-    return networkSafe(s)
+    return modemTextSafe(s)
 }
 
 /// A name from the network (an operator's): nil when missing or empty; otherwise display-safe.
 private func nameField(_ f: [String], _ i: Int) -> String? {
     guard let s = field(f, i), !s.isEmpty else { return nil }
-    return networkSafe(s)
+    return modemTextSafe(s)
 }
 
-// MARK: - Text from the network, safe to show
+// MARK: - Text from the modem or the network, safe to show
 
 /// Characters that move the cursor, erase or forge lines, or reorder what is shown: the C0 controls,
 /// DEL, the C1 controls, the bidirectional marks, embeddings, overrides and isolates (U+061C, U+200E,
 /// U+200F, U+202A–U+202E, U+2066–U+2069), and the line and paragraph separators (U+2028, U+2029).
-private func isUnsafeNetworkScalar(_ v: UInt32) -> Bool {
+private func isUnsafeModemTextScalar(_ v: UInt32) -> Bool {
     v <= 0x1F || (0x7F...0x9F).contains(v) || v == 0x061C || v == 0x200E || v == 0x200F
         || (0x2028...0x202E).contains(v) || (0x2066...0x2069).contains(v)
 }
 
-/// Each unsafe character becomes U+FFFD (the rule of `displaySafe` in SmsModel.swift for a sender,
-/// with the bidirectional marks added; this file is compiled alone, so it keeps its own copy).
-private func networkSafe(_ s: String) -> String {
+/// Text from the modem or the network (a name, an APN, a SIM state), each unsafe character made U+FFFD.
+/// The one rule for this file and ModemSettings.swift. It is the rule of `displaySafe` in SmsModel.swift
+/// for a sender, with the bidirectional marks added; the modem models are built without SmsModel.swift,
+/// so they keep their own.
+func modemTextSafe(_ s: String) -> String {
     var out = String.UnicodeScalarView()
     for c in s.unicodeScalars {
-        out.append(isUnsafeNetworkScalar(c.value) ? "\u{FFFD}" : c)
+        out.append(isUnsafeModemTextScalar(c.value) ? "\u{FFFD}" : c)
     }
     return String(out)
 }
@@ -187,7 +189,7 @@ func parseServiceProvider(_ lines: [String]) -> (fullName: String?, plmn: String
     guard let f = firstFields(lines, "+QSPN") else { return (nil, nil) }
     var name = field(f, 0) ?? ""
     if intField(f, 3) == 1, let decoded = decodeUCS2(name) { name = decoded }
-    return (name.isEmpty ? nil : networkSafe(name), textField(f, 4))
+    return (name.isEmpty ? nil : modemTextSafe(name), textField(f, 4))
 }
 
 /// UCS-2 big-endian in hex (4 hex digits a character; a surrogate pair is taken as UTF-16); nil when

@@ -15,6 +15,9 @@ import Foundation
 /// A sentence for the owner.
 struct ModemFailure: Error, Equatable { let message: String }
 
+/// So `error.localizedDescription` is the owner's sentence, not "The operation couldn't be completed".
+extension ModemFailure: LocalizedError { var errorDescription: String? { message } }
+
 /// AT+QICSGP <context_type>.
 enum PdpType: Int, CaseIterable { case ipv4 = 1, ipv6 = 2, ipv4v6 = 3 }
 
@@ -71,7 +74,7 @@ struct PinOutcome: Equatable { let accepted: Bool; let sim: SimInfo? }
 protocol ModemServing {
     func networkInfo() -> Result<NetworkInfo, ModemFailure>
     func setRadio(on: Bool) -> Result<RadioChange, ModemFailure>
-    func setMode(_ mode: String) -> Result<ModeChange, ModemFailure>          // a canonicalMode value
+    func setMode(_ mode: String) -> Result<ModeChange, ModemFailure>          // one canonicalMode accepts (R8)
     func profiles() -> Result<[DataProfile], ModemFailure>
     func setProfile(_ id: Int, to settings: ProfileSettings, redial: Bool) -> Result<ProfileChange, ModemFailure>
     func sim() -> Result<SimInfo, ModemFailure>
@@ -100,22 +103,6 @@ private func firstAnswer(_ lines: [String], _ prefix: String) -> [String]? {
         if let f = atFields(line, prefix: prefix) { return f }
     }
     return nil
-}
-
-// MARK: - Text from the modem, safe to show
-
-/// Characters that move the cursor, erase or forge lines, or reorder what is shown: the C0 controls,
-/// DEL, the C1 controls, the bidirectional marks, embeddings, overrides and isolates, and the line and
-/// paragraph separators. Each becomes U+FFFD (the rule of ModemNetwork.swift, whose copy is private).
-private func shown(_ s: String) -> String {
-    var out = String.UnicodeScalarView()
-    for c in s.unicodeScalars {
-        let v = c.value
-        let unsafe = v <= 0x1F || (0x7F...0x9F).contains(v) || v == 0x061C || v == 0x200E || v == 0x200F
-            || (0x2028...0x202E).contains(v) || (0x2066...0x2069).contains(v)
-        out.append(unsafe ? "\u{FFFD}" : c)
-    }
-    return String(out)
 }
 
 // MARK: - Network mode
@@ -154,7 +141,7 @@ func parseProfiles(_ lines: [String]) -> [(id: Int, pdpType: String, apn: String
         guard let f = atFields(line, prefix: "+CGDCONT"), let id = answerInt(f, 0), id >= 1,
               let pdpType = answerField(f, 1), let apn = answerField(f, 2),
               !profiles.contains(where: { $0.id == id }) else { continue }
-        profiles.append((id: id, pdpType: shown(pdpType), apn: shown(apn)))
+        profiles.append((id: id, pdpType: modemTextSafe(pdpType), apn: modemTextSafe(apn)))
     }
     return profiles
 }
@@ -170,15 +157,15 @@ func parseProfileSettings(_ lines: [String]) -> ProfileSettings? {
 }
 
 /// AT+QICSGP=<id>,<type>,"<apn>","<user>","<password>",<auth>. It holds the password: send it, never
-/// show or log it. Check `profileProblem` first (no value may hold a `"`).
+/// show or log it. Check `profileProblem` first (no value may hold a `"` or a `\`).
 func profileCommand(_ id: Int, _ s: ProfileSettings) -> String {
     "AT+QICSGP=\(id),\(s.type.rawValue),\"\(s.apn)\",\"\(s.user)\",\"\(s.password)\",\(s.auth.rawValue)"
 }
 
 private let apnRule = "An APN is at most 100 characters of ASCII letters, digits, dots, hyphens and underscores, "
     + "and does not start or end with a dot."
-private let userRule = "A user name is at most 127 characters of printable ASCII, without a double quote (\")."
-private let passwordRule = "A password is at most 127 characters of printable ASCII, without a double quote (\")."
+private let userRule = "A user name is at most 127 characters of printable ASCII, without a double quote (\") or a backslash (\\)."
+private let passwordRule = "A password is at most 127 characters of printable ASCII, without a double quote (\") or a backslash (\\)."
 
 /// Up to 100 of ASCII letters, digits, `.`, `-`, `_`, not starting or ending with `.`; empty is allowed
 /// (the network chooses). Checked by Unicode scalar, so a combining mark is a character of its own.
@@ -194,10 +181,11 @@ private func apnAllowed(_ apn: String) -> Bool {
     }
 }
 
-/// Up to 127 of printable ASCII (0x20–0x7E) without `"`, which would end the quoted value.
+/// Up to 127 of printable ASCII (0x20–0x7E) without `"`, which would end the quoted value, and without
+/// `\`, since a V.250 / 27.007 string constant may read `\hh` as an escape (`a\41` stored as `aA`).
 private func credentialAllowed(_ value: String) -> Bool {
     let scalars = value.unicodeScalars
-    return scalars.count <= 127 && scalars.allSatisfy { (0x20...0x7E).contains($0.value) && $0 != "\"" }
+    return scalars.count <= 127 && scalars.allSatisfy { (0x20...0x7E).contains($0.value) && $0 != "\"" && $0 != "\\" }
 }
 
 /// nil when the settings can be sent to profile `id`; else the sentence saying which rule they break
@@ -247,9 +235,9 @@ private func authOption(_ a: AuthMethod) -> String {
 
 /// The settings in words without the password's part: `IPV4V6, APN "cmnet", PAP, user "u"`.
 private func settingsWords(_ s: ProfileSettings) -> String {
-    var parts = [typeWords(s.type), "APN \"\(shown(s.apn))\"" + (s.apn.isEmpty ? " (the network chooses)" : ""),
+    var parts = [typeWords(s.type), "APN \"\(modemTextSafe(s.apn))\"" + (s.apn.isEmpty ? " (the network chooses)" : ""),
                  authWords(s.auth)]
-    if !s.user.isEmpty { parts.append("user \"\(shown(s.user))\"") }
+    if !s.user.isEmpty { parts.append("user \"\(modemTextSafe(s.user))\"") }
     return parts.joined(separator: ", ")
 }
 
@@ -271,12 +259,14 @@ private func shellQuoted(_ value: String) -> String {
     return String(out)
 }
 
-/// The `RMNet apn set` options that put `s` back: `--apn '' --type ipv4v6 --user '' --auth none`, with
-/// ` --password` at the end when a password is set (the owner types the old one at the prompt).
+/// The `RMNet apn set` options that put `s` back: `--apn '' --type ipv4v6 --user '' --auth none
+/// --no-password`. The last option always says what becomes of the password (ruling R6): `--no-password`
+/// when `s` had none, so a password the change added is cleared; `--password` when `s` had one (the
+/// owner types the old one at the prompt; it is never printed).
 func profileRestoreArguments(_ s: ProfileSettings) -> String {
-    var words = ["--apn", shellQuoted(shown(s.apn)), "--type", typeOption(s.type), "--user", shellQuoted(shown(s.user)),
-                 "--auth", authOption(s.auth)]
-    if !s.password.isEmpty { words.append("--password") }
+    let words = ["--apn", shellQuoted(modemTextSafe(s.apn)), "--type", typeOption(s.type),
+                 "--user", shellQuoted(modemTextSafe(s.user)), "--auth", authOption(s.auth),
+                 s.password.isEmpty ? "--no-password" : "--password"]
     return words.joined(separator: " ")
 }
 
@@ -291,7 +281,7 @@ func profilesJSON(_ profiles: [DataProfile], driverProfile: Int) -> [String: Any
     let rows: [[String: Any]] = profiles.map { p in
         ["id": p.id, "pdpType": p.pdpType, "apn": p.apn,
          "auth": orNull(p.settings.map { authOption($0.auth) }),
-         "user": orNull(p.settings.map { shown($0.user) }),
+         "user": orNull(p.settings.map { modemTextSafe($0.user) }),
          "passwordSet": orNull(p.settings.map { !$0.password.isEmpty }),
          "driver": p.id == driverProfile]
     }
@@ -309,7 +299,7 @@ func parseSimState(_ lines: [String]) -> SimState? {
     case "SIM PUK": return .puk
     case "SIM PIN2": return .pin2
     case "SIM PUK2": return .puk2
-    default: return .other(shown(code))
+    default: return .other(modemTextSafe(code))
     }
 }
 
@@ -320,7 +310,7 @@ func simState(fromError line: String) -> SimState {
     case 10: return .notInserted
     case 13: return .failure
     case 14: return .busy
-    default: return .other(shown(line))
+    default: return .other(modemTextSafe(line))
     }
 }
 
@@ -411,11 +401,13 @@ func radioOffQuestion() -> (title: String, message: String) {
         + "switched on again: press Radio On, or run `RMNet radio on`.")
 }
 
-/// The way back from a mode change: only for a mode that `canonicalMode` gives again, which is what
-/// RMNet can set.
+/// The way back from a mode change: for any mode `canonicalMode` accepts, which the service sends in the
+/// modem's own order (ruling R8: `NR5G:LTE` is put back as `NR5G:LTE`); not for another value.
 private func modeWayBack(_ from: String?) -> String {
     guard let from else { return "After the change, RMNet says how to put the earlier mode back." }
-    guard canonicalMode(from) == from else { return "RMNet cannot set \(from) again, so it cannot put this setting back." }
+    guard canonicalMode(from) != nil else {
+        return "RMNet cannot set \(from) again; to put it back, set it again on the modem's console."
+    }
     return "To put it back, press Put Back in the window or run `RMNet mode \(from.lowercased())`."
 }
 
@@ -459,13 +451,15 @@ func pinQuestion(attempts: Int) -> (title: String, message: String) {
 
 // MARK: - After a change: the sentences
 
+/// Registered: "The radio is on; <registration words> after <n> s." (ruling R5: the words already say
+/// "registered"); not registered within the wait: "…has not registered yet (<words>)".
 func radioSentence(_ c: RadioChange) -> String {
     guard c.on else { return "The radio is off. The driver's connection is down until the radio is switched on again." }
     let words = registrationWords(c.registration)
     let registered = c.registration.map { $0.status == .home || $0.status == .roaming } ?? false
     guard registered else { return "The radio is on, but the modem has not registered yet (\(words))." }
-    if let n = c.secondsToRegister { return "The radio is on; registered (\(words)) after \(n) s." }
-    return "The radio is on; registered (\(words))."
+    if let n = c.secondsToRegister { return "The radio is on; \(words) after \(n) s." }
+    return "The radio is on; \(words)."
 }
 
 func modeSentence(_ c: ModeChange) -> String {
@@ -473,18 +467,20 @@ func modeSentence(_ c: ModeChange) -> String {
     return "The network mode is now \(modeWords(c.after)); it was \(modeWords(c.before)). The modem keeps this setting."
 }
 
-/// A reason from the service as the middle of a sentence: a first word such as "The" lowercased (not
-/// "AT+CFUN" or "I/O"), ending in a full stop.
+/// A reason from the service as the middle of a sentence: trimmed, a first word such as "The" lowercased
+/// (not "AT+CFUN" or "I/O"), ending in `.`, `?` or `!` (a full stop added otherwise). An empty reason
+/// reads "the radio could not be switched on."
 private func clause(_ why: String) -> String {
-    var scalars = Array(shown(why).unicodeScalars)
+    var scalars = Array(modemTextSafe(why.trimmingCharacters(in: .whitespacesAndNewlines)).unicodeScalars)
+    guard let last = scalars.last else { return "the radio could not be switched on." }
     if scalars.count >= 2, (0x41...0x5A).contains(scalars[0].value), (0x61...0x7A).contains(scalars[1].value),
        let lower = Unicode.Scalar(scalars[0].value + 0x20) {
         scalars[0] = lower
     }
+    if last != ".", last != "?", last != "!" { scalars.append(".") }
     var out = String.UnicodeScalarView()
     out.append(contentsOf: scalars)
-    let text = String(out)
-    return text.hasSuffix(".") ? text : text + "."
+    return String(out)
 }
 
 func profileSentence(_ c: ProfileChange) -> String {
