@@ -40,11 +40,16 @@ build/obj/harness/%.o: harness/%.mm
 check-driverkit:
 	./scripts/check-driverkit-compile.sh
 
-# The app's status model (Foundation only), tested without Xcode or hardware.
-app-test: build/app-tests
+# The app's status model and SMS model (Foundation only), tested without Xcode or hardware.
+app-test: build/app-tests build/sms-tests
 	./build/app-tests
+	./build/sms-tests
 
 build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+build/sms-tests: app/SmsModel.swift tests/app/SmsModelTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
