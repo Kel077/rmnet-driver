@@ -1471,3 +1471,25 @@ Build 317.20.51 (`serial-ports` at `72d91a6`, which contains `main` at `61e2941`
 **Not seen:** a fix; DTR's effect on NMEA output; a DIAG tool beyond the version request; sleep and wake with the serial instances; a serial instance failing while `en33` carries traffic.
 
 **Data.** Pings and SMS listings only; no measurement was run.
+
+## Runtime findings (modem controls in the app, 2026-11-15 03:40 to 06:01)
+
+Branch `app-controls`, unsigned app built from the worktree (`build/xcode/Debug/RMNet.app`); the installed driver (317.20.51 at the end) was not changed. Every command that changed the modem ran under the shared modem lock and was put back before the lock was released, and `en33` answered three pings in each family (223.5.5.5 and 2400:3200::1, bound to the port) after each.
+
+**The AT commands, read only (03:40, firmware `RM520NGLAAR03A04M4G_01.204.01.204`).** Every command answered in about 60 ms. `AT+CMEE?` is 1. `AT+CGAUTH` is not supported (`ERROR`), so a profile's user, password and authentication go through `AT+QICSGP=<id>[,…]` (profiles 1 to 16), which shows the same profiles as `AT+CGDCONT?`. `AT+QSPN` gives the operator's names in UCS-2 hex (alphabet 1). On 5G SA only `AT+C5GREG?` is registered (`AT+CEREG?`, `AT+CGREG?`, `AT+CREG?` read 0). `AT+QCAINFO` showed n41 with n28 aggregated. The SIM is ready, its PIN lock off (`AT+CLCK="SC",2` is 0), 3 PIN and 10 PUK attempts left (`AT+QPINC?`).
+
+**A stored password is shown in clear, and a password with no authentication becomes CHAP** (05:22, profile 4, `CMWAP`, used by nothing). `AT+QICSGP=4` read back a test password exactly as set, so the app keeps the current password when only another field changes. The modem had stored the password sent with authentication 0 (none) as CHAP (2) on its own: the service's read-back check reported the change as not matching. The app now refuses a user name or password when the authentication is none. Profile 4 was put back; its `AT+CGDCONT?` line was the same byte for byte.
+
+**LTE SINR.** `AT+QENG="servingcell"` gives LTE SINR as a raw value; the manual's conversion (dB = raw × 2 − 20) matched `AT+QSINR` on band 40 (raw 21, 22 dB).
+
+**Radio** (`RMNet radio off|on`, 05:48): off took the driver to `backoff` and `RMNet network` showed `none (radio off)`; on registered (5GS) 1 s after `AT+CFUN=1` answered, and the driver was up with its addresses 6 s after the verb began.
+
+**Network mode** (`RMNet mode lte`, then `auto`, 05:48 to 05:49): LTE (band 40, registered on EPS) within 1 s; back to 5G SA (n41) within 5 s of `auto`. The driver's connection stayed up through both, with the same addresses.
+
+**APN** (`RMNet apn set --apn cmnet`, then the printed put-back command, 05:49): each redial (radio off, change, radio on) registered within 3 s; the driver was up 11 to 12 s after the verb began, with new addresses; profile 1's `AT+CGDCONT?` line afterwards was the same byte for byte as before.
+
+**The window** (05:57 to 06:01). The Mac gives this session no screen recording, so the window was checked in two ways. The unsigned app, opened with `open -n`, showed one window of 480 by 472 points (the window list). A scratch program drove the window's own controller (`ModemController`) with the real service and drew the real `Network` and `SIM & APN` tabs off screen after each step: the live values; a mode change to LTE with `Put Back` offered, then put back to automatic; `Apply…` of the APN `cmnet` with the redial, then `Put Back…`; the radio off and on. Each did on the modem what the verbs did, and each was put back. The confirmation dialogs and the tab strip were not seen on screen.
+
+**SIM.** `RMNet sim unlock` with the SIM ready says it does not ask for a PIN and sends nothing. No PIN or PUK was sent at any time.
+
+**Data.** Pings only.
