@@ -1014,3 +1014,82 @@ TEST(giving_up_flow_control_omits_it_after_a_restart) {
   CHECK_BYTES(m.last(), expected_request(m, kWdaSetFormatReq).c_str());
   CHECK(!s.flow_control_asked()); CHECK(s.flow_control_refused());
 }
+
+// Pinned behaviour (the deferred list of 2026-11-13): the teardown on entering Backoff, Start
+// Network's 60 s timeout, the backoff's steps.
+
+namespace {
+
+std::string as_text(const std::vector<uint8_t>& f) { return minitest::to_hex(f.data(), f.size()); }
+
+// A captured CTL frame with its 8-bit transaction ID replaced.
+std::vector<uint8_t> ctl_with_txid(const char* hex_text, uint8_t txid) {
+  std::vector<uint8_t> f = hex(hex_text);
+  f[7] = txid;
+  return f;
+}
+
+// The capture's CTL Sync response with CTL transaction `txid`, failed (status 1, error 3).
+std::vector<uint8_t> failed_sync_response(uint8_t txid) {
+  std::vector<uint8_t> f = ctl_with_txid(kCtlSyncResp, txid);
+  f[15] = 0x01; f[17] = 0x03;
+  return f;
+}
+
+}  // namespace
+
+TEST(entering_backoff_sends_the_teardown) {
+  {
+    // From Up, the IPv4 call drops: it is gone, so only its client is released. These are the
+    // capture's own frames, since bring-up used the capture's transaction IDs and nothing came since.
+    FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m); size_t before = m.sent.size();
+    feed(s, kWdsDisconnected4Ind, 5000);
+    CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(m.downs, 1);
+    REQUIRE(m.sent.size() == before + 4);
+    CHECK_BYTES(m.sent[before + 0], kWdsStop6Req);    CHECK_BYTES(m.sent[before + 1], kCtlRelease6Req);
+    CHECK_BYTES(m.sent[before + 2], kCtlRelease4Req); CHECK_BYTES(m.sent[before + 3], kCtlReleaseWdaReq);
+    s.tick(6999); CHECK_EQ(m.sent.size(), before + 4);                        // then nothing until the redial
+  }
+  {
+    // From Up, the probe (transaction 10) goes unanswered: both calls are stopped, IPv6 first, with
+    // the next transaction IDs, then all three clients released.
+    FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m);
+    s.tick(30100); REQUIRE(m.last_txid() == 10u); size_t before = m.sent.size();
+    s.tick(40100);
+    CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(m.downs, 1);
+    REQUIRE(m.sent.size() == before + 5);
+    CHECK_BYTES(m.sent[before + 0], as_text(with_txid(kWdsStop6Req, 11)).c_str());
+    CHECK_BYTES(m.sent[before + 1], kCtlRelease6Req);
+    CHECK_BYTES(m.sent[before + 2], as_text(with_txid(kWdsStop4Req, 12)).c_str());
+    CHECK_BYTES(m.sent[before + 3], kCtlRelease4Req);
+    CHECK_BYTES(m.sent[before + 4], kCtlReleaseWdaReq);
+  }
+}
+
+TEST(start_network_gets_60_s_before_backing_off) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_to(s, m, kWdsFamily4Resp);   // IPv4 Start Network sent at 100
+  CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x20);
+  size_t sent = m.sent.size();
+  s.tick(10100); CHECK(s.state() == rmnet::SessionState::Connecting);         // other requests time out at 10 s
+  s.tick(60099); CHECK(s.state() == rmnet::SessionState::Connecting); CHECK_EQ(m.sent.size(), sent);
+  s.tick(60100); CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(m.ups, 0);
+  // Not on to IPv6: the teardown releases the IPv4 client (no call to stop) and the WDA client.
+  REQUIRE(m.sent.size() == sent + 2);
+  CHECK_BYTES(m.sent[sent + 0], as_text(ctl_with_txid(kCtlRelease4Req, 4)).c_str());
+  CHECK_BYTES(m.sent[sent + 1], as_text(ctl_with_txid(kCtlReleaseWdaReq, 5)).c_str());
+}
+
+TEST(backoff_waits_double_from_2_s_up_to_60_s) {
+  // Every Sync is refused at once, so each Backoff follows the last: 2 s, then 4, 8, 16 and 32 s,
+  // then 60 s, not 64 (a wait of half the 60 s cap or more is followed by the cap), and 60 s on.
+  FakeModem m; rmnet::Session s({}, m); s.start(0);
+  uint64_t t = 0;
+  for (uint64_t wait : {2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000}) {
+    feed_frame(s, failed_sync_response(static_cast<uint8_t>(m.last_txid())), t);
+    CHECK(s.state() == rmnet::SessionState::Backoff);
+    size_t sent = m.sent.size();
+    s.tick(t + wait - 1); CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(m.sent.size(), sent);
+    s.tick(t + wait);     CHECK(s.state() == rmnet::SessionState::Syncing); CHECK_EQ(m.sent.size(), sent + 1);
+    t += wait;
+  }
+}

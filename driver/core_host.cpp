@@ -5,7 +5,8 @@
 
 #include "rmnet/qmi.h"
 #include "rmnet/qmi_msgs.h"
-#include "usb_io.h"
+#include "rmnet/util.h"
+#include "usb_port.h"
 
 #define LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "RMNet: " fmt, ##__VA_ARGS__)
 
@@ -15,9 +16,6 @@ constexpr uint8_t kTlvStartFamily = 0x19;  // WDS Start Network "IP Family Prefe
 constexpr uint8_t kFamilyV4 = 4;
 constexpr uint8_t kFamilyV6 = 6;
 constexpr size_t kEthHeaderLen = 14;
-
-// Rate limit for repeated events: true when n is a power of two.
-bool Worth(uint64_t n) { return n != 0 && (n & (n - 1)) == 0; }
 
 const char* ServiceName(rmnet::QmiService s) {
   switch (s) {
@@ -29,16 +27,6 @@ const char* ServiceName(rmnet::QmiService s) {
       return "WDA";
   }
   return "?";
-}
-
-uint8_t PrefixLength(const uint8_t mask[4]) {
-  uint8_t n = 0;
-  for (int i = 0; i < 4; i++) {
-    for (int b = 7; b >= 0; b--) {
-      if (mask[i] & (1u << b)) n++;
-    }
-  }
-  return n;
 }
 
 // Field by field (no memcmp of the struct: its padding is not set).
@@ -81,7 +69,7 @@ const char* SessionStateName(rmnet::SessionState s) {
   return "?";
 }
 
-CoreHost::CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile, bool flow_control)
+CoreHost::CoreHost(UsbPort& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile, bool flow_control)
     : usb_(usb),
       rx_(rx),
       session_(MakeSessionConfig(profile, flow_control), *this),
@@ -263,7 +251,9 @@ void CoreHost::log_received(const uint8_t* data, size_t len) {
           f.link_layer, f.ul_agg, f.ul_max_datagrams, f.ul_max_size, f.dl_agg, f.dl_max_datagrams, f.dl_max_size,
           rmnet::data_format_usable(f), session_.flow_control_asked() ? 1u : 0u,
           static_cast<unsigned>(f.flow_control));
-    } else if (r.present && r.ok) {
+    } else if (!r.present) {
+      LOG("data format answer has no result");
+    } else if (r.ok) {
       LOG("data format not parsed (result ok)");
     } else {
       LOG("data format refused (error 0x%x)", r.error);
@@ -291,7 +281,8 @@ void CoreHost::log_received(const uint8_t* data, size_t len) {
         logged_settings_known_[f] = true;
       }
       LOG("settings IPv%u: v4 %d (/%u, %u dns), v6 %d (/%u, %u dns), mtu %u", family, s.has_v4,
-          s.has_v4 ? PrefixLength(s.v4_mask) : 0, s.v4_dns_count, s.has_v6, s.v6_prefix_len, s.v6_dns_count, s.mtu);
+          s.has_v4 ? rmnet::prefix_length(s.v4_mask) : 0, s.v4_dns_count, s.has_v6, s.v6_prefix_len,
+          s.v6_dns_count, s.mtu);
     }
   }
 }
@@ -369,7 +360,7 @@ void CoreHost::on_bulk_in(const uint8_t* data, size_t len) {
     if (st == rmnet::QmapStatus::End) break;
     if (st != rmnet::QmapStatus::Ok) {
       counters_.rx_drop_bad_qmap++;
-      if (Worth(counters_.rx_drop_bad_qmap)) {
+      if (rmnet::worth(counters_.rx_drop_bad_qmap)) {
         LOG("bad qmap (%{public}s) at %zu of a %zu-byte transfer (%llu so far)",
             st == rmnet::QmapStatus::Truncated ? "truncated" : "malformed", off, len, counters_.rx_drop_bad_qmap);
       }

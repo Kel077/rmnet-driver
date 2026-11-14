@@ -12,7 +12,7 @@ CORE_OBJS := $(patsubst core/src/%.cpp,build/obj/core/%.o,$(CORE_SRCS))
 TEST_OBJS := $(patsubst tests/%.cpp,build/obj/tests/%.o,$(TEST_SRCS))
 HARNESS_OBJS := $(patsubst harness/%.mm,build/obj/harness/%.o,$(HARNESS_SRCS))
 
-.PHONY: test check-driverkit app-test harness driver clean
+.PHONY: test driver-test check-driverkit app-test script-test harness driver clean
 
 test: build/tests
 	./build/tests $(FILTER)
@@ -28,6 +28,29 @@ build/obj/tests/%.o: tests/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(TEST_FLAGS) -Icore/include -Itests -MMD -MP -c $< -o $@
 
+# CoreHost (driver/core_host.cpp) on the host, behind fakes of UsbPort and RxSink, built with Core's
+# flags, tests and runner included. `make driver-test FILTER=kept` runs only tests whose name contains it.
+DRIVER_TEST_OBJS := build/obj/driver/core_host.o build/obj/driver-tests/test_core_host.o \
+	build/obj/driver-tests/test_main.o
+
+driver-test: build/driver-tests
+	./build/driver-tests $(FILTER)
+
+build/driver-tests: $(CORE_OBJS) $(DRIVER_TEST_OBJS)
+	$(CXX) -o $@ $^
+
+build/obj/driver/core_host.o: driver/core_host.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CORE_FLAGS) -Icore/include -MMD -MP -c $< -o $@
+
+build/obj/driver-tests/test_core_host.o: tests/driver/test_core_host.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CORE_FLAGS) -Icore/include -Idriver -Itests -MMD -MP -c $< -o $@
+
+build/obj/driver-tests/test_main.o: tests/test_main.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CORE_FLAGS) -Itests -MMD -MP -c $< -o $@
+
 harness: build/rmnet-harness
 
 build/rmnet-harness: $(CORE_OBJS) $(HARNESS_OBJS)
@@ -39,14 +62,19 @@ build/obj/harness/%.o: harness/%.mm
 
 check-driverkit:
 	./scripts/check-driverkit-compile.sh
+	./scripts/check-personalities.sh
 
-# The app's status model, SMS model, AT answer logic, the Messages tab's controller, the network model and
-# the settings model, tested without Xcode or hardware (the AT port itself is not opened, and no window is made).
-app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/modemnet-tests build/modemset-tests
+# The app's status model, SMS model, AT answer logic, the Messages tab's controller, the gps verb's
+# NMEA logic and its port reader, the network model and the settings model, tested without Xcode or
+# hardware (neither the AT port nor the NMEA port is opened: the reader reads a pseudo-terminal the test
+# makes, and no window is made).
+app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/nmea-tests build/gpsread-tests build/modemnet-tests build/modemset-tests
 	./build/app-tests
 	./build/sms-tests
 	./build/at-tests
 	./build/smsui-tests
+	./build/nmea-tests
+	./build/gpsread-tests
 	./build/modemnet-tests
 	./build/modemset-tests
 
@@ -66,6 +94,14 @@ build/smsui-tests: app/SmsModel.swift app/SmsController.swift tests/app/SmsContr
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
+build/nmea-tests: app/Nmea.swift tests/app/NmeaTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+build/gpsread-tests: app/Nmea.swift app/GpsCommand.swift tests/app/GpsReadTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
 build/modemnet-tests: app/ModemNetwork.swift tests/app/ModemNetworkTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
@@ -73,6 +109,12 @@ build/modemnet-tests: app/ModemNetwork.swift tests/app/ModemNetworkTests.swift
 build/modemset-tests: app/ModemNetwork.swift app/ModemSettings.swift tests/app/ModemSettingsTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+# The scripts' decisions that need neither the network nor an install: the install script's kept-app
+# and running-driver checks (scripts/install-checks.sh) and soak.sh's status classes (--classify).
+script-test:
+	sh tests/scripts/test-install-checks.sh
+	sh tests/scripts/test-soak-classify.sh
 
 # Unsigned build of the driver and the host app that embeds it. gen.rb writes RMNet.xcodeproj.
 XCODEBUILD := xcodebuild -project RMNet.xcodeproj -configuration Debug -parallelizeTargets \
@@ -89,4 +131,4 @@ driver:
 clean:
 	[ ! -d build ] || find build -mindepth 1 -maxdepth 1 ! -name installed -exec rm -rf {} +
 
--include $(CORE_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(HARNESS_OBJS:.o=.d)
+-include $(CORE_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(HARNESS_OBJS:.o=.d) $(DRIVER_TEST_OBJS:.o=.d)

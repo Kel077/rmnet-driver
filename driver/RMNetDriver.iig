@@ -1,4 +1,5 @@
-// The driver's only DriverKit class: presents the modem's QMI interface as an Ethernet port.
+// The driver's network class: presents the modem's QMI interface as an Ethernet port. The other
+// DriverKit class, RMNetSerial, presents the modem's DIAG and NMEA interfaces as serial ports.
 #ifndef RMNetDriver_h
 #define RMNetDriver_h
 

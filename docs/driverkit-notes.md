@@ -786,6 +786,81 @@ Then add every `core/src/*.cpp` to the dext's Sources phase. `core/src/ethernet_
 
 ---
 
+## 6. Serial ports (USBSerialDriverKit)
+
+Date: 2026-11-15. The modem's DIAG (interface 0) and NMEA (interface 1) interfaces as `/dev/cu.RM520N-GL-DIAG` and `/dev/cu.RM520N-GL-NMEA`, by a second class, `RMNetSerial`, in the same dext. Built and linked with `make driver` (unsigned); **not yet loaded**, so everything marked **[runtime]** is open until the first load of the serial ports.
+
+The class lives in the existing dext rather than a second one: one bundle, one version, one approval and one install path, so `scripts/install-driver.sh`, the app's activation and the version-matched removal stay as they are. A second dext would need its own bundle ID, provisioning profile, activation request, removal path and kept apps.
+
+### 6.1 What `IOUserUSBSerial` does
+
+`$FW/SerialDriverKit.framework/Headers/IOUserSerial.iig` declares `class KERNEL IOUserSerial : protected IOService`, and `$FW/USBSerialDriverKit.framework/Headers/IOUserUSBSerial.iig` declares `class IOUserUSBSerial : protected IOUserSerial`. macOS ships `com.apple.DriverKit-AppleUSBSerial.dext`, whose class `AppleGenericUSBSerial` is an `IOUserUSBSerial` that overrides only `Start` (the superclass's, then `RegisterService`). What `IOUserUSBSerial` does, read from its disassembly (the DriverKit shared cache):
+
+- `Start` calls `IOUserSerial::Start`, then sets `IOTTYBaseName` = `usbserial-` and `IOTTYSuffix` = the USB serial number (or the location ID in hex), followed by the interface number in hex when the configuration has two or more interfaces. It reads the personality's `quirks` (a 16-bit number); bit 0 sends a zero-length packet after a write that is a whole number of max-size packets.
+- `ConnectQueues` opens the interface (for client `this`); `DisconnectQueues` closes it. `HwActivate` (a port being opened) copies the pipes: a bulk IN and a bulk OUT are required (`kIOReturnError` without them), an interrupt IN is optional, so DIAG's two bulk endpoints are enough. Each read is one max-size packet.
+- It does not implement `HwResetFIFO`, `HwSendBreak`, `HwProgramUART`, `HwProgramBaudRate`, `HwProgramMCR`, `HwGetModemStatus`, `HwProgramLatencyTimer` or `HwProgramFlowControl`, which are pure (`LOCAL = 0`) in `IOUserSerial.iig`. `RMNetSerial` implements all eight.
+
+### 6.2 The class
+
+`driver/RMNetSerial.iig` overrides `init`, `free`, `Start`, `Stop` and the ten `Hw*` methods, spelled as in `IOUserSerial.iig` (`HwProgramUART(uint32_t baudRate, uint8_t nDataBits, uint8_t nHalfStopBits, uint8_t parity)`, `HwGetModemStatus(bool * cts, bool * dsr, bool * ri, bool * dcd)`, `HwProgramFlowControl(uint32_t arg, uint8_t xon, uint8_t xoff)`). The `Hw*` methods are `LOCAL`, not `LOCALONLY`, so they follow the RPC rule (3.1): the bodies are `Name_Impl`, and `HwActivate(SUPERDISPATCH)` and `HwDeactivate(SUPERDISPATCH)` reach the superclass. The `.cpp` includes `<USBSerialDriverKit/USBSerialDriverKit.h>`, and `gen.rb`'s `OTHER_LDFLAGS` gains `-framework SerialDriverKit -framework USBSerialDriverKit`; `otool -L` on the dext then lists both frameworks, and `nm -m` shows twelve `RMNetSerial::*_Impl` symbols (`Start`, `Stop` and the ten `Hw*`).
+
+`Start` works in this order:
+
+1. It reads the interface descriptor (`CopyConfigurationDescriptor`, `GetInterfaceDescriptor`, `IOUSBHostFreeDescriptor`, as `RMNetDriver` does) and the personality (`CopyProperties`).
+2. It refuses, with `kIOReturnUnsupported` and a log line, unless the provider is an `IOUSBHostInterface`, its descriptor was read, `RMNetSerialSubClass` and `RMNetSerialProtocol` are integers, `rmnet::serial_interface_matches` accepts the interface's class, subclass and protocol, and `rmnet::tty_name_ok` accepts `RMNetSerialName`. At that point nothing has been opened and the superclass's `Start` has not been called.
+3. The superclass's `Start`, then `SetProperties` with the port's name (6.5), then `RegisterService`.
+
+`Stop` releases the interface and passes `Stop` to the superclass. `HwActivate` and `HwDeactivate` forward to the superclass and log every call (`open`, `close`). `HwProgramMCR` sends DTR and RTS (6.6). `HwGetModemStatus` reports CTS, DSR and DCD on and RI off, so a program that waits for a carrier does not wait forever. The other six succeed without I/O and log their arguments on their first call only.
+
+### 6.3 Personality keys
+
+Two personalities in `driver/Info.plist`, `RMNetSerialDIAG` and `RMNetSerialNMEA`:
+
+| Key | Value |
+|---|---|
+| `CFBundleIdentifier`, `IOUserServerName` | `$(PRODUCT_BUNDLE_IDENTIFIER)` |
+| `CFBundleIdentifierKernel` | `com.apple.driver.driverkit.serial` (as Apple's serial dexts use; `AppleUSBSerial` has no `OSBundleLibraries` entry for it, and neither has ours) |
+| `IOClass` | `IOUserSerial` |
+| `IOProviderClass` | `IOUSBHostInterface` |
+| `IOUserClass` | `RMNetSerial` |
+| `idVendor`, `idProduct`, `bConfigurationValue` | 11388, 2049, 1 (the 4-key match proven for `RMNetDriver`, 4.1) |
+| `bInterfaceNumber` | 0 (DIAG), 1 (NMEA) |
+| `RMNetSerialName` | `RM520N-GL-DIAG`, `RM520N-GL-NMEA` |
+| `RMNetSerialSubClass`, `RMNetSerialProtocol` | 255 and 48 (DIAG, `ff`/`ff`/`30`), 0 and 64 (NMEA, `ff`/`00`/`40`) |
+| `quirks` | 1 (6.7) |
+
+Matching by interface number alone could take an AT or QMI interface if the modem's USB configuration changed (switching DIAG off, for example, renumbers the rest), which is why `Start` checks the class, subclass and protocol first (6.2). `scripts/check-personalities.sh`, run by `make check-driverkit`, also refuses any personality on interface 2 or 3, an `RMNetSerial` one on any interface but 0 or 1 or without `IOClass` `IOUserSerial`, `CFBundleIdentifierKernel` `com.apple.driver.driverkit.serial` and a valid `RMNetSerialName`, `RMNetDriver` on any interface but 4, and a personality whose `IOUserClass` is neither `RMNetSerial` nor `RMNetDriver`.
+
+DIAG is included because it costs one personality on the same class and lets Qualcomm DIAG tools that take a serial device (QCSuper, Quectel's QLog) run on the Mac.
+
+### 6.4 Entitlement and profile
+
+`driver/Driver.entitlements` gains `com.apple.developer.driverkit.family.serial` = true, after `family.networking`. Checked on 2026-11-15 at 03:40: a signed Release build of the `RMNetDriver` target alone, with that key added, `-allowProvisioningUpdates` and team `ABCDE12345`, succeeded. Xcode replaced the profile "DriverKit Team Provisioning Profile: io.rmnetdriver.RMNet.driver" (now `~/Library/Developer/Xcode/UserData/Provisioning Profiles/6d3b0ea4-cad5-43cf-8071-24af4e246bdc.provisionprofile`) with one granting `family.networking` and `family.serial`, and the signed dext carried both. Nothing was installed. The existing `transport.usb` entitlement (`idVendor` `*`) already covers interfaces 0 and 1.
+
+### 6.5 Naming
+
+`IOUserUSBSerial` would name the ports `usbserial-<serial number>0` and `...1`. `RMNetSerial` sets `IOTTYBaseName` to `RMNetSerialName` and `IOTTYSuffix` to `""` with `SetProperties` after the superclass's `Start` and before `RegisterService`: the BSD client, which makes `/dev/cu.*` and `/dev/tty.*`, is matched at registration and reads those two properties, and Apple's Bluetooth serial dext sets them the same way at run time. If `SetProperties` is refused, the port keeps Apple's name and the driver logs `RMNet: serial <name>: naming the port failed`. A name must be 1 to 31 of `A-Z`, `a-z`, `0-9`, `_` and `-` (`rmnet::tty_name_ok`, `rmnet::kTtyNameMax`); the script checks the same rule.
+
+### 6.6 DTR and RTS
+
+Linux's `option`/`usb_wwan` driver sends the CDC request SET_CONTROL_LINE_STATE (`bmRequestType` 0x21, `bRequest` 0x22, `wValue` DTR bit 0 and RTS bit 1, `wIndex` the interface number) when a port opens and closes. `HwProgramMCR` does the same, synchronously, with `IOUSBHostInterface::DeviceRequest` (its `bytesTransferred` is a `uint16_t *`) and a 1000 ms timeout, and logs the values and the status on every call. A failure is logged and the call still returns success, so opening a port never fails on it.
+
+### 6.7 Zero-length packets (`quirks`)
+
+Quectel's Linux driver sets `URB_ZERO_PACKET` on every bulk OUT for vendor 0x2C7C, so both personalities set `quirks` = 1, which makes `IOUserUSBSerial` send a zero-length packet after a write that fills its last packet.
+
+### 6.8 Open questions for the first load **[runtime]**
+
+*Answered 2026-11-15 on 317.20.51; see "Runtime findings (serial ports)": 1 yes; 2 as listed there; 3 yes, one process per instance; 4 yes (both ports started); 5 yes, the modem accepts the request before `HwActivate`; whether NMEA needs DTR was not tested.*
+
+1. Whether our `SetProperties` names win: `ls /dev/cu.*` shows `cu.RM520N-GL-DIAG` and `cu.RM520N-GL-NMEA`, or Apple's `usbserial-...` names (and the log has `naming the port failed`).
+2. Which `Hw*` calls the kernel makes, and in what order, when a port is opened and closed: `open` and `close`, the MCR line on every call, and the first-call lines of the others.
+3. Whether the instances run in their own processes (`ps`). DriverKit starts a separate process for each matched provider unless the personality sets `IOUserServerOneProcess`, so a fault in a serial instance should not stop `en33`.
+4. Whether `CopyProperties` and the interface's `CopyConfigurationDescriptor` answer before the superclass's `Start`. `RMNetDriver` reads both after it; if they do not, every port is refused with `properties not readable` or `the interface descriptor could not be read`.
+5. Whether SET_CONTROL_LINE_STATE succeeds when `HwProgramMCR` is called (the interface is opened by `ConnectQueues`; a request before that may be refused), and whether the modem needs DTR for NMEA output at all.
+
+---
+
 ## Build record
 
 Spike settings: those of `spike-dext/gen.rb`, plus the Core settings above. There is no `DEVELOPMENT_TEAM` or `CODE_SIGN_STYLE`; signing is turned off on the command line.
@@ -918,7 +993,7 @@ From installing 316.16.36, 316.16.40 and 316.16.41 and rebooting the modem with 
 
 ## Recommended source layout for the real driver
 
-- `driver/RMNetDriver.iig` + `.cpp`: the only DriverKit class, an `IOUserNetworkEthernet` subclass. It owns its lifecycle (`Start`, `Stop`, `SetPowerState`), the pool and the four queues, link reporting, the timer, and every `TYPE(...)` completion stub. Each stub is a few lines that forward to the classes below. Everything runs on the Default queue.
+- `driver/RMNetDriver.iig` + `.cpp`: the network class, an `IOUserNetworkEthernet` subclass (*corrected 2026-11-15: this first said "the only DriverKit class"; since the serial ports, `RMNetSerial` (section 6) is the other*). It owns its lifecycle (`Start`, `Stop`, `SetPowerState`), the pool and the four queues, link reporting, the timer, and every `TYPE(...)` completion stub. Each stub is a few lines that forward to the classes below. Everything runs on the Default queue.
 - `driver/usb_io.{h,cpp}`: plain C++ held in the ivars. It holds the interface and three pipes, the posted-read slots and their buffers, the ring of QMI OUT buffers, the uplink buffer, stall recovery and abort. It knows nothing about QMI.
 - `driver/core_host.{h,cpp}`: plain C++ that implements `rmnet::SessionDelegate` and owns `Session`, `EthernetEmulator` and `QmapAggregator`. It turns USB completions into `on_qmi`, `qmap_next` and `wrap_rx` calls, turns TX packets into `handle_tx` and the aggregator, and calls `tick` and the periodic router advertisement. This is where Core is driven from, always on the Default queue, never re-entered from a delegate callback.
 - `driver/Info.plist`, `driver/Driver.entitlements`, `app/` (SwiftUI host, activation, and a status read through `IORegistryEntryCreateCFProperty`), and `gen.rb` at the root, producing the project with `$(SRCROOT)`-relative paths and `core/src/*.cpp` in the dext target.
@@ -1356,3 +1431,43 @@ The owner added 5 GB at 02:24 ("start fixing. i'm giving you 5gb over next two h
 - The ratio check above is the one to repeat before trusting `measure.sh` on any interface other than `en33`.
 
 **Data.** The usage file records 2,093,606,693 bytes since 02:24 (total 3,380,774,194; the scripts' ceiling is 6,300,000,000). It over-records: the two runs at 02:33 each recorded the port's whole traffic (about 202 MB counted twice) and the two qmi-darwin runs were recorded at their doubled counts (about 286 MB too much), as was the 02:08 run (about 155 MB too much). With pings and background traffic, about 2.75 GB of the 6.4 GB allowed for testing is really used, about 3.65 GB left. The usage file is not edited; it errs on the safe side.
+
+## Runtime findings (cleanup build, 2026-11-15 04:43 to 04:47)
+
+Build 317.20.43, from `cleanup` at `bee6b41` (plan `docs/superpowers/plans/2026-11-15-cleanup.md`): the address helpers moved into Core, `CoreHost` reaches USB through the `UsbPort` interface, the wake-retry and no-result data-format log lines changed, and the unused DNS slot of a one-server settings reply is zeroed. Installed with `scripts/install-driver.sh` (its new kept-app check passed: only 317.18.40 was listed and its app is kept), loaded with `AT+CFUN=1,1` at 04:44:05, under the shared modem lock.
+
+- The port was up in both families 30 s after the reboot, on the new build (the running driver's CDHash matches the installed one). `RMNetFlowControlOn` 1, `RMNetFlowControlRefused` 0.
+- The moved helpers print as before: `RMNetIPv4 = 10.93.33.100/29 gw 10.93.33.101`, `RMNetIPv6 = 2001:db8:8ae9:25b5:b1dc:dffc:6574:41f1/64`. The driver's log lines were not captured (`log show` keeps none of the dext's default-level lines; `scripts/driver-log.sh` must run before the event).
+- Pings 3 of 3 in each family; `sms list` works (29 messages, 74 of 255 parts); no new crash report.
+- `scripts/measure.sh en33 up`: **23.0 Mbit/s** (best second 24.8), 20.0 MB moved, `RMNetTxHolds` 0 → 67, no drop. `scripts/measure.sh en33 down`: **58.4 Mbit/s** (best second 93.2), 53.0 MB moved. Cell PCI 32, RSRP -97, RSRQ -11, SINR 4 (weaker than every earlier run). The driver's receive work stayed what it was: about 76 µs per transfer, 14.5 datagrams per transfer, `RMNetRxDropNoPacket` 0; no error or drop counter moved except `RMNetTxDropFiltered` (multicast, by design). `AT+CFUN=0` then `AT+CFUN=1` re-selected the same cell (SINR 5), so a second download was skipped. The low download is the cell's: nothing on the receive path changed in this build, and the driver was no busier per transfer.
+- The radio cycle took the link down and up once (`RMNetTxDropLinkDown` 11, frames sent while it was down); the port came back with new addresses in both families within 8 s.
+
+**Data.** 72,994,373 bytes recorded for the two runs (usage file total 3,453,768,567; the scripts' ceiling 6,300,000,000). With pings and the radio cycle, about 75 MB of the owner's allowance, about 3.57 GB left of 6.4 GB.
+
+## Runtime findings (serial ports, 2026-11-15 04:50 to 04:56)
+
+Build 317.20.51 (`serial-ports` at `72d91a6`, which contains `main` at `61e2941`), installed with `scripts/install-driver.sh` over 317.20.43 and loaded with `AT+CFUN=1,1`; the coordinating session's modem lock was held from 04:50 to 04:55:50. Log: `build/logs/driver-20261115-045059.log` (in the `serial-ports` worktree).
+
+**Loading.** After `activate` the new serial personalities did not attach to the free interfaces 0 and 1: the old entry stayed `terminating for upgrade via delegate` until the modem re-enumerated, and then all three instances of the new build started together. Link up 38 s after `AT+CFUN=1,1`.
+
+**Attachment and names** (6.8 questions 1, 3 and 4):
+- `RMNetSerial` (`IOUserSerial`) on `IOUSBHostInterface@0` and `@1`, `RMNetDriver` on `RmNet@4`, nothing on interfaces 2 and 3 (the console's libusb client came back on 2 a little later).
+- `IOTTYBaseName` `RM520N-GL-DIAG` and `RM520N-GL-NMEA`, `IOTTYSuffix` empty: our names won over `IOUserUSBSerial`'s `usbserial-...`. Devices `/dev/cu.` and `/dev/tty.RM520N-GL-DIAG` and `-NMEA`, mode `crw-rw-rw-`, root:wheel.
+- Three processes of the dext, one per instance (`ps`), so the serial instances do not share `RMNetDriver`'s process.
+- The serial instances' `serial start` and `started on interface` lines of the first load were lost, as `RMNetDriver`'s own `init` and `Start` lines were (the stream loses lines around a load); at the second load (04:54:48) both came: `serial RM520N-GL-DIAG: started on interface 0`, `serial RM520N-GL-NMEA: started on interface 1`. So `CopyProperties` and the descriptor read answer before the superclass's `Start`.
+
+**Calls on open and close** (6.8 questions 2 and 5), the same on every open:
+- Open: `HwProgramMCR(1, 1)` (SET_CONTROL_LINE_STATE status `0x0`), then `HwActivate` (`0x0`), then the first `HwResetFIFO` (tx 1, rx 0), `HwGetModemStatus`, `HwProgramFlowControl` (arg 0, XON 0x11, XOFF 0x13), `HwProgramBaudRate` 9600 and `HwProgramUART` (9600, 8 data bits, 2 half stop bits, parity 1), within 2 ms.
+- Close: the first `HwSendBreak(0)`, `HwProgramMCR(0, 0)` (`0x0`), `HwDeactivate` (`0x0`).
+- So the modem accepts the control request before `HwActivate`: the interface is open by then. Whether NMEA needs DTR at all was not tested.
+- A fresh port's settings had `ECHO` and `ICANON` off and `CLOCAL` off; `RMNet gps` sets `CLOCAL`, and the setting stays on the port for the next opener.
+
+**NMEA.** `AT+QGPSCFG="outport"` answers `usbnmea`. With `AT+QGPS=1` (04:53:07), a 15-second raw read got 1,962 bytes: `GPGGA`, `GPGSA`, `GPRMC` and `GPVTG` once a second each, every checksum valid, `RMC` status `V` and `GGA` quality 0 throughout, no `GSV` (no satellites in view). `RMNet gps 20` printed `gps: no fix after 20 s (104 sentences, 0 satellites in view)` and `RMNet gps 3` the same for 32 sentences, exit 1; at four sentences a second both counts are above what that time delivers, so the first read after an open returns a few seconds of sentences sent before it. Two readers on the port at once split the bytes and each saw broken sentences. Whether an antenna is attached is not known; no fix was seen.
+
+**DIAG.** Writing `00 78 F0 7E` (command 0x00, version) to `/dev/cu.RM520N-GL-DIAG` gave a 58-byte answer starting `00` and ending `7E`, with the firmware's compile and release dates in it; the same after the second load.
+
+**Re-enumeration with the NMEA port open** (04:54:33, `AT+CFUN=1,1` with a raw reader and `RMNet gps 60` both reading): both readers ended with `ENXIO` (`Device not configured`); `RMNet gps` printed `gps: reading the NMEA port failed after 9 s: Device not configured`, exit 1. In the log, the DIAG instance stopped, then the NMEA port's close sent `HwProgramMCR(0, 0)`, which failed with `0xe00002d7` (`kIOReturnOffline`, logged and ignored), `HwDeactivate`, its stop, and `RMNetDriver`'s usual stop sequence. New instances of all three started 10 s later; the ports, `en33` (IPv4 and IPv6, pings 3 of 3 each), `sms list` and the console came back. No crash report. GNSS was off after the reboot (`AT+QGPS?` answered 0), as the owner wanted, so no `AT+QGPSEND` was sent.
+
+**Not seen:** a fix; DTR's effect on NMEA output; a DIAG tool beyond the version request; sleep and wake with the serial instances; a serial instance failing while `en33` carries traffic.
+
+**Data.** Pings and SMS listings only; no measurement was run.

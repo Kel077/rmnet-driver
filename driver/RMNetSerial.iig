@@ -1,0 +1,43 @@
+// The modem's DIAG (interface 0) and NMEA (interface 1) interfaces as serial ports,
+// /dev/cu.RM520N-GL-DIAG and /dev/cu.RM520N-GL-NMEA. Apple's IOUserUSBSerial opens the interface
+// and moves the bytes; this class checks the interface before that, names the port, and answers
+// the serial calls a USB modem port has no hardware for.
+//
+// It must never be matched to interfaces 2 or 3 (the AT ports the owner's console and the app's
+// SMS use from user space) or 4 (QMI, RMNetDriver's): scripts/check-personalities.sh refuses such a
+// personality, and Start refuses an interface whose class, subclass and protocol are not the ones
+// its personality names.
+#ifndef RMNetSerial_h
+#define RMNetSerial_h
+
+#include <Availability.h>
+#include <DriverKit/IOService.iig>
+#include <USBSerialDriverKit/IOUserUSBSerial.iig>
+
+class RMNetSerial : public IOUserUSBSerial
+{
+public:
+    virtual bool init() override;
+    virtual void free() override;
+
+    virtual kern_return_t Start(IOService * provider) override;
+    virtual kern_return_t Stop(IOService * provider) override;
+
+    // A port being opened and closed: forwarded to IOUserUSBSerial, which copies and releases the
+    // pipes.
+    virtual kern_return_t HwActivate() override;
+    virtual kern_return_t HwDeactivate() override;
+
+    // Pure in IOUserSerial and not implemented by IOUserUSBSerial. The modem's ports have no UART:
+    // only DTR and RTS are sent to it (HwProgramMCR); the rest succeed without I/O.
+    virtual kern_return_t HwResetFIFO(bool tx, bool rx) override;
+    virtual kern_return_t HwSendBreak(bool sendBreak) override;
+    virtual kern_return_t HwProgramUART(uint32_t baudRate, uint8_t nDataBits, uint8_t nHalfStopBits, uint8_t parity) override;
+    virtual kern_return_t HwProgramBaudRate(uint32_t baudRate) override;
+    virtual kern_return_t HwProgramMCR(bool dtr, bool rts) override;
+    virtual kern_return_t HwGetModemStatus(bool * cts, bool * dsr, bool * ri, bool * dcd) override;
+    virtual kern_return_t HwProgramLatencyTimer(uint32_t latency) override;
+    virtual kern_return_t HwProgramFlowControl(uint32_t arg, uint8_t xon, uint8_t xoff) override;
+};
+
+#endif /* RMNetSerial_h */

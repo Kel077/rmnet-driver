@@ -1,10 +1,10 @@
 // Drives Core for the driver: plain C++, run on the driver's Default queue.
 //
 // It owns the Session, the EthernetEmulator and the QmapAggregator, sends the session's QMI
-// messages through UsbIo, and logs the session's progress. Link changes are only recorded while
-// Core is running; the driver applies them after the Core call returns (take_link_change, then
-// data_link_down / data_link_up), so nothing it does can re-enter the Session from a delegate
-// callback.
+// messages through a UsbPort (UsbIo in the driver, a fake in tests/driver), and logs the session's
+// progress. Link changes are only recorded while Core is running; the driver applies them after
+// the Core call returns (take_link_change, then data_link_down / data_link_up), so nothing it
+// does can re-enter the Session from a delegate callback.
 //
 // The data path. Downlink: each bulk transfer is split into QMAP frames; a data frame on the
 // session's mux becomes an Ethernet frame in a receive packet from the RxSink; a command frame is
@@ -30,7 +30,7 @@
 #include "rmnet/ethernet.h"
 #include "rmnet/qmap.h"
 #include "rmnet/session.h"
-#include "usb_io.h"
+#include "usb_port.h"
 
 // Where received frames go: the driver's receive packets.
 class RxSink {
@@ -93,7 +93,7 @@ class CoreHost final : public rmnet::SessionDelegate {
   // profile: the data profile the session asks the modem for (SessionConfig::profile).
   // flow_control: whether the session asks the modem for in-band flow control
   // (SessionConfig::flow_control).
-  CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile, bool flow_control);
+  CoreHost(UsbPort& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile, bool flow_control);
   CoreHost(const CoreHost&) = delete;
   CoreHost& operator=(const CoreHost&) = delete;
 
@@ -187,7 +187,7 @@ class CoreHost final : public rmnet::SessionDelegate {
   void drop_open_uplink();
   void set_paused(bool paused);
 
-  UsbIo& usb_;
+  UsbPort& usb_;
   RxSink& rx_;
   rmnet::Session session_;
   rmnet::EthernetEmulator eth_;

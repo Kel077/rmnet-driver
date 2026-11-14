@@ -2,6 +2,7 @@
 // the modem's text messages.
 // Usage: RMNet activate | deactivate | status [--json]
 //        RMNet sms list [--json] | sms send <number> <text> | sms delete <index>...
+//        RMNet gps [seconds]
 //        RMNet (no argument, or opened from the Finder): the status window.
 // It must run from /Applications/RMNet.app for activate and deactivate (scripts/install-driver.sh).
 // With a verb it prints exactly the lines it always has (scripts read them), opens no window and
@@ -269,7 +270,7 @@ if verbs.isEmpty {
     exit(0)
 }
 
-let usage = "usage: RMNet activate | deactivate | status [--json] | sms list [--json] | sms send <number> <text> | sms delete <index>..."
+let usage = "usage: RMNet activate | deactivate | status [--json] | sms list [--json] | sms send <number> <text> | sms delete <index>... | gps [seconds]"
 
 if verbs.first == "sms" {
     guard let smsCommand = parseSms(Array(verbs.dropFirst())) else {
@@ -282,6 +283,14 @@ if verbs.first == "sms" {
         exit(code)
     }
     dispatchMain()
+}
+
+if verbs.first == "gps" {
+    guard let seconds = parseGps(Array(verbs.dropFirst())) else {
+        print(usage)
+        exit(2)
+    }
+    exit(runGps(seconds: seconds))
 }
 
 guard let command = Command(rawValue: verbs.first!),

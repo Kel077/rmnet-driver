@@ -1,0 +1,7 @@
+2 extension(s)
+--- com.apple.system_extension.network_extension (Go to 'System Settings > General > Login Items & Extensions > Network Extensions' to modify these system extension(s))
+enabled	active	teamID	bundleID (version)	name	[state]
+*	*	ABCDE12345	com.example.vpn.network-extension (2.1/210)	Example VPN	[activated enabled]
+--- com.apple.system_extension.driver_extension (Go to 'System Settings > General > Login Items & Extensions > Driver Extensions' to modify these system extension(s))
+enabled	active	teamID	bundleID (version)	name	[state]
+*	*	FGHIJ67890	com.example.hidfilter (1.1.24/1.1.24)	Example HID Driver Extension	[activated enabled]

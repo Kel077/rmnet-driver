@@ -13,7 +13,8 @@ TEST(discover_gets_offer_with_modem_settings) {
   CHECK_EQ(d.op, 2); CHECK_EQ(d.xid, 0x12345678u); CHECK_EQ(d.type, 2); CHECK_EQ(d.yiaddr, "10.102.246.230");
   CHECK_BYTES(d.chaddr, 6, "02 68 7a 43 12 f6");
   CHECK_EQ(d.server_id, "10.102.246.229"); CHECK_EQ(d.lease, 3600u); CHECK_EQ(d.mask, "255.255.255.252");
-  CHECK_EQ(d.router, "10.102.246.229"); CHECK_EQ(d.dns.size(), 2u); CHECK_EQ(d.dns[0], "203.0.113.193"); CHECK_EQ(d.mtu, 1500);
+  CHECK_EQ(d.router, "10.102.246.229"); CHECK_EQ(d.mtu, 1500);
+  REQUIRE(d.dns.size() == 2); CHECK_EQ(d.dns[0], "203.0.113.193");
 }
 TEST(request_for_our_address_gets_ack) {
   rmnet::EthernetEmulator e(rmnet::derive_macs("bfeed1a5")); auto s = link_settings(); e.set_link(&s); uint8_t r[600];
@@ -84,4 +85,22 @@ TEST(malformed_dhcp_dropped) {
   auto release = dhcp_client(7, 1, "", "10.102.246.230");
   CHECK(e.handle_tx(release.data(), release.size(), r, sizeof r).action == rmnet::TxAction::Drop);
   uint8_t small[100]; CHECK(e.handle_tx(q.data(), q.size(), small, sizeof small).action == rmnet::TxAction::Drop);  // reply buffer too small
+}
+
+// Pinned behaviour (the deferred list of 2026-11-13).
+
+TEST(udp_checksum_computing_to_zero_is_sent_as_ffff) {
+  // Two DISCOVERs' replies differ only in the xid they echo. With xid 0 the UDP checksum is c; the
+  // xid 0000:c adds c to the ones'-complement sum, which then folds to 0xffff, so the checksum
+  // computes to 0 and goes out as 0xffff (0 on the wire would mean "no checksum").
+  rmnet::EthernetEmulator e(rmnet::derive_macs("bfeed1a5")); auto s = link_settings(); e.set_link(&s); uint8_t r[600];
+  auto first = dhcp_client(1, 0, "", "");
+  auto t = e.handle_tx(first.data(), first.size(), r, sizeof r); REQUIRE(t.action == rmnet::TxAction::Reply);
+  uint16_t c = static_cast<uint16_t>(r[40] << 8 | r[41]);                    // the UDP checksum: 14 + 20 + 6
+  CHECK(c != 0xffff);                                                         // an ordinary one
+  auto q = dhcp_client(1, c, "", "");
+  t = e.handle_tx(q.data(), q.size(), r, sizeof r); REQUIRE(t.action == rmnet::TxAction::Reply);
+  CHECK_BYTES(r + 40, 2, "ff ff");
+  auto d = parse_dhcp_reply(r, t.reply_len);
+  CHECK_EQ(d.xid, c); CHECK(d.checksums_ok);                                  // 0xffff checks as 0 would
 }

@@ -1,0 +1,5 @@
+2 extension(s)
+--- com.apple.system_extension.driver_extension (Go to 'System Settings > General > Login Items & Extensions > Driver Extensions' to modify these system extension(s))
+enabled	active	teamID	bundleID (version)	name	[state]
+		ABCDE12345	io.rmnetdriver.RMNet.driver (1.0/317.17.5)	io.rmnetdriver.RMNet.driver	[terminated waiting to uninstall on reboot]
+*	*	ABCDE12345	io.rmnetdriver.RMNet.driver (1.0/317.18.40)	io.rmnetdriver.RMNet.driver	[activated enabled]
