@@ -40,15 +40,18 @@ build/obj/harness/%.o: harness/%.mm
 check-driverkit:
 	./scripts/check-driverkit-compile.sh
 
-# The app's status model, SMS model, AT answer logic, the Messages tab's controller, the network model and
-# the settings model, tested without Xcode or hardware (the AT port itself is not opened, and no window is made).
-app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/modemnet-tests build/modemset-tests
+# The app's status model, SMS model, AT answer logic, the Messages tab's controller, the network model, the
+# settings model and the modem tabs' controller, tested without Xcode or hardware (the AT port itself is not
+# opened, and no window is made).
+app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/modemnet-tests build/modemset-tests \
+		build/modemui-tests
 	./build/app-tests
 	./build/sms-tests
 	./build/at-tests
 	./build/smsui-tests
 	./build/modemnet-tests
 	./build/modemset-tests
+	./build/modemui-tests
 
 build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
 	@mkdir -p build
@@ -71,6 +74,10 @@ build/modemnet-tests: app/ModemNetwork.swift tests/app/ModemNetworkTests.swift
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 build/modemset-tests: app/ModemNetwork.swift app/ModemSettings.swift tests/app/ModemSettingsTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+build/modemui-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ModemController.swift tests/app/ModemControllerTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
