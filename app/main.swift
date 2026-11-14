@@ -1,162 +1,138 @@
 // RMNet host app: installs, removes and reports on the RMNet driver extension.
-// Usage: RMNet activate | deactivate | status
+// Usage: RMNet activate | deactivate | status [--json]
+//        RMNet (no argument, or opened from the Finder): the status window.
 // It must run from /Applications/RMNet.app for activate and deactivate (scripts/install-driver.sh).
+// With a verb it prints exactly the lines it always has (scripts read them), opens no window and
+// exits by itself.
 import Foundation
-import IOKit
-import SystemExtensions
 
-let driverID = "io.rmnetdriver.RMNet.driver"
-let driverClass = "RMNetDriver"  // the driver's IOUserClass
-let modemVendor = 0x2C7C
-let modemProduct = 0x0801
+// MARK: - Command-line output
 
-// MARK: - Registry (read only; nothing is opened)
-
-func properties(of entry: io_registry_entry_t) -> [String: Any] {
-    var props: Unmanaged<CFMutableDictionary>?
-    guard IORegistryEntryCreateCFProperties(entry, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS,
-          let dict = props?.takeRetainedValue() as? [String: Any] else { return [:] }
-    return dict
-}
-
-// The first service of class `className` whose properties include all of `match`.
-func firstService(_ className: String, withProperties match: [String: Any]) -> io_service_t {
-    let matching = IOServiceMatching(className) as NSMutableDictionary
-    matching[kIOPropertyMatchKey] = match
-    return IOServiceGetMatchingService(kIOMainPortDefault, matching as CFDictionary)  // consumes `matching`
-}
-
-func intValue(_ value: Any?) -> Int? { (value as? NSNumber)?.intValue }
-
-// Says whether the modem is attached and in QMI mode (an interface with class, subclass and
-// protocol 0xff), so "not installed", "modem not in QMI mode" and "attached" can be told apart.
-func printModem() {
-    let device = firstService("IOUSBHostDevice", withProperties: ["idVendor": modemVendor, "idProduct": modemProduct])
-    guard device != IO_OBJECT_NULL else {
+func printModem(_ modem: ModemState) {
+    switch modem {
+    case .absent:
         print("modem: 2c7c:0801 not attached")
-        return
-    }
-    defer { IOObjectRelease(device) }
-
-    var qmiInterface: Int?
-    var children: io_iterator_t = 0
-    if IORegistryEntryGetChildIterator(device, kIOServicePlane, &children) == KERN_SUCCESS {
-        var child = IOIteratorNext(children)
-        while child != IO_OBJECT_NULL {
-            let p = properties(of: child)
-            if intValue(p["bInterfaceClass"]) == 0xff, intValue(p["bInterfaceSubClass"]) == 0xff,
-               intValue(p["bInterfaceProtocol"]) == 0xff {
-                qmiInterface = intValue(p["bInterfaceNumber"])
-            }
-            IOObjectRelease(child)
-            child = IOIteratorNext(children)
-        }
-        IOObjectRelease(children)
-    }
-    if let number = qmiInterface {
+    case .qmi(let number):
         print("modem: 2c7c:0801 attached, QMI interface \(number) (class, subclass, protocol ff)")
-    } else {
+    case .notQMI:
         print("modem: 2c7c:0801 attached, no interface with class, subclass, protocol ff (not in QMI mode)")
     }
 }
 
-func printDriverEntry() {
-    let entry = firstService("IOService", withProperties: ["IOUserClass": driverClass])
-    guard entry != IO_OBJECT_NULL else {
+func printDriverEntry(_ driver: [String: String]?) {
+    guard let props = driver else {
         print("driver: no \(driverClass) registry entry (not attached)")
         return
     }
-    defer { IOObjectRelease(entry) }
     print("driver: \(driverClass) attached")
-    let props = properties(of: entry)
-    for key in props.keys.filter({ $0.hasPrefix("RMNet") }).sorted() {
+    for key in props.keys.sorted() {
         print("  \(key) = \(props[key]!)")
     }
 }
 
 func printRegistry() {
-    printModem()
-    printDriverEntry()
+    printModem(readModem())
+    printDriverEntry(readDriverProperties())
 }
 
-// MARK: - System extension requests
+func printJSON(_ entries: [ExtensionEntry], error: String? = nil) {
+    var object = statusJSON(readStatus(entries: entries), bundledVersion: bundledDriverVersion() ?? "")
+    if let error = error { object["error"] = error }  // the system's answer was not a list of entries
+    let data = try! JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+}
+
+// MARK: - Verbs
 
 enum Command: String { case activate, deactivate, status }
 
-final class Delegate: NSObject, OSSystemExtensionRequestDelegate {
-    let command: Command
-    init(_ command: Command) { self.command = command }
+func runActivate(_ manager: ExtensionManager) {
+    manager.activate(
+        replacing: { old, new in print("replacing version \(old) with \(new)") },
+        needsApproval: { print("waiting for approval in System Settings") },
+        completion: { finished(.activate, $0) })
+}
 
-    func request(_ request: OSSystemExtensionRequest,
-                 actionForReplacingExtension existing: OSSystemExtensionProperties,
-                 withExtension ext: OSSystemExtensionProperties) -> OSSystemExtensionRequest.ReplacementAction {
-        print("replacing version \(existing.bundleVersion) with \(ext.bundleVersion)")
-        return .replace
+func runDeactivate(_ manager: ExtensionManager) {
+    manager.deactivate(needsApproval: { print("waiting for approval in System Settings") },
+                       completion: { finished(.deactivate, $0) })
+}
+
+func finished(_ command: Command, _ outcome: RequestOutcome) {
+    switch outcome {
+    case .completed: print("\(command.rawValue): done")
+    case .willCompleteAfterReboot: print("\(command.rawValue): done after a reboot")
+    case .other(let raw): print("\(command.rawValue): finished with result \(raw)")
+    case .failed(let error):
+        print("\(command.rawValue) failed: \(error.localizedDescription) (code \((error as NSError).code))")
+        exit(1)
     }
+    exit(0)
+}
 
-    func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
-        print("waiting for approval in System Settings")
-    }
-
-    func request(_ request: OSSystemExtensionRequest, foundProperties properties: [OSSystemExtensionProperties]) {
-        if properties.isEmpty {
-            print("driver extension: not installed")
-        }
-        for p in properties {
-            var flags = [p.isEnabled ? "enabled" : "not enabled"]
-            if p.isAwaitingUserApproval { flags.append("awaiting approval") }
-            if p.isUninstalling { flags.append("uninstalling") }
-            print("driver extension: \(p.bundleIdentifier) version \(p.bundleVersion) (\(p.bundleShortVersion)), "
-                  + flags.joined(separator: ", "))
-        }
-        printRegistry()
-        exit(0)
-    }
-
-    func request(_ request: OSSystemExtensionRequest,
-                 didFinishWithResult result: OSSystemExtensionRequest.Result) {
+func runStatus(_ manager: ExtensionManager, json: Bool) {
+    manager.properties { result in
         switch result {
-        case .completed: print("\(command.rawValue): done")
-        case .willCompleteAfterReboot: print("\(command.rawValue): done after a reboot")
-        @unknown default: print("\(command.rawValue): finished with result \(result.rawValue)")
-        }
-        if command == .status { printRegistry() }
-        exit(0)
-    }
-
-    func request(_ request: OSSystemExtensionRequest, didFailWithError error: Error) {
-        let code = (error as NSError).code
-        if command == .status {
-            print("driver extension: unknown (\(error.localizedDescription), code \(code))")
+        case .success(let found):
+            if json {
+                printJSON(found.map(ExtensionEntry.init))
+                exit(0)
+            }
+            if found.isEmpty {
+                print("driver extension: not installed")
+            }
+            for p in found {
+                var flags = [p.isEnabled ? "enabled" : "not enabled"]
+                if p.isAwaitingUserApproval { flags.append("awaiting approval") }
+                if p.isUninstalling { flags.append("uninstalling") }
+                print("driver extension: \(p.bundleIdentifier) version \(p.bundleVersion) (\(p.bundleShortVersion)), "
+                      + flags.joined(separator: ", "))
+            }
             printRegistry()
+            exit(0)
+        case .failure(let error):
+            let code = (error as NSError).code
+            if json {
+                printJSON([], error: "\(error.localizedDescription) (code \(code))")
+            } else {
+                print("driver extension: unknown (\(error.localizedDescription), code \(code))")
+                printRegistry()
+            }
+            exit(1)
+        }
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+        if json {
+            printJSON([], error: "no answer from the system in 10 s")
         } else {
-            print("\(command.rawValue) failed: \(error.localizedDescription) (code \(code))")
+            print("driver extension: unknown (no answer from the system in 10 s)")
+            printRegistry()
         }
         exit(1)
     }
 }
 
+// MARK: - Entry point
+
 let args = CommandLine.arguments
-guard args.count == 2, let command = Command(rawValue: args[1]) else {
-    print("usage: RMNet activate | deactivate | status")
+// The Finder (and `open`) may pass a process serial number argument; that still means the window.
+let verbs = args.dropFirst().filter { !$0.hasPrefix("-psn_") }
+
+if verbs.isEmpty {
+    MainActor.assumeIsolated { RMNetApp.main() }
+    exit(0)
+}
+
+guard let command = Command(rawValue: verbs.first!),
+      verbs.count == 1 || (command == .status && verbs.count == 2 && verbs.last == "--json") else {
+    print("usage: RMNet activate | deactivate | status [--json]")
     exit(2)
 }
 
-let request: OSSystemExtensionRequest
+let manager = ExtensionManager()
 switch command {
-case .activate:
-    request = .activationRequest(forExtensionWithIdentifier: driverID, queue: .main)
-case .deactivate:
-    request = .deactivationRequest(forExtensionWithIdentifier: driverID, queue: .main)
-case .status:
-    request = .propertiesRequest(forExtensionWithIdentifier: driverID, queue: .main)
-    DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
-        print("driver extension: unknown (no answer from the system in 10 s)")
-        printRegistry()
-        exit(1)
-    }
+case .activate: runActivate(manager)
+case .deactivate: runDeactivate(manager)
+case .status: runStatus(manager, json: verbs.count == 2)
 }
-let delegate = Delegate(command)
-request.delegate = delegate
-OSSystemExtensionManager.shared.submitRequest(request)
 dispatchMain()

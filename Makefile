@@ -12,7 +12,7 @@ CORE_OBJS := $(patsubst core/src/%.cpp,build/obj/core/%.o,$(CORE_SRCS))
 TEST_OBJS := $(patsubst tests/%.cpp,build/obj/tests/%.o,$(TEST_SRCS))
 HARNESS_OBJS := $(patsubst harness/%.mm,build/obj/harness/%.o,$(HARNESS_SRCS))
 
-.PHONY: test check-driverkit harness driver clean
+.PHONY: test check-driverkit app-test harness driver clean
 
 test: build/tests
 	./build/tests $(FILTER)
@@ -39,6 +39,14 @@ build/obj/harness/%.o: harness/%.mm
 
 check-driverkit:
 	./scripts/check-driverkit-compile.sh
+
+# The app's status model (Foundation only), tested without Xcode or hardware.
+app-test: build/app-tests
+	./build/app-tests
+
+build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 # Unsigned build of the driver and the host app that embeds it. gen.rb writes RMNet.xcodeproj.
 XCODEBUILD := xcodebuild -project RMNet.xcodeproj -configuration Debug -parallelizeTargets \
