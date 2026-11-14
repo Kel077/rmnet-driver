@@ -107,7 +107,7 @@ plist_models=$(printf '%s' "$plist_models" | sort)
 
 check "the script's model list names the RM520N-GL's interface 4" 1 \
   "$(printf '%s\n' "$script_models" | grep -qx '0801 4' && echo 1)"
-check "the script's model list has seven models, the RM520N-GL and six untested" 7 "$(printf '%s\n' "$script_models" | grep -c .)"
+check "the script's model list has 14 models, the RM520N-GL and 13 untested" 14 "$(printf '%s\n' "$script_models" | grep -c .)"
 check "quectelModels in app/StatusModel.swift matches the script's model list" "$script_models" "$app_models"
 check "the RMNetDriver personalities match the script's model list" "$script_models" "$plist_models"
 check "only the RM520N-GL is marked tested in quectelModels" 0801 "$app_tested"
@@ -115,7 +115,7 @@ check "only the RM520N-GL is marked tested in quectelModels" 0801 "$app_tested"
 # --- scripts/check-personalities.sh ---
 
 out=$(sh "$CHECK" "$PLIST" 2>&1)
-check "the shipped plist passes" "0 personality check: 9 personalities ok" "$? $out"
+check "the shipped plist passes" "0 personality check: 16 personalities ok" "$? $out"
 
 # A new copy of the shipped plist, changed by PlistBuddy commands; prints its path.
 variant() {
@@ -131,9 +131,12 @@ check_refused() {
 personality check: failed" "$? $out"
 }
 
-rm520=$(variant 'Delete :IOKitPersonalities:RMNetDriver_0121' 'Delete :IOKitPersonalities:RMNetDriver_0191' \
-  'Delete :IOKitPersonalities:RMNetDriver_0195' 'Delete :IOKitPersonalities:RMNetDriver_0296' \
-  'Delete :IOKitPersonalities:RMNetDriver_030e' 'Delete :IOKitPersonalities:RMNetDriver_0316')
+# The shipped plist without the other models' personalities.
+set --
+for name in $names; do
+  case $name in RMNetDriver_*) set -- "$@" "Delete :IOKitPersonalities:$name" ;; esac
+done
+rm520=$(variant "$@")
 out=$(sh "$CHECK" "$rm520" 2>&1)
 check "the RM520N-GL's three personalities alone: the line the script always printed" \
   "0 personality check: 3 personalities ok" "$? $out"
@@ -148,9 +151,9 @@ check_refused "the RM520N-GL's RMNetDriver on interface 5" \
 check_refused "another model on an interface that is not its QMI interface" \
   "personality check: RMNetDriver_0121: RMNetDriver for 2c7c:0121 on interface 2, not its QMI interface 4" \
   "$(variant 'Set :IOKitPersonalities:RMNetDriver_0121:bInterfaceNumber 2')"
-check_refused "the RG255C on interface 4, not its QMI interface 3" \
-  "personality check: RMNetDriver_0316: RMNetDriver for 2c7c:0316 on interface 4, not its QMI interface 3" \
-  "$(variant 'Set :IOKitPersonalities:RMNetDriver_0316:bInterfaceNumber 4')"
+check_refused "the RM500Q-GL on interface 5, not its QMI interface 4" \
+  "personality check: RMNetDriver_0800: RMNetDriver for 2c7c:0800 on interface 5, not its QMI interface 4" \
+  "$(variant 'Set :IOKitPersonalities:RMNetDriver_0800:bInterfaceNumber 5')"
 check_refused "another model's interface given as a string" \
   "personality check: RMNetDriver_0195: RMNetDriver for 2c7c:0195 on interface (none, or not an integer), not its QMI interface 4" \
   "$(variant 'Delete :IOKitPersonalities:RMNetDriver_0195:bInterfaceNumber' \
@@ -158,16 +161,16 @@ check_refused "another model's interface given as a string" \
 check_refused "another model under another vendor" \
   "personality check: RMNetDriver_0191: idVendor 1234, not 11388 (0x2c7c)" \
   "$(variant 'Set :IOKitPersonalities:RMNetDriver_0191:idVendor 1234')"
-check_refused "a product the kernel matches only by class (EC25, 0x0125)" \
-  "personality check: RMNetDriver_0121: RMNetDriver for idProduct 293 (2c7c:0125), not a product in the model list" \
-  "$(variant 'Set :IOKitPersonalities:RMNetDriver_0121:idProduct 293')"
+check_refused "a product not in the list (the RG255C, 0x0316, whose QMI interface is ff/ff/50)" \
+  "personality check: RMNetDriver_0121: RMNetDriver for idProduct 790 (2c7c:0316), not a product in the model list" \
+  "$(variant 'Set :IOKitPersonalities:RMNetDriver_0121:idProduct 790')"
 check_refused "RMNetDriver with no idProduct" \
   "personality check: RMNetDriver: RMNetDriver for idProduct (none, or not an integer), not a product in the model list" \
   "$(variant 'Delete :IOKitPersonalities:RMNetDriver:idProduct')"
 check_refused "a serial personality for another model" \
   "personality check: RMNetSerialNMEA: RMNetSerial for idProduct 289 (2c7c:0121), not 2049 (2c7c:0801, the RM520N-GL, the only model with serial personalities)" \
   "$(variant 'Set :IOKitPersonalities:RMNetSerialNMEA:idProduct 289')"
-check_refused "a serial personality on another model's QMI interface 3: the AT port rule still applies" \
+check_refused "a serial personality for another product on interface 3: the AT port rule still applies" \
   "personality check: RMNetSerialNMEA: on interface 3, an AT port that no personality may match
 personality check: RMNetSerialNMEA: RMNetSerial for idProduct 790 (2c7c:0316), not 2049 (2c7c:0801, the RM520N-GL, the only model with serial personalities)
 personality check: RMNetSerialNMEA: RMNetSerial on interface 3, not 0 or 1" \

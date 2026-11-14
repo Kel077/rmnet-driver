@@ -5,8 +5,8 @@
 //        RMNet gps [seconds]
 //        RMNet (no argument, or opened from the Finder): the status window.
 // It must run from /Applications/RMNet.app for activate and deactivate (scripts/install-driver.sh).
-// With a verb it prints exactly the lines it always has (scripts read them), opens no window and
-// exits by itself.
+// With a verb it opens no window and exits by itself. `status --json` (scripts/soak.sh reads it) keeps
+// its form; the `modem:` line of plain `status` names the model found, and no script reads it.
 import Foundation
 
 // MARK: - Command-line output

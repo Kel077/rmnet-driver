@@ -10,8 +10,8 @@ struct ExtensionEntry {
     var uninstalling: Bool
 }
 
-// The modem on USB (a model from quectelModels): absent, attached without a QMI interface, or
-// attached with one (the interface whose class, subclass and protocol are all 0xff).
+// The modem on USB (a model from quectelModels): absent, attached without its QMI interface, or
+// attached with it (modemState says which).
 enum ModemState {
     case absent, notQMI, qmi(interface: Int)
 }
@@ -29,23 +29,53 @@ struct QuectelModel {
 // One model per line, in this form: tests/scripts/test-personalities.sh reads the products and
 // interfaces from these lines and compares them with the model list in scripts/check-personalities.sh
 // and the RMNetDriver personalities in driver/Info.plist. The RM520N-GL first, so it is the one found
-// when several are attached. The RM520N-GL is the modem the driver was built for and tested on (its
-// QMI interface 4 found on the modem; the kernel matches it by class:
-// {QMI_MATCH_FF_FF_FF(0x2c7c, 0x0801)}, /* Quectel RM520N */). The others are untested: the Quectel
-// entries of the Linux kernel's drivers/net/usb/qmi_wwan.c (torvalds/linux, master, fetched
-// 2026-11-15) that name a fixed QMI interface number; each line's comment is its entry there.
+// when several are attached; it is the modem the driver was built for and tested on, its QMI
+// interface 4 found on the modem. The others are untested Quectel entries of the Linux kernel's
+// drivers/net/usb/qmi_wwan.c (torvalds/linux, master, fetched 2026-11-15); each line's comment gives
+// the entry and, where the entry has no interface number (QMI_MATCH_FF_FF_FF, a match by class), the
+// source of the number: Quectel's UMTS_LTE_5G Linux USB Driver User Guide v3.0 (2022-03-18), Table 1
+// (qmi_wwan_q on interface 4), or the kernel commit that added the model. Not listed: the RG255C
+// (0x0316), whose QMI interface 3 is ff/ff/50, which the driver's Start refuses.
 let quectelModels: [QuectelModel] = [
     QuectelModel(product: 0x0801, qmiInterface: 4, names: "RM520N-GL", tested: true),
     QuectelModel(product: 0x0121, qmiInterface: 4, names: "EC21 Mini PCIe", tested: false),  // {QMI_QUIRK_SET_DTR(0x2c7c, 0x0121, 4)}, /* Quectel EC21 Mini PCIe */
-    QuectelModel(product: 0x0191, qmiInterface: 4, names: "EG91", tested: false),            // {QMI_QUIRK_SET_DTR(0x2c7c, 0x0191, 4)}, /* Quectel EG91 */
-    QuectelModel(product: 0x0195, qmiInterface: 4, names: "EG95", tested: false),            // {QMI_QUIRK_SET_DTR(0x2c7c, 0x0195, 4)}, /* Quectel EG95 */
-    QuectelModel(product: 0x0296, qmiInterface: 4, names: "BG96", tested: false),            // {QMI_FIXED_INTF(0x2c7c, 0x0296, 4)}, /* Quectel BG96 */
-    QuectelModel(product: 0x030e, qmiInterface: 4, names: "EM05GV2", tested: false),         // {QMI_QUIRK_SET_DTR(0x2c7c, 0x030e, 4)}, /* Quectel EM05GV2 */
-    QuectelModel(product: 0x0316, qmiInterface: 3, names: "RG255C", tested: false),          // {QMI_QUIRK_SET_DTR(0x2c7c, 0x0316, 3)}, /* Quectel RG255C */
+    QuectelModel(product: 0x0122, qmiInterface: 4, names: "RG650V", tested: false),  // {QMI_MATCH_FF_FF_FF(0x2c7c, 0x0122)}; interface 4: commit 6b3f18a76be6's listing
+    QuectelModel(product: 0x0125, qmiInterface: 4, names: "EC25, EC20 R2.0 Mini PCIe", tested: false),  // {QMI_MATCH_FF_FF_FF(0x2c7c, 0x0125)}; interface 4: Quectel's guide, Table 1
+    QuectelModel(product: 0x013d, qmiInterface: 4, names: "RG660QB", tested: false),  // {QMI_MATCH_FF_FF_FF(0x2c7c, 0x013d)}; interface 4: commit 4ff75f130d1b's message
+    QuectelModel(product: 0x0191, qmiInterface: 4, names: "EG91", tested: false),  // {QMI_QUIRK_SET_DTR(0x2c7c, 0x0191, 4)}, /* Quectel EG91 */
+    QuectelModel(product: 0x0195, qmiInterface: 4, names: "EG95", tested: false),  // {QMI_QUIRK_SET_DTR(0x2c7c, 0x0195, 4)}, /* Quectel EG95 */
+    QuectelModel(product: 0x0296, qmiInterface: 4, names: "BG96", tested: false),  // {QMI_FIXED_INTF(0x2c7c, 0x0296, 4)}, /* Quectel BG96 */
+    QuectelModel(product: 0x0306, qmiInterface: 4, names: "EP06/EG06/EM06", tested: false),  // {QMI_MATCH_FF_FF_FF(0x2c7c, 0x0306)}; interface 4: Quectel's guide, Table 1
+    QuectelModel(product: 0x030b, qmiInterface: 4, names: "EM060K/EG120K-EA", tested: false),  // {QMI_MATCH_FF_FF_FF(0x2c7c, 0x030b)}; interface 4: Quectel's guide, Table 1
+    QuectelModel(product: 0x030e, qmiInterface: 4, names: "EM05GV2", tested: false),  // {QMI_QUIRK_SET_DTR(0x2c7c, 0x030e, 4)}, /* Quectel EM05GV2 */
+    QuectelModel(product: 0x0512, qmiInterface: 4, names: "EG12/EM12", tested: false),  // {QMI_MATCH_FF_FF_FF(0x2c7c, 0x0512)}; interface 4: Quectel's guide, Table 1
+    QuectelModel(product: 0x0620, qmiInterface: 4, names: "EM160R-GL", tested: false),  // {QMI_MATCH_FF_FF_FF(0x2c7c, 0x0620)}; interface 4: Quectel's guide, Table 1
+    QuectelModel(product: 0x0800, qmiInterface: 4, names: "RM500Q-GL", tested: false),  // {QMI_MATCH_FF_FF_FF(0x2c7c, 0x0800)}; interface 4: Quectel's guide, Table 1
 ]
 
 func quectelModel(product: Int) -> QuectelModel? {
     quectelModels.first { $0.product == product }
+}
+
+// One of the modem's USB interfaces, as the I/O registry describes it (nil: the property is missing).
+struct UsbInterface {
+    let number: Int?
+    let interfaceClass: Int?
+    let subclass: Int?
+    let proto: Int?
+    let endpoints: Int?  // bNumEndpoints
+}
+
+// In QMI mode only when the model's own QMI interface is there with class, subclass and protocol
+// 0xff and, when the registry gives the count, three endpoints: what the driver's Start takes. No
+// other interface is ever taken for it, so a DIAG port with the same class (two endpoints, on
+// another number) is not, and a modem in another USB configuration shows as not in QMI mode.
+func modemState(_ model: QuectelModel, interfaces: [UsbInterface]) -> ModemState {
+    let found = interfaces.contains {
+        $0.number == model.qmiInterface && $0.interfaceClass == 0xff && $0.subclass == 0xff && $0.proto == 0xff
+            && ($0.endpoints == nil || $0.endpoints == 3)
+    }
+    return found ? .qmi(interface: model.qmiInterface) : .notQMI
 }
 
 // The `status` verb's modem line: the model found (its vid:pid, its names, and "(untested)" for
@@ -61,7 +91,9 @@ func modemLine(_ modem: ModemState, model: QuectelModel?) -> String {
     case .qmi(let number):
         return "modem: \(name) attached, QMI interface \(number) (class, subclass, protocol ff)"
     case .notQMI:
-        return "modem: \(name) attached, no interface with class, subclass, protocol ff (not in QMI mode)"
+        let number = model.map { "interface \($0.qmiInterface)" } ?? "its QMI interface"
+        return "modem: \(name) attached, \(number) is not a QMI interface (class, subclass, protocol ff, 3 endpoints): "
+            + "not in QMI mode"
     }
 }
 

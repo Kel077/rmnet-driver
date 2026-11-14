@@ -1,6 +1,7 @@
 // Tests for app/StatusModel.swift: the headline, the advice, canRemoveDirectly, the removal texts,
-// the install confirmation, the table rows, the JSON form, the Quectel model list and the status verb's
-// modem line. Built with swiftc by `make app-test`; needs no Xcode project and no hardware.
+// the install confirmation, the table rows, the JSON form, the Quectel model list, which interface is a
+// model's QMI interface, and the status verb's modem line. Built with swiftc by `make app-test`; needs no
+// Xcode project and no hardware.
 // Stops at the first failure, prints which check failed and exits 1.
 import Foundation
 
@@ -308,30 +309,68 @@ struct StatusModelTests {
         let rm520 = quectelModel(product: 0x0801)
         check(rm520?.qmiInterface == 4 && rm520?.tested == true && rm520?.names == "RM520N-GL",
               "quectelModel: 0x0801 is the RM520N-GL, QMI interface 4, tested", "\(String(describing: rm520))")
-        let rg255c = quectelModel(product: 0x0316)
-        check(rg255c?.qmiInterface == 3 && rg255c?.tested == false && rg255c?.names == "RG255C",
-              "quectelModel: 0x0316 is the RG255C, QMI interface 3, untested", "\(String(describing: rg255c))")
+        let ec25 = quectelModel(product: 0x0125)
+        check(ec25?.qmiInterface == 4 && ec25?.tested == false && ec25?.names == "EC25, EC20 R2.0 Mini PCIe",
+              "quectelModel: 0x0125 is the EC25, QMI interface 4, untested", "\(String(describing: ec25))")
         let ec21 = quectelModel(product: 0x0121)
         check(ec21?.qmiInterface == 4 && ec21?.tested == false, "quectelModel: 0x0121, QMI interface 4, untested",
               "\(String(describing: ec21))")
-        check(quectelModel(product: 0x0125) == nil, "quectelModel: 0x0125 (matched by class only in the kernel) is not listed")
+        let rm500q = quectelModel(product: 0x0800)
+        check(rm500q?.qmiInterface == 4 && rm500q?.tested == false && rm500q?.names == "RM500Q-GL",
+              "quectelModel: 0x0800 is the RM500Q-GL, QMI interface 4, untested", "\(String(describing: rm500q))")
+        check(quectelModel(product: 0x0316) == nil, "quectelModel: 0x0316 (the RG255C, QMI protocol 0x50) is not listed")
         check(quectelModel(product: 0x1234) == nil, "quectelModel: an unknown product")
         check(quectelModels.first?.product == 0x0801, "quectelModels: the RM520N-GL first, so it is found first")
         check(quectelModels.filter { $0.tested }.map { $0.product } == [0x0801], "quectelModels: only the RM520N-GL is tested")
         check(Set(quectelModels.map { $0.product }).count == quectelModels.count, "quectelModels: each product once")
+        check(quectelModels.allSatisfy { $0.qmiInterface == 4 }, "quectelModels: every listed QMI interface is 4")
+
+        // --- which interface is the QMI one --------------------------------------------------------
+        func stateWords(_ s: ModemState) -> String {
+            switch s {
+            case .absent: return "absent"
+            case .notQMI: return "notQMI"
+            case .qmi(let n): return "qmi \(n)"
+            }
+        }
+        func iface(_ number: Int, _ cls: Int, _ sub: Int, _ proto: Int, _ endpoints: Int?) -> UsbInterface {
+            UsbInterface(number: number, interfaceClass: cls, subclass: sub, proto: proto, endpoints: endpoints)
+        }
+        // The RM520N-GL in QMI mode, as the I/O registry lists it.
+        let rm520Interfaces: [UsbInterface] = [
+            iface(0, 0xff, 0xff, 0x30, 2), iface(1, 0xff, 0x00, 0x40, 3), iface(2, 0xff, 0x00, 0x00, 3),
+            iface(3, 0xff, 0x00, 0x00, 3), iface(4, 0xff, 0xff, 0xff, 3),
+        ]
+        var got = stateWords(modemState(rm520!, interfaces: rm520Interfaces))
+        check(got == "qmi 4", "modemState: the RM520N-GL in QMI mode", got)
+        got = stateWords(modemState(rm520!, interfaces: Array(rm520Interfaces.reversed())))
+        check(got == "qmi 4", "modemState: the order the registry lists them in does not matter", got)
+        got = stateWords(modemState(rm520!, interfaces: [iface(4, 0xff, 0xff, 0xff, nil)]))
+        check(got == "qmi 4", "modemState: no endpoint count in the registry: the class decides", got)
+        // An EC25 whose DIAG port (ff/ff/ff, 2 endpoints) is there but interface 4 is not.
+        got = stateWords(modemState(ec25!, interfaces: [iface(0, 0xff, 0xff, 0xff, 2), iface(2, 0xff, 0x00, 0x00, 3)]))
+        check(got == "notQMI", "modemState: a DIAG port with the QMI class is never taken for the QMI interface", got)
+        got = stateWords(modemState(ec25!, interfaces: [iface(4, 0xff, 0xff, 0xff, 2)]))
+        check(got == "notQMI", "modemState: the QMI number with two endpoints is not the QMI interface", got)
+        got = stateWords(modemState(rm500q!, interfaces: [iface(3, 0xff, 0xff, 0xff, 3), iface(4, 0x02, 0x0e, 0x00, 1)]))
+        check(got == "notQMI", "modemState: another interface with the QMI class and endpoints is not taken", got)
+        got = stateWords(modemState(rm520!, interfaces: [iface(4, 0xff, 0xff, 0x50, 3)]))
+        check(got == "notQMI", "modemState: protocol 0x50 is not ff", got)
+        got = stateWords(modemState(rm520!, interfaces: []))
+        check(got == "notQMI", "modemState: no interfaces", got)
 
         // --- the status verb's modem line ------------------------------------------------------
         let qmiLine = modemLine(.qmi(interface: 4), model: rm520)
         check(qmiLine == "modem: 2c7c:0801 RM520N-GL attached, QMI interface 4 (class, subclass, protocol ff)",
               "modemLine: the RM520N-GL in QMI mode", qmiLine)
-        let untestedLine = modemLine(.qmi(interface: 3), model: rg255c)
-        check(untestedLine == "modem: 2c7c:0316 RG255C (untested) attached, QMI interface 3 (class, subclass, protocol ff)",
+        let untestedLine = modemLine(.qmi(interface: 4), model: rm500q)
+        check(untestedLine == "modem: 2c7c:0800 RM500Q-GL (untested) attached, QMI interface 4 (class, subclass, protocol ff)",
               "modemLine: an untested model in QMI mode", untestedLine)
         let notQMILine = modemLine(.notQMI, model: ec21)
-        check(notQMILine == "modem: 2c7c:0121 EC21 Mini PCIe (untested) attached, no interface with class, subclass, protocol ff (not in QMI mode)",
+        check(notQMILine == "modem: 2c7c:0121 EC21 Mini PCIe (untested) attached, interface 4 is not a QMI interface (class, subclass, protocol ff, 3 endpoints): not in QMI mode",
               "modemLine: an untested model not in QMI mode", notQMILine)
         let absentLine = modemLine(.absent, model: nil)
-        check(absentLine == "modem: not attached (no USB device 2c7c with product 0801, 0121, 0191, 0195, 0296, 030e or 0316)",
+        check(absentLine == "modem: not attached (no USB device 2c7c with product 0801, 0121, 0122, 0125, 013d, 0191, 0195, 0296, 0306, 030b, 030e, 0512, 0620 or 0800)",
               "modemLine: no listed modem attached", absentLine)
 
         // --- property strings ------------------------------------------------------------------

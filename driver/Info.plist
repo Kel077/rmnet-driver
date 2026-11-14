@@ -81,6 +81,87 @@
 			<key>RMNetFlowControl</key>
 			<integer>1</integer>
 		</dict>
+		<key>RMNetDriver_0122</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>CFBundleIdentifierKernel</key>
+			<string>com.apple.iokit.IOSkywalkFamily</string>
+			<key>IOClass</key>
+			<string>IOUserNetworkEthernet</string>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostInterface</string>
+			<key>IOUserClass</key>
+			<string>RMNetDriver</string>
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>idVendor</key>
+			<integer>11388</integer>
+			<key>idProduct</key>
+			<integer>290</integer>
+			<key>bConfigurationValue</key>
+			<integer>1</integer>
+			<key>bInterfaceNumber</key>
+			<integer>4</integer>
+			<key>RMNetProfile</key>
+			<integer>1</integer>
+			<key>RMNetFlowControl</key>
+			<integer>1</integer>
+		</dict>
+		<key>RMNetDriver_0125</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>CFBundleIdentifierKernel</key>
+			<string>com.apple.iokit.IOSkywalkFamily</string>
+			<key>IOClass</key>
+			<string>IOUserNetworkEthernet</string>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostInterface</string>
+			<key>IOUserClass</key>
+			<string>RMNetDriver</string>
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>idVendor</key>
+			<integer>11388</integer>
+			<key>idProduct</key>
+			<integer>293</integer>
+			<key>bConfigurationValue</key>
+			<integer>1</integer>
+			<key>bInterfaceNumber</key>
+			<integer>4</integer>
+			<key>RMNetProfile</key>
+			<integer>1</integer>
+			<key>RMNetFlowControl</key>
+			<integer>1</integer>
+		</dict>
+		<key>RMNetDriver_013d</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>CFBundleIdentifierKernel</key>
+			<string>com.apple.iokit.IOSkywalkFamily</string>
+			<key>IOClass</key>
+			<string>IOUserNetworkEthernet</string>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostInterface</string>
+			<key>IOUserClass</key>
+			<string>RMNetDriver</string>
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>idVendor</key>
+			<integer>11388</integer>
+			<key>idProduct</key>
+			<integer>317</integer>
+			<key>bConfigurationValue</key>
+			<integer>1</integer>
+			<key>bInterfaceNumber</key>
+			<integer>4</integer>
+			<key>RMNetProfile</key>
+			<integer>1</integer>
+			<key>RMNetFlowControl</key>
+			<integer>1</integer>
+		</dict>
 		<key>RMNetDriver_0191</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
@@ -162,6 +243,60 @@
 			<key>RMNetFlowControl</key>
 			<integer>1</integer>
 		</dict>
+		<key>RMNetDriver_0306</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>CFBundleIdentifierKernel</key>
+			<string>com.apple.iokit.IOSkywalkFamily</string>
+			<key>IOClass</key>
+			<string>IOUserNetworkEthernet</string>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostInterface</string>
+			<key>IOUserClass</key>
+			<string>RMNetDriver</string>
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>idVendor</key>
+			<integer>11388</integer>
+			<key>idProduct</key>
+			<integer>774</integer>
+			<key>bConfigurationValue</key>
+			<integer>1</integer>
+			<key>bInterfaceNumber</key>
+			<integer>4</integer>
+			<key>RMNetProfile</key>
+			<integer>1</integer>
+			<key>RMNetFlowControl</key>
+			<integer>1</integer>
+		</dict>
+		<key>RMNetDriver_030b</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>CFBundleIdentifierKernel</key>
+			<string>com.apple.iokit.IOSkywalkFamily</string>
+			<key>IOClass</key>
+			<string>IOUserNetworkEthernet</string>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostInterface</string>
+			<key>IOUserClass</key>
+			<string>RMNetDriver</string>
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>idVendor</key>
+			<integer>11388</integer>
+			<key>idProduct</key>
+			<integer>779</integer>
+			<key>bConfigurationValue</key>
+			<integer>1</integer>
+			<key>bInterfaceNumber</key>
+			<integer>4</integer>
+			<key>RMNetProfile</key>
+			<integer>1</integer>
+			<key>RMNetFlowControl</key>
+			<integer>1</integer>
+		</dict>
 		<key>RMNetDriver_030e</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
@@ -189,7 +324,7 @@
 			<key>RMNetFlowControl</key>
 			<integer>1</integer>
 		</dict>
-		<key>RMNetDriver_0316</key>
+		<key>RMNetDriver_0512</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
 			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
@@ -206,11 +341,65 @@
 			<key>idVendor</key>
 			<integer>11388</integer>
 			<key>idProduct</key>
-			<integer>790</integer>
+			<integer>1298</integer>
 			<key>bConfigurationValue</key>
 			<integer>1</integer>
 			<key>bInterfaceNumber</key>
-			<integer>3</integer>
+			<integer>4</integer>
+			<key>RMNetProfile</key>
+			<integer>1</integer>
+			<key>RMNetFlowControl</key>
+			<integer>1</integer>
+		</dict>
+		<key>RMNetDriver_0620</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>CFBundleIdentifierKernel</key>
+			<string>com.apple.iokit.IOSkywalkFamily</string>
+			<key>IOClass</key>
+			<string>IOUserNetworkEthernet</string>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostInterface</string>
+			<key>IOUserClass</key>
+			<string>RMNetDriver</string>
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>idVendor</key>
+			<integer>11388</integer>
+			<key>idProduct</key>
+			<integer>1568</integer>
+			<key>bConfigurationValue</key>
+			<integer>1</integer>
+			<key>bInterfaceNumber</key>
+			<integer>4</integer>
+			<key>RMNetProfile</key>
+			<integer>1</integer>
+			<key>RMNetFlowControl</key>
+			<integer>1</integer>
+		</dict>
+		<key>RMNetDriver_0800</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>CFBundleIdentifierKernel</key>
+			<string>com.apple.iokit.IOSkywalkFamily</string>
+			<key>IOClass</key>
+			<string>IOUserNetworkEthernet</string>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostInterface</string>
+			<key>IOUserClass</key>
+			<string>RMNetDriver</string>
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>idVendor</key>
+			<integer>11388</integer>
+			<key>idProduct</key>
+			<integer>2048</integer>
+			<key>bConfigurationValue</key>
+			<integer>1</integer>
+			<key>bInterfaceNumber</key>
+			<integer>4</integer>
 			<key>RMNetProfile</key>
 			<integer>1</integer>
 			<key>RMNetFlowControl</key>

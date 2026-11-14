@@ -15,6 +15,7 @@
 #include <NetworkingDriverKit/NetworkingDriverKit.h>
 
 #include "rmnet/ethernet.h"
+#include "rmnet/qmi_interface.h"
 #include "rmnet/util.h"
 
 #include "RMNetDriver.h"
@@ -32,7 +33,6 @@ namespace {
 
 // The RM520N-GL's QMI interface, used when the personality names none (ReadQmiInterface).
 constexpr uint8_t kDefaultQmiInterface = 4;
-constexpr uint8_t kVendorSpecific = 0xff;
 constexpr uint32_t kPacketCount = 512;
 constexpr uint32_t kPacketBufSize = 2048;  // one Ethernet frame per packet
 constexpr uint32_t kQueueCapacity = 256;  // the TX completion and both RX queues
@@ -97,9 +97,9 @@ enum : uint32_t {
 };
 
 // The number of the modem's QMI interface, from the service's bInterfaceNumber property: the
-// personality in Info.plist that matched the provider names it (4 for the RM520N-GL, another number
-// for another model). An integer from 0 to 255; anything else, or no such property, gives 4, with a
-// log line. Start refuses a provider with any other number.
+// personality in Info.plist that matched the provider names it (4 for every listed model). An
+// integer from 0 to 255; anything else, or no such property, gives 4, with a log line. The session
+// names it in its requests, and CheckQmiInterface compares the provider's number with it.
 uint8_t ReadQmiInterface(IOService* service) {
   OSDictionary* props = nullptr;
   kern_return_t ret = service->CopyProperties(&props);
@@ -123,18 +123,58 @@ uint8_t ReadQmiInterface(IOService* service) {
   return number;
 }
 
-// True if the provider is the modem's QMI interface: number `number` (ReadQmiInterface), class,
-// subclass and protocol 0xff.
-bool IsQmiInterface(IOService* provider, uint8_t number) {
+// Whether the provider can be the modem's QMI interface; logs why when it cannot. IOKit matched it
+// by the personality's idProduct and bInterfaceNumber, and in the modem's QMI USB configuration
+// (AT+QCFG="usbnet",0) that number is the QMI function's. In another configuration the same number
+// can belong to another function (an MBIM, ECM, DIAG or serial interface), so the checks that guard
+// are the interface's own: class, subclass and protocol 0xff and the QMI function's three endpoints,
+// one interrupt IN, one bulk IN and one bulk OUT (rmnet::qmi_interface_fault, the rule of the
+// kernel's qmi_wwan). The number is compared with the personality's only as a consistency check.
+bool CheckQmiInterface(IOService* provider, uint8_t number) {
   IOUSBHostInterface* intf = OSDynamicCast(IOUSBHostInterface, provider);
-  if (!intf) return false;
-  const IOUSBConfigurationDescriptor* cfg = intf->CopyConfigurationDescriptor();
-  if (!cfg) return false;
-  const IOUSBInterfaceDescriptor* id = intf->GetInterfaceDescriptor(cfg);
-  bool ok = id && id->bInterfaceNumber == number && id->bInterfaceClass == kVendorSpecific &&
-            id->bInterfaceSubClass == kVendorSpecific && id->bInterfaceProtocol == kVendorSpecific;
+  const IOUSBConfigurationDescriptor* cfg = intf ? intf->CopyConfigurationDescriptor() : nullptr;
+  const IOUSBInterfaceDescriptor* id = cfg ? intf->GetInterfaceDescriptor(cfg) : nullptr;
+  if (!id) {
+    LOG("not the QMI interface: no interface descriptor");
+    if (cfg) IOUSBHostFreeDescriptor(cfg);
+    return false;
+  }
+  rmnet::QmiEndpoints eps{id->bNumEndpoints, 0, 0, 0};
+  const IOUSBEndpointDescriptor* ep = nullptr;
+  while ((ep = IOUSBGetNextEndpointDescriptor(cfg, id, reinterpret_cast<const IOUSBDescriptorHeader*>(ep)))) {
+    uint8_t type = IOUSBGetEndpointType(ep);
+    bool in = IOUSBGetEndpointDirection(ep) == kIOUSBEndpointDirectionIn;
+    if (type == kIOUSBEndpointTypeInterrupt && in) {
+      eps.interrupt_in++;
+    } else if (type == kIOUSBEndpointTypeBulk && in) {
+      eps.bulk_in++;
+    } else if (type == kIOUSBEndpointTypeBulk) {
+      eps.bulk_out++;
+    }
+  }
+  uint8_t iface = id->bInterfaceNumber;
+  uint8_t cls = id->bInterfaceClass;
+  uint8_t sub = id->bInterfaceSubClass;
+  uint8_t proto = id->bInterfaceProtocol;
   IOUSBHostFreeDescriptor(cfg);
-  return ok;
+  if (iface != number) {
+    LOG("not the QMI interface: interface %u, but the personality names %u", iface, number);
+    return false;
+  }
+  switch (rmnet::qmi_interface_fault(cls, sub, proto, eps)) {
+    case rmnet::QmiInterfaceFault::None:
+      return true;
+    case rmnet::QmiInterfaceFault::Class:
+      LOG("not the QMI interface: interface %u has class %02x subclass %02x protocol %02x, not ff ff ff", iface, cls,
+          sub, proto);
+      return false;
+    case rmnet::QmiInterfaceFault::Endpoints:
+      LOG("not the QMI interface: interface %u has %u endpoints (%u interrupt in, %u bulk in, %u bulk out), not "
+          "3 (one of each)",
+          iface, eps.total, eps.interrupt_in, eps.bulk_in, eps.bulk_out);
+      return false;
+  }
+  return false;
 }
 
 // The data profile from the service's RMNetProfile property (the personality in Info.plist sets it):
@@ -377,10 +417,12 @@ void RMNetDriver::free() {
   super::free();
 }
 
-// Order (docs/driverkit-notes.md 3.9): open USB and read the serial number, create Core, the
-// interface with the MAC derived from the serial, the timer, then DTR and the interrupt read, then
-// the session. A failure tears down what was made and fails Start. Failures to report the link
-// status or publish properties do not fail Start (see ReportLink and PublishStatus).
+// Order (docs/driverkit-notes.md 3.9): check the provider (CheckQmiInterface: IOKit matched its
+// number, so what guards is its class, subclass and protocol 0xff and the QMI endpoints; nothing is
+// opened before the check), open USB and read the serial number, create Core, the interface with
+// the MAC derived from the serial, the timer, then DTR and the interrupt read, then the session. A
+// failure tears down what was made and fails Start. Failures to report the link status or publish
+// properties do not fail Start (see ReportLink and PublishStatus).
 kern_return_t RMNetDriver::Start_Impl(IOService* provider) {
   LOG_FIRST(kLogStart, "Start");
   kern_return_t ret = Start(provider, SUPERDISPATCH);
@@ -389,10 +431,7 @@ kern_return_t RMNetDriver::Start_Impl(IOService* provider) {
     return ret;
   }
   uint8_t qmiInterface = ReadQmiInterface(this);
-  if (!IsQmiInterface(provider, qmiInterface)) {
-    LOG("not the QMI interface (want number %u, class, subclass and protocol 0xff)", qmiInterface);
-    ret = kIOReturnUnsupported;
-  }
+  if (!CheckQmiInterface(provider, qmiInterface)) ret = kIOReturnUnsupported;
   if (ret == kIOReturnSuccess) ret = CopyDispatchQueue(kIOServiceDefaultQueueName, &ivars->queue);
   if (ret == kIOReturnSuccess) ret = OpenUsb(provider);
 

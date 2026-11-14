@@ -392,7 +392,7 @@ TEST(the_session_names_the_qmi_interface_core_host_was_given) {
   CHECK(sent4[1] == hex(kCtlGetWdaReq));
   CHECK(sent4[2] == hex(kWdaSetFormatReqFlow));
 
-  // Interface 3 (the RG255C's): the same request but for the interface in the Endpoint Info TLV
+  // Another interface number, 3: the same request but for the interface in the Endpoint Info TLV
   // (0x17: endpoint type 2, HSUSB, then the interface number, both 32-bit little-endian).
   std::vector<uint8_t> want = hex(kWdaSetFormatReqFlow);
   const uint8_t endpoint4[] = {0x17, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00};

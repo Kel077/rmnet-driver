@@ -22,26 +22,45 @@ export LC_ALL
 # The products RMNetDriver may match, each with its QMI interface number: the same list as
 # quectelModels in app/StatusModel.swift (tests/scripts/test-personalities.sh compares the two, and
 # both with the RMNetDriver personalities in driver/Info.plist). 0801 is the RM520N-GL, the modem
-# this driver was built for and tested on, whose QMI interface 4 was found on the modem (the kernel
-# matches it by class: {QMI_MATCH_FF_FF_FF(0x2c7c, 0x0801)}, /* Quectel RM520N */). The others are
-# untested: they are the Quectel (vendor 0x2c7c) entries of the Linux kernel's
-# drivers/net/usb/qmi_wwan.c (torvalds/linux, master, fetched 2026-11-15) that name a fixed QMI
-# interface number:
+# this driver was built for and tested on, whose QMI interface 4 was found on the modem. The others
+# are untested Quectel (vendor 0x2c7c) entries of the Linux kernel's drivers/net/usb/qmi_wwan.c
+# (torvalds/linux, master, fetched 2026-11-15), each with the source of its interface number. Five
+# name it in the entry:
 #   0121 4   {QMI_QUIRK_SET_DTR(0x2c7c, 0x0121, 4)},  /* Quectel EC21 Mini PCIe */
 #   0191 4   {QMI_QUIRK_SET_DTR(0x2c7c, 0x0191, 4)},  /* Quectel EG91 */
 #   0195 4   {QMI_QUIRK_SET_DTR(0x2c7c, 0x0195, 4)},  /* Quectel EG95 */
 #   0296 4   {QMI_FIXED_INTF(0x2c7c, 0x0296, 4)},     /* Quectel BG96 */
 #   030e 4   {QMI_QUIRK_SET_DTR(0x2c7c, 0x030e, 4)},  /* Quectel EM05GV2 */
-#   0316 3   {QMI_QUIRK_SET_DTR(0x2c7c, 0x0316, 3)},  /* Quectel RG255C */
-# The kernel's other Quectel entries match by class only (QMI_MATCH_FF_FF_FF), with no fixed
-# interface number, so they are not in the list (README, "Supported models").
+# The kernel matches the rest by class only ({QMI_MATCH_FF_FF_FF(0x2c7c, <product>)}), so the number
+# comes from elsewhere. Quectel's UMTS_LTE_5G Linux USB Driver User Guide (version 3.0, 2022-03-18),
+# Table 1, gives interface 4 (qmi_wwan_q, RmNet after AT+QCFG="usbnet",0) for:
+#   0125 4   /* Quectel EC25, EC20 R2.0  Mini PCIe */  (Table 1: EC20-CE/EC25 series/EG25-G/EM05 series)
+#   0306 4   /* Quectel EP06/EG06/EM06 */
+#   030b 4   /* Quectel EM060K/EG120K-EA */            (Table 1: EG065K series/EG060K-EA/EG120K series)
+#   0512 4   /* Quectel EG12/EM12 */                   (Table 1: EG12 series/EM12-G/EG18 series)
+#   0620 4   /* Quectel EM160R-GL */                   (Table 1: EG512R-EA/EM160R-GL/EM120R-GL/EM121R-GL)
+#   0800 4   /* Quectel RM500Q-GL */                   (Table 1: RG500Q series/RM500Q series/...)
+# and the kernel commits that added the two newest give it:
+#   0122 4   /* Quectel RG650V */   commit 6b3f18a76be6 (2024-10-24), its usb-devices listing:
+#            If#= 4 Alt= 0 #EPs= 3 Cls=ff(vend.) Sub=ff Prot=ff Driver=qmi_wwan
+#   013d 4   /* Quectel RG660QB */  commit 4ff75f130d1b (2026-09-03): its QMI interface (interface 4)
+#            uses class/subclass/protocol ff/ff/ff
+# Not listed: the RG255C ({QMI_QUIRK_SET_DTR(0x2c7c, 0x0316, 3)}), whose QMI interface is ff/ff/50
+# (commit 5c964c8a97c1's listing), which RMNetDriver's Start refuses (it takes only ff/ff/ff).
 models='0801 4
 0121 4
+0122 4
+0125 4
+013d 4
 0191 4
 0195 4
 0296 4
+0306 4
+030b 4
 030e 4
-0316 3'
+0512 4
+0620 4
+0800 4'
 
 if [ "${1:-}" = --models ]; then
   echo "$models"

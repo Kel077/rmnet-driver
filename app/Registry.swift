@@ -23,33 +23,32 @@ func firstService(_ className: String, withProperties match: [String: Any]) -> i
 func intValue(_ value: Any?) -> Int? { (value as? NSNumber)?.intValue }
 
 // Whether a modem from quectelModels is attached (the first the list names, if several are), which
-// model it is (nil when none is), and whether it is in QMI mode: an interface with class, subclass
-// and protocol 0xff (the model's QMI interface number when that interface has them), so "not
-// installed", "modem not in QMI mode" and "attached" can be told apart.
+// model it is (nil when none is), and whether it is in QMI mode (modemState: its own QMI interface,
+// with class, subclass and protocol 0xff and three endpoints), so "not installed", "modem not in QMI
+// mode" and "attached" can be told apart.
 func readModemModel() -> (state: ModemState, model: QuectelModel?) {
     for model in quectelModels {
         let device = firstService("IOUSBHostDevice", withProperties: ["idVendor": modemVendor, "idProduct": model.product])
         guard device != IO_OBJECT_NULL else { continue }
         defer { IOObjectRelease(device) }
 
-        var qmiInterface: Int?
+        var interfaces: [UsbInterface] = []
         var children: io_iterator_t = 0
         if IORegistryEntryGetChildIterator(device, kIOServicePlane, &children) == KERN_SUCCESS {
             var child = IOIteratorNext(children)
             while child != IO_OBJECT_NULL {
                 let p = properties(of: child)
-                if intValue(p["bInterfaceClass"]) == 0xff, intValue(p["bInterfaceSubClass"]) == 0xff,
-                   intValue(p["bInterfaceProtocol"]) == 0xff, let number = intValue(p["bInterfaceNumber"]),
-                   qmiInterface == nil || number == model.qmiInterface {
-                    qmiInterface = number
-                }
+                interfaces.append(UsbInterface(number: intValue(p["bInterfaceNumber"]),
+                                               interfaceClass: intValue(p["bInterfaceClass"]),
+                                               subclass: intValue(p["bInterfaceSubClass"]),
+                                               proto: intValue(p["bInterfaceProtocol"]),
+                                               endpoints: intValue(p["bNumEndpoints"])))
                 IOObjectRelease(child)
                 child = IOIteratorNext(children)
             }
             IOObjectRelease(children)
         }
-        if let number = qmiInterface { return (.qmi(interface: number), model) }
-        return (.notQMI, model)
+        return (modemState(model, interfaces: interfaces), model)
     }
     return (.absent, nil)
 }
