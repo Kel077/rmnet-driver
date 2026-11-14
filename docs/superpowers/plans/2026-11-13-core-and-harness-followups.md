@@ -90,7 +90,9 @@ Small hardening left open:
 - The install script's stop check sees only the `activated enabled` entry.
 - `PrefixLength` is duplicated, and it and `FormatIPv6` are untested.
 - "usb failed" is published for about 4 s on re-enumeration.
-- A failed `WakeAtTime` ends all ticks, and while stopping can stall `Stop`.
+- A failed `WakeAtTime` ends all ticks, and while stopping can stall `Stop`. Since the uplink-hold plan's fix wave it matters more: `TxPacketsAvailable_Impl` returns early while a hold is on, so after a failed bulk OUT completion, the end of a recovery or a link down, the 100 ms tick is the only thing that restarts a held drain. With no tick and no transfer in flight, the uplink would stay held for good. Not seen.
+- The first-time log line "first qmap command reply kept" (`CoreHost::keep_reply`), like `first qmap command` and `first uplink transfer`, can fall inside a bulk-read handler that `RMNetRxHandlerMaxUs` times, so one of them could set the maximum once.
+- `docs/driverkit-notes.md` says build 316.19.9 "saw about 860" drains that did nothing during the burst. That figure is an estimate (999 refused offers minus 135 transfers), not a count.
 - Packets held at `Stop` are abandoned (watch the driver process's memory in the soak).
 - `acquire_uplink` ignores `failed_`.
 - `logged_bad_qmap_` is dead.
