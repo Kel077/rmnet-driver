@@ -13,30 +13,43 @@ enum SmsActivity: Equatable {
     case sending
 }
 
-/// The Messages tab's state. It takes any SmsServing, so it can be driven by a fake; it uses no SwiftUI
-/// or AppKit. Its methods are called on the main thread, and every service call runs on `queue`, one at
-/// a time, with the result handed back to the main thread.
+/// The Messages tab's state. It takes any SmsServing, so it can be driven by a fake; its logic uses no
+/// SwiftUI or AppKit. Its methods are called on the main thread, and every service call runs on `queue`,
+/// one at a time, with the result handed back to the main thread. The app has exactly one, owned by the
+/// app delegate (StatusView.swift), so that quitting can wait for a running call.
 final class SmsController: ObservableObject {
     @Published private(set) var messages: [SmsMessage] = []
-    @Published private(set) var listed = false              // a listing has succeeded at least once
-    @Published private(set) var stale = false               // the last listing failed; the list is older
+    @Published private(set) var listedAt: Date? = nil        // the last listing that succeeded
+    @Published private(set) var listFailure: String? = nil   // the last listing's failure; nil after a success
     @Published private(set) var unread: Set<SmsMessageKey> = []
     @Published private(set) var running: SmsActivity? = nil
-    @Published private(set) var status = ""                 // the last result, failure or what runs now
-    @Published private(set) var statusIsFailure = false
+    // The result of the last send or delete (or what runs now). A listing never writes here.
+    @Published private(set) var result = ""
+    @Published private(set) var resultIsFailure = false
     @Published var selection: SmsMessageKey? = nil {
         // Selecting a message is reading it: its unread mark goes.
         didSet { if let s = selection { unread.remove(s) } }
     }
     @Published var to = ""     // not saved anywhere
-    @Published var text = ""   // not saved anywhere
+    @Published var text = "" { // not saved anywhere
+        // After a success, starting a new message clears the result line.
+        didSet {
+            if clearResultOnTyping, !text.isEmpty {
+                clearResultOnTyping = false
+                setResult("", failure: false)
+            }
+        }
+    }
 
     private let service: SmsServing
     private let queue: DispatchQueue
     private var timer: Timer?
     private var tabShown = false
     private var windowVisible = true
-    private var statusFromListing = false   // the status line holds a listing's failure
+    private var confirmingDelete = false     // the delete confirmation is open: timer ticks skip
+    private var clearResultOnTyping = false
+    private var stopping = false             // the app is quitting: nothing new starts
+    private var whenFinished: (() -> Void)?  // the reply to a quit that waits for the running call
 
     static let refreshInterval: TimeInterval = 15
 
@@ -48,14 +61,15 @@ final class SmsController: ObservableObject {
 
     deinit { timer?.invalidate() }
 
+    var listed: Bool { listedAt != nil }
     var selectedMessage: SmsMessage? { messages.first { $0.key == selection } }
-    var sendEnabled: Bool { running == nil && canSend(number: to, text: text) }
-    var deleteEnabled: Bool { running == nil && selectedMessage != nil }
-    var refreshEnabled: Bool { running == nil }
+    var sendEnabled: Bool { running == nil && !stopping && canSend(number: to, text: text) }
+    var deleteEnabled: Bool { running == nil && !stopping && selectedMessage != nil }
+    var refreshEnabled: Bool { running == nil && !stopping }
 
     // MARK: When the modem is asked
 
-    /// The tab is shown (true) or another tab is (false).
+    /// The Messages tab is the one shown (true) or not (false, also when the window closes).
     func setTabShown(_ shown: Bool) {
         tabShown = shown
         updateTimer()
@@ -67,14 +81,19 @@ final class SmsController: ObservableObject {
         updateTimer()
     }
 
-    private var active: Bool { tabShown && windowVisible }
+    /// While the delete confirmation is open the 15 s refresh skips its turns.
+    func setConfirmingDelete(_ open: Bool) {
+        confirmingDelete = open
+    }
+
+    private var active: Bool { tabShown && windowVisible && !stopping }
 
     // Lists at once when the tab becomes active, then every 15 s; stops when it is not.
     private func updateTimer() {
         if active {
             guard timer == nil else { return }
             let t = Timer(timeInterval: SmsController.refreshInterval, repeats: true) { [weak self] _ in
-                self?.refresh()
+                self?.tick()
             }
             RunLoop.main.add(t, forMode: .common)
             timer = t
@@ -85,11 +104,40 @@ final class SmsController: ObservableObject {
         }
     }
 
+    private func tick() {
+        guard !confirmingDelete else { return }
+        refresh()
+    }
+
+    // MARK: Quitting
+
+    /// Asked when the app is about to end. With no call running it returns false and the app may end now.
+    /// Otherwise nothing new starts, `reply` is called once the running call has finished (a send is
+    /// never cut short), and it returns true.
+    func quitWhenFinished(_ reply: @escaping () -> Void) -> Bool {
+        stopping = true
+        updateTimer()
+        guard let now = running else { return false }
+        whenFinished = reply
+        setResult(now == .sending ? "RMNet quits when the message has been sent."
+                                  : "RMNet quits when the current request to the modem has finished.",
+                  failure: false)
+        return true
+    }
+
+    // Called by each finish after `running` is cleared; true when a quit was waiting (it is answered).
+    private func answeredQuit() -> Bool {
+        guard let reply = whenFinished else { return false }
+        whenFinished = nil
+        reply()
+        return true
+    }
+
     // MARK: The three calls
 
     /// Lists the messages, unless a call is already running (a timer tick then skips its turn).
     func refresh() {
-        guard running == nil else { return }
+        guard running == nil, !stopping else { return }
         running = .listing
         let service = self.service
         queue.async {
@@ -98,37 +146,36 @@ final class SmsController: ObservableObject {
         }
     }
 
-    private func finishListing(_ result: Result<[SmsMessage], SmsFailure>) {
+    private func finishListing(_ outcome: Result<[SmsMessage], SmsFailure>) {
         running = nil
-        switch result {
+        switch outcome {
         case .success(let found):
             messages = found
-            listed = true
-            stale = false
+            listedAt = Date()
+            listFailure = nil
             unread = unreadMarks(listed: found, kept: unread)
             if let s = selection, !found.contains(where: { $0.key == s }) { selection = nil }
             if let s = selection { unread.remove(s) }
-            if statusFromListing { setStatus("", failure: false) }
         case .failure(let failure):
-            stale = listed
-            setStatus(failure.message, failure: true)
-            statusFromListing = true
+            listFailure = failure.message
         }
+        _ = answeredQuit()
     }
 
     /// Deletes every stored part of `message`, if it is still listed and nothing else runs.
     func delete(_ message: SmsMessage) {
-        // A refresh may have started while the confirmation was open.
+        guard !stopping else { return }
+        // A refresh may have started just before the confirmation opened.
         guard running == nil else {
-            setStatus("The modem was busy with another request. Nothing was deleted; press Delete again.", failure: true)
+            setResult("The modem was busy with another request. Nothing was deleted; press Delete again.", failure: true)
             return
         }
         guard messages.contains(where: { $0.key == message.key }) else {
-            setStatus("That message is no longer listed. Nothing was deleted.", failure: true)
+            setResult("That message is no longer listed. Nothing was deleted.", failure: true)
             return
         }
         running = .deleting
-        setStatus("Deleting \(message.indices.count) stored part(s)…", failure: false)
+        setResult("Deleting \(message.indices.count) stored part(s)…", failure: false)
         let service = self.service
         let indices = message.indices
         queue.async {
@@ -137,15 +184,17 @@ final class SmsController: ObservableObject {
         }
     }
 
-    private func finishDelete(_ result: Result<Int, SmsFailure>) {
+    private func finishDelete(_ outcome: Result<Int, SmsFailure>) {
         running = nil
-        switch result {
+        switch outcome {
         case .success(let count):
             selection = nil
-            setStatus("Deleted \(count) stored part(s).", failure: false)
+            setResult("Deleted \(count) stored part(s).", failure: false)
+            clearResultOnTyping = true
         case .failure(let failure):
-            setStatus(failure.message, failure: true)
+            setResult(failure.message, failure: true)
         }
+        if answeredQuit() { return }
         if active { refresh() }
     }
 
@@ -155,7 +204,7 @@ final class SmsController: ObservableObject {
         let number = to, body = text
         let parts = partCount(body)
         running = .sending
-        setStatus("Sending \(parts) part(s) to \(number). This can take up to a minute per part.", failure: false)
+        setResult("Sending \(parts) part(s) to \(number). This can take up to a minute per part.", failure: false)
         let service = self.service
         queue.async {
             let result = service.send(to: number, text: body)
@@ -163,22 +212,24 @@ final class SmsController: ObservableObject {
         }
     }
 
-    private func finishSend(_ result: Result<Int, SmsFailure>, number: String) {
+    private func finishSend(_ outcome: Result<Int, SmsFailure>, number: String) {
         running = nil
-        switch result {
+        switch outcome {
         case .success(let parts):
             text = ""
-            setStatus("Sent to \(number) in \(parts) part(s).", failure: false)
+            setResult("Sent to \(number) in \(parts) part(s).", failure: false)
+            clearResultOnTyping = true
         case .failure(let failure):
-            setStatus(failure.message, failure: true)
+            setResult(failure.message, failure: true)
         }
+        if answeredQuit() { return }
         if active { refresh() }
     }
 
-    private func setStatus(_ line: String, failure: Bool) {
-        status = line
-        statusIsFailure = failure
-        statusFromListing = false
+    private func setResult(_ line: String, failure: Bool) {
+        result = line
+        resultIsFailure = failure
+        if !line.isEmpty { clearResultOnTyping = false }
     }
 }
 
@@ -194,6 +245,7 @@ struct SmsRow: View {
     let message: SmsMessage
     let unread: Bool
     let selected: Bool
+    let listedAt: Date
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -203,7 +255,7 @@ struct SmsRow: View {
                         .font(.caption.bold())
                         .foregroundStyle(.blue)
                 }
-                Text(verbatim: rowTitle(message, now: Date()))
+                Text(verbatim: rowTitle(message, now: listedAt))
                     .fontWeight(unread ? .bold : .regular)
             }
             let note = rowNote(message)
@@ -228,37 +280,33 @@ struct SmsRow: View {
 }
 
 struct SmsView: View {
-    // Owned by the window (RMNetWindow), so the list and its unread marks survive a switch of tabs.
+    // The process's one controller, owned by the app delegate.
     @ObservedObject var controller: SmsController
     @State private var confirming: SmsMessage? = nil  // the message the delete confirmation is about
 
-    private var emptyText: String {
-        if controller.listed { return "No messages on the modem." }
-        if controller.statusIsFailure, controller.running == nil { return "The messages could not be read." }
-        return "Reading the messages…"
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Spacer()
+            HStack(alignment: .top) {
+                // The list's own line: when it was listed, or why the last listing failed.
+                Text(verbatim: listLine(updated: controller.listedAt, failure: controller.listFailure))
+                    .foregroundStyle(controller.listFailure == nil ? Color.secondary : Color.orange)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 Button("Refresh") { controller.refresh() }
                     .disabled(!controller.refreshEnabled)
                 Button("Delete…") { confirming = controller.selectedMessage }
                     .disabled(!controller.deleteEnabled)
             }
-            if controller.stale {
-                Text("The last listing failed; the list below may be out of date.")
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
             if controller.messages.isEmpty {
-                Text(emptyText)
+                Text(verbatim: listPlaceholder(listed: controller.listed, failed: controller.listFailure != nil))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 120, maxHeight: .infinity)
             } else {
+                let listedAt = controller.listedAt ?? Date()
                 List(controller.messages, selection: $controller.selection) { m in
-                    SmsRow(message: m, unread: controller.unread.contains(m.key), selected: controller.selection == m.key)
+                    SmsRow(message: m, unread: controller.unread.contains(m.key),
+                           selected: controller.selection == m.key, listedAt: listedAt)
                 }
                 .frame(minHeight: 120)
             }
@@ -268,6 +316,7 @@ struct SmsView: View {
                     Text("To")
                     TextField("Number, with + and the country code", text: $controller.to)
                         .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
                 }
                 let badNumber = numberNote(controller.to)
                 if !badNumber.isEmpty {
@@ -275,11 +324,10 @@ struct SmsView: View {
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
-                // TextEditor scrolls inside its frame, so a long text is never clipped.
-                TextEditor(text: $controller.text)
-                    .font(.body)
+                // Plain text with no automatic substitutions (PlainTextEditor.swift); it scrolls inside its
+                // frame, so a long text is never clipped.
+                PlainTextEditor(text: $controller.text, editable: controller.running != .sending)
                     .frame(minHeight: 48, idealHeight: 64, maxHeight: 96)
-                    .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.4)))
                 HStack {
                     Text(verbatim: composeNote(controller.text))
                         .font(.caption)
@@ -290,26 +338,20 @@ struct SmsView: View {
                 }
             }
             .disabled(controller.running == .sending)
-            if !controller.status.isEmpty {
-                Text(verbatim: controller.status)
-                    .foregroundStyle(controller.statusIsFailure ? Color.red : Color.primary)
+            if !controller.result.isEmpty {
+                // The last send's or delete's result; only the next send or delete replaces it.
+                Text(verbatim: controller.result)
+                    .foregroundStyle(controller.resultIsFailure ? Color.red : Color.primary)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding()
         .frame(minWidth: 480, minHeight: 420)
-        // The modem is asked only while this tab is shown and the window can be seen.
-        .onAppear {
-            controller.setWindowVisible(true)
-            controller.setTabShown(true)
-        }
-        .onDisappear { controller.setTabShown(false) }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeOcclusionStateNotification)) { _ in
-            controller.setWindowVisible(NSApp.occlusionState.contains(.visible))
-        }
+        .onChange(of: confirming != nil) { _, open in controller.setConfirmingDelete(open) }
         .confirmationDialog(confirming.map { deleteQuestion($0).title } ?? "",
                             isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
+                            titleVisibility: .visible,
                             presenting: confirming) { m in
             Button("Delete", role: .destructive) { controller.delete(m) }
             Button("Cancel", role: .cancel) {}

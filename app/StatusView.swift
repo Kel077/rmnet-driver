@@ -10,28 +10,55 @@ struct RMNetApp: App {
 
     var body: some Scene {
         Window("RMNet", id: "status") {
-            RMNetWindow()
+            RMNetWindow(messages: appDelegate.messages)
         }
         .defaultSize(width: 520, height: 480)
     }
 }
 
-// The window's two tabs: Driver (the status below) and Messages (SmsView.swift).
+enum WindowTab: Hashable {
+    case driver
+    case messages
+}
+
+// The window's two tabs: Driver (the status below) and Messages (SmsView.swift). The tab shown is tracked
+// by the selection; the Messages tab asks the modem only while it is the one shown and the window can be
+// seen. The controller is not observed here, so typing a message does not redraw the Driver tab.
 struct RMNetWindow: View {
-    @StateObject private var messages = SmsController()
+    let messages: SmsController
+    @State private var tab = WindowTab.driver
 
     var body: some View {
-        TabView {
+        TabView(selection: $tab) {
             StatusView()
                 .tabItem { Text("Driver") }
+                .tag(WindowTab.driver)
             SmsView(controller: messages)
                 .tabItem { Text("Messages") }
+                .tag(WindowTab.messages)
+        }
+        .onAppear { messages.setTabShown(tab == .messages) }
+        .onChange(of: tab) { _, shown in messages.setTabShown(shown == .messages) }
+        .onDisappear { messages.setTabShown(false) }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeOcclusionStateNotification)) { _ in
+            messages.setWindowVisible(NSApp.occlusionState.contains(.visible))
         }
     }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    // The process's one SmsController (and so its one serial queue to the modem): the window shows it, and
+    // quitting waits for its running call.
+    let messages = SmsController()
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    // Every way of quitting (Cmd-Q, the Dock's Quit, closing the last window, logout) comes here. With a
+    // call to the modem running, the app ends only when it has finished; a send is never cut short.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let waits = messages.quitWhenFinished { NSApp.reply(toApplicationShouldTerminate: true) }
+        return waits ? .terminateLater : .terminateNow
+    }
 }
 
 // What the window knows of the system's listing.

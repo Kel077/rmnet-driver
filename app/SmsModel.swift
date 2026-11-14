@@ -747,18 +747,59 @@ func numberNote(_ number: String) -> String {
     number.isEmpty || validNumber(number) ? "" : "The number is 3 to 20 digits, with an optional + in front."
 }
 
-/// "<sender>, <time>": today's messages (in `timeZone`) as HH:mm, others as yyyy-MM-dd HH:mm.
+/// Formatters for the window's times, one set per time zone, made once (rows are drawn often).
+private final class TimeFormats {
+    struct Formats { let calendar: Calendar; let time: DateFormatter; let dayAndTime: DateFormatter; let seconds: DateFormatter }
+    private static var made: [TimeZone: Formats] = [:]
+    private static let lock = NSLock()
+
+    static func formats(_ timeZone: TimeZone) -> Formats {
+        lock.lock()
+        defer { lock.unlock() }
+        if let found = made[timeZone] { return found }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        func formatter(_ pattern: String) -> DateFormatter {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.calendar = calendar
+            f.timeZone = timeZone
+            f.dateFormat = pattern
+            return f
+        }
+        let set = Formats(calendar: calendar, time: formatter("HH:mm"), dayAndTime: formatter("yyyy-MM-dd HH:mm"),
+                      seconds: formatter("HH:mm:ss"))
+        made[timeZone] = set
+        return set
+    }
+}
+
+/// "<sender>, <time>": a time on the same day as `now` (in `timeZone`) as HH:mm, others as
+/// yyyy-MM-dd HH:mm. The window passes the time of the last listing as `now`.
 func rowTitle(_ m: SmsMessage, now: Date, timeZone: TimeZone = .current) -> String {
     let sender = m.sender.isEmpty ? "unknown sender" : m.sender
     guard let time = m.timestamp else { return "\(sender), no time" }
-    var calendar = Calendar(identifier: .gregorian)
-    calendar.timeZone = timeZone
-    let formatter = DateFormatter()
-    formatter.locale = Locale(identifier: "en_US_POSIX")
-    formatter.calendar = calendar
-    formatter.timeZone = timeZone
-    formatter.dateFormat = calendar.isDate(time, inSameDayAs: now) ? "HH:mm" : "yyyy-MM-dd HH:mm"
-    return "\(sender), \(formatter.string(from: time))"
+    let f = TimeFormats.formats(timeZone)
+    let text = f.calendar.isDate(time, inSameDayAs: now) ? f.time.string(from: time) : f.dayAndTime.string(from: time)
+    return "\(sender), \(text)"
+}
+
+/// The line about the list itself: when it was last listed, or why the last listing failed. A send's
+/// or a delete's result never goes here.
+func listLine(updated: Date?, failure: String?, timeZone: TimeZone = .current) -> String {
+    let at = updated.map { TimeFormats.formats(timeZone).seconds.string(from: $0) }
+    switch (failure, at) {
+    case (nil, nil): return ""
+    case (nil, let t?): return "Updated \(t)."
+    case (let f?, nil): return f
+    case (let f?, let t?): return "\(f) The list below may be out of date; it was updated \(t)."
+    }
+}
+
+/// What the list area says while there are no rows.
+func listPlaceholder(listed: Bool, failed: Bool) -> String {
+    if listed { return "No messages on the modem." }
+    return failed ? "The messages could not be read." : "Reading the messages…"
 }
 
 /// What a row says besides its title and text: "not readable", "<n> part(s) missing" or "".

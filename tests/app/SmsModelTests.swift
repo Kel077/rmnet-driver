@@ -210,7 +210,8 @@ func readBack(_ pdus: [SubmitPdu], reference: Int, number: String) -> String? {
     return text
 }
 
-// --- the window's helpers (composeNote, canSend, numberNote, rowTitle, rowNote, deleteQuestion, unreadMarks)
+// --- the window's helpers (composeNote, canSend, numberNote, rowTitle, rowNote, deleteQuestion, unreadMarks,
+// listLine, listPlaceholder)
 
 func message(_ indices: [Int], unread: Bool = false, sender: String = "+27838890001", time: Date? = nil,
              text: String = "hi", missing: Int = 0, readable: Bool = true) -> SmsMessage {
@@ -230,6 +231,10 @@ func windowHelperChecks() {
         (String(repeating: "a", count: 1530), "10 parts, GSM alphabet"),
         (String(repeating: "a", count: 1531), "too long: 11 parts, at most 10"),
         (String(repeating: "a", count: 153 * 11 + 1), "too long: 12 parts, at most 10"),
+        (String(repeating: "好", count: 70), "1 part, Unicode"),
+        (String(repeating: "好", count: 71), "2 parts, Unicode"),
+        (String(repeating: "好", count: 670), "10 parts, Unicode"),
+        (String(repeating: "好", count: 671), "too long: 11 parts, at most 10"),
     ]
     for (text, want) in notes {
         let got = composeNote(text)
@@ -306,6 +311,27 @@ func windowHelperChecks() {
     check(marks == [a.key, b.key], "unreadMarks: new unread plus kept, gone dropped", "\(marks)")
     check(unreadMarks(listed: [], kept: [a.key]).isEmpty, "unreadMarks: nothing listed")
     check(unreadMarks(listed: [b, c], kept: []).isEmpty, "unreadMarks: nothing unread")
+
+    // listLine: the state of the list, never a send's or a delete's result.
+    let updated = utc(1794657609) // 12:00:09 UTC, 20:00:09 in Shanghai
+    let busy = "The modem's AT port is busy."
+    let lines: [(Date?, String?, TimeZone, String)] = [
+        (nil, nil, utcZone, ""),
+        (updated, nil, utcZone, "Updated 12:00:09."),
+        (updated, nil, shanghai, "Updated 20:00:09."),
+        (updated, busy, utcZone, "The modem's AT port is busy. The list below may be out of date; it was updated 12:00:09."),
+        (nil, busy, utcZone, "The modem's AT port is busy."),
+    ]
+    for (at, failure, zone, want) in lines {
+        let got = listLine(updated: at, failure: failure, timeZone: zone)
+        check(got == want, "listLine: \(want.isEmpty ? "nothing" : want)", "got \"\(got)\"")
+    }
+
+    // listPlaceholder: what an empty list area says, from the list's state only.
+    check(listPlaceholder(listed: false, failed: false) == "Reading the messages…", "listPlaceholder: first listing")
+    check(listPlaceholder(listed: false, failed: true) == "The messages could not be read.", "listPlaceholder: failed")
+    check(listPlaceholder(listed: true, failed: false) == "No messages on the modem.", "listPlaceholder: empty")
+    check(listPlaceholder(listed: true, failed: true) == "No messages on the modem.", "listPlaceholder: empty, then failed")
 }
 
 @main
