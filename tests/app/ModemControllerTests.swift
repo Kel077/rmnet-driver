@@ -133,6 +133,22 @@ func timer(of c: ModemController) -> Timer? {
     Mirror(reflecting: c).children.first(where: { $0.label == "timer" }).flatMap { $0.value as? Timer }
 }
 
+/// The timer is scheduled in the main run loop's common modes (so it turns while a menu or a sheet is open).
+func scheduled(_ t: Timer?) -> Bool {
+    guard let t else { return false }
+    return CFRunLoopContainsTimer(CFRunLoopGetMain(), unsafeBitCast(t, to: CFRunLoopTimer.self), .commonModes)
+}
+
+/// Waits for `condition` without running the main run loop, so that results handed to the main thread
+/// stay unread (fails the check after 2 s).
+func waitOffMain(until condition: () -> Bool, _ name: String) {
+    let deadline = Date().addingTimeInterval(2)
+    while !condition() {
+        if Date() > deadline { check(false, "timed out waiting: \(name)") }
+        usleep(1000)
+    }
+}
+
 /// Moves the next turn of every controller's timer to the distant future, so that no turn comes by itself.
 func holdTimers() {
     for live in liveControllers {
@@ -261,8 +277,9 @@ let portBusy = ModemFailure(message: "Another program is using the modem's spare
 let notAnswered = ModemFailure(message: "The modem did not answer in time.")
 let refused = ModemFailure(message: "The modem refused the command (+CME ERROR: 3). Nothing was changed.")
 
-let busyLine = "The modem was busy with another request. Nothing was changed; try again."
-let busyPinLine = "The modem was busy with another request. The PIN was not sent; enter it again."
+let waitingLine = "Waiting for the current read to finish…"
+let anotherChange = "Another change to the modem has not finished yet. Nothing was changed; try again when it has."
+let anotherChangePin = "Another change to the modem has not finished yet. The PIN was not sent; enter it again when it has."
 
 // MARK: - The checks
 
@@ -277,7 +294,9 @@ struct ModemControllerTests {
         modeChanges()
         radio()
         profileChanges()
-        busy()
+        queuedChanges()
+        refreshing()
+        nothingDone()
         pinEntry()
         quitting()
         resuming()
@@ -307,7 +326,8 @@ struct ModemControllerTests {
         check(rig.fake.calls == [.networkInfo] && c.running == .reading, "read: the Network tab reads networkInfo() at once",
               "\(rig.fake.calls)")
         check(timer(of: c)?.timeInterval == 5, "read: the Network tab's timer turns every 5 s")
-        check(!c.refreshEnabled, "read: Refresh is off while a read runs")
+        check(scheduled(timer(of: c)), "read: the Network tab's timer is scheduled in the main run loop")
+        check(c.refreshEnabled, "read: a read leaves Refresh on (R12)")
         c.tick()
         c.refresh()
         timer(of: c)?.fire()
@@ -368,14 +388,15 @@ struct ModemControllerTests {
         check(rig.fake.calls.count == 5, "read: a tick reads nothing while the window is hidden", "\(rig.fake.calls)")
         c.setWindowVisible(true)
         rig.answerInfo(6, .success(network("LTE")), "the window shown again is read at once")
-        check(timer(of: c)?.timeInterval == 5, "read: the timer runs again when the window shows")
+        check(timer(of: c)?.timeInterval == 5 && scheduled(timer(of: c)), "read: the timer runs again when the window shows")
 
         // The SIM & APN tab: profiles() then sim() in one queued block, at once and every 30 s.
         c.setTabShown(.simAndApn)
         rig.waitForCall(7, "the SIM & APN tab is read at once")
         check(rig.fake.calls.last == .profiles && c.running == .reading, "read: the SIM & APN tab reads profiles() first",
               "\(rig.fake.calls)")
-        check(timer(of: c)?.timeInterval == 30, "read: the SIM & APN tab's timer turns every 30 s")
+        check(timer(of: c)?.timeInterval == 30 && scheduled(timer(of: c)),
+              "read: the SIM & APN tab's timer turns every 30 s, scheduled in the main run loop")
         rig.fake.releaseProfiles(.success(listing()))
         rig.waitForCall(8, "sim() follows profiles()")
         check(rig.fake.calls.last == .sim && c.running == .reading, "read: sim() follows profiles() in the same read")
@@ -581,8 +602,8 @@ struct ModemControllerTests {
 
         c.tick()
         rig.waitForCall(3, "a turn starts")
-        check(!c.applyEnabled && !c.pinEnabled && !c.modeChangeEnabled && !c.refreshEnabled,
-              "enabled: everything is off while a read runs")
+        check(c.applyEnabled && c.pinEnabled && c.modeChangeEnabled && c.refreshEnabled,
+              "enabled: a read leaves every button on (R12)")
         rig.fake.releaseProfiles(.success(listing()))
         rig.fake.releaseSim(.success(asksPin(1)))
         pump(until: { c.running == nil }, "the turn comes back")
@@ -626,7 +647,7 @@ struct ModemControllerTests {
         c.changeMode()
         settle()
         check(rig.fake.calls.count == 2, "mode: nothing else starts while the change runs", "\(rig.fake.calls)")
-        check(c.result == "Changing the network mode to LTE only…", "mode: a second Change while one runs leaves the line alone",
+        check(c.result == anotherChange && c.resultIsFailure, "mode: a second Change while one runs is refused with a sentence",
               c.result)
         let change = ModeChange(before: "AUTO", after: "LTE")
         rig.fake.releaseMode(.success(change))
@@ -800,18 +821,26 @@ struct ModemControllerTests {
         rig.fake.releaseSim(.success(ready))
         pump(until: { c.running == nil }, "the read comes back")
 
-        // A change that fails: its sentence, the undo unchanged, the form back on the values read.
+        // A change that fails: its sentence, the undo unchanged, the owner's edit kept to be corrected (R11).
         c.form?.apn = "x"
+        c.form?.password = "newSecret2"
+        let typed = c.form!
         c.applyProfile()
         rig.waitForCall(9, "a change that will fail")
         rig.fake.releaseProfile(.failure(refused))
         rig.waitForCall(10, "the tab is read again after the failure")
         check(c.result == refused.message && c.resultIsFailure && c.undo == nil, "profile: a failure's sentence; no undo", c.result)
-        check(c.form == old && !c.formEdited, "profile: after a failure the form shows the values read")
+        check(c.form == typed && c.formEdited, "profile: a failed Apply keeps the edited form (R11)")
         rig.fake.releaseProfiles(.success(listing(three: old)))
         rig.waitForCall(11, "sim()")
         rig.fake.releaseSim(.success(ready))
         pump(until: { c.running == nil }, "the read comes back")
+        check(c.form == typed && c.formEdited && c.applyEnabled, "profile: the read after it keeps the edit; Apply is on to try again")
+        var afterFailure = ""
+        dump(c, to: &afterFailure)
+        check(!afterFailure.contains("newSecret2") && !afterFailure.contains("oldSecret1"),
+              "profile: a dump of the controller shows neither password")
+        c.revertForm()
 
         // A change whose redial left the radio off: said as a failure; it can be put back.
         c.form?.apn = "y"
@@ -823,46 +852,211 @@ struct ModemControllerTests {
         rig.waitForCall(13, "the tab is read again")
         check(c.result == profileSentence(leftOff) && c.resultIsFailure, "profile: the radio left off is said as a failure", c.result)
         check(c.undo == .profile(id: 3, old), "profile: a change that left the radio off can be put back")
+        check(c.form == tried && !c.formEdited, "profile: a change made (radio left off) fills the form")
         rig.fake.releaseProfiles(.success(listing(three: tried)))
         rig.waitForCall(14, "sim()")
         rig.fake.releaseSim(.success(ready))
         pump(until: { c.running == nil }, "the read comes back")
+
+        // A Put Back that fails keeps an edit made meanwhile and the undo; one that succeeds fills the form.
+        c.form?.user = "edited"
+        let edit = c.form!
+        c.putBack()
+        rig.waitForCall(15, "a put back that will fail")
+        rig.fake.releaseProfile(.failure(notAnswered))
+        rig.answerSettings(16, .success(listing(three: tried)), .success(ready), "the read after the failed put back")
+        check(c.form == edit && c.formEdited && c.undo == .profile(id: 3, old) && c.resultIsFailure,
+              "put back: a failure keeps the edited form and the undo (R11)", c.result)
+        c.putBack()
+        rig.waitForCall(18, "the put back again")
+        rig.fake.releaseProfile(.success(ProfileChange(id: 3, before: tried, after: old, redial: .done(radioOn))))
+        rig.waitForCall(19, "the read after the put back")
+        check(c.form == old && !c.formEdited && c.undo == nil, "put back: success fills the form with what the modem has")
+        rig.fake.releaseProfiles(.success(listing(three: old)))
+        rig.waitForCall(20, "sim()")
+        rig.fake.releaseSim(.success(ready))
+        pump(until: { c.running == nil }, "the read comes back")
+        check(c.form == old && !c.formEdited, "put back: the read after it fills the form from what was read")
         c.setTabShown(nil)
     }
 
-    // A change asked for while a read runs (a turn began just before its confirmation opened) is refused
-    // with a sentence and never reaches the service.
-    static func busy() {
+    // A change asked for while a read runs (a turn began just before its confirmation opened) waits for
+    // it on the queue and starts as soon as it has finished (R12); at most one waits; a change running or
+    // waiting turns the buttons off, a read does not.
+    static func queuedChanges() {
         let rig = Rig()
         let c = rig.controller
-        c.setTabShown(.simAndApn)
-        rig.answerSettings(1, .success(listing()), .success(asksPin(3)), "the first settings read")
-        c.pickedMode = "LTE"
-        c.changeMode()
-        rig.waitForCall(3, "a mode change, for an undo")
-        rig.fake.releaseMode(.success(ModeChange(before: "AUTO", after: "LTE")))
-        rig.answerSettings(4, .success(listing()), .success(asksPin(3)), "the read after it")
-        c.form?.apn = "cmnet"
-        c.pickedMode = "NR5G"
-
+        c.setTabShown(.network)
+        rig.answerInfo(1, .success(network("AUTO")), "the first read")
         c.tick()
-        rig.waitForCall(6, "a turn starts")
-        let refusals: [(String, () -> Void)] = [("Radio", { c.setRadio(on: false) }), ("Change", { c.changeMode() }),
-                                                ("Apply", { c.applyProfile() }), ("Put Back", { c.putBack() })]
-        for (name, press) in refusals {
-            press()
-            check(c.result == busyLine && c.resultIsFailure, "busy: \(name) while a read runs is refused with a sentence", c.result)
-        }
-        c.enterPin("13572468")
-        check(c.result == busyPinLine && c.resultIsFailure, "busy: Unlock while a read runs is refused with a sentence", c.result)
-        rig.fake.releaseProfiles(.success(listing()))
-        rig.waitForCall(7, "sim()")
-        rig.fake.releaseSim(.success(asksPin(3)))
-        pump(until: { c.running == nil }, "the turn comes back")
+        rig.waitForCall(2, "a turn starts")
+        c.pickedMode = "LTE"
+        check(c.modeChangeEnabled && c.refreshEnabled, "queue: a read leaves Change and Refresh on")
+        c.changeMode()
+        check(c.result == waitingLine && !c.resultIsFailure && c.running == .reading, "queue: the change waits for the read", c.result)
+        check(!c.modeChangeEnabled && !c.refreshEnabled && !c.pinEnabled && !c.applyEnabled,
+              "queue: a waiting change turns the buttons off")
+        c.setRadio(on: false)
+        check(c.result == anotherChange && c.resultIsFailure, "queue: a second change while one waits is refused with a sentence",
+              c.result)
+        c.tick()
+        c.refresh()
         settle()
-        check(rig.fake.calls.count == 7 && rig.fake.calls.suffix(2) == [.profiles, .sim],
-              "busy: none of them reached the service")
-        check(c.undo == .mode("AUTO") && c.result == busyPinLine, "busy: the undo is kept; the read leaves the result line", c.result)
+        check(rig.fake.calls == [.networkInfo, .networkInfo], "queue: the waiting change has not reached the service yet",
+              "\(rig.fake.calls)")
+        rig.fake.releaseInfo(.success(network("AUTO")))
+        rig.waitForCall(3, "the waiting change starts after the read")
+        check(rig.fake.calls.last == .setMode("LTE") && c.running == .mode, "queue: the change starts as soon as the read has finished",
+              "\(rig.fake.calls)")
+        check(c.result == "Changing the network mode to LTE only…" && !c.resultIsFailure, "queue: then its running line", c.result)
+        check(c.info == network("AUTO") && c.infoAt != nil, "queue: the read before it was applied")
+        let change = ModeChange(before: "AUTO", after: "LTE")
+        rig.fake.releaseMode(.success(change))
+        rig.answerInfo(4, .success(network("LTE")), "the read after the change")
+        check(c.undo == .mode("AUTO") && c.result == modeSentence(change) && !c.resultIsFailure, "queue: the change was made", c.result)
+        settle()
+        check(rig.fake.calls.count == 4 && rig.fake.mostAtOnce == 1 && rig.fake.callsOffQueue == 0,
+              "queue: the refused radio switch never ran; one call at a time, on the queue", "\(rig.fake.calls)")
+
+        // The view calls the action before setConfirming(false): it starts at once, before the read that
+        // became due while the confirmation was open; that read follows it.
+        c.setConfirming(true)
+        c.setWindowVisible(false)
+        c.setWindowVisible(true)
+        c.setRadio(on: false)
+        rig.waitForCall(5, "the confirmed change starts at once")
+        check(rig.fake.calls.last == .setRadio(false) && c.running == .radio, "queue: a confirmed change starts at once")
+        c.setConfirming(false)
+        settle()
+        check(rig.fake.calls.count == 5, "queue: no read while the change runs")
+        rig.fake.releaseRadio(.success(radioOff))
+        rig.answerInfo(6, .success(network("LTE")), "the read after the change")
+        check(c.result == radioSentence(radioOff), "queue: the change's sentence", c.result)
+
+        // The other order (setConfirming(false) first, so the due read starts): the change is not refused,
+        // it waits for that read (reviewer minor 8).
+        c.setConfirming(true)
+        c.setWindowVisible(false)
+        c.setWindowVisible(true)
+        c.setConfirming(false)
+        rig.waitForCall(7, "the read that was due starts")
+        c.setRadio(on: true)
+        check(c.result == waitingLine, "queue: a change confirmed after the read started waits for it", c.result)
+        rig.fake.releaseInfo(.success(network("LTE")))
+        rig.waitForCall(8, "the change after the read")
+        check(rig.fake.calls.last == .setRadio(true) && c.running == .radio, "queue: then it starts")
+        rig.fake.releaseRadio(.success(radioOn))
+        rig.answerInfo(9, .success(network("LTE")), "the read after the change")
+        check(c.result == radioSentence(radioOn) && !c.resultIsFailure, "queue: the change was made", c.result)
+        c.setTabShown(nil)
+
+        // A PIN that waits: the attempts the confirmation showed go to the service unchanged, not the ones
+        // read meanwhile (R13), and no stored property holds the PIN while it waits.
+        let rig2 = Rig()
+        let p = rig2.controller
+        p.setTabShown(.simAndApn)
+        rig2.answerSettings(1, .success(listing()), .success(asksPin(3)), "the first settings read")
+        p.tick()
+        rig2.waitForCall(3, "a turn starts")
+        let pin = "75318642"
+        p.enterPin(pin, shownAttempts: 3)
+        check(p.result == waitingLine && !p.pinEnabled, "queue: the PIN waits for the read", p.result)
+        check(keepsNoCopy(p, of: pin), "queue: no stored property holds a waiting PIN")
+        p.enterPin(pin, shownAttempts: 3)
+        check(p.result == anotherChangePin && p.resultIsFailure, "queue: a second PIN while one waits is refused", p.result)
+        rig2.fake.releaseProfiles(.success(listing()))
+        rig2.waitForCall(4, "sim()")
+        rig2.fake.releaseSim(.success(asksPin(2)))
+        rig2.waitForCall(5, "the PIN after the read")
+        check(rig2.fake.calls.last == .enterPin(pin, shownAttempts: 3) && p.running == .pin,
+              "queue: the attempts shown are passed unchanged, not the ones read meanwhile (R13)")
+        check(p.sim == asksPin(2), "queue: the read before the PIN was applied")
+        rig2.fake.releasePin(.success(PinOutcome(accepted: false, sim: asksPin(2))))
+        rig2.answerSettings(6, .success(listing()), .success(asksPin(2)), "the read after the PIN")
+        check(keepsNoCopy(p, of: pin), "queue: no stored property holds the PIN afterwards")
+        check(rig2.fake.calls.count == 7, "queue: the refused second PIN was never sent", "\(rig2.fake.calls.count)")
+        p.setTabShown(nil)
+    }
+
+    // An explicit Refresh: works in a visible window with a tab shown; does nothing (and is off) while a
+    // confirmation is open; does nothing while the window is hidden; adds nothing to a read that runs.
+    static func refreshing() {
+        let rig = Rig()
+        let c = rig.controller
+        c.setTabShown(.network)
+        rig.answerInfo(1, .success(network("AUTO")), "the first read")
+        c.refresh()
+        rig.answerInfo(2, .success(network("AUTO")), "Refresh in a visible window reads at once")
+        c.setConfirming(true)
+        check(!c.refreshEnabled, "refresh: off while a confirmation is open")
+        c.refresh()
+        settle()
+        check(rig.fake.calls.count == 2, "refresh: does nothing while a confirmation is open", "\(rig.fake.calls)")
+        c.setConfirming(false)
+        check(c.refreshEnabled, "refresh: on again when the confirmation closes")
+        settle()
+        check(rig.fake.calls.count == 2, "refresh: a Refresh refused during the confirmation is not run later", "\(rig.fake.calls)")
+        c.setWindowVisible(false)
+        c.refresh()
+        settle()
+        check(rig.fake.calls.count == 2, "refresh: does nothing while the window is hidden", "\(rig.fake.calls)")
+        c.setWindowVisible(true)
+        rig.answerInfo(3, .success(network("AUTO")), "the window shows again")
+        c.refresh()
+        rig.waitForCall(4, "a Refresh")
+        c.refresh()
+        settle()
+        check(rig.fake.calls.count == 4, "refresh: a second Refresh while a read runs adds nothing", "\(rig.fake.calls)")
+        rig.fake.releaseInfo(.success(network("AUTO")))
+        pump(until: { c.running == nil }, "the read comes back")
+        c.setTabShown(nil)
+        c.refresh()
+        settle()
+        check(rig.fake.calls.count == 4, "refresh: does nothing with no modem tab shown", "\(rig.fake.calls)")
+    }
+
+    // Every change that does nothing says why on the result line, and nothing reaches the service.
+    static func nothingDone() {
+        let rig = Rig()
+        let c = rig.controller
+        c.putBack()
+        check(c.result == "There is no change to put back." && c.resultIsFailure, "nothing: Put Back with no undo", c.result)
+        c.applyProfile()
+        check(c.result == "The settings of profile 1 have not been read. Nothing was changed.", "nothing: Apply before a read", c.result)
+        c.changeMode()
+        check(c.result == "Choose a network mode first. Nothing was changed.", "nothing: Change with no pick", c.result)
+        c.enterPin("1234", shownAttempts: 3)
+        check(c.result == "The SIM has not been read yet. The PIN was not sent.", "nothing: Unlock before the SIM is read", c.result)
+
+        c.setTabShown(.network)
+        rig.answerInfo(1, .success(network("AUTO")), "the first read")
+        c.changeMode()
+        check(c.result == "The network mode is already automatic (5G, LTE and WCDMA). Nothing was changed.",
+              "nothing: Change to the mode the modem has", c.result)
+        c.pickedMode = "5g"
+        c.changeMode()
+        check(c.result == "RMNet cannot set the network mode 5g. Nothing was changed.", "nothing: Change to a mode RMNet cannot set",
+              c.result)
+
+        c.setTabShown(.simAndApn)
+        rig.answerSettings(2, .success(listing()), .success(ready), "the settings read")
+        c.applyProfile()
+        check(c.result == "Profile 1 already has these settings. Nothing was changed.", "nothing: Apply of an unedited form", c.result)
+        c.form?.apn = "cm net"
+        c.applyProfile()
+        check(c.result == profileProblem(1, c.form!)! + " Nothing was changed." && c.resultIsFailure,
+              "nothing: Apply with a problem says the rule", c.result)
+        c.enterPin("1234", shownAttempts: 3)
+        check(c.result == "The SIM does not ask for its PIN now (SIM: ready). The PIN was not sent.",
+              "nothing: Unlock when the SIM does not ask for its PIN", c.result)
+        rig.driver = 7
+        c.tick()
+        rig.answerSettings(4, .success(listing()), .success(ready), "the driver on profile 7")
+        c.applyProfile()
+        check(c.result == "The modem does not list profile 7. Nothing was changed.", "nothing: Apply to a profile not listed", c.result)
+        settle()
+        check(rig.fake.calls == [.networkInfo, .profiles, .sim, .profiles, .sim], "nothing: none of them reached the service",
+              "\(rig.fake.calls)")
         c.setTabShown(nil)
     }
 
@@ -874,7 +1068,7 @@ struct ModemControllerTests {
         let c = rig.controller
         c.setTabShown(.simAndApn)
         rig.answerSettings(1, .success(listing()), .success(asksPin(3)), "the first settings read")
-        c.enterPin(pin)
+        c.enterPin(pin, shownAttempts: 3)
         rig.waitForCall(3, "the PIN reaches the service")
         check(rig.fake.calls.last == .enterPin(pin, shownAttempts: 3), "pin: the PIN goes with the attempts the owner was shown")
         check(c.running == .pin && c.result == "Sending the PIN to the SIM…" && !c.pinEnabled, "pin: the running sentence", c.result)
@@ -890,9 +1084,11 @@ struct ModemControllerTests {
         rig.fake.releaseSim(.success(ready))
         pump(until: { c.running == nil }, "the read comes back")
         check(!c.pinEnabled && c.sim == ready, "pin: Unlock is off once the SIM is ready")
-        c.enterPin(pin)
+        c.enterPin(pin, shownAttempts: 3)
         settle()
         check(rig.fake.calls.count == 5, "pin: nothing is sent while the SIM does not ask for its PIN")
+        check(c.result == "The SIM does not ask for its PIN now (SIM: ready). The PIN was not sent." && c.resultIsFailure,
+              "pin: and it says why", c.result)
         c.setTabShown(nil)
 
         // A refused PIN, the last attempt, a failure, and a malformed PIN.
@@ -901,27 +1097,43 @@ struct ModemControllerTests {
         p.setTabShown(.simAndApn)
         rig2.answerSettings(1, .success(listing()), .success(asksPin(2)), "the first settings read")
         let other = "86420135"
-        p.enterPin(other)
+        p.enterPin(other, shownAttempts: 2)
         rig2.waitForCall(3, "the PIN reaches the service")
         check(rig2.fake.calls.last == .enterPin(other, shownAttempts: 2), "pin: 2 attempts shown, 2 passed")
         let wrong = PinOutcome(accepted: false, sim: asksPin(1))
         rig2.fake.releasePin(.success(wrong))
-        rig2.answerSettings(4, .success(listing()), .success(asksPin(1)), "the read after the refused PIN")
+        rig2.waitForCall(4, "the read after the refused PIN starts")
+        check(p.sim == asksPin(1) && p.pinEnabled, "pin: the SIM read with the outcome is shown at once (1 attempt left)")
+        rig2.fake.releaseProfiles(.success(listing()))
+        rig2.waitForCall(5, "sim()")
+        rig2.fake.releaseSim(.success(asksPin(1)))
+        pump(until: { p.running == nil }, "the read comes back")
         check(p.result == pinSentence(wrong) && p.resultIsFailure, "pin: a refused PIN is said as a failure", p.result)
         check(keepsNoCopy(p, of: other), "pin: no stored property holds a refused PIN")
 
-        p.enterPin(other)
+        p.enterPin(other, shownAttempts: 1)
         rig2.waitForCall(6, "the last attempt")
         check(rig2.fake.calls.last == .enterPin(other, shownAttempts: 1), "pin: the last attempt passes 1")
         rig2.fake.releasePin(.failure(notAnswered))
         rig2.answerSettings(7, .success(listing()), .success(asksPin(1)), "the read after the failure")
         check(p.result == notAnswered.message && p.resultIsFailure, "pin: a failure's sentence", p.result)
 
-        p.enterPin("12a4")
-        p.enterPin("123")
+        p.enterPin("12a4", shownAttempts: 1)
+        p.enterPin("123", shownAttempts: 1)
         settle()
         check(rig2.fake.calls.count == 8, "pin: a malformed PIN is not sent")
-        check(p.result == "A PIN is 4 to 8 digits." && p.resultIsFailure, "pin: a malformed PIN is refused with the rule", p.result)
+        check(p.result == "A PIN is 4 to 8 digits. The PIN was not sent." && p.resultIsFailure,
+              "pin: a malformed PIN is refused with the rule", p.result)
+        p.enterPin(other, shownAttempts: 0)
+        settle()
+        check(rig2.fake.calls.count == 8, "pin: nothing is sent when the confirmation showed no attempts left")
+        check(p.result == "The SIM has no PIN attempts left: it needs its PUK from the carrier, and RMNet does not enter PUKs. "
+              + "The PIN was not sent.", "pin: and it says why", p.result)
+        p.enterPin(other, shownAttempts: 2)
+        rig2.waitForCall(9, "attempts shown that differ from the SIM read")
+        check(rig2.fake.calls.last == .enterPin(other, shownAttempts: 2), "pin: the attempts shown are passed unchanged (R13)")
+        rig2.fake.releasePin(.failure(ModemFailure(message: "The SIM now shows 1 attempt left, not 2. The PIN was not sent.")))
+        rig2.answerSettings(10, .success(listing()), .success(asksPin(1)), "the read after it")
         check(keepsNoCopy(p, of: other), "pin: still no copy afterwards")
         p.setTabShown(nil)
     }
@@ -962,6 +1174,7 @@ struct ModemControllerTests {
         }
         let reading = "RMNet quits when the current request to the modem has finished."
         let radioBack = "RMNet quits when the radio has been switched back on."
+        let radioOffLine = "RMNet quits when the radio has been switched off."
         let modeLine = "RMNet quits when the network mode has been changed."
         let pinLine = "RMNet quits when the PIN has been checked."
         let edited = ProfileSettings(type: .ipv4v6, apn: "cmnet", user: "", password: "", auth: .none)
@@ -971,7 +1184,7 @@ struct ModemControllerTests {
         let tick: (ModemController) -> Void = { $0.tick() }
         let apply: (ModemController) -> Void = { $0.form?.apn = "cmnet"; $0.applyProfile() }
         let changeMode: (ModemController) -> Void = { $0.pickedMode = "LTE"; $0.changeMode() }
-        let unlock: (ModemController) -> Void = { $0.enterPin("24681357") }
+        let unlock: (ModemController) -> Void = { $0.enterPin("24681357", shownAttempts: 3) }
         let cases: [Case] = [
             Case(name: "a network read", tab: .network, notice: reading, goesAhead: true, calls: 1, start: tick,
                  end: { $0.releaseInfo(.success(network("AUTO"))) }, result: nil),
@@ -981,8 +1194,12 @@ struct ModemControllerTests {
                  end: { $0.releaseProfiles(.success(listing())); $0.releaseSim(.success(asksPin(3))) }, result: nil),
             Case(name: "a radio switch", tab: .network, notice: radioBack, goesAhead: true, calls: 1,
                  start: { $0.setRadio(on: true) }, end: { $0.releaseRadio(.success(radioOn)) }, result: nil),
-            Case(name: "a radio switch that fails", tab: .network, notice: radioBack, goesAhead: false, calls: 1,
+            Case(name: "a radio switch off", tab: .network, notice: radioOffLine, goesAhead: true, calls: 1,
+                 start: { $0.setRadio(on: false) }, end: { $0.releaseRadio(.success(radioOff)) }, result: nil),
+            Case(name: "a radio switch off that fails", tab: .network, notice: radioOffLine, goesAhead: false, calls: 1,
                  start: { $0.setRadio(on: false) }, end: { $0.releaseRadio(.failure(notAnswered)) }, result: notAnswered.message),
+            Case(name: "a radio switch on that fails", tab: .network, notice: radioBack, goesAhead: false, calls: 1,
+                 start: { $0.setRadio(on: true) }, end: { $0.releaseRadio(.failure(notAnswered)) }, result: notAnswered.message),
             Case(name: "a mode change", tab: .network, notice: modeLine, goesAhead: true, calls: 1, start: changeMode,
                  end: { $0.releaseMode(.success(ModeChange(before: "AUTO", after: "LTE"))) }, result: nil),
             Case(name: "a mode change that fails", tab: .network, notice: modeLine, goesAhead: false, calls: 1, start: changeMode,
@@ -1046,6 +1263,59 @@ struct ModemControllerTests {
                 settle()
                 check(rig.replies == [false] && rig.attention == 1, "\(name): still exactly one reply", "\(rig.replies)")
             }
+            c.setTabShown(nil)
+        }
+
+        // A change waiting behind a read when the quit begins is dropped: it is never made, and the quit
+        // waits only for the read (R12).
+        do {
+            let rig = Rig()
+            let c = rig.controller
+            c.setTabShown(.simAndApn)
+            rig.answerSettings(1, .success(listing()), .success(asksPin(3)), "the first read")
+            c.tick()
+            rig.waitForCall(3, "a turn starts")
+            c.form?.apn = "cmnet"
+            c.applyProfile()
+            check(c.result == waitingLine, "quit with a waiting change: the change waits", c.result)
+            check(c.quitWhenFinished() == true, "quit with a waiting change: the quit waits for the read")
+            check(c.quitNotice.line == reading, "quit with a waiting change: the line is the read's", c.quitNotice.line)
+            check(c.result == "RMNet is quitting, so the change that waited for a read was not made." && c.resultIsFailure,
+                  "quit with a waiting change: the result line says it was not made", c.result)
+            rig.fake.releaseProfiles(.success(listing()))
+            rig.fake.releaseSim(.success(asksPin(3)))
+            pump(until: { !rig.replies.isEmpty }, "the reply")
+            settle()
+            check(rig.replies == [true] && rig.attention == 0, "quit with a waiting change: replies true once after the read",
+                  "\(rig.replies)")
+            check(rig.fake.calls == [.profiles, .sim, .profiles, .sim], "quit with a waiting change: it never reached the service",
+                  "\(rig.fake.calls)")
+            c.setTabShown(nil)
+        }
+
+        // A waiting change that has already started on the queue when the quit begins (the main thread has
+        // not yet heard that the read finished): the quit waits for the change, with its line.
+        do {
+            let rig = Rig()
+            let c = rig.controller
+            c.setTabShown(.network)
+            rig.answerInfo(1, .success(network("AUTO")), "the first read")
+            c.tick()
+            rig.waitForCall(2, "a turn starts")
+            c.setRadio(on: false)
+            rig.fake.releaseInfo(.success(network("AUTO")))
+            waitOffMain(until: { rig.fake.calls.count == 3 && rig.fake.blocked == 1 }, "the change starts on the queue")
+            check(c.running == .reading, "quit with a started change: the main thread has not heard yet")
+            check(c.quitWhenFinished() == true, "quit with a started change: the quit waits")
+            check(c.quitNotice.line == radioOffLine, "quit with a started change: the line is the change's", c.quitNotice.line)
+            pump(until: { c.running == .radio }, "the main thread hears the read has finished")
+            check(c.result == "Switching the radio off…" && rig.replies.isEmpty, "quit with a started change: it runs", c.result)
+            rig.fake.releaseRadio(.success(radioOff))
+            pump(until: { !rig.replies.isEmpty }, "the reply")
+            settle()
+            check(rig.replies == [true] && c.result == radioSentence(radioOff), "quit with a started change: replies true once after it",
+                  "\(rig.replies)")
+            check(rig.fake.calls.count == 3, "quit with a started change: no read follows", "\(rig.fake.calls)")
             c.setTabShown(nil)
         }
     }

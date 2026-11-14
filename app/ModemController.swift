@@ -5,8 +5,9 @@
 // the driver's profile number are closures given by the app delegate, so it uses no AppKit or SwiftUI and
 // is tested with a fake service (tests/app/ModemControllerTests.swift), as SmsController is.
 //
-// A PIN is passed to the service and never kept: no stored property holds it. A profile's old password is
-// kept in memory only, in `undo` (ProfileSettings shows only whether one is set in any string conversion).
+// A PIN is passed to the service and never kept: no stored property holds it (only the block on the queue
+// does, until the call returns). A profile's old password is kept in memory only, in `undo`
+// (ProfileSettings shows only whether one is set in any string conversion).
 import Combine
 import Foundation
 
@@ -29,6 +30,42 @@ final class ModemQuitNotice: ObservableObject {
     @Published fileprivate(set) var line = ""
 }
 
+/// A change on its way through the queue: started at once, or waiting there behind a read that runs
+/// (ruling R12). The main thread drops it when the app begins to quit before it started; the queue starts
+/// it only if it was not dropped. It holds no value of the change (a PIN is only in the queued block).
+private final class ModemChange {
+    let activity: ModemActivity
+    let line: String       // the result line while it runs
+    let quitLine: String   // the window's line while a quit waits for it
+    private let lock = NSLock()
+    private var started = false
+    private var dropped = false
+
+    init(_ activity: ModemActivity, line: String, quitLine: String) {
+        self.activity = activity
+        self.line = line
+        self.quitLine = quitLine
+    }
+
+    /// On the queue: true when it may run now (it was not dropped); from then on it cannot be dropped.
+    func start() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if dropped { return false }
+        started = true
+        return true
+    }
+
+    /// On the main thread: true when it was dropped before it started (it will never run).
+    func drop() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if started { return false }
+        dropped = true
+        return true
+    }
+}
+
 /// The app has exactly one, owned by the app delegate, so that quitting can wait for a running call. Its
 /// methods are called on the main thread; every service call runs on `queue` (shared with the Messages
 /// tab, so the AT port is never opened twice at once), one at a time, with the result handed back to the
@@ -38,11 +75,12 @@ final class ModemController: ObservableObject {
     @Published private(set) var infoAt: Date? = nil
     @Published private(set) var infoFailure: String? = nil       // the last network read's failure; nil after a success
     @Published private(set) var profiles: [DataProfile] = []     // the last profiles() that succeeded
-    @Published private(set) var sim: SimInfo? = nil               // the last sim() that succeeded
+    @Published private(set) var sim: SimInfo? = nil               // the last SIM read that succeeded
     @Published private(set) var settingsAt: Date? = nil           // the last settings read whose two parts succeeded
     @Published private(set) var settingsFailure: String? = nil    // the last settings read's failure; nil after a success
     @Published private(set) var running: ModemActivity? = nil
-    // The result of the last change (or what runs now). A read never writes here.
+    // The result of the last change (or what runs or waits now), or why a change asked for was not made.
+    // A read never writes here.
     @Published private(set) var result = ""
     @Published private(set) var resultIsFailure = false
     @Published private(set) var undo: ModemUndo? = nil
@@ -53,6 +91,10 @@ final class ModemController: ObservableObject {
 
     static let networkInterval: TimeInterval = 5
     static let settingsInterval: TimeInterval = 30
+
+    private static let readingQuitLine = "RMNet quits when the current request to the modem has finished."
+    private static let radioOnQuitLine = "RMNet quits when the radio has been switched back on."
+    private static let anotherChange = "Another change to the modem has not finished yet. Nothing was changed; try again when it has."
 
     private let service: ModemServing
     private let queue: DispatchQueue
@@ -68,6 +110,7 @@ final class ModemController: ObservableObject {
     private var quitWaits = false                // a quit waits for the running call to finish
     private var readingTab: ModemTab?            // the tab the running read is for
     private var readWanted = false               // the shown tab is to be read as soon as nothing runs
+    private var change: ModemChange? = nil       // the change running, or waiting on the queue behind a read
     private var driverProfileRead: Int? = nil    // driverProfile() at the last settings refresh
     private var formSource: ProfileSettings? = nil  // the values `form` was last filled from
     private var pickedFrom: String? = nil        // the mode `pickedMode` was last set from
@@ -89,21 +132,23 @@ final class ModemController: ObservableObject {
     var driverAttached: Bool { driverProfileRead != nil }
     /// The form differs from the values it was filled from.
     var formEdited: Bool { form != formSource }
+    // A read does not turn the buttons off (a change asked for during one waits for it); a change that
+    // runs or waits, and quitting, do.
     var applyEnabled: Bool {
-        guard idle, formEdited, let form else { return false }
+        guard changeFree, formEdited, let form else { return false }
         return profileProblem(profileID, form) == nil
     }
     var modeChangeEnabled: Bool {
-        guard idle, let picked = pickedMode, canonicalMode(picked) != nil else { return false }
+        guard changeFree, let picked = pickedMode, canonicalMode(picked) != nil else { return false }
         return picked != info?.mode
     }
     var pinEnabled: Bool {
-        guard idle, let sim, sim.state == .pin, let attempts = sim.pinAttempts else { return false }
+        guard changeFree, let sim, sim.state == .pin, let attempts = sim.pinAttempts else { return false }
         return attempts >= 1
     }
-    var refreshEnabled: Bool { idle }
+    var refreshEnabled: Bool { changeFree && !confirming }
 
-    private var idle: Bool { running == nil && !stopping }
+    private var changeFree: Bool { change == nil && !stopping }
 
     /// The driver's profile's settings in the last profiles read; nil when it is not listed or not read.
     private var driverSettings: ProfileSettings? {
@@ -125,7 +170,9 @@ final class ModemController: ObservableObject {
     }
 
     /// While a confirmation is open the timer's turns skip and nothing new is read; a read that was due
-    /// meanwhile starts when it closes.
+    /// meanwhile starts when it closes. The view calls the confirmed action (setRadio, changeMode,
+    /// applyProfile, putBack, enterPin) before `setConfirming(false)`, so that the change starts at once
+    /// rather than after that read (it would still be made after the read, not refused).
     func setConfirming(_ open: Bool) {
         confirming = open
         readIfDue()
@@ -160,22 +207,22 @@ final class ModemController: ObservableObject {
         }
     }
 
-    /// Starts the read that is due, once nothing runs and no confirmation is open.
+    /// Starts the read that is due, once nothing runs (`refresh` checks the rest).
     private func readIfDue() {
-        guard readWanted, active, !confirming, running == nil else { return }
+        guard readWanted, running == nil else { return }
         refresh()
     }
 
     /// One turn of the timer: skipped while a confirmation is open or a call runs.
     func tick() {
-        guard active, !confirming else { return }
         refresh()
     }
 
-    /// Reads what the shown tab needs, unless a call is already running: the Network tab networkInfo();
-    /// the SIM & APN tab profiles() then sim(), in one block on the queue.
+    /// Reads what the shown tab needs: the Network tab networkInfo(); the SIM & APN tab profiles() then
+    /// sim(), in one block on the queue. Nothing while a call runs, no tab is shown, the window is hidden,
+    /// a confirmation is open or the app quits.
     func refresh() {
-        guard running == nil, !stopping, let tab else { return }
+        guard running == nil, active, !confirming, let tab else { return }
         readWanted = false
         running = .reading
         readingTab = tab
@@ -208,7 +255,7 @@ final class ModemController: ObservableObject {
         case .failure(let failure):
             infoFailure = failure.message
         }
-        finished(succeeded: true, changed: false)
+        readFinished()
     }
 
     private func finishSettings(_ listed: Result<[DataProfile], ModemFailure>, _ read: Result<SimInfo, ModemFailure>) {
@@ -230,6 +277,17 @@ final class ModemController: ObservableObject {
         // The editor follows the modem unless the owner edited it; an edit for another profile than the
         // driver's now is dropped.
         if form == nil || !formEdited || profileID != earlierProfile { fillForm(driverSettings) }
+        readFinished()
+    }
+
+    // After a read: a change that waited behind it on the queue runs now (its finish answers a quit and
+    // reads again); otherwise as after any call.
+    private func readFinished() {
+        if let waiting = change {
+            running = waiting.activity
+            setResult(waiting.line, failure: false)
+            return
+        }
         finished(succeeded: true, changed: false)
     }
 
@@ -250,17 +308,24 @@ final class ModemController: ObservableObject {
 
     // MARK: Quitting
 
-    /// Asked when the app is about to end. Stops the timer and anything new. With no call running it
-    /// returns false and the app may end now. Otherwise it returns true, and once the running call has
-    /// finished `replyToQuit` is called once (a change is never cut short): with true after a read or a
-    /// change that succeeded; with false (the quit is cancelled, the app asks for attention and the
-    /// controller works again) after a change that did not, so that the owner sees its result line.
+    /// Asked when the app is about to end. Stops the timer and anything new; a change that waits behind a
+    /// read and has not started is dropped (it is never made). With no call running it returns false and
+    /// the app may end now. Otherwise it returns true, and once the running call has finished
+    /// `replyToQuit` is called once (a change is never cut short): with true after a read or a change that
+    /// succeeded; with false (the quit is cancelled, the app asks for attention and the controller works
+    /// again) after a change that did not, so that the owner sees its result line.
     func quitWhenFinished() -> Bool {
         stopping = true
         updateTimer()
-        guard let now = running else { return false }
+        if let waiting = change, running == .reading, waiting.drop() {
+            change = nil
+            setResult("RMNet is quitting, so the change that waited for a read was not made.", failure: true)
+        }
+        guard running != nil else { return false }
         quitWaits = true
-        quitNotice.line = quitWaitLine(now)
+        // A change running, or one that waited and has already started on the queue, is what the quit waits
+        // for; with no change, what runs is a read.
+        quitNotice.line = change?.quitLine ?? ModemController.readingQuitLine
         return true
     }
 
@@ -298,36 +363,52 @@ final class ModemController: ObservableObject {
     }
 
     // MARK: The changes
+    //
+    // Each change first checks what it was asked to do and, when it does nothing, says why on the result
+    // line. While the app quits nothing starts (the quit line says so). One change at a time: while
+    // another runs or waits, a new one is refused with a sentence. A change asked for while a read runs
+    // waits for it on the queue and starts as soon as it has finished (ruling R12).
 
-    /// True when a change may start now. While a read runs (a turn began just before the confirmation
-    /// opened) the change is refused with `busy`; while a change runs nothing is said (its line stays).
-    private func mayStart(busy: String) -> Bool {
-        guard !stopping else { return false }
-        if running == .reading { setResult(busy, failure: true) }
-        return running == nil
+    private func refuse(_ why: String) {
+        setResult(why, failure: true)
     }
 
-    private static let busyChange = "The modem was busy with another request. Nothing was changed; try again."
-
-    /// Runs one call on the queue and hands its result to `finish` on the main thread.
-    private func run<T>(_ activity: ModemActivity, _ call: @escaping (ModemServing) -> Result<T, ModemFailure>,
-                        then finish: @escaping (Result<T, ModemFailure>) -> Void) {
-        running = activity
+    /// Puts the call on the queue: running at once, or waiting behind the read that runs.
+    private func submit<T>(_ activity: ModemActivity, line: String, quitLine: String,
+                           _ call: @escaping (ModemServing) -> Result<T, ModemFailure>,
+                           then finish: @escaping (Result<T, ModemFailure>) -> Void) {
+        let next = ModemChange(activity, line: line, quitLine: quitLine)
+        change = next
+        if running == nil {
+            running = activity
+            setResult(line, failure: false)
+        } else {
+            setResult("Waiting for the current read to finish…", failure: false)
+        }
         let service = self.service
         queue.async {
+            guard next.start() else { return }  // dropped: the app began to quit before it started
             let outcome = call(service)
             DispatchQueue.main.async { finish(outcome) }
         }
     }
 
+    // The change has finished (its result is handed back).
+    private func changeEnded() {
+        running = nil
+        change = nil
+    }
+
     /// Switches the radio on (AT+CFUN=1) or off (AT+CFUN=4). No undo: the other switch is the way back.
     func setRadio(on: Bool) {
-        guard mayStart(busy: ModemController.busyChange) else { return }
-        setResult(on ? "Switching the radio on…" : "Switching the radio off…", failure: false)
-        run(.radio, { $0.setRadio(on: on) }) { outcome in
-            self.running = nil
+        guard !stopping else { return }
+        guard change == nil else { return refuse(ModemController.anotherChange) }
+        submit(.radio, line: on ? "Switching the radio on…" : "Switching the radio off…",
+               quitLine: on ? ModemController.radioOnQuitLine : "RMNet quits when the radio has been switched off.",
+               { $0.setRadio(on: on) }) { outcome in
+            self.changeEnded()
             switch outcome {
-            case .success(let change): self.setResult(radioSentence(change), failure: false)
+            case .success(let switched): self.setResult(radioSentence(switched), failure: false)
             case .failure(let failure): self.setResult(failure.message, failure: true)
             }
             self.finished(succeeded: (try? outcome.get()) != nil, changed: true)
@@ -336,24 +417,30 @@ final class ModemController: ObservableObject {
 
     /// Changes the network mode to `pickedMode`.
     func changeMode() {
-        guard mayStart(busy: ModemController.busyChange) else { return }
-        guard let mode = pickedMode, canonicalMode(mode) != nil, mode != info?.mode else { return }
-        setResult("Changing the network mode to \(modeWords(mode))…", failure: false)
-        run(.mode, { $0.setMode(mode) }) { self.finishMode($0, puttingBack: false) }
+        guard !stopping else { return }
+        guard let mode = pickedMode else { return refuse("Choose a network mode first. Nothing was changed.") }
+        guard canonicalMode(mode) != nil else {
+            return refuse("RMNet cannot set the network mode \(modemTextSafe(mode)). Nothing was changed.")
+        }
+        guard mode != info?.mode else { return refuse("The network mode is already \(modeWords(mode)). Nothing was changed.") }
+        guard change == nil else { return refuse(ModemController.anotherChange) }
+        submit(.mode, line: "Changing the network mode to \(modeWords(mode))…",
+               quitLine: "RMNet quits when the network mode has been changed.",
+               { $0.setMode(mode) }) { self.finishMode($0, puttingBack: false) }
     }
 
     private func finishMode(_ outcome: Result<ModeChange, ModemFailure>, puttingBack: Bool) {
-        running = nil
+        changeEnded()
         switch outcome {
-        case .success(let change):
+        case .success(let done):
             if puttingBack {
                 undo = nil
             } else {
                 // Put Back only for a mode RMNet can set again (ruling R8).
-                undo = canonicalMode(change.before) != nil ? .mode(change.before) : nil
+                undo = canonicalMode(done.before) != nil ? .mode(done.before) : nil
             }
-            setPick(change.after)
-            setResult(modeSentence(change), failure: false)
+            setPick(done.after)
+            setResult(modeSentence(done), failure: false)
         case .failure(let failure):
             setPick(info?.mode)
             setResult(failure.message, failure: true)
@@ -364,26 +451,34 @@ final class ModemController: ObservableObject {
     /// Writes the form to the driver's profile, with a redial (the service switches the radio off and on
     /// again when it was on).
     func applyProfile() {
-        guard mayStart(busy: ModemController.busyChange) else { return }
-        guard let settings = form, formEdited, profileProblem(profileID, settings) == nil else { return }
+        guard !stopping else { return }
         let id = profileID
-        setResult("Changing profile \(id)…", failure: false)
-        run(.profile, { $0.setProfile(id, to: settings, redial: true) }) { self.finishProfile($0, id: id, puttingBack: false) }
+        guard let settings = form else {
+            let listed = profiles.isEmpty || profiles.contains(where: { $0.id == id })
+            return refuse(listed ? "The settings of profile \(id) have not been read. Nothing was changed."
+                                 : "The modem does not list profile \(id). Nothing was changed.")
+        }
+        guard formEdited else { return refuse("Profile \(id) already has these settings. Nothing was changed.") }
+        if let problem = profileProblem(id, settings) { return refuse("\(problem) Nothing was changed.") }
+        guard change == nil else { return refuse(ModemController.anotherChange) }
+        submit(.profile, line: "Changing profile \(id)…", quitLine: ModemController.radioOnQuitLine,
+               { $0.setProfile(id, to: settings, redial: true) }) { self.finishProfile($0, id: id, puttingBack: false) }
     }
 
     private func finishProfile(_ outcome: Result<ProfileChange, ModemFailure>, id: Int, puttingBack: Bool) {
-        running = nil
+        changeEnded()
         let succeeded: Bool
         switch outcome {
-        case .success(let change):
-            undo = puttingBack ? nil : .profile(id: id, change.before)
-            // The editor shows what the modem now has; the read that follows fills it again.
-            fillForm(id == profileID ? change.after : driverSettings)
+        case .success(let done):
+            undo = puttingBack ? nil : .profile(id: id, done.before)
+            // The editor shows what the modem now has (read back by the service); the read that follows
+            // fills it again.
+            fillForm(id == profileID ? done.after : driverSettings)
             // The profile was changed, but a radio left off is said as a failure: the connection is down.
-            if case .radioLeftOff = change.redial { succeeded = false } else { succeeded = true }
-            setResult(profileSentence(change), failure: !succeeded)
+            if case .radioLeftOff = done.redial { succeeded = false } else { succeeded = true }
+            setResult(profileSentence(done), failure: !succeeded)
         case .failure(let failure):
-            fillForm(driverSettings)
+            // The form is kept as it is (ruling R11): an edit can be corrected and applied again.
             setResult(failure.message, failure: true)
             succeeded = false
         }
@@ -392,33 +487,44 @@ final class ModemController: ObservableObject {
 
     /// Applies the undo the way the change was made (a profile put back redials); clears it on success.
     func putBack() {
-        guard mayStart(busy: ModemController.busyChange) else { return }
-        guard let undo else { return }
+        guard !stopping else { return }
+        guard let undo else { return refuse("There is no change to put back.") }
+        guard change == nil else { return refuse(ModemController.anotherChange) }
         switch undo {
         case .mode(let mode):
-            setResult("Putting the network mode back to \(modeWords(mode))…", failure: false)
-            run(.mode, { $0.setMode(mode) }) { self.finishMode($0, puttingBack: true) }
+            submit(.mode, line: "Putting the network mode back to \(modeWords(mode))…",
+                   quitLine: "RMNet quits when the network mode has been changed.",
+                   { $0.setMode(mode) }) { self.finishMode($0, puttingBack: true) }
         case .profile(let id, let settings):
-            setResult("Putting profile \(id) back…", failure: false)
-            run(.profile, { $0.setProfile(id, to: settings, redial: true) }) { self.finishProfile($0, id: id, puttingBack: true) }
+            submit(.profile, line: "Putting profile \(id) back…", quitLine: ModemController.radioOnQuitLine,
+                   { $0.setProfile(id, to: settings, redial: true) }) { self.finishProfile($0, id: id, puttingBack: true) }
         }
     }
 
-    /// Sends the PIN with the attempts left the owner was shown (the service sends nothing unless the SIM
-    /// still shows that many). The PIN is not kept: only the call on the queue holds it, until it returns.
-    func enterPin(_ pin: String) {
-        guard mayStart(busy: "The modem was busy with another request. The PIN was not sent; enter it again.") else { return }
-        guard let sim, sim.state == .pin, let shown = sim.pinAttempts, shown >= 1 else { return }
-        if let problem = pinProblem(pin) {
-            setResult(problem, failure: true)
-            return
+    /// Sends the PIN with the attempts left that the owner's confirmation showed, passed to the service
+    /// unchanged (ruling R13): the service sends nothing unless the SIM still shows that many. The PIN is
+    /// not kept: only the block on the queue holds it, until the call returns.
+    func enterPin(_ pin: String, shownAttempts: Int) {
+        guard !stopping else { return }
+        guard let sim else { return refuse("The SIM has not been read yet. The PIN was not sent.") }
+        guard sim.state == .pin else {
+            return refuse("The SIM does not ask for its PIN now (SIM: \(simStateWords(sim.state))). The PIN was not sent.")
         }
-        setResult("Sending the PIN to the SIM…", failure: false)
-        run(.pin, { $0.enterPin(pin, shownAttempts: shown) }) { outcome in
-            self.running = nil
+        guard shownAttempts >= 1 else {
+            return refuse("The SIM has no PIN attempts left: it needs its PUK from the carrier, and RMNet does not enter "
+                          + "PUKs. The PIN was not sent.")
+        }
+        if let problem = pinProblem(pin) { return refuse("\(problem) The PIN was not sent.") }
+        guard change == nil else {
+            return refuse("Another change to the modem has not finished yet. The PIN was not sent; enter it again when it has.")
+        }
+        submit(.pin, line: "Sending the PIN to the SIM…", quitLine: "RMNet quits when the PIN has been checked.",
+               { $0.enterPin(pin, shownAttempts: shownAttempts) }) { outcome in
+            self.changeEnded()
             let succeeded: Bool
             switch outcome {
             case .success(let checked):
+                if let read = checked.sim { self.sim = read }  // the attempts and the Unlock state at once
                 succeeded = checked.accepted  // a refused PIN is said as a failure
                 self.setResult(pinSentence(checked), failure: !succeeded)
             case .failure(let failure):
@@ -432,14 +538,5 @@ final class ModemController: ObservableObject {
     private func setResult(_ line: String, failure: Bool) {
         result = line
         resultIsFailure = failure
-    }
-}
-
-private func quitWaitLine(_ activity: ModemActivity) -> String {
-    switch activity {
-    case .radio, .profile: return "RMNet quits when the radio has been switched back on."
-    case .mode: return "RMNet quits when the network mode has been changed."
-    case .pin: return "RMNet quits when the PIN has been checked."
-    case .reading: return "RMNet quits when the current request to the modem has finished."
     }
 }
