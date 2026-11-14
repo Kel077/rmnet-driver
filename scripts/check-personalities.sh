@@ -2,9 +2,11 @@
 # Checks which USB interfaces the dext's personalities may match, before anything is built or
 # installed. The modem's interfaces 2 and 3 are its AT ports (the owner's console and the app's
 # SMS), so no personality may match them; RMNetSerial may match only 0 (DIAG) and 1 (NMEA), with
-# Apple's serial kernel class and a usable port name, and RMNetDriver only 4 (QMI). RMNetSerial
-# checks the interface's class, subclass and protocol again in Start; this check catches a wrong
-# personality before it reaches the modem.
+# Apple's serial kernel class and a usable port name; RMNetDriver only 4 (QMI); and a personality
+# of any other IOUserClass, or none, is refused. RMNetSerial checks the interface's class, subclass
+# and protocol again in Start; this check catches a wrong personality before it reaches the modem.
+# The messages show the typed values the checks compare (an integer or a string): a value that is
+# missing or of another type shows as "(none, or not an integer)" or "(none, or not a string)".
 #
 # Usage: scripts/check-personalities.sh [plist]   (default: driver/Info.plist)
 set -u
@@ -67,13 +69,13 @@ while IFS= read -r name; do
     RMNetSerial)
       case $ifn_int in
         0 | 1) ;;
-        *) fail "$name" "RMNetSerial on interface ${ifn:-(none)}, not 0 or 1" ;;
+        *) fail "$name" "RMNetSerial on interface ${ifn_int:-(none, or not an integer)}, not 0 or 1" ;;
       esac
       v=$(value "$name" IOClass string)
-      [ "$v" = IOUserSerial ] || fail "$name" "IOClass ${v:-(none)}, not IOUserSerial"
+      [ "$v" = IOUserSerial ] || fail "$name" "IOClass ${v:-(none, or not a string)}, not IOUserSerial"
       v=$(value "$name" CFBundleIdentifierKernel string)
       [ "$v" = com.apple.driver.driverkit.serial ] ||
-        fail "$name" "CFBundleIdentifierKernel ${v:-(none)}, not com.apple.driver.driverkit.serial"
+        fail "$name" "CFBundleIdentifierKernel ${v:-(none, or not a string)}, not com.apple.driver.driverkit.serial"
       if ! v=$(value "$name" RMNetSerialName string); then
         fail "$name" "RMNetSerialName missing or not a string"
       elif ! name_ok "$v"; then
@@ -82,7 +84,10 @@ while IFS= read -r name; do
       ;;
     RMNetDriver)
       drivers=$((drivers + 1))
-      [ "$ifn_int" = 4 ] || fail "$name" "RMNetDriver on interface ${ifn:-(none)}, not 4"
+      [ "$ifn_int" = 4 ] || fail "$name" "RMNetDriver on interface ${ifn_int:-(none, or not an integer)}, not 4"
+      ;;
+    *)
+      fail "$name" "unknown IOUserClass ${class:-(none, or not a string)}"
       ;;
   esac
 done <<EOF
