@@ -1,5 +1,7 @@
 #include "minitest.h"
 
+#include <string.h>
+
 #include <list>
 
 #include "captures.h"
@@ -177,4 +179,62 @@ TEST(data_format_reports_the_modems_flow_control) {
   two[two.size() - 4] = 0x02; two[1] += 1; two[11] += 1;
   CHECK(!rmnet::parse_wda_data_format(decode_bytes(two), &f));
   CHECK(rmnet::data_format_usable(f));                                        // f is the last good parse
+}
+
+// Pinned behaviour (the deferred list of 2026-11-13).
+
+namespace {
+
+const std::vector<uint8_t> kResultOk = {0x00, 0x00, 0x00, 0x00};
+
+rmnet::QmiMessage settings_frame(const std::vector<RawTlv>& tlvs) {
+  return wds_frame(rmnet::QmiKind::Response, rmnet::kWdsGetCurrentSettings, tlvs);
+}
+
+}  // namespace
+
+TEST(settings_reply_with_a_short_ipv6_or_mtu_tlv_is_rejected) {
+  // Each TLV at its layout's size parses; one byte shorter, the whole reply is rejected. IPv6
+  // address and gateway: 16 address bytes, then the prefix length. IPv6 DNS: 16. MTU: u32le.
+  const struct { uint8_t type; size_t len; } layouts[] = {{0x25, 17}, {0x26, 17}, {0x27, 16}, {0x28, 16}, {0x29, 4}};
+  for (const auto& l : layouts) {
+    rmnet::RuntimeSettings whole{}, cut{};
+    CHECK(rmnet::parse_wds_current_settings(settings_frame({{0x02, kResultOk}, {l.type, std::vector<uint8_t>(l.len, 0x01)}}), &whole));
+    CHECK(!rmnet::parse_wds_current_settings(settings_frame({{0x02, kResultOk}, {l.type, std::vector<uint8_t>(l.len - 1, 0x01)}}), &cut));
+    CHECK(!cut.has_v6); CHECK_EQ(cut.v6_dns_count, 0); CHECK_EQ(cut.mtu, 0u);
+  }
+}
+TEST(ipv6_settings_reply_leaves_the_ipv4_dns_servers_as_they_were) {
+  rmnet::RuntimeSettings s{};
+  CHECK(rmnet::parse_wds_current_settings(decode(kWdsSettings4Resp), &s));
+  CHECK(rmnet::parse_wds_current_settings(decode(kWdsSettings6Resp), &s));   // no TLV 0x15 or 0x16
+  CHECK_EQ(s.v4_dns_count, 2);
+  CHECK_BYTES(s.v4_dns[0], 4, "cb 00 71 c1"); CHECK_BYTES(s.v4_dns[1], 4, "cb 00 71 d1");
+}
+TEST(failed_settings_parse_leaves_every_field_unchanged) {
+  // A reply with every TLV the parser takes, each well formed and different from what *out holds,
+  // then a 3-byte MTU: it fails after everything else was read. *out starts as a byte pattern
+  // (padding included) with neither family, and must come back byte for byte.
+  std::vector<RawTlv> tlvs = {
+      {0x02, kResultOk},
+      {0x1e, {0xe6, 0xf6, 0x66, 0x0a}}, {0x20, {0xe5, 0xf6, 0x66, 0x0a}}, {0x21, {0xfc, 0xff, 0xff, 0xff}},
+      {0x15, {0xc1, 0x71, 0x00, 0xcb}}, {0x16, {0xd1, 0x71, 0x00, 0xcb}},
+      {0x25, std::vector<uint8_t>(17, 0x24)}, {0x26, std::vector<uint8_t>(17, 0x26)},
+      {0x27, std::vector<uint8_t>(16, 0x27)}, {0x28, std::vector<uint8_t>(16, 0x28)},
+      {0x29, {0xdc, 0x05, 0x00}}};
+  rmnet::RuntimeSettings s;
+  memset(&s, 0x5a, sizeof s); s.has_v4 = false; s.has_v6 = false;
+  uint8_t before[sizeof s]; memcpy(before, &s, sizeof s);
+  CHECK(!rmnet::parse_wds_current_settings(settings_frame(tlvs), &s));
+  CHECK(memcmp(&s, before, sizeof s) == 0);
+  // The same TLVs with a whole MTU but a failed result: unchanged too.
+  std::vector<RawTlv> failed = tlvs;
+  failed.front().value = {0x01, 0x00, 0x0e, 0x00}; failed.back().value = {0xdc, 0x05, 0x00, 0x00};
+  CHECK(!rmnet::parse_wds_current_settings(settings_frame(failed), &s));
+  CHECK(memcmp(&s, before, sizeof s) == 0);
+  // With a whole MTU and a good result the reply parses and changes them all.
+  tlvs.back().value = {0xdc, 0x05, 0x00, 0x00};
+  CHECK(rmnet::parse_wds_current_settings(settings_frame(tlvs), &s));
+  CHECK(s.has_v4); CHECK(s.has_v6); CHECK_EQ(s.v4_dns_count, 2); CHECK_EQ(s.v6_dns_count, 2); CHECK_EQ(s.mtu, 1500u);
+  CHECK_BYTES(s.v4_addr, 4, "0a 66 f6 e6"); CHECK_BYTES(s.v4_dns[1], 4, "cb 00 71 d1"); CHECK_EQ(s.v6_prefix_len, 0x24);
 }
