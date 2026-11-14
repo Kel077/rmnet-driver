@@ -138,10 +138,42 @@ let latin1 = "00" + "04" + "0B917238880900F1" + "00" + "04" + "99309251619580" +
 // The classic vector with DCS F0 (group 1111: class 0, bit 2 = 0 -> GSM 7-bit).
 let classGroup = "07917283010010F5040BC87238880900F100F0993092516195800AE8329BFD4697D9EC37"
 
+// The whole basic table: the 127 septets 0x00...0x7F without the escape 0x1B, in order.
+//   07 91 7283010010F5  SMSC; 04 DELIVER; 0B C8 7238880900F1 sender 27838890001; 00 PID; 00 DCS GSM 7-bit
+//   99 30 92 51 61 95 80  the classic vector's time
+//   7F               TP-UDL 127 septets = 889 bits -> 112 octets
+//   then the 127 septets packed (septet n at bits 7n...7n+6). o0 = 00 | (01&1)<<7 = 0x80;
+//   o1 = 01>>1 | (02&3)<<6 = 0x80; o2 = 02>>2 | (03&7)<<5 = 0x60; ... The 112 octets were computed by an
+//   independent packer (a big little-endian integer in Python) and equal the reviewer's own packing.
+let wholeTable = "07917283010010F5" + "04" + "0BC87238880900F1" + "00" + "00" + "99309251619580" + "7F"
+    + "8080604028180E888462C168381E90886442A9582E988C86D3F17C4021D18854329D5029D58AD572BD6031D98C56B3DD"
+    + "7039DD8ED7F3FD8041E19058341E9149E592D9743EA151E9945AB55EB159ED96DBF57EC161F1985C369FD169F59ADD76BFE1"
+    + "71F99C5EB7DFF179FD9EDFF7FF01"
+
+// The same 127 characters written out from TS 23.038 §6.2.1, row by row, not taken from the model's table.
+let wholeTableText =
+    "@\u{00A3}$\u{00A5}\u{00E8}\u{00E9}\u{00F9}\u{00EC}\u{00F2}\u{00C7}\n\u{00D8}\u{00F8}\r\u{00C5}\u{00E5}"  // 0x00-0x0F
+    + "\u{0394}_\u{03A6}\u{0393}\u{039B}\u{03A9}\u{03A0}\u{03A8}\u{03A3}\u{0398}\u{039E}"            // 0x10-0x1A
+    + "\u{00C6}\u{00E6}\u{00DF}\u{00C9}"                                                             // 0x1C-0x1F
+    + " !\"#\u{00A4}%&'()*+,-./"                                                                     // 0x20-0x2F
+    + "0123456789:;<=>?"                                                                             // 0x30-0x3F
+    + "\u{00A1}ABCDEFGHIJKLMNO"                                                                      // 0x40-0x4F
+    + "PQRSTUVWXYZ\u{00C4}\u{00D6}\u{00D1}\u{00DC}\u{00A7}"                                          // 0x50-0x5F
+    + "\u{00BF}abcdefghijklmno"                                                                      // 0x60-0x6F
+    + "pqrstuvwxyz\u{00E4}\u{00F6}\u{00F1}\u{00FC}\u{00E0}"                                          // 0x70-0x7F
+
+// Alphanumeric sender "AlertsP" (7 septets = 49 bits in 7 octets: 4176594E9F4301; the first six octets
+// as in `alphanumeric` except o5 = s>>5 | (P&0x3F)<<2 = 0x03|0x40 = 0x43, o6 = P>>6 = 0x01).
+// The length 0D (13 useful semi-octets) is right; 0E (14, twice the octets) leaves 56 bits = 8 septets
+// whose last is the zero padding, which must not read as a trailing "@".
+func alphaSender(_ length: String) -> String {
+    "00" + "04" + length + "D0" + "4176594E9F4301" + "00" + "00" + "99309251619580" + "0A" + "E8329BFD4697D9EC37"
+}
+
 let classicTime = utc(922713419) // 1999-03-29 13:16:59 UTC
 
 let deliverVectors = [classic, chinese, alphanumeric, national, withHeader, extensionText, emoji, concat16,
-                      latin1, classGroup]
+                      latin1, classGroup, wholeTable]
 
 // --- assembly helpers ------------------------------------------------------------------------------
 
@@ -212,6 +244,46 @@ struct SmsModelTests {
         let february30 = decode("07917283010010F5040BC87238880900F10000992003516195800AE8329BFD4697D9EC37")
         check(february30.readable && february30.timestamp == nil, "30 February: readable, no time", "\(february30)")
 
+        // --- the alphabet table, position by position ---------------------------------------------
+        let table = decode(wholeTable)
+        check(table.readable && Array(table.text.unicodeScalars) == Array(wholeTableText.unicodeScalars),
+              "the 127 basic septets decode to TS 23.038's characters in order",
+              "\(Array(table.text.unicodeScalars).count) scalars: \(table.text.debugDescription)")
+        // "@£$_¤¡¿ÄΔ" by hand from TS 23.038: @ 00, £ 01, $ 02, _ 11, ¤ 24, ¡ 40, ¿ 60, Ä 5B, Δ 10.
+        // 9 septets = 63 bits -> 8 octets 808020420282B710 (independent packer).
+        // TPDU: 01 00 0B 91 7238880900F1 00 00 09 + 8 octets = 4 + 6 + 3 + 8 = 21.
+        check(encodeSubmit(to: "+27838890001", text: "@\u{00A3}$_\u{00A4}\u{00A1}\u{00BF}\u{00C4}\u{0394}", reference: 0)
+                == .success([SubmitPdu(hex: "0001000B917238880900F1000009" + "808020420282B710", tpduLength: 21)]),
+              "encodeSubmit: non-ASCII GSM characters to their exact septets")
+
+        // --- more data coding groups (TS 23.038 §4) ------------------------------------------------
+        // The classic vector with DCS 40: group 01xx (automatic deletion), alphabet bits 00 = GSM 7-bit.
+        expectPart("07917283010010F5040BC87238880900F10040993092516195800AE8329BFD4697D9EC37",
+                   "DCS 40, group 01xx", sender: "27838890001", text: "hellohello", time: classicTime)
+        // DCS C0: group 1100 (message waiting, discard), GSM 7-bit.
+        expectPart("07917283010010F5040BC87238880900F100C0993092516195800AE8329BFD4697D9EC37",
+                   "DCS C0, group 1100", sender: "27838890001", text: "hellohello", time: classicTime)
+        // DCS D0: group 1101 (message waiting, store), GSM 7-bit.
+        expectPart("07917283010010F5040BC87238880900F100D0993092516195800AE8329BFD4697D9EC37",
+                   "DCS D0, group 1101", sender: "27838890001", text: "hellohello", time: classicTime)
+        // The emoji vector with DCS E0: group 1110 (message waiting, store), UCS-2.
+        expectPart("00" + "04" + "0B917238880900F1" + "00" + "E0" + "99309251619580" + "0A" + "004800690020D83DDE00",
+                   "DCS E0, group 1110", sender: "+27838890001", text: "Hi 😀", time: classicTime)
+        // DCS 80: group 1000 is reserved.
+        expectUnreadable("07917283010010F5040BC87238880900F10080993092516195800AE8329BFD4697D9EC37",
+                         "DCS 80, reserved group 1000")
+
+        // --- an odd UCS-2 body: the emoji vector with UDL 0B and one extra octet 41 -----------------
+        expectPart("00" + "04" + "0B917238880900F1" + "00" + "08" + "99309251619580" + "0B" + "004800690020D83DDE0041",
+                   "odd UCS-2 body read without its last octet", sender: "+27838890001", text: "Hi 😀",
+                   time: classicTime)
+
+        // --- an alphanumeric sender padded to whole octets ------------------------------------------
+        expectPart(alphaSender("0E"), "alphanumeric length 14: no phantom @", sender: "AlertsP", text: "hellohello",
+                   time: classicTime)
+        expectPart(alphaSender("0D"), "alphanumeric length 13", sender: "AlertsP", text: "hellohello",
+                   time: classicTime)
+
         // --- not readable, no crash ----------------------------------------------------------------
         expectUnreadable("", "empty hex")
         expectUnreadable("0", "one hex digit")
@@ -261,6 +333,16 @@ struct SmsModelTests {
         check(parseListing(["+CMGL: 2,1,,29\r", "\(classic)\r"]) == [StoredPdu(index: 2, status: .read, hex: classic)],
               "parseListing: carriage returns trimmed")
         check(parseListing(["OK"]).isEmpty && parseListing([]).isEmpty, "parseListing: empty store")
+        check(parseListing(["+CMGL: 3,0,,29", "+CMTI: \"ME\",4", classic])
+                == [StoredPdu(index: 3, status: .unread, hex: classic)],
+              "parseListing: an unsolicited line between header and hex is skipped")
+        check(parseListing(["+CMGL: 3,0,,29", "+CMTI: \"ME\",4", "", "^RSSI: 5", classic, "+CMGL: 4,1,,24",
+                            "+CDS: 6", emoji, "OK"])
+                == [StoredPdu(index: 3, status: .unread, hex: classic), StoredPdu(index: 4, status: .read, hex: emoji)],
+              "parseListing: several unsolicited lines, two entries")
+        check(parseListing(["+CMGL: 3,0,,29", "+CMTI: \"ME\",4", "+CMGL: 4,1,,24", emoji])
+                == [StoredPdu(index: 4, status: .read, hex: emoji)],
+              "parseListing: a header without hex never takes the next header's hex")
         check(parseListing(["+CMGL: 99999999999999999999999,1,,29", classic]).isEmpty,
               "parseListing: an index past Int is dropped, no trap")
 
@@ -271,14 +353,64 @@ struct SmsModelTests {
         check(ordered.count == 1 && ordered.first?.text == "ABC" && ordered.first?.indices == [10, 11, 12]
                 && ordered.first?.missingParts == 0 && ordered.first?.readable == true,
               "assemble: parts 3, 1, 2 give ABC", "\(ordered)")
-        let duplicate = assemble([part(20, "+111", t1, "X", (6, 2, 1)), part(5, "+111", t1, "A", (6, 2, 1)),
+        let duplicate = assemble([part(20, "+111", t1, "A", (6, 2, 1)), part(5, "+111", t1, "A", (6, 2, 1)),
                                   part(21, "+111", t1, "B", (6, 2, 2))])
         check(duplicate.count == 1 && duplicate.first?.text == "AB" && duplicate.first?.indices == [5, 20, 21]
                 && duplicate.first?.missingParts == 0,
-              "assemble: a duplicate keeps the lower index's text, lists both", "\(duplicate)")
+              "assemble: an identical duplicate is one message listing both indices", "\(duplicate)")
+        // The same sequence with a different text is another message, even inside the time window.
+        let clash = assemble([part(20, "+111", t1, "X", (6, 2, 1)), part(5, "+111", t1, "A", (6, 2, 1)),
+                              part(21, "+111", t1, "B", (6, 2, 2))])
+        check(clash.map { $0.text }.sorted() == ["AB", "X[...]"]
+                && clash.first { $0.text == "AB" }?.indices == [5, 21]
+                && clash.first { $0.text == "X[...]" }?.indices == [20],
+              "assemble: a repeated sequence with a different text starts another message", "\(clash)")
+        // The same sender, reference and total a day apart: two messages, each with its own indices and unread.
+        let day = utc(1_700_086_400)
+        let reused = assemble([part(1, "+111", t1, "A1", (9, 2, 1)), part(2, "+111", t1, "A2", (9, 2, 2)),
+                               part(3, "+111", day, "B1", (9, 2, 1), status: .unread),
+                               part(4, "+111", day, "B2", (9, 2, 2), status: .unread)])
+        check(reused.count == 2 && reused[0] == SmsMessage(indices: [3, 4], unread: true, sender: "+111", timestamp: day,
+                                                           text: "B1B2", missingParts: 0, readable: true)
+                && reused[1] == SmsMessage(indices: [1, 2], unread: false, sender: "+111", timestamp: t1, text: "A1A2",
+                                           missingParts: 0, readable: true),
+              "assemble: a reference reused a day later is another message", "\(reused)")
+        let minute = assemble([part(1, "+111", utc(1_700_000_060), "C", (3, 3, 3)),
+                               part(2, "+111", utc(1_700_000_030), "B", (3, 3, 2)), part(3, "+111", t1, "A", (3, 3, 1))])
+        check(minute.count == 1 && minute.first?.text == "ABC" && minute.first?.timestamp == t1,
+              "assemble: three parts within a minute are one message", "\(minute)")
+        let window = assemble([part(1, "+111", t1, "A", (3, 2, 1)), part(2, "+111", utc(1_700_000_900), "B", (3, 2, 2)),
+                               part(3, "+111", t1, "C", (4, 2, 1)), part(4, "+111", utc(1_700_000_901), "D", (4, 2, 2))])
+        check(window.map { $0.text }.sorted() == ["AB", "C[...]", "[...]D"],
+              "assemble: 15 minutes joins, 15 minutes and 1 second does not", "\(window.map { $0.text })")
+        let untimed = assemble([part(6, "+111", t1, "A", (8, 2, 1)), part(7, "+111", nil, "B", (8, 2, 2))])
+        check(untimed.count == 1 && untimed.first?.text == "AB" && untimed.first?.indices == [6, 7],
+              "assemble: a part without a time joins by sender, reference and total", "\(untimed)")
+        // Every order of the same six parts gives the same messages.
+        let six = [part(1, "+111", t1, "A", (9, 2, 1)), part(2, "+111", utc(1_700_000_010), "B", (9, 2, 2)),
+                   part(3, "+111", day, "C", (9, 2, 1)), part(4, "+111", utc(1_700_086_405), "D", (9, 2, 2)),
+                   part(5, "+111", utc(1_700_000_020), "A", (9, 2, 1)), part(6, "+111", utc(1_700_000_015), "X", (9, 2, 1))]
+        let wantSix = assemble(six)
+        check(wantSix.map { $0.text } == ["CD", "X[...]", "AB"] && wantSix.map { $0.indices } == [[3, 4], [6], [1, 2, 5]],
+              "assemble: six colliding parts", "\(wantSix.map { "\($0.text) \($0.indices)" })")
+        func permutations(_ items: [SmsPart]) -> [[SmsPart]] {
+            guard let head = items.first else { return [[]] }
+            return permutations(Array(items.dropFirst())).flatMap { rest in
+                (0...rest.count).map { i -> [SmsPart] in var r = rest; r.insert(head, at: i); return r }
+            }
+        }
+        let orders = permutations(six)
+        check(orders.count == 720 && orders.allSatisfy { assemble($0) == wantSix },
+              "assemble: the same result for all 720 orders of the input")
         let gap = assemble([part(1, "+111", t1, "A", (7, 3, 1)), part(3, "+111", t1, "C", (7, 3, 3))])
         check(gap.count == 1 && gap.first?.text == "A[...]C" && gap.first?.missingParts == 1 && gap.first?.indices == [1, 3],
               "assemble: a missing middle part", "\(gap)")
+        let run = assemble([part(1, "+111", t1, "A", (7, 5, 1)), part(5, "+111", t1, "E", (7, 5, 5))])
+        check(run.first?.text == "A[...]E" && run.first?.missingParts == 3,
+              "assemble: a run of missing parts is one [...], each counted", "\(run)")
+        let hostile = assemble([part(1, "+111", t1, "A", (7, 255, 1))])
+        check(hostile.first?.text == "A[...]" && hostile.first?.missingParts == 254,
+              "assemble: a total of 255 with one part", "\(hostile)")
         let senders = assemble([part(1, "+111", t1, "A", (9, 2, 1)), part(2, "+222", t2, "B", (9, 2, 1))])
         check(senders.count == 2 && senders.allSatisfy { $0.missingParts == 1 },
               "assemble: two senders with the same reference and total kept apart", "\(senders)")

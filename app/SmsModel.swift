@@ -246,7 +246,10 @@ private func readAddress(_ r: inout OctetReader) -> String? {
     guard semiOctets <= 20, let value = r.take((semiOctets + 1) / 2) else { return nil }
     let typeOfNumber = (type >> 4) & 0x07
     if typeOfNumber == 5 {
-        guard let septets = unpackSeptets(value, from: 0, count: semiOctets * 4 / 7) else { return nil }
+        guard var septets = unpackSeptets(value, from: 0, count: semiOctets * 4 / 7) else { return nil }
+        // A length given as twice the octets (not the useful semi-octets) can fill whole septets with the
+        // zero padding; drop that last septet so it does not read as a trailing "@".
+        if (semiOctets * 4) % 7 == 0, septets.last == 0x00 { septets.removeLast() }
         return gsmDecode(septets)
     }
     var s = typeOfNumber == 1 ? "+" : ""
@@ -310,10 +313,15 @@ private func serviceCentreTime(_ o: [UInt8]) -> Date? {
 
 private enum Alphabet { case gsm7, latin1, ucs2 }
 
-/// General data coding groups 00xx (not compressed) and the message class group 1111; nothing else.
+/// General data coding groups 00xx and 01xx (automatic deletion), not compressed; the message waiting
+/// groups 1100 and 1101 (7-bit) and 1110 (UCS-2); the message class group 1111. 1000-1011 are reserved.
 private func alphabet(fromCodingScheme dcs: UInt8) -> Alphabet? {
     switch dcs >> 4 {
-    case 0x0...0x3:
+    case 0xC, 0xD:
+        return .gsm7
+    case 0xE:
+        return .ucs2
+    case 0x0...0x7:
         if dcs & 0x20 != 0 { return nil } // compressed
         switch (dcs >> 2) & 0x03 {
         case 0: return .gsm7
@@ -379,8 +387,8 @@ private func readUserData(_ ud: [UInt8], length: Int, alphabet: Alphabet,
         for o in ud[headerOctets..<length] { scalars.append(Unicode.Scalar(o)) }
         return (String(scalars), concat)
     case .ucs2:
+        // An odd octet count is read without its last octet.
         let body = Array(ud[headerOctets..<length])
-        guard body.count % 2 == 0 else { return nil }
         var units: [UInt16] = []
         units.reserveCapacity(body.count / 2)
         var i = 0
@@ -402,7 +410,9 @@ private func isHexLine(_ s: String) -> Bool {
 }
 
 /// The lines AT+CMGL=4 answers: "+CMGL: <index>,<stat>,[<alpha>],<length>" then a hex line.
-/// An entry without its hex line is dropped; any other line is ignored.
+/// An entry without its hex line is dropped; any other line is ignored. Between a header and its hex line,
+/// lines that are neither hex nor a header (blank lines, unsolicited results such as +CMTI) are skipped;
+/// the next header ends the search, so a header never takes another header's hex.
 func parseListing(_ lines: [String]) -> [StoredPdu] {
     var out: [StoredPdu] = []
     var i = 0
@@ -414,14 +424,17 @@ func parseListing(_ lines: [String]) -> [StoredPdu] {
             .map { trimmed(String($0)) }
         guard fields.count >= 2, let index = Int(fields[0]), index >= 0,
               let stat = Int(fields[1]), let status = SmsStatus(rawValue: stat) else { continue }
-        // The PDU is the next non-blank line, if it is hex.
         var j = i
-        while j < lines.count, trimmed(lines[j]).isEmpty { j += 1 }
-        guard j < lines.count else { continue }
-        let hex = trimmed(lines[j])
-        guard isHexLine(hex) else { continue }
-        out.append(StoredPdu(index: index, status: status, hex: hex))
-        i = j + 1
+        while j < lines.count {
+            let candidate = trimmed(lines[j])
+            if candidate.hasPrefix("+CMGL:") { break }
+            if isHexLine(candidate) {
+                out.append(StoredPdu(index: index, status: status, hex: candidate))
+                i = j + 1
+                break
+            }
+            j += 1
+        }
     }
     return out
 }
@@ -499,40 +512,80 @@ func readSubmit(_ hex: String) -> (number: String, text: String, concat: SmsConc
 
 private struct GroupKey: Hashable { let sender: String; let reference: Int; let total: Int }
 
-/// Groups parts by sender, reference and total; newest first, entries without a time last by index.
+/// Parts further than this from a group's earliest part start another message.
+private let groupWindow: TimeInterval = 15 * 60
+
+private struct PartGroup { let key: GroupKey; var earliest: Date?; var members: [SmsPart] }
+
+/// Parts belong to one message when they have the same sender, reference and total, each part's time is
+/// within 15 minutes of the group's earliest part (a part without a time joins by the key alone), and the
+/// group does not already hold that sequence number with a different text. A repeated sequence with the
+/// same text is a duplicate: the lower index gives the text and both indices are listed. Parts are taken
+/// in order of time, then index, so the result does not depend on the order of the listing.
+/// Messages come newest first; entries without a time last, by index.
 func assemble(_ parts: [SmsPart]) -> [SmsMessage] {
     var messages: [SmsMessage] = []
-    var groups: [GroupKey: [SmsPart]] = [:]
-    var order: [GroupKey] = []
+    var candidates: [SmsPart] = []
     for p in parts {
-        guard p.readable, let c = p.concat else {
+        if p.readable, p.concat != nil {
+            candidates.append(p)
+        } else {
             messages.append(SmsMessage(indices: [p.index], unread: p.status == .unread, sender: p.sender,
                                        timestamp: p.timestamp, text: p.text, missingParts: 0,
                                        readable: p.readable))
-            continue
         }
-        let key = GroupKey(sender: p.sender, reference: c.reference, total: c.total)
-        if groups[key] == nil { order.append(key) }
-        groups[key, default: []].append(p)
     }
-    for key in order {
-        let members = groups[key] ?? []
+    // Time first (parts without a time after the others), then index; the rest only breaks exact ties.
+    candidates.sort { a, b in
+        switch (a.timestamp, b.timestamp) {
+        case let (ta?, tb?) where ta != tb: return ta < tb
+        case (.some, .none): return true
+        case (.none, .some): return false
+        default:
+            if a.index != b.index { return a.index < b.index }
+            let sa = a.concat?.sequence ?? 0, sb = b.concat?.sequence ?? 0
+            if sa != sb { return sa < sb }
+            if a.sender != b.sender { return a.sender < b.sender }
+            return a.text < b.text
+        }
+    }
+    var groups: [PartGroup] = []
+    for p in candidates {
+        guard let c = p.concat else { continue }
+        let key = GroupKey(sender: p.sender, reference: c.reference, total: c.total)
+        let home = groups.firstIndex { g in
+            guard g.key == key else { return false }
+            if let t = p.timestamp, let e = g.earliest, abs(t.timeIntervalSince(e)) > groupWindow { return false }
+            return !g.members.contains { $0.concat?.sequence == c.sequence && $0.text != p.text }
+        }
+        if let h = home {
+            groups[h].members.append(p)
+            if groups[h].earliest == nil { groups[h].earliest = p.timestamp }
+        } else {
+            groups.append(PartGroup(key: key, earliest: p.timestamp, members: [p]))
+        }
+    }
+    for g in groups {
         var text = ""
         var missing = 0
-        for sequence in 1...max(1, key.total) {
+        var inGap = false
+        for sequence in 1...max(1, g.key.total) {
             // A duplicate sequence keeps the lower index for the text.
-            let candidates = members.filter { $0.concat?.sequence == sequence }
-            if let chosen = candidates.min(by: { $0.index < $1.index }) {
+            let same = g.members.filter { $0.concat?.sequence == sequence }
+            if let chosen = same.min(by: { $0.index < $1.index }) {
                 text += chosen.text
+                inGap = false
             } else {
-                text += "[...]"
+                // A run of missing parts shows as one mark; each one is counted.
+                if !inGap { text += "[...]" }
+                inGap = true
                 missing += 1
             }
         }
         // The message's time is its earliest part's.
-        let timestamp = members.compactMap { $0.timestamp }.min()
-        messages.append(SmsMessage(indices: members.map { $0.index }.sorted(),
-                                   unread: members.contains { $0.status == .unread }, sender: key.sender,
+        let timestamp = g.members.compactMap { $0.timestamp }.min()
+        messages.append(SmsMessage(indices: g.members.map { $0.index }.sorted(),
+                                   unread: g.members.contains { $0.status == .unread }, sender: g.key.sender,
                                    timestamp: timestamp, text: text, missingParts: missing, readable: true))
     }
     return messages.sorted { a, b in
