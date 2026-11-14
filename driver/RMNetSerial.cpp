@@ -7,6 +7,7 @@
 
 #include <DriverKit/DriverKit.h>
 #include <USBDriverKit/USBDriverKit.h>  // umbrella: also declares IOUSBHostFreeDescriptor
+#include <SerialDriverKit/SerialDriverKit.h>  // kIOTTYBaseNameKey, kIOTTYSuffixKey
 #include <USBSerialDriverKit/USBSerialDriverKit.h>
 
 #include "RMNetSerial.h"
@@ -180,7 +181,8 @@ kern_return_t RMNetSerial::Start_Impl(IOService* provider) {
   OSString* base = OSString::withCString(ivars->name);
   OSString* suffix = OSString::withCString("");
   kern_return_t nameRet = kIOReturnNoMemory;
-  if (names && base && suffix && names->setObject("IOTTYBaseName", base) && names->setObject("IOTTYSuffix", suffix)) {
+  if (names && base && suffix && names->setObject(kIOTTYBaseNameKey, base) &&
+      names->setObject(kIOTTYSuffixKey, suffix)) {
     nameRet = SetProperties(names);
   }
   OSSafeReleaseNULL(base);
