@@ -75,9 +75,7 @@ func advice(_ s: DriverStatus, bundledVersion: String) -> [String] {
         lines.append("AT+CFUN=1,1")
     }
     if s.entries.count > 1 || s.entries.contains(where: isSwitchedOff) {
-        let versions = s.entries.map { $0.version }.joined(separator: ", ")
         lines.append("The driver was switched off in System Settings, so the system keeps an old entry and refuses every new installation.")
-        lines.append("To clear it, use Remove here once for each listed version (\(versions)), each time from an RMNet app that carries that version (build/installed/RMNet-<version>.app).")
     } else if let entry = s.entries.first {
         if entry.uninstalling {
             lines.append("The system is removing the driver; it goes when the modem is unplugged or the Mac restarts.")
@@ -90,6 +88,9 @@ func advice(_ s: DriverStatus, bundledVersion: String) -> [String] {
     if s.entries.count == 1, !s.attached, case .qmi = s.modem, headline(s) == "Connecting" {
         lines.append("The modem is in QMI mode but the driver has not attached. If this lasts, unplug the modem and plug it in again.")
     }
+    if !canActivate(s) {
+        lines.append("Install and Update are off until this is cleared. \(keptAppsLine(s.entries))")
+    }
     lines.append("Do not switch the driver off in System Settings while the modem is attached. Use Remove here.")
     return lines
 }
@@ -97,6 +98,48 @@ func advice(_ s: DriverStatus, bundledVersion: String) -> [String] {
 // Deactivation works only from an app that embeds the installed version, and only with one entry.
 func canRemoveDirectly(_ s: DriverStatus, bundledVersion: String) -> Bool {
     s.entries.count == 1 && s.entries[0].version == bundledVersion
+}
+
+// Whether an activation may be sent. Not when the listing shows the stuck state: more than one
+// entry, a switched-off entry or an uninstalling one. An activation then fails, or adds an entry
+// that needs its own removal. One entry awaiting approval is fine (asking again is harmless).
+func canActivate(_ s: DriverStatus) -> Bool {
+    s.entries.count <= 1 && !s.entries.contains(where: { isSwitchedOff($0) || $0.uninstalling })
+}
+
+// Which kept app removes each listed version.
+func keptAppsLine(_ entries: [ExtensionEntry]) -> String {
+    let apps = entries.map { "\($0.version) from build/installed/RMNet-\($0.version).app" }
+    return "Use Remove once for each listed version, from the app that carries it, kept in the project folder: "
+        + apps.joined(separator: "; ") + "."
+}
+
+// The listing in words: "316.19.56 (enabled)", "none".
+func describeListing(_ entries: [ExtensionEntry]) -> String {
+    if entries.isEmpty { return "none" }
+    return entries.map { e -> String in
+        var flags = [e.enabled ? "enabled" : "not enabled"]
+        if e.awaitingApproval { flags.append("awaiting approval") }
+        if e.uninstalling { flags.append("uninstalling") }
+        return "\(e.version) (\(flags.joined(separator: ", ")))"
+    }.joined(separator: ", ")
+}
+
+// What Remove… sends for a listing, with this app carrying `bundledVersion`.
+enum RemovalPlan: Equatable {
+    case nothingListed           // nothing to remove; the button is off
+    case deactivate              // the bundled version is listed: deactivate it
+    case activateThenDeactivate  // one entry of another version: replace it with the bundled one first
+    case cannot                  // stuck, and the bundled version is not listed: send nothing
+}
+
+func removalPlan(_ s: DriverStatus, bundledVersion: String) -> RemovalPlan {
+    if s.entries.isEmpty { return .nothingListed }
+    if canRemoveDirectly(s, bundledVersion: bundledVersion) { return .deactivate }
+    if !canActivate(s) {
+        return s.entries.contains(where: { $0.version == bundledVersion }) ? .deactivate : .cannot
+    }
+    return bundledVersion.isEmpty ? .cannot : .activateThenDeactivate
 }
 
 // A registry property as text: strings as they are, numbers in decimal, data as Foundation prints
@@ -132,20 +175,27 @@ func tableRows(_ s: DriverStatus, bundledVersion: String) -> [TableRow] {
 }
 
 // The status as one JSON object (`RMNet status --json`). Properties stay a flat object of strings
-// under "properties"; scripts read RMNetState and the counters there.
-func statusJSON(_ s: DriverStatus, bundledVersion: String) -> [String: Any] {
+// under "properties"; scripts read RMNetState and the counters there. With `listingError` (the
+// system gave no listing) the extension's state is unknown: the headline is "Unknown", "entries" is
+// null, no button may act, and the error is under "error". The registry part is still read.
+let unknownHeadline = "Unknown"
+
+func statusJSON(_ s: DriverStatus, bundledVersion: String, listingError: String? = nil) -> [String: Any] {
+    let known = listingError == nil
     var object: [String: Any] = [
-        "headline": headline(s),
-        "advice": advice(s, bundledVersion: bundledVersion),
-        "entries": s.entries.map {
+        "headline": known ? headline(s) : unknownHeadline,
+        "advice": known ? advice(s, bundledVersion: bundledVersion) : [],
+        "entries": known ? s.entries.map {
             ["version": $0.version, "enabled": $0.enabled, "awaitingApproval": $0.awaitingApproval,
              "uninstalling": $0.uninstalling] as [String: Any]
-        },
+        } as Any : NSNull(),
         "attached": s.attached,
         "bundledVersion": bundledVersion,
-        "canRemoveDirectly": canRemoveDirectly(s, bundledVersion: bundledVersion),
+        "canActivate": known && canActivate(s),
+        "canRemoveDirectly": known && canRemoveDirectly(s, bundledVersion: bundledVersion),
         "properties": s.properties,
     ]
+    if let error = listingError { object["error"] = error }
     switch s.modem {
     case .absent: object["modem"] = "absent"
     case .notQMI: object["modem"] = "notQMI"

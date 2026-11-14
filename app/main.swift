@@ -35,11 +35,21 @@ func printRegistry() {
     printDriverEntry(readDriverProperties())
 }
 
+// With `error` (the system gave no listing) the headline is "Unknown" and "error" says why.
 func printJSON(_ entries: [ExtensionEntry], error: String? = nil) {
-    var object = statusJSON(readStatus(entries: entries), bundledVersion: bundledDriverVersion() ?? "")
-    if let error = error { object["error"] = error }  // the system's answer was not a list of entries
+    let object = statusJSON(readStatus(entries: entries), bundledVersion: bundledDriverVersion() ?? "",
+                            listingError: error)
     let data = try! JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
     print(String(data: data, encoding: .utf8)!)
+}
+
+func outcomeWords(_ outcome: RequestOutcome) -> String {
+    switch outcome {
+    case .completed: return "completed"
+    case .willCompleteAfterReboot: return "completes after a reboot"
+    case .other(let raw): return "result \(raw)"
+    case .failed(let error): return describe(error)
+    }
 }
 
 // MARK: - Verbs
@@ -73,7 +83,7 @@ func finished(_ command: Command, _ outcome: RequestOutcome) {
 func runStatus(_ manager: ExtensionManager, json: Bool) {
     manager.properties { result in
         switch result {
-        case .success(let found):
+        case .listed(let found):
             if json {
                 printJSON(found.map(ExtensionEntry.init))
                 exit(0)
@@ -90,7 +100,7 @@ func runStatus(_ manager: ExtensionManager, json: Bool) {
             }
             printRegistry()
             exit(0)
-        case .failure(let error):
+        case .notListed(.failed(let error)):
             let code = (error as NSError).code
             if json {
                 printJSON([], error: "\(error.localizedDescription) (code \(code))")
@@ -99,6 +109,21 @@ func runStatus(_ manager: ExtensionManager, json: Bool) {
                 printRegistry()
             }
             exit(1)
+        case .notListed(let outcome):
+            // Finished without a listing. The plain verb prints what it printed before the window.
+            if json {
+                printJSON([], error: "the system finished without listing the driver (\(outcomeWords(outcome)))")
+                exit(1)
+            }
+            switch outcome {
+            case .willCompleteAfterReboot: print("status: done after a reboot")
+            case .other(let raw): print("status: finished with result \(raw)")
+            default: print("status: done")
+            }
+            printRegistry()
+            exit(0)
+        case .noAnswer:
+            break  // no timeout is passed here; the one below answers
         }
     }
     DispatchQueue.main.asyncAfter(deadline: .now() + 10) {

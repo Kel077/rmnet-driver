@@ -29,6 +29,21 @@ enum RequestOutcome {
     case failed(Error)
 }
 
+// The system's answer to a properties request.
+enum PropertiesAnswer {
+    case listed([OSSystemExtensionProperties])
+    case notListed(RequestOutcome)  // finished or failed without a listing
+    case noAnswer                   // no answer within the timeout
+}
+
+// How a removal ended.
+enum RemoveResult {
+    case notSent(String)                   // nothing was sent; why
+    case activationEnded(RequestOutcome)   // the install-first step ended other than completed
+    case listingAfterActivation(String)    // after it, the listing did not allow the removal
+    case deactivation(RequestOutcome)      // the system's answer to the deactivation
+}
+
 // The system's own words for an error, and its code.
 func describe(_ error: Error) -> String {
     "\(error.localizedDescription) (code \((error as NSError).code))"
@@ -38,16 +53,24 @@ final class ExtensionManager {
     // Requests in flight keep their delegates here until they finish.
     private var delegates: [ObjectIdentifier: RequestDelegate] = [:]
 
-    // Lists the system's entries for the driver.
-    func properties(completion: @escaping (Result<[OSSystemExtensionProperties], Error>) -> Void) {
+    // Lists the system's entries for the driver. With a timeout, a request that has not answered by
+    // then reports `.noAnswer`, and a later answer is ignored.
+    func properties(timeout: TimeInterval? = nil, completion: @escaping (PropertiesAnswer) -> Void) {
         let request = OSSystemExtensionRequest.propertiesRequest(forExtensionWithIdentifier: driverID, queue: .main)
         let d = RequestDelegate()
-        d.onProperties = { completion(.success($0)) }
-        d.onFinish = { outcome in
-            // A properties request normally answers with properties; anything else is reported as such.
-            if case .failed(let error) = outcome { completion(.failure(error)) } else { completion(.success([])) }
+        var answered = false
+        let answer = { (a: PropertiesAnswer) in
+            guard !answered else { return }
+            answered = true
+            completion(a)
         }
+        d.onProperties = { answer(.listed($0)) }
+        // A properties request normally answers with properties; a finish without them is not a listing.
+        d.onFinish = { answer(.notListed($0)) }
         submit(request, d)
+        if let timeout = timeout {
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { answer(.noAnswer) }
+        }
     }
 
     // Activates the embedded driver, replacing any installed version. `replacing` and
@@ -73,31 +96,49 @@ final class ExtensionManager {
         submit(request, d)
     }
 
-    // Removes the driver. When this app cannot deactivate the installed entry directly (another
-    // version, or more than one entry), it first activates the embedded version, which replaces the
-    // installed one without approval or password, so that the versions then match. If that
-    // activation is refused but an entry with the embedded version is listed, it still asks for the
-    // deactivation, which can remove that entry. `step` reports what is being asked.
+    // Removes the driver, following `removalPlan`:
+    //   .deactivate: asks for the deactivation (the system asks for an administrator password).
+    //   .activateThenDeactivate: activates the bundled version first (a replacement of the one
+    //     listed entry); only if that completes, lists again, and deactivates only if the listing
+    //     now holds exactly the bundled version. Any other answer stops here and is reported.
+    //   .cannot, .nothingListed: sends nothing.
+    // `step` reports what is being asked.
     func remove(status: DriverStatus, bundledVersion: String, step: @escaping (String) -> Void,
-                completion: @escaping (RequestOutcome) -> Void) {
+                completion: @escaping (RemoveResult) -> Void) {
         let deactivateNow = {
             step("Asking the system to remove the driver; macOS asks for an administrator password.")
-            self.deactivate(completion: completion)
+            self.deactivate { completion(.deactivation($0)) }
         }
-        if canRemoveDirectly(status, bundledVersion: bundledVersion) {
+        switch removalPlan(status, bundledVersion: bundledVersion) {
+        case .nothingListed:
+            completion(.notSent("The system lists no driver; there is nothing to remove."))
+        case .cannot:
+            completion(.notSent("This app carries version \(bundledVersion.isEmpty ? "unknown" : bundledVersion), "
+                                + "which is not listed, and the listing does not allow installing it first. "
+                                + keptAppsLine(status.entries)))
+        case .deactivate:
             deactivateNow()
-            return
-        }
-        step("Installing version \(bundledVersion) first, so that this app can remove it.")
-        activate(needsApproval: { step("Waiting for approval in System Settings before removing.") }) { outcome in
-            switch outcome {
-            case .completed, .willCompleteAfterReboot, .other:
-                deactivateNow()
-            case .failed:
-                if status.entries.contains(where: { $0.version == bundledVersion }) {
-                    deactivateNow()
-                } else {
-                    completion(outcome)
+        case .activateThenDeactivate:
+            step("Installing version \(bundledVersion) first, so that this app can remove it.")
+            activate(needsApproval: { step("Waiting for approval in System Settings before removing.") }) { outcome in
+                guard case .completed = outcome else {
+                    completion(.activationEnded(outcome))
+                    return
+                }
+                step("Version \(bundledVersion) installed; reading the listing again.")
+                self.properties(timeout: 10) { answer in
+                    guard case .listed(let found) = answer else {
+                        completion(.listingAfterActivation("the system did not list the driver"))
+                        return
+                    }
+                    let entries = found.map(ExtensionEntry.init)
+                    let now = DriverStatus(entries: entries, modem: status.modem, attached: status.attached,
+                                           properties: status.properties)
+                    if canRemoveDirectly(now, bundledVersion: bundledVersion) {
+                        deactivateNow()
+                    } else {
+                        completion(.listingAfterActivation("the system lists " + describeListing(entries)))
+                    }
                 }
             }
         }
