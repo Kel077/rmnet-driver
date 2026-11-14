@@ -609,6 +609,12 @@ echo "last sample:    $last_line"
 [ "$final_sample" -eq 1 ] || echo "                (no sample after the pings stopped: $GAUGE not judged)"
 echo "duration:       $elapsed s of $DURATION s; pings ran $ping_secs s; $samples samples"
 echo "moved:          in $acc_in bytes, out $acc_out bytes"
+# Reporting only: a counter already above 0 at the start passes if it stays there, so say so.
+nonzero=$(awk -F, -v names="$COUNTERS" 'NR == 2 {
+    k = split(names, nm, " ")
+    for (i = 1; i <= k; i++) if ($(8 + i) != "" && $(8 + i) != "0") s = s " " nm[i] "=" $(8 + i)
+    print (s == "" ? " none" : s); exit }' "$CSV")
+echo "nonzero at start:$nonzero"
 [ "$resets" -eq 0 ] || echo "counter resets: $resets (the interface was recreated during the run)"
 if [ "$usage_ok" -eq 1 ]; then
   echo "recorded:       in $rec_in bytes, out $rec_out bytes, in $USAGE"
