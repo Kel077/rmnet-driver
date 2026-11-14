@@ -1,8 +1,8 @@
 #!/bin/sh
 # Measures throughput on one network port, from the port's own byte counters, under a data budget.
 #
-#   scripts/measure.sh <interface> down|up|down-long|up-long
-#   scripts/measure.sh --analyse down|up|down-long|up-long <samples file>
+#   scripts/measure.sh <interface> down|up|down-long|up-long|both
+#   scripts/measure.sh --analyse down|up|down-long|up-long|both <samples file>
 #                                         (re-prints the figures of a saved run)
 #
 # down: 4 parallel downloads from mensura.cdn-apple.com/api/v1/gm/large, stopped when 50,000,000
@@ -25,6 +25,16 @@
 # up-long: the up transfer, stopped when 60,000,000 bytes have left the port, or after 8 s. Each
 #       upload sends one 20,000,000-byte body, so 80 MB of payload is the most it can send (about
 #       83 MB at the port).
+# both: the down and up transfers at the same time under one watchdog, to show whether a busy
+#       uplink slows a download: 4 downloads, each stopping itself at 40,000,000 bytes, and 4
+#       uploads, each sending one 15,000,000-byte body, stopped when 150,000,000 bytes have arrived
+#       on the port, or 50,000,000 bytes have left it, or after 8 s, whichever is first. As in
+#       down-long, a run can be about 165,000,000 bytes in at the sample that stops it, with up
+#       to about 16,000,000 more in flight after the stop; out, it cannot pass the four bodies
+#       (60,000,000 bytes of payload, about 63,000,000 at the port). If the watchdog dies, the
+#       streams' own limits hold a run to about 160,000,000 bytes of payload in (more at the port,
+#       as in down-long) and 60,000,000 out. Downloads that end at their limit are counted as in
+#       down.
 #
 # Nothing is resolved through the system resolver: every transfer is bound to the port with
 # --interface and pinned to one server address with --resolve. Proxies are bypassed (--noproxy),
@@ -38,24 +48,31 @@
 #   gate figure  the mean rate from 1.0 s after traffic starts (the first sample with more than
 #                100,000 bytes moved in the measured direction) to the last sample before the stop;
 #   best 1 s     the highest rate over any span of at least 1.0 s between two samples.
+# both measures each direction: it prints these figures for the download, from the bytes in, and
+# then for the upload, from the bytes out, each with its own start of traffic, from the same
+# samples.
 #
 # The cellular data is metered. Every run appends "time direction bytes-in bytes-out" to the usage
 # file (build/installed/measure-usage.log, which `make clean` keeps; MEASURE_USAGE_FILE overrides
 # it on lo0 only), also when it fails or is interrupted; the direction is down or up (down-long is
-# recorded as down, up-long as up). After the stop, the counters are sampled every 0.25 s until the
-# measured direction moves less than 100,000 bytes between two samples, for at most 6 s (data in an
-# upload's send buffers keeps leaving for seconds after curl is killed), and only then read for the
-# usage line; an interrupted run waits the same way. If the counters cannot be read at the end, the
-# run is charged at least its reservation in the measured direction. A run refuses to start (exit 2)
-# if a line of the usage file is not "<time> <down|up> <bytes in> <bytes out>" with non-negative
-# whole numbers, or if the recorded total plus this run's reservation (its stop threshold plus a
-# margin for what arrives after the stop: 10,000,000 bytes for down and up, 40,000,000 for down-long,
-# 25,000,000 for up-long) would pass 1,300,000,000 bytes. It warns when a run moved
-# more than 60,000,000 bytes (down and up), 384,000,000 (down-long) or 72,000,000 (up-long; for the
-# long modes, the stop threshold plus 20 percent). The run fails if fewer than 1,000,000 bytes
-# crossed the port in the measured direction (curl did not go through it). A run killed outright
-# (SIGKILL) records nothing and leaves its temporary directory (${TMPDIR:-/tmp}/measure.*) behind,
-# with the upload body in it for up and up-long (up to 20,000,000 bytes).
+# recorded as down, up-long as up, both as down, with its real bytes in and out). After the stop,
+# the counters are sampled every 0.25 s until the measured direction (for both, each of the two)
+# moves less than 100,000 bytes between two samples, for at most 6 s (data in an upload's send
+# buffers keeps leaving for seconds after curl is killed), and only then read for the usage line;
+# an interrupted run waits the same way. If the counters cannot be read at the end, the run is
+# charged at least its reservation in the measured direction (both: at least 150,000,000 in and
+# 50,000,000 out, its two stop thresholds). A run refuses to start (exit 2) if a line of the usage
+# file is not "<time> <down|up> <bytes in> <bytes out>" with non-negative whole numbers, or if the
+# recorded total plus this run's reservation (its stop threshold plus a margin for what arrives
+# after the stop: 10,000,000 bytes for down and up, 40,000,000 for down-long, 25,000,000 for
+# up-long; for both, its two stop thresholds plus 40,000,000, so 240,000,000) would pass
+# 1,300,000,000 bytes. It warns when a run moved more than 60,000,000 bytes (down and up),
+# 384,000,000 (down-long), 72,000,000 (up-long; for the long modes, the stop threshold plus 20
+# percent) or 288,000,000 (both: its reservation plus 20 percent), in and out together. The run
+# fails if fewer than 1,000,000 bytes crossed the port in the measured direction, for both in
+# either direction (curl did not go through it). A run killed outright (SIGKILL) records nothing
+# and leaves its temporary directory (${TMPDIR:-/tmp}/measure.*) behind, with the upload body in it
+# for up, up-long and both (up to 20,000,000 bytes).
 #
 # For testing with no network: MEASURE_TEST_PORT=<port> sends every transfer to 127.0.0.1:<port>
 # over plain HTTP, MEASURE_NETSTAT=<program> replaces netstat, and MEASURE_USAGE_FILE=<file> replaces
@@ -86,9 +103,17 @@ die() {
   exit 1
 }
 
-# Prints the figures for a samples file. $1 is the direction, $2 the file. The first line of the
-# file is the baseline at time 0, the last line the last sample before the stop.
+# Prints the figures for a samples file. $1 is the direction (both: the download's figures, from
+# the bytes in, then the upload's, from the bytes out, each under a label), $2 the file. The first
+# line of the file is the baseline at time 0, the last line the last sample before the stop.
 analyse() {
+  if [ "$1" = both ]; then
+    echo "download:         figures from the bytes in"
+    analyse down "$2"
+    echo "upload:           figures from the bytes out"
+    analyse up "$2"
+    return
+  fi
   awk -v dir="$1" '
     BEGIN { n = 0 }
     { t[n] = $1; m[n] = (dir == "down") ? $2 : $3; n++ }
@@ -127,13 +152,14 @@ analyse() {
     }' "$2"
 }
 
-MODES="down|up|down-long|up-long"
+MODES="down|up|down-long|up-long|both"
 
 if [ "${1:-}" = "--analyse" ]; then
   [ $# -eq 3 ] || die "usage: $0 --analyse $MODES <samples file>"
   case $2 in
     down | down-long) adir=down ;;
     up | up-long) adir=up ;;
+    both) adir=both ;;
     *) die "mode must be one of $MODES" ;;
   esac
   [ -r "$3" ] || die "cannot read $3"
@@ -144,22 +170,22 @@ fi
 [ $# -eq 2 ] || die "usage: $0 <interface> $MODES"
 IFACE=$1
 MODE=$2
-# Per mode: the measured direction (DIR, also the usage line's direction word), the stop threshold
-# and time limit, the margin added to the stop threshold for the reservation, the warning threshold,
-# and the per-stream limit: each download's byte limit (STREAM_BYTES) or each upload's body in
-# millions of bytes (BODY_MB).
+# Per mode: the measured direction (DIR: down, up, or both for the two at once; also the usage
+# line's direction word, except that both is recorded as down), the stop threshold (STOP_BYTES, on
+# the bytes in for down and both, out for up; both also stops on STOP_OUT_BYTES out) and time limit,
+# the margin added to the stop thresholds for the reservation, the warning threshold, and the
+# per-stream limits: each download's byte limit (STREAM_BYTES) and each upload's body in millions
+# of bytes (BODY_MB).
 case $MODE in
   down) DIR=down STOP_BYTES=50000000 STOP_SECS=8 MARGIN=10000000 WARN_BYTES=60000000 STREAM_BYTES=15000000 ;;
   up) DIR=up STOP_BYTES=10000000 STOP_SECS=6 MARGIN=10000000 WARN_BYTES=60000000 BODY_MB=4 ;;
   down-long) DIR=down STOP_BYTES=320000000 STOP_SECS=8 MARGIN=40000000 WARN_BYTES=384000000 STREAM_BYTES=90000000 ;;
   up-long) DIR=up STOP_BYTES=60000000 STOP_SECS=8 MARGIN=25000000 WARN_BYTES=72000000 BODY_MB=20 ;;
+  both) DIR=both STOP_BYTES=150000000 STOP_OUT_BYTES=50000000 STOP_SECS=8 MARGIN=40000000 WARN_BYTES=288000000 STREAM_BYTES=40000000 BODY_MB=15 ;;
   *) die "mode must be one of $MODES" ;;
 esac
-if [ "$DIR" = down ]; then
-  URL="$SCHEME://$HOST:$PORT/api/v1/gm/large"
-else
-  URL="$SCHEME://$HOST:$PORT/api/v1/gm/slurp"
-fi
+DOWN_URL="$SCHEME://$HOST:$PORT/api/v1/gm/large"
+UP_URL="$SCHEME://$HOST:$PORT/api/v1/gm/slurp"
 
 # The test settings change where the bytes are counted, sent or recorded, so they are refused on any
 # interface but lo0, before the usage file is touched or anything is sent.
@@ -215,6 +241,7 @@ if ! used=$(usage_total "$USAGE"); then
   exit 2
 fi
 reserve=$((STOP_BYTES + MARGIN))
+[ "$DIR" != both ] || reserve=$((STOP_BYTES + STOP_OUT_BYTES + MARGIN))
 echo "usage file: $USAGE, recorded total $used bytes; this run reserves $reserve; budget $BUDGET"
 if [ $((used + reserve)) -gt $BUDGET ]; then
   echo "measure: REFUSED: $used recorded + $reserve for this run would pass $BUDGET bytes" >&2
@@ -273,18 +300,28 @@ stop_transfers() {
 }
 
 # Waits after the stop until the counters settle: samples them every 0.25 s until the measured
-# direction moves less than SETTLE_BYTES between two samples, for at most SETTLE_SECS, so that what
-# was in flight (above all an upload's send buffers, which drain after curl is killed) is counted.
-# Sets waited (seconds since the call) and settled (1 if they settled, 0 if not).
+# direction (for both, each of the two) moves less than SETTLE_BYTES between two samples, for at
+# most SETTLE_SECS, so that what was in flight (above all an upload's send buffers, which drain
+# after curl is killed) is counted. Sets waited (seconds since the call) and settled (1 if they
+# settled, 0 if not).
 settle() {
   s_start=$(now)
   settled=0
   while :; do
     sleep 0.25
-    if [ "$DIR" = down ]; then s_before=$acc_in; else s_before=$acc_out; fi
+    s_in=$acc_in
+    s_out=$acc_out
     advance || break
-    if [ "$DIR" = down ]; then s_after=$acc_in; else s_after=$acc_out; fi
-    if [ $((s_after - s_before)) -lt $SETTLE_BYTES ]; then
+    # what the measured direction moved since the last sample; for both, the larger of the two
+    case $DIR in
+      down) s_moved=$((acc_in - s_in)) ;;
+      up) s_moved=$((acc_out - s_out)) ;;
+      both)
+        s_moved=$((acc_in - s_in))
+        [ $((acc_out - s_out)) -le $s_moved ] || s_moved=$((acc_out - s_out))
+        ;;
+    esac
+    if [ $s_moved -lt $SETTLE_BYTES ]; then
       settled=1
       break
     fi
@@ -294,8 +331,10 @@ settle() {
 }
 
 # Appends this run to the usage file once, from a final reading of the counters. If that reading
-# fails, the run is charged at least its reservation in the measured direction, since the bytes
-# after the last good sample are unknown. Signals are ignored from here on: once recorded is set,
+# fails, the run is charged at least its reservation in the measured direction (both: at least its
+# stop threshold in each direction), since the bytes after the last good sample are unknown. The
+# usage file's direction words are down and up: both is recorded as down, with its real bytes in
+# and out. Signals are ignored from here on: once recorded is set,
 # a signal before the append would exit through cleanup, whose record() would then return early
 # and leave the run unrecorded.
 record() {
@@ -308,9 +347,12 @@ record() {
   if [ "$last_ok" -eq 0 ]; then
     if [ "$DIR" = down ] && [ "$rec_in" -lt "$reserve" ]; then rec_in=$reserve; fi
     if [ "$DIR" = up ] && [ "$rec_out" -lt "$reserve" ]; then rec_out=$reserve; fi
+    if [ "$DIR" = both ] && [ "$rec_in" -lt "$STOP_BYTES" ]; then rec_in=$STOP_BYTES; fi
+    if [ "$DIR" = both ] && [ "$rec_out" -lt "$STOP_OUT_BYTES" ]; then rec_out=$STOP_OUT_BYTES; fi
     echo "measure: WARNING: the counters could not be read at the end; charging in $rec_in, out $rec_out" >&2
   fi
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $DIR $rec_in $rec_out" >>"$USAGE"
+  if [ "$DIR" = both ]; then rec_dir=down; else rec_dir=$DIR; fi
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $rec_dir $rec_in $rec_out" >>"$USAGE"
 }
 
 cleanup() {
@@ -335,7 +377,7 @@ on_signals() {
 }
 on_signals
 
-if [ "$DIR" = up ]; then
+if [ "$DIR" != down ]; then
   dd if=/dev/zero of="$WORK/body" bs=1000000 count=$BODY_MB 2>/dev/null || die "cannot write the upload body"
 fi
 
@@ -349,13 +391,15 @@ started=1
 t_start=$(now)
 echo "0 0 0" >"$SAMPLES"
 for k in 1 2 3 4; do
-  if [ "$DIR" = down ]; then
-    ($CURL --stderr "$WORK/curl$k.err" -o - "$URL" | head -c $STREAM_BYTES | wc -c >"$WORK/stream$k") &
-  else
-    ($CURL --stderr "$WORK/curl$k.err" -o /dev/null -H 'Content-Type: application/octet-stream' \
-      --data-binary "@$WORK/body" "$URL") &
+  if [ "$DIR" != up ]; then
+    ($CURL --stderr "$WORK/curl$k.err" -o - "$DOWN_URL" | head -c $STREAM_BYTES | wc -c >"$WORK/stream$k") &
+    pids="$pids $!"
   fi
-  pids="$pids $!"
+  if [ "$DIR" != down ]; then
+    ($CURL --stderr "$WORK/curl-up$k.err" -o /dev/null -H 'Content-Type: application/octet-stream' \
+      --data-binary "@$WORK/body" "$UP_URL") &
+    pids="$pids $!"
+  fi
 done
 set +f
 on_signals
@@ -371,9 +415,13 @@ while :; do
   }
   t=$(awk -v a="$t_start" -v b="$(now)" 'BEGIN { printf "%.3f", b - a }')
   echo "$t $acc_in $acc_out" >>"$SAMPLES"
-  if [ "$DIR" = down ]; then moved=$acc_in; else moved=$acc_out; fi
+  if [ "$DIR" = up ]; then moved=$acc_out; else moved=$acc_in; fi
   if [ "$moved" -ge "$STOP_BYTES" ]; then
-    reason="byte cap ($STOP_BYTES)"
+    if [ "$DIR" = both ]; then reason="byte cap in ($STOP_BYTES)"; else reason="byte cap ($STOP_BYTES)"; fi
+    break
+  fi
+  if [ "$DIR" = both ] && [ "$acc_out" -ge "$STOP_OUT_BYTES" ]; then
+    reason="byte cap out ($STOP_OUT_BYTES)"
     break
   fi
   if awk -v t="$t" -v s="$STOP_SECS" 'BEGIN { exit !(t >= s) }'; then
@@ -390,7 +438,7 @@ done
 stop_transfers
 duration=$t
 at_limit=0
-if [ "$DIR" = down ]; then
+if [ "$DIR" != up ]; then
   for k in 1 2 3 4; do
     n=$(cat "$WORK/stream$k" 2>/dev/null | tr -d ' ')
     [ "${n:-0}" -ge $STREAM_BYTES ] && at_limit=$((at_limit + 1))
@@ -415,7 +463,7 @@ fi
 echo "moved:            in $acc_in bytes, out $acc_out bytes"
 echo "recorded:         in $rec_in bytes, out $rec_out bytes"
 echo "duration:         $duration s to the last sample; stopped by $reason"
-if [ "$DIR" = down ]; then
+if [ "$DIR" != up ]; then
   echo "streams at limit: $at_limit of 4 ended at their own $STREAM_BYTES-byte limit before the stop"
 fi
 echo "samples:          $SAMPLES"
@@ -427,6 +475,12 @@ if [ $((rec_in + rec_out)) -gt $WARN_BYTES ]; then
   echo "" >&2
   echo "measure: WARNING: this run moved $((rec_in + rec_out)) bytes, more than $WARN_BYTES" >&2
   echo "" >&2
+fi
+if [ "$DIR" = both ]; then
+  if [ "$acc_in" -lt $MIN_BYTES ] || [ "$acc_out" -lt $MIN_BYTES ]; then
+    die "FAILED: only $acc_in bytes in and $acc_out bytes out crossed $IFACE, under $MIN_BYTES in at least one direction; curl did not go through it"
+  fi
+  exit 0
 fi
 if [ "$DIR" = down ]; then measured=$acc_in; else measured=$acc_out; fi
 if [ "$measured" -lt $MIN_BYTES ]; then
