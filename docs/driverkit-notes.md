@@ -645,13 +645,16 @@ kern_return_t NetSpike::SetPowerState_Impl(uint32_t powerFlags) {
 }
 ```
 
-`IOUserNetworkEthernet` exports its own `SetPowerState_Impl`, so `SUPERDISPATCH` reaches it. AppleEthernetIXL overrides `SetPowerState`; AppleUserECM does not. **[runtime]** What the USB interface looks like after wake. The design already says to treat wake as a full restart.
+`IOUserNetworkEthernet` exports its own `SetPowerState_Impl`, so `SUPERDISPATCH` reaches it. AppleEthernetIXL overrides `SetPowerState`; AppleUserECM does not. **[runtime]** What the USB interface looks like after wake. The design already says to treat wake as a full restart. **Answered (owner's sleep test, 2026-11-14 17:22 to 17:23, build 317.9.11):** the modem stayed attached and the same driver instance carried on; no request completed while held (`RMNetSleepCompletions` 0), so the requests pending at the power-off stayed pending across the sleep, and the interface answered at once after the wake (link up 0.58 s after the wake call). Seen for sleeps of up to 28 s only; see "Runtime findings (sleep and wake)".
 
 **As built (recovery plan, Task 3, 317.9.11).** `SetPowerState` has no `QUEUENAME` in `IOService.iig`, so it runs on the Default queue as a call of its own, never inside a Core call or a `UsbIo` listener call; `RestartSession` may be called from it. Every call is logged with its flags and passed to the superclass.
 - Power off (`powerFlags == kIOServicePowerCapabilityOff`): Core is not called and nothing is sent. The driver marks itself asleep, counts `RMNetSleeps` and holds `UsbIo` (`UsbIo::hold`): nothing is posted, re-posted, submitted or sent, nothing is delivered to the listener, and completions that arrive are counted (`RMNetSleepCompletions`, `RMNetSleepLastStatus`) but never toward a failure limit, a recovery or `on_fatal`; a not-attached or no-device status still marks the device gone. While asleep the timer tick calls neither Core nor USB (it publishes status and counters only), and `DrainTx` keeps frames in the queue. A second power off while asleep does nothing new.
 - Power on (`powerFlags & kIOServicePowerCapabilityOn`) while asleep: counts `RMNetWakes`. If USB had failed, or the stop sequence runs, nothing more. If the device went during the sleep, `OnUsbFatal("device gone during the sleep")`: the session stops, the link goes down, the state says `detached`, nothing is sent (`UsbIo` stays held), and a new instance follows the re-enumeration. Otherwise `UsbIo::resume` clears the failure memory (uplink stall count and its restart memory, per-read and interrupt failure counts, recovery counts), finishes a pipe recovery whose requests have returned, posts the interrupt read and every bulk read not posted, sends what is queued and reads waiting responses; then `RestartSession("wake")` takes the link down and starts the session from sync, and `EnsureTimer` makes sure a tick is pending. `RMNetLastWakeUpMs` is the time from that call to the next link up (0 until then).
 - Power on while not asleep (one comes at every start: `RMNetLastPowerFlags` 2 on a fresh instance), and low power: nothing.
 - `Stop` while asleep: `finish_sending` ends the hold and drops the messages waiting behind it; the stop sequence then runs as before.
+- If a re-post is refused at the wake (`resume` fails), the port goes down as `usb failed` and stays down until a re-enumeration or a manual reload; nothing retries.
+
+**Seen on the Mac (2026-11-14 17:22 to 17:23).** Two sleeps and two wakes, each with the device kept and the requests pending: the power-off held `UsbIo`, the power-on resumed it and restarted the session, and the port came back up with new addresses in both families. Details, and what was not seen, in "Runtime findings (sleep and wake)".
 
 ### 3.9 Order of work
 
@@ -1090,9 +1093,9 @@ The commit after 317.8.44, built and tested but not installed (the next task ins
 - **Stop without its timer.** A failed arm counts as no timer in `AdvanceStop`'s two waits, and a failed re-arm in the stopping tick advances the stop at once.
 - **Pause timing** runs only while the data link is up.
 
-## Runtime findings (sleep and wake, 2026-11-14 17:11): SLEEP AND WAKE NOT YET TRIED
+## Runtime findings (sleep and wake, 2026-11-14 17:11 and 17:22)
 
-Build 317.9.11 (the sleep and wake commit). Installed with `scripts/install-driver.sh`, loaded with one `AT+CFUN=1,1` at 17:11:55; the new instance reported link up at 17:12:28.742. Log: `build/logs/driver-20261114-171124.log`. The Mac has not been put to sleep: every path of 3.8 "As built" except the power-on call at start is unexercised.
+Build 317.9.11 (the sleep and wake commit). Installed with `scripts/install-driver.sh`, loaded with one `AT+CFUN=1,1` at 17:11:55; the new instance reported link up at 17:12:28.742. Log: `build/logs/driver-20261114-171124.log` (the load and the idle check; it was stopped before the sleep test, so no log line covers the sleeps).
 
 **Seen.**
 - A power-on call reaches each new instance at start: `RMNetLastPowerFlags` was 2 (`kIOServicePowerCapabilityOn`) with `RMNetSleeps` and `RMNetWakes` 0. The log line for it was lost with the instance's first lines, as usual.
@@ -1100,4 +1103,14 @@ Build 317.9.11 (the sleep and wake commit). Installed with `scripts/install-driv
 - Link up, both families, `en33` first in neither `scutil --nwi` list, both 5-ping checks 5 of 5, no new crash report.
 
 **`detached` is never set by a modem reboot.** The old instance (317.8.44) ended as every reboot has: `interrupt read failed: 0xe00002eb` (`kIOReturnAborted`), `interrupt read not posted: 0xe00002d8`, `usb failed: interrupt read could not be posted` with no "(device gone)", `Stop` 4 ms later. `0xe00002d8` is `kIOReturnNotReady`; `kIOReturnNotAttached` is `0xe00002d9`. Earlier sections named it wrongly (corrected above), and `UsbIo`'s `Gone()` (not-attached or no-device) matches neither status seen, so `RMNetState` said `syncing`, then the entry was gone; polling every half second never showed `detached`. Whether to treat `kIOReturnNotReady` as gone is open: around a sleep it might also mean a bus not yet awake.
+
+**The owner's sleep test (17:22 to 17:23).** The owner slept and woke the Mac; the controller read the results at 17:24. Sources: `RMNet status`, `ps` for the driver process, `pmset -g log`, `ifconfig`, `scutil --nwi`, the two pings, the `DiagnosticReports` folders. The log stream was not running across the sleep.
+- **No re-enumeration.** The driver process was the same before and after (pid 82581, started 17:12:10): the modem stayed attached and the instance survived.
+- **Power calls.** `RMNetSleeps` 2 and `RMNetWakes` 2. `pmset -g log` shows three sleep entries in that minute and a half: at 17:22:02 a clamshell sleep that became a dark wake 2 s later and a full wake at 17:22:07; at 17:22:13 a software sleep until 17:22:41 (28 s); at 17:23:10 a software sleep until 17:23:33 (23 s). The driver therefore saw two power-offs for three sleep entries; which entry did not reach it is not known. `RMNetLastPowerFlags` 2. The uppercase `SetPowerState` is the path macOS uses, with flags 0 (off) and 2 (on); the lowercase `setPowerState` and its first-call line were not looked for (no log).
+- **Nothing completed while held.** `RMNetSleepCompletions` 0 and `RMNetSleepLastStatus` 0: the requests pending at the power-off stayed pending across the sleep, and the stack cancelled nothing.
+- **Wake.** `RMNetLastWakeUpMs` 578: link up 0.58 s after the last wake call. `RMNetState` up with new addresses in both families: IPv4 10.66.47.163 before, 10.99.149.174/30 after; IPv6 prefix 2001:db8:8797:a840 before, 2001:db8:8db1:9c01 after. So the port came back with the new call's addresses, not the old ones.
+- **No error.** `RMNetUsbBulkInErrors`, `RMNetUsbBulkOutErrors`, `RMNetUsbBulkOutTimeouts`, `RMNetUsbRecoveries`, `RMNetTimerArmFailures` and `RMNetUplinkStuckRestarts` all 0; `RMNetTxDropLinkDown` 17 (frames queued across the two restarts, dropped as link down, as designed); `RMNetPacketsHeld` 0; `RMNetRxStock` 25.
+- **Checks.** `ping -c 5 -b en33 223.5.5.5` 5 of 5 (average 16.6 ms); `ping6 -c 5 -B en33 2400:3200::1` 5 of 5 (average 38.2 ms). No new crash report; `en33` first in neither `scutil --nwi` list.
+
+**Not seen:** a sleep during which the stack cancels or fails transfers (`RMNetSleepCompletions` above 0); a re-enumeration on wake; a bus that answers not-ready (or refuses any re-post) at the wake call, which would leave the port down until a re-enumeration or a manual reload, since nothing retries; a sleep longer than half a minute; a `Stop` while asleep; a second power-off while asleep, or a power-on without one (the missing third sleep may be either, or neither); and the log lines of the power calls and of `resume`.
 

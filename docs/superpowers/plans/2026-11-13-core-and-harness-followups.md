@@ -161,7 +161,9 @@ Small hardening:
 
 ## Sent here by the recovery plan's Task 3, sleep and wake (2026-11-14)
 
-- **Sleep and wake have not been tried.** Build 317.9.11 holds `UsbIo` at power off and resumes it and restarts the session at power on (`docs/driverkit-notes.md` 3.8, "As built"); none of it has run. The owner's sleep test decides which of three things macOS does: the device stays and transfers stay pending, the stack fails or aborts them (`RMNetSleepCompletions`, `RMNetSleepLastStatus`), or the modem re-enumerates (a new instance with `RMNetSleeps` 0).
-- **A bus not ready at the wake call is fatal.** If posting the interrupt read or a bulk read at resume fails (for example with `kIOReturnNotReady`), the port goes down as `usb failed` and stays down until the modem re-enumerates. That meets "fresh addresses or down", but a retry after a short delay may be needed if the test shows it.
+- **Sleep and wake.** Build 317.9.11 holds `UsbIo` at power off and resumes it and restarts the session at power on (`docs/driverkit-notes.md` 3.8, "As built").
+  - **Seen on hardware (2026-11-14, 17:22 to 17:23), for one case:** the device stayed attached and its requests stayed pending. Two power-offs and two wakes (for three sleep entries in `pmset -g log`; which one did not reach the driver is unknown), the same driver instance throughout, `RMNetSleepCompletions` 0, link up 0.58 s after the last wake with new addresses in both families, both pings 5 of 5, every USB error counter 0 (`docs/driverkit-notes.md`, "Runtime findings (sleep and wake)").
+  - **Open (not seen):** a sleep during which the stack cancels or fails transfers; a re-enumeration on wake; a bus that answers not-ready at the wake call; a sleep longer than half a minute; a `Stop` while asleep.
+- **A bus not ready at the wake call is fatal.** If posting the interrupt read or a bulk read at resume fails (for example with `kIOReturnNotReady`), the port goes down as `usb failed` and stays down until a re-enumeration or a manual reload; nothing retries. That meets "fresh addresses or down", but a retry after a short delay may be needed if it is ever seen. Not seen in the one test.
 - **Uplink transfers that complete while held** are counted neither as sent nor as dropped (`RMNetTxPackets`, `RMNetTxDropUsb`), and reads that complete while held are discarded unread.
 
