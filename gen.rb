@@ -86,7 +86,7 @@ drv = native_target(
     'GCC_ENABLE_CPP_EXCEPTIONS'    => 'NO',
     'GCC_ENABLE_CPP_RTTI'          => 'NO',
     'HEADER_SEARCH_PATHS'          => ['$(SRCROOT)/core/include'],
-    'OTHER_LDFLAGS'                => '-framework DriverKit -framework USBDriverKit -framework NetworkingDriverKit',
+    'OTHER_LDFLAGS'                => '-framework DriverKit -framework USBDriverKit -framework NetworkingDriverKit -framework SerialDriverKit -framework USBSerialDriverKit',
     'SKIP_INSTALL'                 => 'YES',
   }.merge(signing),
 )

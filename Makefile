@@ -39,6 +39,7 @@ build/obj/harness/%.o: harness/%.mm
 
 check-driverkit:
 	./scripts/check-driverkit-compile.sh
+	./scripts/check-personalities.sh
 
 # The app's status model, SMS model, AT answer logic, the Messages tab's controller and the gps verb's
 # NMEA logic, tested without Xcode or hardware (neither the AT port nor the NMEA port is opened, and no

@@ -786,6 +786,79 @@ Then add every `core/src/*.cpp` to the dext's Sources phase. `core/src/ethernet_
 
 ---
 
+## 6. Serial ports (USBSerialDriverKit)
+
+Date: 2026-11-15. The modem's DIAG (interface 0) and NMEA (interface 1) interfaces as `/dev/cu.RM520N-GL-DIAG` and `/dev/cu.RM520N-GL-NMEA`, by a second class, `RMNetSerial`, in the same dext. Built and linked with `make driver` (unsigned); **not yet loaded**, so everything marked **[runtime]** is open until the first load of the serial ports.
+
+The class lives in the existing dext rather than a second one: one bundle, one version, one approval and one install path, so `scripts/install-driver.sh`, the app's activation and the version-matched removal stay as they are. A second dext would need its own bundle ID, provisioning profile, activation request, removal path and kept apps.
+
+### 6.1 What `IOUserUSBSerial` does
+
+`$FW/SerialDriverKit.framework/Headers/IOUserSerial.iig` declares `class KERNEL IOUserSerial : protected IOService`, and `$FW/USBSerialDriverKit.framework/Headers/IOUserUSBSerial.iig` declares `class IOUserUSBSerial : protected IOUserSerial`. macOS ships `com.apple.DriverKit-AppleUSBSerial.dext`, whose class `AppleGenericUSBSerial` is an `IOUserUSBSerial` that overrides only `Start` (the superclass's, then `RegisterService`). What `IOUserUSBSerial` does, read from its disassembly (the DriverKit shared cache):
+
+- `Start` calls `IOUserSerial::Start`, then sets `IOTTYBaseName` = `usbserial-` and `IOTTYSuffix` = the USB serial number (or the location ID in hex), followed by the interface number in hex when the configuration has two or more interfaces. It reads the personality's `quirks` (a 16-bit number); bit 0 sends a zero-length packet after a write that is a whole number of max-size packets.
+- `ConnectQueues` opens the interface (for client `this`); `DisconnectQueues` closes it. `HwActivate` (a port being opened) copies the pipes: a bulk IN and a bulk OUT are required (`kIOReturnError` without them), an interrupt IN is optional, so DIAG's two bulk endpoints are enough. Each read is one max-size packet.
+- It does not implement `HwResetFIFO`, `HwSendBreak`, `HwProgramUART`, `HwProgramBaudRate`, `HwProgramMCR`, `HwGetModemStatus`, `HwProgramLatencyTimer` or `HwProgramFlowControl`, which are pure (`LOCAL = 0`) in `IOUserSerial.iig`. `RMNetSerial` implements all eight.
+
+### 6.2 The class
+
+`driver/RMNetSerial.iig` overrides `init`, `free`, `Start`, `Stop` and the ten `Hw*` methods, spelled as in `IOUserSerial.iig` (`HwProgramUART(uint32_t baudRate, uint8_t nDataBits, uint8_t nHalfStopBits, uint8_t parity)`, `HwGetModemStatus(bool * cts, bool * dsr, bool * ri, bool * dcd)`, `HwProgramFlowControl(uint32_t arg, uint8_t xon, uint8_t xoff)`). The `Hw*` methods are `LOCAL`, not `LOCALONLY`, so they follow the RPC rule (3.1): the bodies are `Name_Impl`, and `HwActivate(SUPERDISPATCH)` and `HwDeactivate(SUPERDISPATCH)` reach the superclass. The `.cpp` includes `<USBSerialDriverKit/USBSerialDriverKit.h>`, and `gen.rb`'s `OTHER_LDFLAGS` gains `-framework SerialDriverKit -framework USBSerialDriverKit`; `otool -L` on the dext then lists both frameworks, and `nm -m` shows twelve `RMNetSerial::*_Impl` symbols (`Start`, `Stop` and the ten `Hw*`).
+
+`Start` works in this order:
+
+1. It reads the interface descriptor (`CopyConfigurationDescriptor`, `GetInterfaceDescriptor`, `IOUSBHostFreeDescriptor`, as `RMNetDriver` does) and the personality (`CopyProperties`).
+2. It refuses, with `kIOReturnUnsupported` and a log line, unless the provider is an `IOUSBHostInterface`, its descriptor was read, `RMNetSerialSubClass` and `RMNetSerialProtocol` are integers, `rmnet::serial_interface_matches` accepts the interface's class, subclass and protocol, and `rmnet::tty_name_ok` accepts `RMNetSerialName`. At that point nothing has been opened and the superclass's `Start` has not been called.
+3. The superclass's `Start`, then `SetProperties` with the port's name (6.5), then `RegisterService`.
+
+`Stop` releases the interface and passes `Stop` to the superclass. `HwActivate` and `HwDeactivate` forward to the superclass and log every call (`open`, `close`). `HwProgramMCR` sends DTR and RTS (6.6). `HwGetModemStatus` reports CTS, DSR and DCD on and RI off, so a program that waits for a carrier does not wait forever. The other six succeed without I/O and log their arguments on their first call only.
+
+### 6.3 Personality keys
+
+Two personalities in `driver/Info.plist`, `RMNetSerialDIAG` and `RMNetSerialNMEA`:
+
+| Key | Value |
+|---|---|
+| `CFBundleIdentifier`, `IOUserServerName` | `$(PRODUCT_BUNDLE_IDENTIFIER)` |
+| `CFBundleIdentifierKernel` | `com.apple.driver.driverkit.serial` (as Apple's serial dexts use; `AppleUSBSerial` has no `OSBundleLibraries` entry for it, and neither has ours) |
+| `IOClass` | `IOUserSerial` |
+| `IOProviderClass` | `IOUSBHostInterface` |
+| `IOUserClass` | `RMNetSerial` |
+| `idVendor`, `idProduct`, `bConfigurationValue` | 11388, 2049, 1 (the 4-key match proven for `RMNetDriver`, 4.1) |
+| `bInterfaceNumber` | 0 (DIAG), 1 (NMEA) |
+| `RMNetSerialName` | `RM520N-GL-DIAG`, `RM520N-GL-NMEA` |
+| `RMNetSerialSubClass`, `RMNetSerialProtocol` | 255 and 48 (DIAG, `ff`/`ff`/`30`), 0 and 64 (NMEA, `ff`/`00`/`40`) |
+| `quirks` | 1 (6.7) |
+
+Matching by interface number alone could take an AT or QMI interface if the modem's USB configuration changed (switching DIAG off, for example, renumbers the rest), which is why `Start` checks the class, subclass and protocol first (6.2). `scripts/check-personalities.sh`, run by `make check-driverkit`, also refuses any personality on interface 2 or 3, an `RMNetSerial` one on any interface but 0 or 1 or without `IOClass` `IOUserSerial`, `CFBundleIdentifierKernel` `com.apple.driver.driverkit.serial` and a valid `RMNetSerialName`, and `RMNetDriver` on any interface but 4.
+
+DIAG is included because it costs one personality on the same class and lets Qualcomm DIAG tools that take a serial device (QCSuper, Quectel's QLog) run on the Mac.
+
+### 6.4 Entitlement and profile
+
+`driver/Driver.entitlements` gains `com.apple.developer.driverkit.family.serial` = true, after `family.networking`. Checked on 2026-11-15 at 03:40: a signed Release build of the `RMNetDriver` target alone, with that key added, `-allowProvisioningUpdates` and team `ABCDE12345`, succeeded. Xcode replaced the profile "DriverKit Team Provisioning Profile: io.rmnetdriver.RMNet.driver" (now `~/Library/Developer/Xcode/UserData/Provisioning Profiles/6d3b0ea4-cad5-43cf-8071-24af4e246bdc.provisionprofile`) with one granting `family.networking` and `family.serial`, and the signed dext carried both. Nothing was installed. The existing `transport.usb` entitlement (`idVendor` `*`) already covers interfaces 0 and 1.
+
+### 6.5 Naming
+
+`IOUserUSBSerial` would name the ports `usbserial-<serial number>0` and `...1`. `RMNetSerial` sets `IOTTYBaseName` to `RMNetSerialName` and `IOTTYSuffix` to `""` with `SetProperties` after the superclass's `Start` and before `RegisterService`: the BSD client, which makes `/dev/cu.*` and `/dev/tty.*`, is matched at registration and reads those two properties, and Apple's Bluetooth serial dext sets them the same way at run time. If `SetProperties` is refused, the port keeps Apple's name and the driver logs `RMNet: serial <name>: naming the port failed`. A name must be 1 to 31 of `A-Z`, `a-z`, `0-9`, `_` and `-` (`rmnet::tty_name_ok`, `rmnet::kTtyNameMax`); the script checks the same rule.
+
+### 6.6 DTR and RTS
+
+Linux's `option`/`usb_wwan` driver sends the CDC request SET_CONTROL_LINE_STATE (`bmRequestType` 0x21, `bRequest` 0x22, `wValue` DTR bit 0 and RTS bit 1, `wIndex` the interface number) when a port opens and closes. `HwProgramMCR` does the same, synchronously, with `IOUSBHostInterface::DeviceRequest` (its `bytesTransferred` is a `uint16_t *`) and a 1000 ms timeout, and logs the values and the status on every call. A failure is logged and the call still returns success, so opening a port never fails on it.
+
+### 6.7 Zero-length packets (`quirks`)
+
+Quectel's Linux driver sets `URB_ZERO_PACKET` on every bulk OUT for vendor 0x2C7C, so both personalities set `quirks` = 1, which makes `IOUserUSBSerial` send a zero-length packet after a write that fills its last packet.
+
+### 6.8 Open questions for the first load **[runtime]**
+
+1. Whether our `SetProperties` names win: `ls /dev/cu.*` shows `cu.RM520N-GL-DIAG` and `cu.RM520N-GL-NMEA`, or Apple's `usbserial-...` names (and the log has `naming the port failed`).
+2. Which `Hw*` calls the kernel makes, and in what order, when a port is opened and closed: `open` and `close`, the MCR line on every call, and the first-call lines of the others.
+3. Whether the instances run in their own processes (`ps`). DriverKit starts a separate process for each matched provider unless the personality sets `IOUserServerOneProcess`, so a fault in a serial instance should not stop `en33`.
+4. Whether `CopyProperties` and the interface's `CopyConfigurationDescriptor` answer before the superclass's `Start`. `RMNetDriver` reads both after it; if they do not, every port is refused with `properties not readable` or `the interface descriptor could not be read`.
+5. Whether SET_CONTROL_LINE_STATE succeeds when `HwProgramMCR` is called (the interface is opened by `ConnectQueues`; a request before that may be refused), and whether the modem needs DTR for NMEA output at all.
+
+---
+
 ## Build record
 
 Spike settings: those of `spike-dext/gen.rb`, plus the Core settings above. There is no `DEVELOPMENT_TEAM` or `CODE_SIGN_STYLE`; signing is turned off on the command line.

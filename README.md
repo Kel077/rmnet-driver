@@ -5,7 +5,7 @@ A macOS driver that makes a Quectel RM520N-GL 5G modem in QMI USB mode appear as
 ## Make targets
 
 - `make test` builds `build/tests` and runs every test; `make test FILTER=bytes` runs only tests whose name contains `bytes`.
-- `make check-driverkit` syntax-checks every `core/src/*.cpp` against the installed DriverKit SDK.
+- `make check-driverkit` syntax-checks every `core/src/*.cpp` against the installed DriverKit SDK, then runs `scripts/check-personalities.sh`, which checks which USB interfaces the personalities in `driver/Info.plist` may match (below, "Serial ports").
 - `make app-test` compiles and runs the app's five test programs: the status model (`app/StatusModel.swift` with `tests/app/StatusModelTests.swift`), the SMS model (`app/SmsModel.swift` with `tests/app/SmsModelTests.swift`), the AT port's answer logic (`app/AtPort.swift` with `tests/app/AtPortTests.swift`), the `Messages` tab's controller (`app/SmsController.swift` with `tests/app/SmsControllerTests.swift`, driven by a fake service) and the `gps` verb's NMEA logic (`app/Nmea.swift` with `tests/app/NmeaTests.swift`); it needs no Xcode project, no window and no hardware.
 - `make harness` builds `build/rmnet-harness`, the command-line harness (below).
 - `make driver` generates `RMNet.xcodeproj` and builds the driver and the host app unsigned into `build/xcode/`, printing `driver build ok`.
@@ -40,6 +40,22 @@ ditto build/installed/RMNet-<version>.app /Applications/RMNet.app
 ```
 
 If no copy exists, build one for that version: `/usr/bin/ruby gen.rb ABCDE12345`, then the `xcodebuild` command in `scripts/install-driver.sh` with `CURRENT_PROJECT_VERSION=<version>`, and deactivate from that app the same way. Each installed entry needs its own matching app.
+
+### Serial ports
+
+The same driver also presents two of the modem's other USB interfaces as serial ports, with a second class, `RMNetSerial` (`driver/RMNetSerial.cpp`), which is installed, updated and removed with the rest of the driver:
+
+| Interface | Class / subclass / protocol | Function | Device |
+|---|---|---|---|
+| 0 | `ff` / `ff` / `30` | DIAG | `/dev/cu.RM520N-GL-DIAG` (and `/dev/tty.RM520N-GL-DIAG`) |
+| 1 | `ff` / `00` / `40` | NMEA | `/dev/cu.RM520N-GL-NMEA` (and `/dev/tty.RM520N-GL-NMEA`) |
+
+Nothing else on the modem is claimed: interfaces 2 and 3, the AT ports, stay free for the owner's console and the app's `sms` verbs, and interface 4 is `RMNetDriver`'s. The two personalities in `driver/Info.plist` (`RMNetSerialDIAG` and `RMNetSerialNMEA`) match by interface number, which a change of the modem's USB configuration could give to another function, so `Start` refuses an interface whose class is not `0xff` or whose subclass and protocol differ from the personality's `RMNetSerialSubClass` and `RMNetSerialProtocol`, before anything is opened (the log says `RMNet: serial refused interface <n> (class <c> subclass <s> protocol <p>)`). `scripts/check-personalities.sh` refuses any personality on interface 2 or 3, a serial one on any interface but 0 or 1, and `RMNetDriver` on any but 4. Apple's `IOUserUSBSerial` moves the bytes; `RMNetSerial` names the port from the personality's `RMNetSerialName`, sends DTR and RTS to the modem when a port opens and closes, and accepts the baud rate and the other UART settings without sending them anywhere (the ports have no UART). In the I/O registry each port is an `IOUserSerial` with `IOUserClass` `RMNetSerial`.
+
+- NMEA: `cat /dev/cu.RM520N-GL-NMEA` prints the modem's GNSS sentences. The modem sends them only while GNSS is on: `AT+QGPS=1` on the console turns it on and `AT+QGPSEND` turns it off. Without a fix the sentences come with their position fields empty.
+- DIAG: the port speaks Qualcomm's DIAG protocol, framed as HDLC, for tools that take a serial device, such as QCSuper.
+
+**Not yet shown**: the serial ports are built but have not been installed, so none of the behaviour above has been seen on the modem yet.
 
 ## Harness
 

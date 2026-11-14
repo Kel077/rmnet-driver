@@ -13,6 +13,8 @@
 	</array>
 	<key>com.apple.developer.driverkit.family.networking</key>
 	<true/>
+	<key>com.apple.developer.driverkit.family.serial</key>
+	<true/>
 	<key>com.apple.security.app-sandbox</key>
 	<true/>
 </dict>
