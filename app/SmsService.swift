@@ -152,7 +152,7 @@ private func sendFailure(part: Int, of total: Int, reason: String, known: Bool) 
 func describe(_ error: AtError) -> String {
     switch error {
     case .modemNotAttached:
-        return "The modem is not attached."
+        return "The RM520N-GL (USB 2c7c:0801) is not attached."
     case .noAtInterface:
         return "The modem has no spare AT port."
     case .busy:

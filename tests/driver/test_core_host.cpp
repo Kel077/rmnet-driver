@@ -1,12 +1,14 @@
 // CoreHost on the host: a fake UsbPort and RxSink stand in for the driver's USB and receive packets.
 // The tests cover the transmit hold (a frame refused while every uplink buffer is in flight), the
-// kept QMAP command replies, and the pause limit (kPauseMaxMs).
+// kept QMAP command replies, the pause limit (kPauseMaxMs), and the QMI interface number the session
+// puts in its requests.
 #include "minitest.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <memory>
 #include <vector>
 
@@ -122,7 +124,7 @@ struct Rig {
   FakeRx rx;
   CoreHost core;
 
-  Rig() : core(usb, rx, rmnet::derive_macs("bfeed1a5"), 1, true) {
+  Rig() : core(usb, rx, rmnet::derive_macs("bfeed1a5"), 1, true, 4) {
     core.link_up(recorded_link());
     CoreHost::LinkChange c = core.take_link_change();
     CHECK(c.up);
@@ -361,4 +363,43 @@ TEST(restart_lifts_the_pause_and_drops_the_kept_replies) {
   CHECK(m.hdr.service == rmnet::QmiService::CTL);
   CHECK(m.hdr.kind == rmnet::QmiKind::Request);
   CHECK_EQ(m.hdr.msg_id, rmnet::kCtlSync);
+}
+
+namespace {
+
+// What CoreHost's session sends on the control pipe for QMI interface `qmi_interface`, from its
+// start to its Set Data Format request: the recorded CTL Sync and WDA client replies are fed back
+// as the driver feeds them, so the third message is that request.
+std::vector<std::vector<uint8_t>> sent_up_to_set_data_format(uint8_t qmi_interface) {
+  FakeUsb usb;
+  FakeRx rx;
+  CoreHost core(usb, rx, rmnet::derive_macs("bfeed1a5"), 1, true, qmi_interface);
+  core.start(0);
+  std::vector<uint8_t> sync = hex(kCtlSyncResp);
+  std::vector<uint8_t> wda = hex(kCtlGetWdaResp);
+  core.on_control(sync.data(), sync.size(), 10);
+  core.on_control(wda.data(), wda.size(), 20);
+  return usb.qmi;
+}
+
+}  // namespace
+
+TEST(the_session_names_the_qmi_interface_core_host_was_given) {
+  // The RM520N-GL's interface 4: the recorded requests, byte for byte.
+  std::vector<std::vector<uint8_t>> sent4 = sent_up_to_set_data_format(4);
+  REQUIRE(sent4.size() == 3u);
+  CHECK(sent4[0] == hex(kCtlSyncReq));
+  CHECK(sent4[1] == hex(kCtlGetWdaReq));
+  CHECK(sent4[2] == hex(kWdaSetFormatReqFlow));
+
+  // Interface 3 (the RG255C's): the same request but for the interface in the Endpoint Info TLV
+  // (0x17: endpoint type 2, HSUSB, then the interface number, both 32-bit little-endian).
+  std::vector<uint8_t> want = hex(kWdaSetFormatReqFlow);
+  const uint8_t endpoint4[] = {0x17, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00};
+  std::vector<uint8_t>::iterator at = std::search(want.begin(), want.end(), endpoint4, endpoint4 + sizeof endpoint4);
+  REQUIRE(at != want.end());
+  at[7] = 0x03;
+  std::vector<std::vector<uint8_t>> sent3 = sent_up_to_set_data_format(3);
+  REQUIRE(sent3.size() == 3u);
+  CHECK(sent3[2] == want);
 }

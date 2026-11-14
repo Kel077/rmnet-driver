@@ -10,10 +10,59 @@ struct ExtensionEntry {
     var uninstalling: Bool
 }
 
-// The modem on USB: 2c7c:0801 absent, attached without a QMI interface, or attached with one
-// (the interface whose class, subclass and protocol are all 0xff).
+// The modem on USB (a model from quectelModels): absent, attached without a QMI interface, or
+// attached with one (the interface whose class, subclass and protocol are all 0xff).
 enum ModemState {
     case absent, notQMI, qmi(interface: Int)
+}
+
+// A Quectel modem the driver matches (an RMNetDriver personality in driver/Info.plist): its USB
+// product under vendor 0x2C7C, the number of its QMI interface, its model names, and whether the
+// driver has run on it.
+struct QuectelModel {
+    let product: Int
+    let qmiInterface: Int
+    let names: String
+    let tested: Bool
+}
+
+// One model per line, in this form: tests/scripts/test-personalities.sh reads the products and
+// interfaces from these lines and compares them with the model list in scripts/check-personalities.sh
+// and the RMNetDriver personalities in driver/Info.plist. The RM520N-GL first, so it is the one found
+// when several are attached. The RM520N-GL is the modem the driver was built for and tested on (its
+// QMI interface 4 found on the modem; the kernel matches it by class:
+// {QMI_MATCH_FF_FF_FF(0x2c7c, 0x0801)}, /* Quectel RM520N */). The others are untested: the Quectel
+// entries of the Linux kernel's drivers/net/usb/qmi_wwan.c (torvalds/linux, master, fetched
+// 2026-11-15) that name a fixed QMI interface number; each line's comment is its entry there.
+let quectelModels: [QuectelModel] = [
+    QuectelModel(product: 0x0801, qmiInterface: 4, names: "RM520N-GL", tested: true),
+    QuectelModel(product: 0x0121, qmiInterface: 4, names: "EC21 Mini PCIe", tested: false),  // {QMI_QUIRK_SET_DTR(0x2c7c, 0x0121, 4)}, /* Quectel EC21 Mini PCIe */
+    QuectelModel(product: 0x0191, qmiInterface: 4, names: "EG91", tested: false),            // {QMI_QUIRK_SET_DTR(0x2c7c, 0x0191, 4)}, /* Quectel EG91 */
+    QuectelModel(product: 0x0195, qmiInterface: 4, names: "EG95", tested: false),            // {QMI_QUIRK_SET_DTR(0x2c7c, 0x0195, 4)}, /* Quectel EG95 */
+    QuectelModel(product: 0x0296, qmiInterface: 4, names: "BG96", tested: false),            // {QMI_FIXED_INTF(0x2c7c, 0x0296, 4)}, /* Quectel BG96 */
+    QuectelModel(product: 0x030e, qmiInterface: 4, names: "EM05GV2", tested: false),         // {QMI_QUIRK_SET_DTR(0x2c7c, 0x030e, 4)}, /* Quectel EM05GV2 */
+    QuectelModel(product: 0x0316, qmiInterface: 3, names: "RG255C", tested: false),          // {QMI_QUIRK_SET_DTR(0x2c7c, 0x0316, 3)}, /* Quectel RG255C */
+]
+
+func quectelModel(product: Int) -> QuectelModel? {
+    quectelModels.first { $0.product == product }
+}
+
+// The `status` verb's modem line: the model found (its vid:pid, its names, and "(untested)" for
+// any but the RM520N-GL) and whether it is in QMI mode, or the products looked for.
+func modemLine(_ modem: ModemState, model: QuectelModel?) -> String {
+    let name = model.map { String(format: "2c7c:%04x ", $0.product) + $0.names + ($0.tested ? "" : " (untested)") }
+        ?? "2c7c"
+    switch modem {
+    case .absent:
+        let products = quectelModels.map { String(format: "%04x", $0.product) }
+        return "modem: not attached (no USB device 2c7c with product "
+            + products.dropLast().joined(separator: ", ") + " or " + (products.last ?? "") + ")"
+    case .qmi(let number):
+        return "modem: \(name) attached, QMI interface \(number) (class, subclass, protocol ff)"
+    case .notQMI:
+        return "modem: \(name) attached, no interface with class, subclass, protocol ff (not in QMI mode)"
+    }
 }
 
 struct DriverStatus {

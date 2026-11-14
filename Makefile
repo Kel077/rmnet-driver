@@ -100,10 +100,12 @@ build/gpsread-tests: app/Nmea.swift app/GpsCommand.swift tests/app/GpsReadTests.
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 # The scripts' decisions that need neither the network nor an install: the install script's kept-app
-# and running-driver checks (scripts/install-checks.sh) and soak.sh's status classes (--classify).
+# and running-driver checks (scripts/install-checks.sh), soak.sh's status classes (--classify), and the
+# driver's personalities against the model list (scripts/check-personalities.sh).
 script-test:
 	sh tests/scripts/test-install-checks.sh
 	sh tests/scripts/test-soak-classify.sh
+	sh tests/scripts/test-personalities.sh
 
 # Unsigned build of the driver and the host app that embeds it. gen.rb writes RMNet.xcodeproj.
 XCODEBUILD := xcodebuild -project RMNet.xcodeproj -configuration Debug -parallelizeTargets \

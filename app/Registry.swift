@@ -4,8 +4,7 @@ import Foundation
 import IOKit
 
 let driverClass = "RMNetDriver"  // the driver's IOUserClass
-let modemVendor = 0x2C7C
-let modemProduct = 0x0801
+let modemVendor = 0x2C7C  // the products are in quectelModels (StatusModel.swift)
 
 func properties(of entry: io_registry_entry_t) -> [String: Any] {
     var props: Unmanaged<CFMutableDictionary>?
@@ -23,31 +22,39 @@ func firstService(_ className: String, withProperties match: [String: Any]) -> i
 
 func intValue(_ value: Any?) -> Int? { (value as? NSNumber)?.intValue }
 
-// Whether the modem is attached, and in QMI mode (an interface with class, subclass and protocol
-// 0xff), so "not installed", "modem not in QMI mode" and "attached" can be told apart.
-func readModem() -> ModemState {
-    let device = firstService("IOUSBHostDevice", withProperties: ["idVendor": modemVendor, "idProduct": modemProduct])
-    guard device != IO_OBJECT_NULL else { return .absent }
-    defer { IOObjectRelease(device) }
+// Whether a modem from quectelModels is attached (the first the list names, if several are), which
+// model it is (nil when none is), and whether it is in QMI mode: an interface with class, subclass
+// and protocol 0xff (the model's QMI interface number when that interface has them), so "not
+// installed", "modem not in QMI mode" and "attached" can be told apart.
+func readModemModel() -> (state: ModemState, model: QuectelModel?) {
+    for model in quectelModels {
+        let device = firstService("IOUSBHostDevice", withProperties: ["idVendor": modemVendor, "idProduct": model.product])
+        guard device != IO_OBJECT_NULL else { continue }
+        defer { IOObjectRelease(device) }
 
-    var qmiInterface: Int?
-    var children: io_iterator_t = 0
-    if IORegistryEntryGetChildIterator(device, kIOServicePlane, &children) == KERN_SUCCESS {
-        var child = IOIteratorNext(children)
-        while child != IO_OBJECT_NULL {
-            let p = properties(of: child)
-            if intValue(p["bInterfaceClass"]) == 0xff, intValue(p["bInterfaceSubClass"]) == 0xff,
-               intValue(p["bInterfaceProtocol"]) == 0xff {
-                qmiInterface = intValue(p["bInterfaceNumber"])
+        var qmiInterface: Int?
+        var children: io_iterator_t = 0
+        if IORegistryEntryGetChildIterator(device, kIOServicePlane, &children) == KERN_SUCCESS {
+            var child = IOIteratorNext(children)
+            while child != IO_OBJECT_NULL {
+                let p = properties(of: child)
+                if intValue(p["bInterfaceClass"]) == 0xff, intValue(p["bInterfaceSubClass"]) == 0xff,
+                   intValue(p["bInterfaceProtocol"]) == 0xff, let number = intValue(p["bInterfaceNumber"]),
+                   qmiInterface == nil || number == model.qmiInterface {
+                    qmiInterface = number
+                }
+                IOObjectRelease(child)
+                child = IOIteratorNext(children)
             }
-            IOObjectRelease(child)
-            child = IOIteratorNext(children)
+            IOObjectRelease(children)
         }
-        IOObjectRelease(children)
+        if let number = qmiInterface { return (.qmi(interface: number), model) }
+        return (.notQMI, model)
     }
-    if let number = qmiInterface { return .qmi(interface: number) }
-    return .notQMI
+    return (.absent, nil)
 }
+
+func readModem() -> ModemState { readModemModel().state }
 
 // The RMNet* properties of the driver's registry entry, as strings, or nil if it is not attached.
 func readDriverProperties() -> [String: String]? {

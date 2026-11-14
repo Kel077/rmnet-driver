@@ -11,15 +11,8 @@ import Foundation
 
 // MARK: - Command-line output
 
-func printModem(_ modem: ModemState) {
-    switch modem {
-    case .absent:
-        print("modem: 2c7c:0801 not attached")
-    case .qmi(let number):
-        print("modem: 2c7c:0801 attached, QMI interface \(number) (class, subclass, protocol ff)")
-    case .notQMI:
-        print("modem: 2c7c:0801 attached, no interface with class, subclass, protocol ff (not in QMI mode)")
-    }
+func printModem(_ modem: ModemState, _ model: QuectelModel?) {
+    print(modemLine(modem, model: model))
 }
 
 func printDriverEntry(_ driver: [String: String]?) {
@@ -34,7 +27,8 @@ func printDriverEntry(_ driver: [String: String]?) {
 }
 
 func printRegistry() {
-    printModem(readModem())
+    let (modem, model) = readModemModel()
+    printModem(modem, model)
     printDriverEntry(readDriverProperties())
 }
 

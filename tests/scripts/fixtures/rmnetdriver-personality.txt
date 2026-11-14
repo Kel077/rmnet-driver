@@ -1,0 +1,14 @@
+Dict {
+    IOClass = IOUserNetworkEthernet
+    CFBundleIdentifier = $(PRODUCT_BUNDLE_IDENTIFIER)
+    IOProviderClass = IOUSBHostInterface
+    idProduct = 2049
+    bConfigurationValue = 1
+    IOUserServerName = $(PRODUCT_BUNDLE_IDENTIFIER)
+    idVendor = 11388
+    CFBundleIdentifierKernel = com.apple.iokit.IOSkywalkFamily
+    RMNetProfile = 1
+    bInterfaceNumber = 4
+    RMNetFlowControl = 1
+    IOUserClass = RMNetDriver
+}

@@ -95,7 +95,10 @@ class CoreHost final : public rmnet::SessionDelegate {
   // profile: the data profile the session asks the modem for (SessionConfig::profile).
   // flow_control: whether the session asks the modem for in-band flow control
   // (SessionConfig::flow_control).
-  CoreHost(UsbPort& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile, bool flow_control);
+  // qmi_interface: the number of the USB interface the session runs on, which its requests name
+  // (SessionConfig::iface_number; 4 on the RM520N-GL).
+  CoreHost(UsbPort& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile, bool flow_control,
+           uint8_t qmi_interface);
   CoreHost(const CoreHost&) = delete;
   CoreHost& operator=(const CoreHost&) = delete;
 

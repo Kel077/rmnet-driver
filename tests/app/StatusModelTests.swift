@@ -1,5 +1,6 @@
 // Tests for app/StatusModel.swift: the headline, the advice, canRemoveDirectly, the removal texts,
-// the install confirmation, the table rows and the JSON form. Built with swiftc by `make app-test`; needs no Xcode project and no hardware.
+// the install confirmation, the table rows, the JSON form, the Quectel model list and the status verb's
+// modem line. Built with swiftc by `make app-test`; needs no Xcode project and no hardware.
 // Stops at the first failure, prints which check failed and exits 1.
 import Foundation
 
@@ -302,6 +303,36 @@ struct StatusModelTests {
         let unknownNone = tableRows(status([]), bundledVersion: "316.21.4", listingKnown: false)
         check(unknownNone[4].value == "unknown", "tableRows: an unknown listing with no last entry says unknown, not none",
               "\(unknownNone[4])")
+
+        // --- Quectel models ----------------------------------------------------------------------
+        let rm520 = quectelModel(product: 0x0801)
+        check(rm520?.qmiInterface == 4 && rm520?.tested == true && rm520?.names == "RM520N-GL",
+              "quectelModel: 0x0801 is the RM520N-GL, QMI interface 4, tested", "\(String(describing: rm520))")
+        let rg255c = quectelModel(product: 0x0316)
+        check(rg255c?.qmiInterface == 3 && rg255c?.tested == false && rg255c?.names == "RG255C",
+              "quectelModel: 0x0316 is the RG255C, QMI interface 3, untested", "\(String(describing: rg255c))")
+        let ec21 = quectelModel(product: 0x0121)
+        check(ec21?.qmiInterface == 4 && ec21?.tested == false, "quectelModel: 0x0121, QMI interface 4, untested",
+              "\(String(describing: ec21))")
+        check(quectelModel(product: 0x0125) == nil, "quectelModel: 0x0125 (matched by class only in the kernel) is not listed")
+        check(quectelModel(product: 0x1234) == nil, "quectelModel: an unknown product")
+        check(quectelModels.first?.product == 0x0801, "quectelModels: the RM520N-GL first, so it is found first")
+        check(quectelModels.filter { $0.tested }.map { $0.product } == [0x0801], "quectelModels: only the RM520N-GL is tested")
+        check(Set(quectelModels.map { $0.product }).count == quectelModels.count, "quectelModels: each product once")
+
+        // --- the status verb's modem line ------------------------------------------------------
+        let qmiLine = modemLine(.qmi(interface: 4), model: rm520)
+        check(qmiLine == "modem: 2c7c:0801 RM520N-GL attached, QMI interface 4 (class, subclass, protocol ff)",
+              "modemLine: the RM520N-GL in QMI mode", qmiLine)
+        let untestedLine = modemLine(.qmi(interface: 3), model: rg255c)
+        check(untestedLine == "modem: 2c7c:0316 RG255C (untested) attached, QMI interface 3 (class, subclass, protocol ff)",
+              "modemLine: an untested model in QMI mode", untestedLine)
+        let notQMILine = modemLine(.notQMI, model: ec21)
+        check(notQMILine == "modem: 2c7c:0121 EC21 Mini PCIe (untested) attached, no interface with class, subclass, protocol ff (not in QMI mode)",
+              "modemLine: an untested model not in QMI mode", notQMILine)
+        let absentLine = modemLine(.absent, model: nil)
+        check(absentLine == "modem: not attached (no USB device 2c7c with product 0801, 0121, 0191, 0195, 0296, 030e or 0316)",
+              "modemLine: no listed modem attached", absentLine)
 
         // --- property strings ------------------------------------------------------------------
         check(propertyString(NSNumber(value: 0)) == "0", "propertyString: number 0")

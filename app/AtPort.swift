@@ -6,7 +6,7 @@ import IOKit
 import IOUSBHost
 
 enum AtError: Error, Equatable {
-    case modemNotAttached      // no 2c7c:0801 on USB
+    case modemNotAttached      // no RM520N-GL (2c7c:0801) on USB: the AT port is used on that model only
     case noAtInterface         // the modem is there but has no interface 3 with two bulk endpoints
     case busy                  // another program holds the interface
     case io(Int32)             // an IOKit status from a transfer or the open

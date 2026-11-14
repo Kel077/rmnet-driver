@@ -40,8 +40,9 @@ bool SameSettings(const rmnet::RuntimeSettings& a, const rmnet::RuntimeSettings&
          memcmp(a.v6_dns, b.v6_dns, sizeof a.v6_dns) == 0 && a.v6_dns_count == b.v6_dns_count && a.mtu == b.mtu;
 }
 
-rmnet::SessionConfig MakeSessionConfig(uint8_t profile, bool flow_control) {
+rmnet::SessionConfig MakeSessionConfig(uint8_t profile, bool flow_control, uint8_t qmi_interface) {
   rmnet::SessionConfig cfg{};
+  cfg.iface_number = qmi_interface;
   cfg.profile = profile;
   cfg.flow_control = flow_control;
   return cfg;
@@ -69,10 +70,11 @@ const char* SessionStateName(rmnet::SessionState s) {
   return "?";
 }
 
-CoreHost::CoreHost(UsbPort& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile, bool flow_control)
+CoreHost::CoreHost(UsbPort& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile, bool flow_control,
+                   uint8_t qmi_interface)
     : usb_(usb),
       rx_(rx),
-      session_(MakeSessionConfig(profile, flow_control), *this),
+      session_(MakeSessionConfig(profile, flow_control, qmi_interface), *this),
       eth_(macs),
       agg_(nullptr, 0, 0, 0),
       uplink_slot_(-1),

@@ -30,7 +30,8 @@
 
 namespace {
 
-constexpr uint8_t kQmiInterfaceNumber = 4;
+// The RM520N-GL's QMI interface, used when the personality names none (ReadQmiInterface).
+constexpr uint8_t kDefaultQmiInterface = 4;
 constexpr uint8_t kVendorSpecific = 0xff;
 constexpr uint32_t kPacketCount = 512;
 constexpr uint32_t kPacketBufSize = 2048;  // one Ethernet frame per packet
@@ -43,6 +44,7 @@ constexpr uint32_t kMinMtu = 576;
 constexpr uint8_t kDefaultProfile = 1;
 constexpr const char* kProfileKey = "RMNetProfile";
 constexpr const char* kFlowControlKey = "RMNetFlowControl";
+constexpr const char* kInterfaceKey = "bInterfaceNumber";
 constexpr uint32_t kTxBatch = 32;
 constexpr uint32_t kTxHold = 256;  // sent packets the completion queue has not taken yet
 constexpr uint32_t kRxHold = 256;  // filled packets the completion queue has not taken yet
@@ -94,14 +96,42 @@ enum : uint32_t {
   kLogUplinkUsable = 1u << 31,
 };
 
-// True if the provider is the modem's QMI interface: number 4, class, subclass and protocol 0xff.
-bool IsQmiInterface(IOService* provider) {
+// The number of the modem's QMI interface, from the service's bInterfaceNumber property: the
+// personality in Info.plist that matched the provider names it (4 for the RM520N-GL, another number
+// for another model). An integer from 0 to 255; anything else, or no such property, gives 4, with a
+// log line. Start refuses a provider with any other number.
+uint8_t ReadQmiInterface(IOService* service) {
+  OSDictionary* props = nullptr;
+  kern_return_t ret = service->CopyProperties(&props);
+  uint8_t number = kDefaultQmiInterface;
+  if (ret != kIOReturnSuccess || !props) {
+    LOG("bInterfaceNumber: properties not readable (0x%x); using interface %u", ret, number);
+  } else {
+    OSObject* obj = props->getObject(kInterfaceKey);
+    OSNumber* num = OSDynamicCast(OSNumber, obj);
+    if (!obj) {
+      LOG("bInterfaceNumber: no such property; using interface %u", number);
+    } else if (!num) {
+      LOG("bInterfaceNumber: not an integer; using interface %u", number);
+    } else if (num->unsigned64BitValue() > 255) {
+      LOG("bInterfaceNumber: %llu is not from 0 to 255; using interface %u", num->unsigned64BitValue(), number);
+    } else {
+      number = static_cast<uint8_t>(num->unsigned64BitValue());
+    }
+  }
+  OSSafeReleaseNULL(props);
+  return number;
+}
+
+// True if the provider is the modem's QMI interface: number `number` (ReadQmiInterface), class,
+// subclass and protocol 0xff.
+bool IsQmiInterface(IOService* provider, uint8_t number) {
   IOUSBHostInterface* intf = OSDynamicCast(IOUSBHostInterface, provider);
   if (!intf) return false;
   const IOUSBConfigurationDescriptor* cfg = intf->CopyConfigurationDescriptor();
   if (!cfg) return false;
   const IOUSBInterfaceDescriptor* id = intf->GetInterfaceDescriptor(cfg);
-  bool ok = id && id->bInterfaceNumber == kQmiInterfaceNumber && id->bInterfaceClass == kVendorSpecific &&
+  bool ok = id && id->bInterfaceNumber == number && id->bInterfaceClass == kVendorSpecific &&
             id->bInterfaceSubClass == kVendorSpecific && id->bInterfaceProtocol == kVendorSpecific;
   IOUSBHostFreeDescriptor(cfg);
   return ok;
@@ -358,8 +388,9 @@ kern_return_t RMNetDriver::Start_Impl(IOService* provider) {
     LOG("super Start failed 0x%x", ret);
     return ret;
   }
-  if (!IsQmiInterface(provider)) {
-    LOG("not the QMI interface");
+  uint8_t qmiInterface = ReadQmiInterface(this);
+  if (!IsQmiInterface(provider, qmiInterface)) {
+    LOG("not the QMI interface (want number %u, class, subclass and protocol 0xff)", qmiInterface);
     ret = kIOReturnUnsupported;
   }
   if (ret == kIOReturnSuccess) ret = CopyDispatchQueue(kIOServiceDefaultQueueName, &ivars->queue);
@@ -383,7 +414,9 @@ kern_return_t RMNetDriver::Start_Impl(IOService* provider) {
     bool flowControl = ReadFlowControl(this);
     LOG("flow control %u", flowControl ? 1u : 0u);
     ivars->rxBridge = new RxBridge(this);
-    if (ivars->rxBridge) ivars->core = new CoreHost(*ivars->usb, *ivars->rxBridge, macs, profile, flowControl);
+    if (ivars->rxBridge) {
+      ivars->core = new CoreHost(*ivars->usb, *ivars->rxBridge, macs, profile, flowControl, qmiInterface);
+    }
     if (!ivars->core) ret = kIOReturnNoMemory;
   }
   if (ret == kIOReturnSuccess) ret = CreateInterface(macs.host);
