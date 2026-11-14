@@ -60,6 +60,8 @@ bool Session::flow_control_asked() const { return flow_asked_; }
 
 bool Session::flow_control_refused() const { return flow_refused_; }
 
+void Session::give_up_flow_control() { flow_refused_ = true; }
+
 void Session::start(uint64_t now_ms) {
   if (state_ != SessionState::Idle) return;
   begin_sync(now_ms);

@@ -986,3 +986,31 @@ TEST(a_failure_without_flow_control_is_as_before) {
     s.tick(20100); CHECK(s.state() == rmnet::SessionState::Backoff);
   }
 }
+
+TEST(a_refusal_is_remembered_across_a_backoff_redial) {
+  FakeModem m; rmnet::Session s(flow_config(), m); bring_up_to(s, m, kCtlGetWdaResp);
+  feed_frame(s, set_format_error_frame(1, m.last_txid(), kSomeError), 100);  // refused
+  feed_frame(s, set_format_error_frame(1, m.last_txid(), kSomeError), 200);  // the fallback fails too
+  CHECK(s.state() == rmnet::SessionState::Backoff);
+  s.tick(2200); CHECK(s.state() == rmnet::SessionState::Syncing);            // the redial, from backoff
+  feed_frame(s, answering_last(m, kCtlSyncResp), 2300);
+  feed_frame(s, answering_last(m, kCtlGetWdaResp), 2300);
+  CHECK_BYTES(m.last(), expected_request(m, kWdaSetFormatReq).c_str());
+  CHECK(!s.flow_control_asked()); CHECK(s.flow_control_refused());
+}
+
+TEST(giving_up_flow_control_omits_it_after_a_restart) {
+  FakeModem m; rmnet::Session s(flow_config(), m); bring_up_to(s, m, kCtlGetWdaResp);
+  feed_frame(s, granted_format_response(m.last_txid()), 100);
+  answer_from(s, m, 100, kCtlGetWds4Resp);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.cfg.format.flow_control, 1);
+  size_t sent = m.sent.size();
+  s.give_up_flow_control();
+  CHECK_EQ(m.sent.size(), sent); CHECK(s.state() == rmnet::SessionState::Up);   // sends nothing, changes nothing else
+  CHECK(s.flow_control_refused());
+  s.stop(); s.start(1000);
+  feed_frame(s, answering_last(m, kCtlSyncResp), 1100);
+  feed_frame(s, answering_last(m, kCtlGetWdaResp), 1100);
+  CHECK_BYTES(m.last(), expected_request(m, kWdaSetFormatReq).c_str());
+  CHECK(!s.flow_control_asked()); CHECK(s.flow_control_refused());
+}

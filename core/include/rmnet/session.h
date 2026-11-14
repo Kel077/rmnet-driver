@@ -110,6 +110,9 @@ class Session {
   SessionState state() const;
   bool flow_control_asked() const;    // the last Set Data Format request asked for flow control
   bool flow_control_refused() const;  // a request that asked for it failed; no later one asks
+  // Counts flow control as refused from now on, as a failed request would: no later Set Data Format
+  // request of this Session asks for it. Sends nothing and changes nothing else; any state.
+  void give_up_flow_control();
 
  private:
   // What the outstanding request is, so its response goes to the right handler.

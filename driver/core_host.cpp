@@ -254,11 +254,15 @@ void CoreHost::log_received(const uint8_t* data, size_t len) {
   if (m.hdr.service == rmnet::QmiService::WDA && m.hdr.msg_id == rmnet::kWdaSetDataFormat) {
     rmnet::DataFormat f;
     if (rmnet::parse_wda_data_format(m, &f)) {
-      // Logged before the session sees the answer, so flow_control_asked is about this request.
+      // "last request asked": the session's last Set Data Format request, which a late answer to an
+      // earlier one is not; logged before the session sees this answer.
       LOG("data format: link layer %u, ul agg %u (%u datagrams, %u bytes), dl agg %u (%u datagrams, %u bytes), "
-          "usable %d, flow control asked %u, modem says %u",
+          "usable %d, flow control: last request asked %u, modem says %u",
           f.link_layer, f.ul_agg, f.ul_max_datagrams, f.ul_max_size, f.dl_agg, f.dl_max_datagrams, f.dl_max_size,
-          rmnet::data_format_usable(f), session_.flow_control_asked() ? 1u : 0u, static_cast<unsigned>(f.flow_control));
+          rmnet::data_format_usable(f), session_.flow_control_asked() ? 1u : 0u,
+          static_cast<unsigned>(f.flow_control));
+    } else if (r.present && r.ok) {
+      LOG("data format not parsed (result ok)");
     } else {
       LOG("data format refused (error 0x%x)", r.error);
     }

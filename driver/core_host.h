@@ -125,6 +125,9 @@ class CoreHost final : public rmnet::SessionDelegate {
   rmnet::SessionState state() const { return session_.state(); }
   bool flow_control_asked() const { return session_.flow_control_asked(); }
   bool flow_control_refused() const { return session_.flow_control_refused(); }
+  // No later Set Data Format request of this session asks for flow control (Session::give_up_flow_control).
+  // Sends nothing; the driver calls it before the restart that a pause reaching kPauseMaxMs asks for.
+  void give_up_flow_control() { session_.give_up_flow_control(); }
 
   // The data path. None of these calls the Session.
   // Applying a link change: down clears the emulator's link and the uplink pause; up (also again

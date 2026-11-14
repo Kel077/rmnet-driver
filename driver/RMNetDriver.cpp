@@ -1185,7 +1185,9 @@ void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
 // kTxQueueCapacity or, if the system refused that, kQueueCapacity (not a counter; it never changes).
 // In-band flow control (not counters either): RMNetFlowControlAsked is 1 if the last Set Data Format
 // request asked for it, RMNetFlowControlRefused 1 once the modem refused it (no later request asks),
-// and RMNetFlowControlOn the modem's answer in the data format in use.
+// and RMNetFlowControlOn the modem's answer in the data format in use now: 0 whenever the session is
+// not up. RMNetFlowControlRefused also becomes 1 when the driver gives flow control up after a pause
+// that reached kPauseMaxMs.
 void RMNetDriver::PublishCounters() {
   const DataCounters& c = ivars->core->counters();
   uint32_t txPending = ivars->txPendingCount - ivars->txPendingNext;
@@ -1193,6 +1195,8 @@ void RMNetDriver::PublishCounters() {
   uint32_t poolCount = 0;
   kern_return_t pret = ivars->pool ? ivars->pool->GetPacketCount(&poolCount) : kIOReturnNotReady;
   LOG_FIRST(kLogPoolCount, "pool GetPacketCount: %u (0x%x)", poolCount, pret);
+  bool flowControlOn =
+      ivars->core->state() == rmnet::SessionState::Up && ivars->core->link_config().format.flow_control != 0;
   struct Entry {
     const char* key;
     uint64_t value;
@@ -1253,7 +1257,7 @@ void RMNetDriver::PublishCounters() {
       {"RMNetTxQueueCapacity", ivars->txQueueCapacity},
       {"RMNetFlowControlAsked", ivars->core->flow_control_asked() ? 1u : 0u},
       {"RMNetFlowControlRefused", ivars->core->flow_control_refused() ? 1u : 0u},
-      {"RMNetFlowControlOn", ivars->core->link_config().format.flow_control != 0 ? 1u : 0u},
+      {"RMNetFlowControlOn", flowControlOn ? 1u : 0u},
   };
   bool changed = !ivars->countersPublished;
   for (uint32_t i = 0; i < kCounterCount; i++) {
@@ -1375,7 +1379,16 @@ void RMNetDriver::TimerFired_Impl(OSAction*, uint64_t) {
     ApplyCore();
   }
   ivars->core->data_tick(now);
-  if (ivars->core->take_restart_wanted()) RestartSession("uplink paused with no flow enable");
+  if (ivars->core->take_restart_wanted()) {
+    // A pause that never ends must not repeat after every restart: the restarted session does not
+    // ask for flow control again.
+    if (ivars->core->flow_control_asked()) {
+      ivars->core->give_up_flow_control();
+      LOG("flow control given up: the uplink stayed paused for %u s with no flow enable",
+          (unsigned)(kPauseMaxMs / 1000));
+    }
+    RestartSession("uplink paused with no flow enable");
+  }
   FlushRx();
   if (ivars->txHeld || ivars->txWaitUplink || ivars->txDoneCount > 0) DrainTx();
   if (++ivars->ticks % kCounterTicks == 0) PublishCounters();
