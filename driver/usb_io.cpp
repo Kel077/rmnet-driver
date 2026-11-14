@@ -109,6 +109,7 @@ UsbIo::UsbIo(UsbIoListener& listener)
       out_recoveries_(0),
       in_recovery_ticks_(0),
       out_recovery_ticks_(0),
+      out_timeouts_(0),
       head_(0),
       count_(0),
       out_busy_(false),
@@ -119,6 +120,7 @@ UsbIo::UsbIo(UsbIoListener& listener)
       intr_failures_(0),
       phase_(Phase::Running),
       failed_(false),
+      gone_(false),
       send_failed_(false),
       sent_at_stop_(0),
       dropped_at_stop_(0) {}
@@ -290,6 +292,7 @@ void UsbIo::submit_next() {
       out_busy_ = true;
       return;
     }
+    note(ret);
     LOG("control request 0x%02x not submitted: 0x%x", s.request, ret);
     head_ = (head_ + 1) % kRingSlots;
     count_--;
@@ -303,6 +306,7 @@ void UsbIo::submit_next() {
 
 void UsbIo::control_out_complete(IOReturn status, uint32_t) {
   out_busy_ = false;
+  note(status);
   if (count_ > 0) {
     uint8_t request = slots_[head_].request;
     head_ = (head_ + 1) % kRingSlots;
@@ -327,11 +331,13 @@ void UsbIo::control_out_complete(IOReturn status, uint32_t) {
 kern_return_t UsbIo::post_interrupt() {
   kern_return_t ret = intr_in_->AsyncIO(intr_buf_, intr_size_, intr_action_, 0);  // 0: interrupt endpoint
   if (ret == kIOReturnSuccess) intr_busy_ = true;
+  note(ret);
   return ret;
 }
 
 void UsbIo::interrupt_complete(IOReturn status, uint32_t bytes) {
   intr_busy_ = false;
+  note(status);
   if (phase_ != Phase::Running) return;  // not re-posted while stopping
   if (status != kIOReturnSuccess) {
     intr_failures_++;
@@ -370,6 +376,7 @@ void UsbIo::post_response_read() {
   kern_return_t ret = intf_->AsyncDeviceRequest(kInterfaceToHostClass, kGetEncapsulatedResponse, 0, iface_number_,
                                                 kResponseSize, in_buf_, in_action_, kControlTimeoutMs);
   if (ret != kIOReturnSuccess) {
+    note(ret);
     // The drain ends here. A notification noted during it is dropped with it: with no read in
     // flight, the next notification starts a fresh drain.
     LOG("response read not submitted: 0x%x", ret);
@@ -382,6 +389,7 @@ void UsbIo::post_response_read() {
 
 void UsbIo::control_in_complete(IOReturn status, uint32_t bytes) {
   in_busy_ = false;
+  note(status);
   if (phase_ != Phase::Running) return;  // Core is not called once stopping
   if (status == kIOReturnSuccess && bytes > 0) {
     deliver(bytes);
@@ -437,6 +445,7 @@ void UsbIo::post_read(uint32_t i) {
     reads_busy_++;
     return;
   }
+  note(ret);
   LOG("bulk read %u not posted: 0x%x", i, ret);
   fail("bulk read could not be posted");
 }
@@ -453,6 +462,7 @@ void UsbIo::bulk_in_complete(uint32_t i, IOReturn status, uint32_t bytes) {
   if (i >= kBulkReads || !read_busy_[i]) return;
   read_busy_[i] = false;
   reads_busy_--;
+  note(status);
   // Not delivered or re-posted while stopping, nor after a fatal failure (the session is over).
   if (phase_ != Phase::Running || failed_) return;
   if (status == kIOReturnSuccess) {
@@ -551,6 +561,7 @@ bool UsbIo::send_uplink(int slot, uint32_t len) {
   }
   kern_return_t ret = bulk_out_->AsyncIO(uplink_buf_[slot], len, uplink_action_[slot], kUplinkTimeoutMs);
   if (ret != kIOReturnSuccess) {
+    note(ret);
     uplink_[slot] = Uplink::Free;
     stats_.bulk_out_errors++;
     if (Worth(stats_.bulk_out_errors)) {
@@ -570,13 +581,19 @@ bool UsbIo::send_uplink(int slot, uint32_t len) {
 // A failure that halts the endpoint starts a recovery of the pipe, as for bulk IN: no uplink
 // transfer is started (acquire_uplink gives none), the pipe is aborted asynchronously, and once
 // no transfer is in flight the stall is cleared. kMaxRecoveries in a row with no successful
-// transfer between them is fatal. Aborts and timeouts leave the endpoint usable.
+// transfer between them is fatal. Aborts and timeouts leave the endpoint usable. A timeout
+// (kUplinkTimeoutMs) means the modem did not take the data: kUplinkTimeoutsFatal of them in a row
+// with no successful transfer between them is fatal, so an uplink that only ever times out cannot
+// stay up (the drain would otherwise refill the freed buffers forever).
 void UsbIo::bulk_out_complete(uint32_t i, IOReturn status, uint32_t) {
   if (i >= kUplinkSlots || uplink_[i] != Uplink::InFlight) return;
   uplink_[i] = Uplink::Free;
   uplinks_busy_--;
+  note(status);
   bool ok = status == kIOReturnSuccess;
+  bool timed_out = status == kIOReturnTimeout;
   bool expected_abort = status == kIOReturnAborted && out_recovering_;
+  if (timed_out) stats_.bulk_out_timeouts++;
   if (!ok && !expected_abort) {
     stats_.bulk_out_errors++;
     if (phase_ == Phase::Running && Worth(stats_.bulk_out_errors)) {
@@ -584,11 +601,22 @@ void UsbIo::bulk_out_complete(uint32_t i, IOReturn status, uint32_t) {
     }
   }
   if (phase_ != Phase::Running || failed_) return;  // the owner is not called while stopping
-  if (ok) out_recoveries_ = 0;
+  if (ok) {
+    out_recoveries_ = 0;
+    out_timeouts_ = 0;
+  } else if (timed_out) {
+    out_timeouts_++;
+  }
   listener_.on_bulk_out_done(static_cast<int>(i), ok);
   if (phase_ != Phase::Running || failed_) return;
   if (Gone(status)) {
     fail("bulk out: device not attached");
+    return;
+  }
+  if (out_timeouts_ >= kUplinkTimeoutsFatal) {
+    LOG("uplink: %u transfers in a row timed out after %u ms (%llu timeouts)", out_timeouts_,
+        kUplinkTimeoutMs, stats_.bulk_out_timeouts);
+    fail("uplink is not accepting data");
     return;
   }
   if (Halts(status) && !out_recovering_) begin_out_recovery();
@@ -639,6 +667,11 @@ void UsbIo::end_out_recovery() {
 }
 
 // --- Stopping ----------------------------------------------------------------------------------------
+
+// Remembers that the device has gone, from any request's completion status or submission result.
+void UsbIo::note(IOReturn status) {
+  if (Gone(status)) gone_ = true;
+}
 
 void UsbIo::fail(const char* what) {
   if (failed_) return;

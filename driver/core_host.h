@@ -18,6 +18,8 @@
 // recovering) is kept, up to kKeptReplies in order, and sent when a transfer completes
 // (on_bulk_out_done, before the driver restarts its drain) or on data_tick. Kept replies are
 // discarded, and counted as reply drops, on a link down, at stop and on drop_kept_replies.
+// A pause that no flow enable lifts within kPauseMaxMs (timed by data_tick) makes CoreHost ask the
+// driver for a session restart (take_restart_wanted); it never restarts the session itself.
 // No per-packet logging: counters carry it.
 #pragma once
 
@@ -74,12 +76,16 @@ struct DataCounters {
   uint64_t command_replies;    // replies sent
   uint64_t command_reply_drops;  // replies not sent: none could be kept (store full, or too big
                                  // for a kept slot), the send failed, or a kept one was discarded
+  uint64_t uplink_pause_timeouts;  // pauses not lifted within kPauseMaxMs (each asked for a restart)
 };
 
 enum : uint32_t {
   kKeptReplies = 4,       // command replies kept while no uplink buffer is free
   kKeptReplyBytes = 64,   // each: a flow control reply is 4 + 16 bytes; larger ones are not kept
 };
+
+// The longest the uplink may stay paused by a QMAP flow disable before the session is restarted.
+enum : uint32_t { kPauseMaxMs = 30000 };
 
 class CoreHost final : public rmnet::SessionDelegate {
  public:
@@ -92,6 +98,17 @@ class CoreHost final : public rmnet::SessionDelegate {
   void stop();
   void tick(uint64_t now_ms);
   void on_control(const uint8_t* data, size_t len, uint64_t now_ms);  // one QMUX frame
+  // Stops the session and starts it again from sync. Safe whatever the session's state: idle (it
+  // only starts), starting, up or in backoff. In between, the data path's link state is cleared as
+  // a link down clears it (data_link_down): the emulator loses its link, the pause is lifted (so
+  // take_uplink_resumed is true afterwards if the uplink was paused, and the driver's drain runs),
+  // and the kept command replies are discarded and counted as reply drops. The open uplink buffer
+  // is released unsent, its packets counted as tx_drop_link_down. A pending restart wish is
+  // cleared. If the link was up, take_link_change then reports a link down (and no up: the new
+  // session reports its own link up when the call comes up). Frames the driver keeps (its transmit
+  // hold) go through transmit afterwards as usual and are dropped as link down. The caller applies
+  // the link change afterwards, as after any Core call; must not be called from a Core callback.
+  void restart(uint64_t now_ms);
 
   // Link changes since the last call, in the order to apply them: down first (the link went
   // down), then up (the link is up with link_config(); also a family added while already up).
@@ -110,9 +127,12 @@ class CoreHost final : public rmnet::SessionDelegate {
   // format, starts the bulk reads, and sends a router advertisement if IPv6 is new.
   void data_link_down();
   void data_link_up(uint64_t now_ms);
-  // Sends kept command replies a buffer is free for; then the periodic router advertisement,
-  // every kRouterAdvertMs while up with IPv6.
+  // Sends kept command replies a buffer is free for; times a pause (kPauseMaxMs, then a restart
+  // is wanted); then the periodic router advertisement, every kRouterAdvertMs while up with IPv6.
   void data_tick(uint64_t now_ms);
+  // True once after data_tick found the uplink paused for kPauseMaxMs: the driver should restart
+  // the session (restart), after the Core call has returned. Only data_tick sets it.
+  bool take_restart_wanted();
   void on_bulk_in(const uint8_t* data, size_t len);
   void on_bulk_out_done(int slot, bool ok);
   // One frame from the host. False only when it needs an uplink buffer and all are in flight:
@@ -150,6 +170,7 @@ class CoreHost final : public rmnet::SessionDelegate {
   bool open_uplink();
   bool count_no_uplink();
   void send_uplink();
+  void drop_open_uplink();
   void set_paused(bool paused);
 
   UsbIo& usb_;
@@ -166,6 +187,10 @@ class CoreHost final : public rmnet::SessionDelegate {
   bool data_v6_;           // ... and whether it had IPv6
   bool paused_;            // the modem sent flow disable
   bool resumed_;
+  bool pause_timed_;       // paused_, and pause_start_ms_ is the first data_tick that saw it
+  bool pause_expired_;     // this pause already asked for a restart
+  uint64_t pause_start_ms_;
+  bool restart_wanted_;
   uint64_t last_advert_ms_;
   DataCounters counters_;
   bool logged_first_command_;

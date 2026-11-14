@@ -65,6 +65,8 @@ public:
     kern_return_t CreateInterface(const uint8_t * hostMac) LOCALONLY;
     kern_return_t StartTimer() LOCALONLY;
     void ArmTimer() LOCALONLY;
+    void EnsureTimer() LOCALONLY;
+    void RestartSession(const char * why) LOCALONLY;
     void TearDown(IOService * provider) LOCALONLY;
     void AdvanceStop() LOCALONLY;
     void FinishStop() LOCALONLY;

@@ -47,6 +47,10 @@ enum : uint32_t {
   kMaxUplink = 16384,    // the largest uplink transfer Core accepts
 };
 
+// Bulk OUT transfers that ended in their timeout (kUplinkTimeoutMs, 5 s), in a row with no
+// successful transfer between them, after which the uplink is given up (on_fatal).
+enum { kUplinkTimeoutsFatal = 3 };
+
 // Completion actions made by the driver (its CreateAction* methods). UsbIo takes a reference
 // to each and releases it with the other USB objects. Each bulk action carries its slot index
 // as a uint32_t in its reference area.
@@ -67,6 +71,7 @@ struct UsbIoStats {
   // Reads that came back filled to their length: the read size, not the modem's aggregation,
   // ended the transfer.
   uint64_t full_reads;
+  uint64_t bulk_out_timeouts;  // uplink transfers that ended in their timeout (also in bulk_out_errors)
 };
 
 class UsbIo {
@@ -91,7 +96,9 @@ class UsbIo {
   // A bulk pipe whose endpoint halts is recovered without blocking: nothing new is posted on it,
   // it is aborted asynchronously, and ClearStall runs only once nothing is pending on it. While
   // bulk OUT recovers, acquire_uplink gives no buffer (uplink_recovering() says why). A failed
-  // abort, or a recovery not finished within about 1 s (tick), is fatal.
+  // abort, or a recovery not finished within about 1 s (tick), is fatal. A timed-out uplink
+  // transfer does not halt the pipe; kUplinkTimeoutsFatal of them in a row, with no successful
+  // transfer between, are fatal ("uplink is not accepting data").
   //
   // Bulk IN: posts every idle read, each `read_len` bytes (rounded up to the endpoint's packet
   // size, at most kMaxDownlink). Later re-posts use the newest length. Reads keep being re-posted
@@ -106,6 +113,9 @@ class UsbIo {
   bool send_uplink(int slot, uint32_t len);
   void release_uplink(int slot);
   bool uplink_recovering() const { return out_recovering_; }
+  // True once any request or submission has returned not-attached or no-device: the device has
+  // gone (a re-enumeration or an unplug), as opposed to a failure of a device still present.
+  bool device_gone() const { return gone_; }
   // Called by the owner every 100 ms while running: bounds a pipe recovery to about 1 s, after
   // which it is fatal. Does nothing once finish_sending or abort has been called.
   void tick();
@@ -166,6 +176,7 @@ class UsbIo {
   void begin_out_recovery();
   void end_out_recovery();
   void fail(const char* what);
+  void note(IOReturn status);
   void release();
 
   UsbIoListener& listener_;
@@ -212,6 +223,7 @@ class UsbIo {
   uint32_t out_recoveries_;  // recoveries in a row with no successful transfer between
   uint32_t in_recovery_ticks_;   // ticks since the current bulk IN recovery began
   uint32_t out_recovery_ticks_;  // ticks since the current bulk OUT recovery began
+  uint32_t out_timeouts_;  // bulk OUT timeouts in a row with no successful transfer between
   uint32_t head_;   // oldest queued slot
   uint32_t count_;  // queued slots, the head one in flight when out_busy_
   bool out_busy_;
@@ -223,6 +235,7 @@ class UsbIo {
   enum class Phase : uint8_t { Running, Draining, Aborted, Released };
   Phase phase_;
   bool failed_;
+  bool gone_;  // a status said the device is not attached (device_gone)
   bool send_failed_;         // a control request failed while draining
   uint32_t sent_at_stop_;    // messages sent after finish_sending
   uint32_t dropped_at_stop_; // messages not sent after finish_sending

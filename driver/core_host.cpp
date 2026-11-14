@@ -84,6 +84,10 @@ CoreHost::CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t p
       data_v6_(false),
       paused_(false),
       resumed_(false),
+      pause_timed_(false),
+      pause_expired_(false),
+      pause_start_ms_(0),
+      restart_wanted_(false),
       last_advert_ms_(0),
       counters_(),
       logged_first_command_(false),
@@ -110,6 +114,17 @@ void CoreHost::stop() {
   session_.stop();
   note_state();
   drop_kept_replies();
+}
+
+void CoreHost::restart(uint64_t now_ms) {
+  LOG("session restart from %{public}s", SessionStateName(session_.state()));
+  session_.stop();  // records a link down if the link was up; queues the releases
+  note_state();
+  drop_open_uplink();
+  data_link_down();
+  restart_wanted_ = false;
+  session_.start(now_ms);
+  note_state();
 }
 
 void CoreHost::tick(uint64_t now_ms) {
@@ -272,6 +287,17 @@ void CoreHost::data_link_up(uint64_t now_ms) {
 
 void CoreHost::data_tick(uint64_t now_ms) {
   send_kept_replies();  // the backstop: a completion normally sends them first
+  // A pause is timed from the first tick that sees it (at most one tick late).
+  if (paused_ && !pause_timed_) {
+    pause_timed_ = true;
+    pause_start_ms_ = now_ms;
+  }
+  if (paused_ && !pause_expired_ && now_ms - pause_start_ms_ >= kPauseMaxMs) {
+    pause_expired_ = true;
+    restart_wanted_ = true;
+    counters_.uplink_pause_timeouts++;
+    LOG("uplink paused for %u ms with no flow enable: session restart wanted", (unsigned)kPauseMaxMs);
+  }
   if (!data_up_ || !data_v6_) return;
   if (now_ms - last_advert_ms_ < kRouterAdvertMs) return;
   send_router_advert();
@@ -437,9 +463,17 @@ void CoreHost::send_reply(int slot, size_t len) {
   }
 }
 
+bool CoreHost::take_restart_wanted() {
+  bool r = restart_wanted_;
+  restart_wanted_ = false;
+  return r;
+}
+
 void CoreHost::set_paused(bool paused) {
   if (paused == paused_) return;
   paused_ = paused;
+  pause_timed_ = false;
+  pause_expired_ = false;
   if (!paused) resumed_ = true;
   LOG("uplink %{public}s", paused ? "paused (flow disable)" : "resumed");
 }
@@ -550,3 +584,14 @@ void CoreHost::send_uplink() {
 }
 
 void CoreHost::flush_uplink() { send_uplink(); }
+
+// The open uplink buffer is given back unsent; its packets count as dropped for link down.
+void CoreHost::drop_open_uplink() {
+  int slot = uplink_slot_;
+  if (slot < 0) return;
+  uplink_slot_ = -1;
+  counters_.tx_drop_link_down += slot_packets_[slot];
+  slot_packets_[slot] = 0;
+  slot_bytes_[slot] = 0;
+  usb_.release_uplink(slot);
+}

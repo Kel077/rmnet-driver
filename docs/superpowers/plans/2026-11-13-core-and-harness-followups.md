@@ -51,7 +51,9 @@ Line references were at commit `680948c`; since the code has moved, they are now
 
 Port up but passing nothing (belongs with the Up-state liveness work):
 - A bulk OUT that only ever times out is never escalated: a 5 s timeout frees the buffer and counts `RMNetTxDropUsb`, and nothing counts consecutive ones (`kUplinkTimeoutMs` and `Halts` in `driver/usb_io.cpp`, `UsbIo::bulk_out_complete`).
+  - **Settled in code (2026-11-14, 317.8.44), not seen on hardware.** `kUplinkTimeoutsFatal` (3) timeouts in a row with no successful bulk OUT between them call `on_fatal("uplink is not accepting data")`; `RMNetUsbBulkOutTimeouts` counts every timeout.
 - A QMAP flow disable never followed by an enable pauses the uplink for good (`CoreHost::on_command` and `CoreHost::set_paused`, `driver/core_host.cpp`).
+  - **Settled in code (2026-11-14, 317.8.44), not seen on hardware.** A pause not lifted within `kPauseMaxMs` (30 s, timed by `data_tick`) asks the driver to restart the session (`CoreHost::take_restart_wanted`, `RMNetDriver::RestartSession`, `CoreHost::restart`); `RMNetUplinkPauseTimeouts` counts them. No command frame has ever arrived, so this has never run.
 
 Carrier MTU:
 - A carrier MTU below 1500 never reaches the interface for IPv4: `setMaxTransferUnit` returns Unsupported and `getMaxTransferUnit` is read only at registration (`RMNetDriver::ApplyCore` and `RMNetDriver::getMaxTransferUnit`, `driver/RMNetDriver.cpp`); the router advertisement covers IPv6. Latent: every call so far had 1500.
@@ -90,7 +92,9 @@ Small hardening left open:
 - The install script's stop check sees only the `activated enabled` entry.
 - `PrefixLength` is duplicated, and it and `FormatIPv6` are untested.
 - "usb failed" is published for about 4 s on re-enumeration.
+  - **Settled in code (2026-11-14, 317.8.44).** `RMNetState` says `detached` instead when UsbIo had seen a not-attached or no-device status (`UsbIo::device_gone`). Not yet seen: the instance replaced at the 317.8.44 load was the older 316.19.56, which still said `usb failed`; the next reload is the first that can show it.
 - A failed `WakeAtTime` ends all ticks, and while stopping can stall `Stop`. Since the uplink-hold plan's fix wave it matters more: `TxPacketsAvailable_Impl` returns early while a hold is on, so after a failed bulk OUT completion, the end of a recovery or a link down, the 100 ms tick is the only thing that restarts a held drain. With no tick and no transfer in flight, the uplink would stay held for good. Not seen.
+  - **Settled in code (2026-11-14, 317.8.44), not seen on hardware.** A failed arm is remembered and `RMNetDriver::EnsureTimer` retries it from every completion handler, `TxPacketsAvailable_Impl` and `RxPacketsAvailable_Impl`, also while stopping, never after the stop sequence has cancelled the timer; `RMNetTimerArmFailures` counts failures. Left open: if the arm fails while stopping and no request ever completes again, the stop still waits (the deadlines need a tick).
 - The first-time log line "first qmap command reply kept" (`CoreHost::keep_reply`), like `first qmap command` and `first uplink transfer`, can fall inside a bulk-read handler that `RMNetRxHandlerMaxUs` times, so one of them could set the maximum once.
 - `docs/driverkit-notes.md` says build 316.19.9 "saw about 860" drains that did nothing during the burst. That figure is an estimate (999 refused offers minus 135 transfers), not a count.
 - Packets held at `Stop` are abandoned (watch the driver process's memory in the soak).

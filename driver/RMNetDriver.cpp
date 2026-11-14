@@ -195,7 +195,7 @@ struct RxBridge final : RxSink {
 };
 
 // What PublishCounters last published, in its order.
-enum : uint32_t { kCounterCount = 41 };
+enum : uint32_t { kCounterCount = 44 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -208,6 +208,8 @@ struct RMNetDriver_IVars {
   OSAction* rxAvailAction;
   IOTimerDispatchSource* timer;
   OSAction* timerAction;
+  bool timerArmFailed;         // the last WakeAtTime failed: no tick is due (EnsureTimer retries)
+  uint64_t timerArmFailures;   // WakeAtTime failures since Start
   UsbBridge* bridge;
   RxBridge* rxBridge;
   UsbIo* usb;       // released objects only once its aborted completions have arrived
@@ -220,6 +222,7 @@ struct RMNetDriver_IVars {
   uint64_t stopStartMs;
   uint64_t abortStartMs;
   bool usbFailed;
+  bool usbDetached;  // usbFailed, and UsbIo had seen the device gone (not attached / no device)
   bool coreStopped;  // session.stop() was called; the Session is not called again
   bool linkActive;  // the link status last reported to the stack
   uint32_t mtu;     // what getMaxTransferUnit answers
@@ -445,10 +448,30 @@ kern_return_t RMNetDriver::StartTimer() {
   return ret;
 }
 
-// The timer is one-shot: re-armed after every tick.
+// The timer is one-shot: re-armed after every tick. A failure is remembered (timerArmFailed) and
+// EnsureTimer tries again from every other entry into the driver; until one succeeds no tick is due.
 void RMNetDriver::ArmTimer() {
   kern_return_t ret = ivars->timer->WakeAtTime(kIOTimerClockUptimeRaw, NowNs() + kTickNs, kTickLeewayNs);
-  if (ret != kIOReturnSuccess) LOG("timer not armed: 0x%x", ret);
+  if (ret == kIOReturnSuccess) {
+    if (ivars->timerArmFailed) LOG("timer armed again after %llu failures", ivars->timerArmFailures);
+    ivars->timerArmFailed = false;
+    return;
+  }
+  ivars->timerArmFailed = true;
+  ivars->timerArmFailures++;
+  uint64_t n = ivars->timerArmFailures;
+  if ((n & (n - 1)) == 0) LOG("timer not armed: 0x%x (%llu failures)", ret, n);
+}
+
+// Called from every completion handler, TxPacketsAvailable and RxPacketsAvailable: if the last arm
+// failed, the timer is armed again, so the tick (Core's tick, the counters, the stall-recovery
+// deadline, the held drain, and while stopping the two deadlines of AdvanceStop) resumes. Never
+// once the stop sequence is done (FinishStop sets kStopDone before it cancels the timer), so a
+// cancelled timer is never armed.
+void RMNetDriver::EnsureTimer() {
+  if (!ivars || !ivars->timerArmFailed || !ivars->timer) return;
+  if (ivars->stopPhase == RMNetDriver_IVars::kStopDone) return;
+  ArmTimer();
 }
 
 // The stop sequence, shared by Stop and a failed Start (docs/driverkit-notes.md 3.9):
@@ -518,6 +541,7 @@ void RMNetDriver::AdvanceStop() {
 
 void RMNetDriver::FinishStop() {
   ivars->stopPhase = RMNetDriver_IVars::kStopDone;
+  ivars->timerArmFailed = false;  // the timer is cancelled: nothing arms it again (EnsureTimer)
   if (ivars->timer) ivars->timer->Cancel(^{});
   IOService* provider = ivars->stopProvider;
   ivars->stopProvider = nullptr;
@@ -557,16 +581,37 @@ void RMNetDriver::OnControl(const uint8_t* data, size_t len) {
   ApplyCore();
 }
 
-// The control channel stopped for good (the interrupt read keeps failing). The session cannot
-// continue: stop it and report the link down. It is not restarted; a re-enumeration starts afresh.
+// USB stopped for good (the interrupt read keeps failing, a bulk pipe cannot be recovered, the
+// uplink keeps timing out, the device has gone). The session cannot continue: stop it and report
+// the link down. It is not restarted; a re-enumeration starts afresh. RMNetState says "detached"
+// rather than "usb failed" when UsbIo had seen a not-attached or no-device status by then: the
+// device went away (every modem reboot shows this a few seconds before Stop).
 void RMNetDriver::OnUsbFatal(const char* what) {
-  LOG("usb failed: %{public}s", what);
+  bool gone = ivars->usb && ivars->usb->device_gone();
+  LOG("usb failed: %{public}s%{public}s", what, gone ? " (device gone)" : "");
   ivars->usbFailed = true;
+  ivars->usbDetached = gone;
   if (ivars->stopping || !ivars->core) return;
   ivars->core->drop_kept_replies();  // they will never find an uplink buffer (not the Session)
   if (ivars->coreStopped) return;
   ivars->coreStopped = true;
   ivars->core->stop();
+  ApplyCore();
+}
+
+// Stops the session and starts it again from sync (CoreHost::restart), then applies the link down
+// it recorded, so the port reports link down, and link up again when the new call comes up. The one
+// case where the Session is called after a stop. Never while stopping, after a fatal USB error, or
+// once the session was stopped for good (coreStopped, which only those two set): the wish is then
+// dropped, with a log line. Called only after a Core call has returned, never from a Core callback.
+void RMNetDriver::RestartSession(const char* why) {
+  if (!ivars->core || ivars->stopping || ivars->usbFailed || ivars->coreStopped) {
+    LOG("session restart (%{public}s) not made: %{public}s", why,
+        ivars->stopping ? "stopping" : (ivars->usbFailed ? "usb failed" : "session stopped"));
+    return;
+  }
+  LOG("session restart: %{public}s", why);
+  ivars->core->restart(NowMs());
   ApplyCore();
 }
 
@@ -630,7 +675,9 @@ void RMNetDriver::PublishStatus() {
   char state[24];
   char v4[64] = "none";
   char v6[80] = "none";
-  snprintf(state, sizeof state, "%s", ivars->usbFailed ? "usb failed" : SessionStateName(ivars->core->state()));
+  const char* name = SessionStateName(ivars->core->state());
+  if (ivars->usbFailed) name = ivars->usbDetached ? "detached" : "usb failed";
+  snprintf(state, sizeof state, "%s", name);
   if (ivars->linkActive) {
     const rmnet::RuntimeSettings& s = ivars->core->link_config().settings;
     if (s.has_v4) FormatIPv4(s, v4, sizeof v4);
@@ -745,6 +792,7 @@ IOReturn RMNetDriver::setPowerState(unsigned long powerState, IOService* whatDev
 // (OnBulkOutDone) or the timer tick restarts the drain.
 void RMNetDriver::TxPacketsAvailable_Impl(OSAction*) {
   LOG_FIRST(kLogTxAvailable, "TxPacketsAvailable");
+  EnsureTimer();
   if (ivars->txWaitUplink) {
     FlushTxDone();
     return;
@@ -755,6 +803,7 @@ void RMNetDriver::TxPacketsAvailable_Impl(OSAction*) {
 // Empty receive packets arrived; also a chance to hand up filled ones the queue refused before.
 void RMNetDriver::RxPacketsAvailable_Impl(OSAction*) {
   LOG_FIRST(kLogRxAvailable, "RxPacketsAvailable");
+  EnsureTimer();
   if (ivars->stopping) return;
   FlushRx();
 }
@@ -905,7 +954,9 @@ void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
 // RMNetRxHandlerTotalUs are the longest and the summed bulk read handler time; divided by
 // RMNetRxTransfers, the total gives the mean (the transfers handled before the receive path's
 // first log lines are not timed). RMNetQmapCommandRepliesKept is the command replies CoreHost
-// keeps now for want of an uplink buffer, from 0 to kKeptReplies.
+// keeps now for want of an uplink buffer, from 0 to kKeptReplies. RMNetTimerArmFailures counts failed
+// WakeAtTime calls; RMNetUsbBulkOutTimeouts uplink transfers that ended in their 5 s timeout;
+// RMNetUplinkPauseTimeouts QMAP pauses that lasted kPauseMaxMs and asked for a session restart.
 void RMNetDriver::PublishCounters() {
   const DataCounters& c = ivars->core->counters();
   uint32_t txPending = ivars->txPendingCount - ivars->txPendingNext;
@@ -959,6 +1010,9 @@ void RMNetDriver::PublishCounters() {
       {"RMNetRxHandlerMaxUs", ivars->rxHandlerMaxNs / 1000},
       {"RMNetRxHandlerTotalUs", ivars->rxHandlerTotalNs / 1000},
       {"RMNetQmapCommandRepliesKept", ivars->core->kept_replies()},
+      {"RMNetTimerArmFailures", ivars->timerArmFailures},
+      {"RMNetUsbBulkOutTimeouts", u.bulk_out_timeouts},
+      {"RMNetUplinkPauseTimeouts", c.uplink_pause_timeouts},
   };
   bool changed = !ivars->countersPublished;
   for (uint32_t i = 0; i < kCounterCount; i++) {
@@ -1012,6 +1066,7 @@ void RMNetDriver::BulkInComplete_Impl(OSAction* action, IOReturn status, uint32_
   }
   if (handled) ivars->rxReadSeen = true;
   if (ivars->stopping) AdvanceStop();
+  EnsureTimer();
 }
 
 void RMNetDriver::BulkOutComplete_Impl(OSAction* action, IOReturn status, uint32_t actualByteCount, uint64_t) {
@@ -1020,24 +1075,28 @@ void RMNetDriver::BulkOutComplete_Impl(OSAction* action, IOReturn status, uint32
   uint32_t slot = *static_cast<uint32_t*>(action->GetReference());
   ivars->usb->bulk_out_complete(slot, status, actualByteCount);
   if (ivars->stopping) AdvanceStop();
+  EnsureTimer();
 }
 
 void RMNetDriver::InterruptComplete_Impl(OSAction*, IOReturn status, uint32_t actualByteCount, uint64_t) {
   LOG_FIRST(kLogInterruptComplete, "InterruptComplete 0x%x, %u bytes", status, actualByteCount);
   if (ivars && ivars->usb) ivars->usb->interrupt_complete(status, actualByteCount);
   if (ivars && ivars->stopping) AdvanceStop();
+  EnsureTimer();
 }
 
 void RMNetDriver::ControlOutComplete_Impl(OSAction*, IOReturn status, uint32_t bytesTransferred) {
   LOG_FIRST(kLogControlOutComplete, "ControlOutComplete 0x%x, %u bytes", status, bytesTransferred);
   if (ivars && ivars->usb) ivars->usb->control_out_complete(status, bytesTransferred);
   if (ivars && ivars->stopping) AdvanceStop();
+  EnsureTimer();
 }
 
 void RMNetDriver::ControlInComplete_Impl(OSAction*, IOReturn status, uint32_t bytesTransferred) {
   LOG_FIRST(kLogControlInComplete, "ControlInComplete 0x%x, %u bytes", status, bytesTransferred);
   if (ivars && ivars->usb) ivars->usb->control_in_complete(status, bytesTransferred);
   if (ivars && ivars->stopping) AdvanceStop();
+  EnsureTimer();
 }
 
 void RMNetDriver::TimerFired_Impl(OSAction*, uint64_t) {
@@ -1057,6 +1116,7 @@ void RMNetDriver::TimerFired_Impl(OSAction*, uint64_t) {
     ApplyCore();
   }
   ivars->core->data_tick(now);
+  if (ivars->core->take_restart_wanted()) RestartSession("uplink paused with no flow enable");
   FlushRx();
   if (ivars->txHeld || ivars->txWaitUplink || ivars->txDoneCount > 0) DrainTx();
   if (++ivars->ticks % kCounterTicks == 0) PublishCounters();
