@@ -568,3 +568,75 @@ TEST(ipv4_without_gateway_or_mask_is_not_up) {
   CHECK_EQ(m.ups, 2); CHECK(m.cfg.settings.has_v4);
   CHECK_BYTES(m.cfg.settings.v4_gateway, 4, "0a 66 f6 e5"); CHECK_BYTES(m.cfg.settings.v4_mask, 4, "ff ff ff fc");
 }
+
+namespace {
+
+// The link comes up IPv4-only at 100, then the host ticks every 100 ms up to 60100, as the driver
+// does. Each probe is answered at once, each retry's Start Network fails at once, except the third
+// retry (sent at 35100), whose failure arrives at `third_fail` (35200..60100). Afterwards the next
+// probe is due at 90100 (the last answered at 60100) and the next retry 40 s after `third_fail`.
+void up_with_slow_third_retry(rmnet::Session& s, FakeModem& m, uint64_t third_fail) {
+  bring_up_v4_only(s, m, 100);
+  std::vector<uint64_t> retries, probes;
+  uint16_t third = 0;
+  for (uint64_t t = 200; t <= 60100; t += 100) {
+    if (t == third_fail) feed_frame(s, failed_start_frame(16, third), t);
+    size_t sent = m.sent.size();
+    s.tick(t);
+    if (m.sent.size() == sent) continue;
+    if (m.last()[9] == 0x2d) {
+      probes.push_back(t);
+      feed_frame(s, settings4_response_with_txid(m.last_txid()), t);
+    } else {
+      retries.push_back(t);
+      if (retries.size() == 3) third = m.last_txid();
+      else feed_frame(s, failed_start_frame(16, m.last_txid()), t);
+    }
+  }
+  CHECK(retries == std::vector<uint64_t>({5100, 15100, 35100}));
+  CHECK(probes == std::vector<uint64_t>({30100, 60100}));
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1); CHECK_EQ(m.downs, 0);
+}
+
+// Ticks every 100 ms over [from, to] and checks that nothing is sent and the link stays up.
+void quiet(rmnet::Session& s, FakeModem& m, uint64_t from, uint64_t to) {
+  size_t sent = m.sent.size();
+  for (uint64_t t = from; t <= to; t += 100) s.tick(t);
+  CHECK_EQ(m.sent.size(), sent); CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0);
+}
+
+}  // namespace
+
+// The worst case for a silent modem: a retry falls due just before the next probe and goes out to
+// a modem that no longer answers. Its Start Network waits 60 s, the probe follows and waits 10 s:
+// the link goes down 100 s after the last answered probe.
+TEST(silent_modem_during_a_retry_is_noticed_after_the_retry_times_out) {
+  FakeModem m; rmnet::Session s({}, m);
+  up_with_slow_third_retry(s, m, 50000);                                      // last answered probe 60100; retry due 90000
+  // From here the modem answers nothing.
+  quiet(s, m, 60200, 89900);
+  s.tick(90000); CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0x20);      // retry: Start Network, 60 s timeout
+  quiet(s, m, 90100, 149900);                                                 // the probe due at 90100 waits
+  size_t sent = m.sent.size();
+  s.tick(150000);                                                             // the retry times out; the link stays up
+  CHECK_EQ(m.sent.size(), sent); CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0);
+  s.tick(150100); CHECK_EQ(m.sent.size(), sent + 1);                          // the probe, not a second retry
+  CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);
+  quiet(s, m, 150200, 160000);
+  s.tick(160100);                                                             // 100000 ms after the last answered probe
+  CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(m.downs, 1);
+  s.tick(160200); CHECK_EQ(m.downs, 1);
+}
+
+TEST(retry_and_probe_due_on_the_same_tick_send_the_retry_first) {
+  FakeModem m; rmnet::Session s({}, m);
+  up_with_slow_third_retry(s, m, 50100);                                      // probe and retry both due at 90100
+  quiet(s, m, 60200, 90000);
+  size_t sent = m.sent.size();
+  s.tick(90100); CHECK_EQ(m.sent.size(), sent + 1);
+  CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0x20);                     // the retry's Start Network
+  feed_frame(s, failed_start_frame(16, m.last_txid()), 90150);
+  s.tick(90200); CHECK_EQ(m.sent.size(), sent + 2);
+  CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);                     // then the probe, on the next tick
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0);
+}

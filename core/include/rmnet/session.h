@@ -77,6 +77,13 @@ enum : uint32_t {
 
 enum : uint32_t { kFamilyRetryFirstMs = 5000, kFamilyRetryMaxMs = 60000 };   // 5 s, 10 s, 20 s, 40 s, then 60 s
 
+// How long a modem that goes silent while Up can go unnoticed, counted from the last answered
+// probe: normally about 40 s (the interval, then the probe's kRequestTimeoutMs). With one family
+// missing, a retry outstanding as the modem goes silent delays the probe, since only one request
+// is outstanding at a time and a retry that times out keeps the link up: a retry sent just before
+// the probe falls due waits up to kStartNetworkTimeoutMs, then the probe goes on the next tick and
+// waits kRequestTimeoutMs, so about 100 s. No second retry can start first: the next one waits at
+// least kFamilyRetryFirstMs (silent_modem_during_a_retry_is_noticed_after_the_retry_times_out).
 enum : uint32_t { kLivenessIntervalMs = 30000 };
 
 class Session {

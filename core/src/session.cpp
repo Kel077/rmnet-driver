@@ -199,6 +199,8 @@ void Session::on_response(const QmiMessage& m, uint64_t now_ms) {
     }
     case Step::Settings: {
       if (state_ == SessionState::Refreshing) {
+        // A refresh without settings goes to Backoff, taking the other family down too. That
+        // includes an IPv4 reply with an address but no gateway or mask; intended.
         clear_family_settings(current_);
         if (!parse_wds_current_settings(m, &link_.settings) || !family_has_settings(current_)) {
           break;
