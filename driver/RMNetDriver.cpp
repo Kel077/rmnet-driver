@@ -251,7 +251,8 @@ struct RMNetDriver_IVars {
   // deadline, a fatal error, a power-off or Stop ends it, the driver behaves as while asleep (every
   // check of asleep also checks it). wakeUpPending: the wake restarted the session and its link up
   // has not come yet; lastWakeUpMs is the time from that wake call to the link up (0 until then).
-  // wakeRetries: resume attempts after the first of their wake, since start.
+  // wakeRetries: resume attempts after the first of their wake, since start; wakeRetriesNow: the
+  // same for the current wake only (reset by its first attempt).
   bool asleep;
   bool resumePending;
   bool wakeUpPending;
@@ -260,6 +261,7 @@ struct RMNetDriver_IVars {
   uint64_t wakeStartMs;
   uint64_t lastWakeUpMs;
   uint64_t wakeRetries;
+  uint64_t wakeRetriesNow;
   uint32_t lastPowerFlags;
   uint32_t txQueueCapacity;  // the TX submission queue's capacity once made (0 until then)
   bool countersPublished;
@@ -683,7 +685,9 @@ void RMNetDriver::PowerOn(uint32_t powerFlags) {
 void RMNetDriver::ResumeUsb() {
   bool first = !ivars->resumePending;
   ivars->resumePending = false;
-  if (!first) {
+  if (first) {
+    ivars->wakeRetriesNow = 0;
+  } else {
     if (ivars->usb->device_gone()) {
       // As at the wake call: take the link down, with the state "detached".
       LOG("wake %llu: the device went while its resume was pending; nothing more", ivars->wakes);
@@ -691,6 +695,7 @@ void RMNetDriver::ResumeUsb() {
       return;
     }
     ivars->wakeRetries++;
+    ivars->wakeRetriesNow++;
   }
   bool lastTry = NowMs() - ivars->wakeStartMs >= kResumeRetryMs;
   UsbIo::Resume r = ivars->usb->resume(lastTry);
@@ -703,7 +708,10 @@ void RMNetDriver::ResumeUsb() {
     return;
   }
   if (r == UsbIo::Resume::Failed) return;  // already reported as usb failed
-  if (!first) LOG("wake %llu: usb resumed on retry %llu", ivars->wakes, ivars->wakeRetries);
+  if (!first) {
+    LOG("wake %llu: usb resumed on retry %llu (%llu retries since start)", ivars->wakes, ivars->wakeRetriesNow,
+        ivars->wakeRetries);
+  }
   ivars->wakeUpPending = true;
   RestartSession("wake");
 }

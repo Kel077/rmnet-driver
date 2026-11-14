@@ -6,7 +6,7 @@
 #include "rmnet/qmi.h"
 #include "rmnet/qmi_msgs.h"
 #include "rmnet/util.h"
-#include "usb_io.h"
+#include "usb_port.h"
 
 #define LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "RMNet: " fmt, ##__VA_ARGS__)
 
@@ -69,7 +69,7 @@ const char* SessionStateName(rmnet::SessionState s) {
   return "?";
 }
 
-CoreHost::CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile, bool flow_control)
+CoreHost::CoreHost(UsbPort& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile, bool flow_control)
     : usb_(usb),
       rx_(rx),
       session_(MakeSessionConfig(profile, flow_control), *this),
@@ -251,7 +251,9 @@ void CoreHost::log_received(const uint8_t* data, size_t len) {
           f.link_layer, f.ul_agg, f.ul_max_datagrams, f.ul_max_size, f.dl_agg, f.dl_max_datagrams, f.dl_max_size,
           rmnet::data_format_usable(f), session_.flow_control_asked() ? 1u : 0u,
           static_cast<unsigned>(f.flow_control));
-    } else if (r.present && r.ok) {
+    } else if (!r.present) {
+      LOG("data format answer has no result");
+    } else if (r.ok) {
       LOG("data format not parsed (result ok)");
     } else {
       LOG("data format refused (error 0x%x)", r.error);

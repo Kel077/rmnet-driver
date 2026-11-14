@@ -20,6 +20,7 @@
 #include <DriverKit/IOReturn.h>
 
 #include "rmnet/stall.h"
+#include "usb_port.h"
 
 class IOService;
 class IOUSBHostInterface;
@@ -46,12 +47,7 @@ class UsbIoListener {
   ~UsbIoListener() = default;
 };
 
-enum : uint32_t {
-  kBulkReads = 32,       // bulk IN reads kept posted
-  kUplinkSlots = 8,      // bulk OUT buffers
-  kMaxDownlink = 31744,  // the largest downlink transfer Core accepts (data_format_usable)
-  kMaxUplink = 16384,    // the largest uplink transfer Core accepts
-};
+// kBulkReads, kUplinkSlots, kMaxDownlink and kMaxUplink: usb_port.h.
 
 // Bulk OUT stalls are counted by rmnet::UplinkStallCounter (core/include/rmnet/stall.h):
 // rmnet::kUplinkStallsStuck stalls in a row, with no successful transfer between them, make the
@@ -90,7 +86,8 @@ struct UsbIoStats {
   uint32_t sleep_last_status;
 };
 
-class UsbIo {
+// The UsbPort methods (send, start_bulk, the uplink buffers) are described in usb_port.h.
+class UsbIo final : public UsbPort {
  public:
   explicit UsbIo(UsbIoListener& listener);
   ~UsbIo();  // releases whatever is still held
@@ -105,9 +102,7 @@ class UsbIo {
   void read_serial(char* out, size_t cap);
   // Raises DTR, keeps one interrupt read posted, and reads any responses already waiting.
   kern_return_t start();
-  // Queues one SEND_ENCAPSULATED_COMMAND; messages go out one at a time, in order. False if the
-  // message is too long, the ring is full, or UsbIo is stopping.
-  bool send(const uint8_t* data, size_t len);
+  bool send(const uint8_t* data, size_t len) override;
 
   // A bulk pipe whose endpoint halts is recovered without blocking: nothing new is posted on it,
   // it is aborted asynchronously, and ClearStall runs only once nothing is pending on it. While
@@ -116,20 +111,12 @@ class UsbIo {
   // transfer does not halt the pipe; rmnet::kUplinkStallsStuck stalls in a row, with no successful
   // transfer between, ask for a session restart, and again after it are fatal ("uplink is not
   // accepting data").
-  //
-  // Bulk IN: posts every idle read, each `read_len` bytes (rounded up to the endpoint's packet
-  // size, at most kMaxDownlink). Later re-posts use the newest length. Reads keep being re-posted
-  // until finish_sending. A read that cannot be posted is fatal.
-  void start_bulk(uint32_t read_len);
-  // Bulk OUT. acquire_uplink reserves a free buffer and returns its slot, or -1 when all are in
-  // use; uplink_buffer gives its kMaxUplink bytes. send_uplink sends `len` bytes from a reserved
-  // slot (false if it could not be submitted; the slot is then free again); release_uplink frees
-  // a reserved slot unsent. Nothing is sent once finish_sending has been called.
-  int acquire_uplink();
-  uint8_t* uplink_buffer(int slot) const;
-  bool send_uplink(int slot, uint32_t len);
-  void release_uplink(int slot);
-  bool uplink_recovering() const { return out_recovering_; }
+  void start_bulk(uint32_t read_len) override;
+  int acquire_uplink() override;
+  uint8_t* uplink_buffer(int slot) const override;
+  bool send_uplink(int slot, uint32_t len) override;
+  void release_uplink(int slot) override;
+  bool uplink_recovering() const override { return out_recovering_; }
   // True once any request or submission has returned not-attached or no-device: the device has
   // gone (a re-enumeration or an unplug), as opposed to a failure of a device still present.
   bool device_gone() const { return gone_; }
@@ -166,7 +153,7 @@ class UsbIo {
   void hold();
   Resume resume(bool last_try);
   bool held() const { return held_; }
-  uint16_t bulk_out_packet_size() const { return bulk_out_mps_; }  // from the endpoint descriptor
+  uint16_t bulk_out_packet_size() const override { return bulk_out_mps_; }
   const UsbIoStats& stats() const { return stats_; }
   // Stopping, in three calls made by the owner (docs/driverkit-notes.md 3.9):
   // finish_sending: no new messages or uplink transfers are accepted, reads (control and bulk)

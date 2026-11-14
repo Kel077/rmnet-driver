@@ -5,6 +5,7 @@ A macOS driver that makes a Quectel RM520N-GL 5G modem in QMI USB mode appear as
 ## Make targets
 
 - `make test` builds `build/tests` and runs every test; `make test FILTER=bytes` runs only tests whose name contains `bytes`.
+- `make driver-test` builds `build/driver-tests`, the driver's `CoreHost` (`driver/core_host.cpp`) on the host behind a fake of its USB interface (`driver/usb_port.h`), and runs its tests (`tests/driver/`); `FILTER` works as for `make test`.
 - `make check-driverkit` syntax-checks every `core/src/*.cpp` against the installed DriverKit SDK.
 - `make app-test` compiles and runs the app's four test programs: the status model (`app/StatusModel.swift` with `tests/app/StatusModelTests.swift`), the SMS model (`app/SmsModel.swift` with `tests/app/SmsModelTests.swift`), the AT port's answer logic (`app/AtPort.swift` with `tests/app/AtPortTests.swift`) and the `Messages` tab's controller (`app/SmsController.swift` with `tests/app/SmsControllerTests.swift`, driven by a fake service); it needs no Xcode project, no window and no hardware.
 - `make harness` builds `build/rmnet-harness`, the command-line harness (below).

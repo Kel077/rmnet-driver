@@ -12,7 +12,7 @@ CORE_OBJS := $(patsubst core/src/%.cpp,build/obj/core/%.o,$(CORE_SRCS))
 TEST_OBJS := $(patsubst tests/%.cpp,build/obj/tests/%.o,$(TEST_SRCS))
 HARNESS_OBJS := $(patsubst harness/%.mm,build/obj/harness/%.o,$(HARNESS_SRCS))
 
-.PHONY: test check-driverkit app-test harness driver clean
+.PHONY: test driver-test check-driverkit app-test harness driver clean
 
 test: build/tests
 	./build/tests $(FILTER)
@@ -27,6 +27,29 @@ build/obj/core/%.o: core/src/%.cpp
 build/obj/tests/%.o: tests/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(TEST_FLAGS) -Icore/include -Itests -MMD -MP -c $< -o $@
+
+# CoreHost (driver/core_host.cpp) on the host, behind fakes of UsbPort and RxSink, built with Core's
+# flags, tests and runner included. `make driver-test FILTER=kept` runs only tests whose name contains it.
+DRIVER_TEST_OBJS := build/obj/driver/core_host.o build/obj/driver-tests/test_core_host.o \
+	build/obj/driver-tests/test_main.o
+
+driver-test: build/driver-tests
+	./build/driver-tests $(FILTER)
+
+build/driver-tests: $(CORE_OBJS) $(DRIVER_TEST_OBJS)
+	$(CXX) -o $@ $^
+
+build/obj/driver/core_host.o: driver/core_host.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CORE_FLAGS) -Icore/include -MMD -MP -c $< -o $@
+
+build/obj/driver-tests/test_core_host.o: tests/driver/test_core_host.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CORE_FLAGS) -Icore/include -Idriver -Itests -MMD -MP -c $< -o $@
+
+build/obj/driver-tests/test_main.o: tests/test_main.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CORE_FLAGS) -Itests -MMD -MP -c $< -o $@
 
 harness: build/rmnet-harness
 
@@ -79,4 +102,4 @@ driver:
 clean:
 	[ ! -d build ] || find build -mindepth 1 -maxdepth 1 ! -name installed -exec rm -rf {} +
 
--include $(CORE_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(HARNESS_OBJS:.o=.d)
+-include $(CORE_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(HARNESS_OBJS:.o=.d) $(DRIVER_TEST_OBJS:.o=.d)

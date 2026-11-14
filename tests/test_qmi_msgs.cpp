@@ -238,3 +238,29 @@ TEST(failed_settings_parse_leaves_every_field_unchanged) {
   CHECK(s.has_v4); CHECK(s.has_v6); CHECK_EQ(s.v4_dns_count, 2); CHECK_EQ(s.v6_dns_count, 2); CHECK_EQ(s.mtu, 1500u);
   CHECK_BYTES(s.v4_addr, 4, "0a 66 f6 e6"); CHECK_BYTES(s.v4_dns[1], 4, "cb 00 71 d1"); CHECK_EQ(s.v6_prefix_len, 0x24);
 }
+
+// One DNS server: the unused second slot is zero, not whatever the parser's stack held. A reply with
+// two servers is parsed just before, so its second server sits where the parser's local array is
+// (each call's frame starts at the same place) and a copy of an unset slot would show it.
+TEST(settings_reply_with_one_ipv4_dns_server_leaves_the_second_slot_zero) {
+  rmnet::QmiMessage two = decode(kWdsSettings4Resp);  // TLVs 0x15 and 0x16
+  rmnet::QmiMessage one = settings_frame({{0x02, kResultOk}, {0x15, {0xc1, 0x71, 0x00, 0xcb}}});
+  rmnet::RuntimeSettings scratch{}, s;
+  memset(&s, 0xee, sizeof s); s.has_v4 = false; s.has_v6 = false;
+  CHECK(rmnet::parse_wds_current_settings(two, &scratch));
+  CHECK(rmnet::parse_wds_current_settings(one, &s));
+  CHECK_EQ(s.v4_dns_count, 1);
+  CHECK_BYTES(s.v4_dns[0], 4, "cb 00 71 c1");
+  CHECK_BYTES(s.v4_dns[1], 4, "00 00 00 00");
+}
+TEST(settings_reply_with_one_ipv6_dns_server_leaves_the_second_slot_zero) {
+  rmnet::QmiMessage two = decode(kWdsSettings6Resp);  // TLVs 0x27 and 0x28
+  rmnet::QmiMessage one = settings_frame({{0x02, kResultOk}, {0x27, std::vector<uint8_t>(16, 0x27)}});
+  rmnet::RuntimeSettings scratch{}, s;
+  memset(&s, 0xee, sizeof s); s.has_v4 = false; s.has_v6 = false;
+  CHECK(rmnet::parse_wds_current_settings(two, &scratch));
+  CHECK(rmnet::parse_wds_current_settings(one, &s));
+  CHECK_EQ(s.v6_dns_count, 1);
+  CHECK_BYTES(s.v6_dns[0], 16, "27 27 27 27 27 27 27 27 27 27 27 27 27 27 27 27");
+  CHECK_BYTES(s.v6_dns[1], 16, "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00");
+}
