@@ -1,6 +1,6 @@
 // The gps verb's logic, apart from the port so that `make app-test` covers it without hardware: NMEA 0183
-// sentences, coordinates, the report built from the sentences, the verb's outcome text and its
-// arguments. Foundation only. Nothing here prints, logs or stores a position.
+// sentences, coordinates, the report built from the sentences, how the reading ended, the verb's outcome
+// text and its arguments. Foundation only. Nothing here prints, logs or stores a position.
 import Foundation
 
 // One sentence. "$GPRMC,123519,A,...*6A" is talker "GP", type "RMC" and the fields after the address,
@@ -168,9 +168,29 @@ struct GpsReport {
     }
 }
 
-// The lines the gps verb prints after reading for `seconds`, and its exit code: 0 with a fix, 1 without.
-// Only numbers parsed from the sentences are printed, never a field as it came.
-func gpsOutcome(_ report: GpsReport, seconds: Int) -> (lines: [String], code: Int32) {
+// How the reading of the port ended. `elapsed` is whole seconds since the reading started, rounded down.
+enum GpsEnd: Equatable {
+    case deadline                                   // the time ran out (or the one second after a fix)
+    case closed(elapsed: Int)                       // read returned 0 (end of file) or the port hung up
+    case failed(elapsed: Int, reason: String)       // select or read failed; reason is strerror(errno)
+}
+
+// The lines the gps verb prints after asking for `seconds` of reading that ended as `end` says, and its
+// exit code: 0 with a fix, 1 without. A fix is printed however the reading ended. Without one, a port
+// that closed or failed is reported as such, never as the receiver's state: only a reading that ran its
+// full time says that GNSS may be off or has no fix. Only numbers parsed from the sentences are printed,
+// never a field as it came.
+func gpsOutcome(_ report: GpsReport, seconds: Int, end: GpsEnd) -> (lines: [String], code: Int32) {
+    if !report.hasFix {
+        switch end {
+        case .deadline:
+            break
+        case .closed(let elapsed):
+            return (["gps: the NMEA port closed after \(elapsed) s (\(report.sentences) sentences read)"], 1)
+        case .failed(let elapsed, let reason):
+            return (["gps: reading the NMEA port failed after \(elapsed) s: \(reason)"], 1)
+        }
+    }
     guard report.sentences > 0 else {
         return (["gps: no NMEA sentences in \(seconds) s; GNSS may be off (AT+QGPS? on the console shows it, "
                  + "AT+QGPS=1 switches it on)"], 1)

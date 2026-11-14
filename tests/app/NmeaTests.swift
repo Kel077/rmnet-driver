@@ -1,5 +1,6 @@
 // Tests for app/Nmea.swift: sentence parsing, coordinates, the report the gps verb builds from the
-// sentences, its outcome text, the line buffer and the verb's arguments. Built with swiftc by
+// sentences, its outcome text (also after the port closed or failed), the line buffer and the verb's
+// arguments. Built with swiftc by
 // `make app-test`; needs no Xcode project and no hardware (nothing here opens the port).
 // Stops at the first failure, prints which check failed and exits 1.
 import Foundation
@@ -53,8 +54,9 @@ func report(_ lines: [String], into start: GpsReport = GpsReport()) -> GpsReport
     return r
 }
 
-func expectOutcome(_ r: GpsReport, _ lines: [String], _ code: Int32, _ name: String) {
-    let got = gpsOutcome(r, seconds: 10)
+// The outcome after asking for 10 s, the reading having ended as `end` says.
+func expectOutcome(_ r: GpsReport, _ lines: [String], _ code: Int32, _ name: String, end: GpsEnd) {
+    let got = gpsOutcome(r, seconds: 10, end: end)
     check(got.lines == lines && got.code == code, "outcome: \(name)",
           "want \(lines) \(code), got \(got.lines) \(got.code)")
 }
@@ -137,7 +139,7 @@ struct NmeaTests {
         check(fix.satellitesUsed == 8, "report: satellites used", "got \(String(describing: fix.satellitesUsed))")
         check(fix.time == "123519", "report: time", "got \(String(describing: fix.time))")
         expectOutcome(fix, ["gps: fix 48.117300, 11.516667", "  altitude 545.4 m, 8 satellites used, 12:35:19 UTC"], 0,
-                      "fix with altitude, satellites and time")
+                      "fix with altitude, satellites and time", end: .deadline)
         check(!report([line3], into: fix).hasFix, "report: a later RMC with status V clears the position")
         check(!report([withChecksum("GPRMC,123519,V,4807.038,N,01131.000,E,,,230394,,")]).hasFix,
               "report: RMC with status V and coordinates is no fix")
@@ -152,7 +154,7 @@ struct NmeaTests {
         check(noFix.sentences == 4, "report: no fix, four sentences", "got \(noFix.sentences)")
         check(!noFix.hasFix && noFix.latitude == nil && noFix.longitude == nil, "report: no fix")
         check(noFix.satellitesInView == 0, "report: none in view", "got \(noFix.satellitesInView)")
-        expectOutcome(noFix, ["gps: no fix after 10 s (4 sentences, 0 satellites in view)"], 1, "no fix")
+        expectOutcome(noFix, ["gps: no fix after 10 s (4 sentences, 0 satellites in view)"], 1, "no fix", end: .deadline)
 
         // --- report: satellites in view, the latest per talker -------------------------------------
         let inView = report([line8, line9])
@@ -168,7 +170,8 @@ struct NmeaTests {
               "got \(String(describing: southWest.latitude)) \(String(describing: southWest.longitude))")
         check(southWest.time == "021500.00", "report: time with hundredths", "got \(String(describing: southWest.time))")
         check(southWest.altitude == nil && southWest.satellitesUsed == nil, "report: RMC gives no altitude or count")
-        expectOutcome(southWest, ["gps: fix -33.502057, -70.676130", "  02:15:00 UTC"], 0, "fix with time only")
+        expectOutcome(southWest, ["gps: fix -33.502057, -70.676130", "  02:15:00 UTC"], 0, "fix with time only",
+                      end: .deadline)
         let lost = report([line10], into: southWest)
         check(!lost.hasFix && lost.latitude == nil && lost.longitude == nil, "report: the latest (GGA, quality 0) decides")
         check(lost.sentences == 2, "report: both sentences count", "got \(lost.sentences)")
@@ -180,7 +183,21 @@ struct NmeaTests {
 
         // --- outcome: nothing read -----------------------------------------------------------------
         expectOutcome(GpsReport(), ["gps: no NMEA sentences in 10 s; GNSS may be off (AT+QGPS? on the console shows it, "
-                                    + "AT+QGPS=1 switches it on)"], 1, "no sentences")
+                                    + "AT+QGPS=1 switches it on)"], 1, "no sentences", end: .deadline)
+
+        // --- outcome: the port closed or failed: never reported as the receiver's state ------------
+        expectOutcome(noFix, ["gps: the NMEA port closed after 0 s (4 sentences read)"], 1, "port closed, no fix",
+                      end: .closed(elapsed: 0))
+        expectOutcome(GpsReport(), ["gps: the NMEA port closed after 7 s (0 sentences read)"], 1,
+                      "port closed, nothing read", end: .closed(elapsed: 7))
+        expectOutcome(GpsReport(), ["gps: reading the NMEA port failed after 3 s: Device not configured"], 1,
+                      "read failed, nothing read", end: .failed(elapsed: 3, reason: "Device not configured"))
+        expectOutcome(noFix, ["gps: reading the NMEA port failed after 0 s: Input/output error"], 1,
+                      "read failed, no fix", end: .failed(elapsed: 0, reason: "Input/output error"))
+        let fixLines = ["gps: fix 48.117300, 11.516667", "  altitude 545.4 m, 8 satellites used, 12:35:19 UTC"]
+        expectOutcome(fix, fixLines, 0, "a fix, then the port closed", end: .closed(elapsed: 2))
+        expectOutcome(fix, fixLines, 0, "a fix, then a read failed",
+                      end: .failed(elapsed: 1, reason: "Device not configured"))
 
         // --- line buffer ---------------------------------------------------------------------------
         expectLines(Array((line5 + "\r\n" + line6 + "\r\n").utf8), [line5, line6], "two lines with CR LF")
