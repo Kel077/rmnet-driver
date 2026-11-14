@@ -66,10 +66,11 @@ check-driverkit:
 
 # The app's status model, SMS model, AT answer logic, the Messages tab's controller, the gps verb's
 # NMEA logic and its port reader, the network model, the settings model, the modem service (against a
-# scripted port) and the modem tabs' controller, tested without Xcode or hardware (neither the AT port nor
-# the NMEA port is opened: the reader reads a pseudo-terminal the test makes, and no window is made).
+# scripted port), the modem verbs (against a fake service) and the modem tabs' controller, tested without
+# Xcode or hardware (neither the AT port nor the NMEA port is opened: the reader reads a pseudo-terminal the
+# test makes, and no window is made).
 app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/nmea-tests build/gpsread-tests \
-		build/modemnet-tests build/modemset-tests build/modemsvc-tests build/modemui-tests
+		build/modemnet-tests build/modemset-tests build/modemsvc-tests build/modemcli-tests build/modemui-tests
 	./build/app-tests
 	./build/sms-tests
 	./build/at-tests
@@ -79,6 +80,7 @@ app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build
 	./build/modemnet-tests
 	./build/modemset-tests
 	./build/modemsvc-tests
+	./build/modemcli-tests
 	./build/modemui-tests
 
 build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
@@ -116,6 +118,10 @@ build/modemset-tests: app/ModemNetwork.swift app/ModemSettings.swift tests/app/M
 # SmsService.swift brings describe(_: AtError).
 build/modemsvc-tests: app/AtPort.swift app/SmsModel.swift app/SmsService.swift app/ModemNetwork.swift \
 		app/ModemSettings.swift app/ModemService.swift tests/app/ModemServiceTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+build/modemcli-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ModemCli.swift tests/app/ModemCliTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 

@@ -166,6 +166,8 @@ private let apnRule = "An APN is at most 100 characters of ASCII letters, digits
     + "and does not start or end with a dot."
 private let userRule = "A user name is at most 127 characters of printable ASCII, without a double quote (\") or a backslash (\\)."
 private let passwordRule = "A password is at most 127 characters of printable ASCII, without a double quote (\") or a backslash (\\)."
+private let noAuthenticationRule = "With no authentication the user name and password must be empty; "
+    + "choose PAP, CHAP or PAP or CHAP to use them."
 
 /// Up to 100 of ASCII letters, digits, `.`, `-`, `_`, not starting or ending with `.`; empty is allowed
 /// (the network chooses). Checked by Unicode scalar, so a combining mark is a character of its own.
@@ -189,12 +191,15 @@ private func credentialAllowed(_ value: String) -> Bool {
 }
 
 /// nil when the settings can be sent to profile `id`; else the sentence saying which rule they break
-/// (the profile number first, then the APN, the user name, the password; never quoting the password).
+/// (the profile number first, then the APN, the user name, the password, then that with no authentication
+/// both are empty; never quoting the password). With authentication 0 the modem turns a profile that has a
+/// password into CHAP by itself (seen on 2026-11-15, ruling R15), so RMNet does not send such a profile.
 func profileProblem(_ id: Int, _ s: ProfileSettings) -> String? {
     if !(1...16).contains(id) { return "Profile \(id) cannot be changed by RMNet: AT+QICSGP takes profiles 1 to 16." }
     if !apnAllowed(s.apn) { return apnRule }
     if !credentialAllowed(s.user) { return userRule }
     if !credentialAllowed(s.password) { return passwordRule }
+    if s.auth == AuthMethod.none && !(s.user.isEmpty && s.password.isEmpty) { return noAuthenticationRule }
     return nil
 }
 
