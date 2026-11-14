@@ -1257,3 +1257,22 @@ Build 317.16.8 (main's driver code: flow control asked and granted, transmit que
 **Not measured.** A download while an upload runs; the same tests on PCI 32; a second 8-second download (one run on this cell does not measure the driver: 278 and 37 Mbit/s were seen four minutes apart on 2026-11-14).
 
 **Data.** The three runs moved 199,492,768 bytes (recorded; the usage file's total is 509,193,836). With traffic the usage file does not record, about 516 MB of the 1,400 MB is used.
+
+## Runtime findings (two-way load, 2026-11-15 01:37)
+
+Build 317.16.8 (flow control on, transmit queue of 64), cell PCI 893, RSRP -91, SINR 14, idle pings 21 to 38 ms. `scripts/measure.sh en33 both`: four downloads and four uploads started together, stopped by the 8 s time limit; samples `build/logs/measure-20261115-013715-both.samples`. Each direction's figures include the other direction's acknowledgements (a few percent; the output says so).
+
+| | Two-way, 01:37 | One-way, 00:33 and 00:44, same cell |
+|---|---|---|
+| Download, gate figure | **143.2 Mbit/s** (best second 161.8) | 154.8 Mbit/s (best second 177.2) |
+| Download, each second | 134, 143, 161, 128, 152, 144, 161, 118 | 77, 135, 139, 174, 173, 153, 135, 163 |
+| Upload, gate figure | **30.4 Mbit/s** (best second 53.9) | 33.6 Mbit/s (best second 56.6) |
+| Upload, each second | 15, 23, 22, 19, 56, 35, 56, 9 | |
+| Moved | 145.1 MB in, 28.7 MB out | 145.6 MB in; 34.3 MB out |
+
+- **A busy uplink does not hold the download back.** Both directions kept close to what each got alone a few minutes earlier (download about 8 % less, upload about 10 % less, within the run-to-run spread of this cell). Two of the four downloads reached their own 40 MB limit before the stop, so the download's last seconds ran on fewer streams: the download figure is if anything a little low.
+- **Small packets during two-way load:** a ping every 0.2 s, 75 of 75 answered; during the 8 s of load the median was 78 ms and the slowest 202 ms, against 21 to 38 ms before and a median of 19 ms after. Busier than during an upload alone (slowest 122 ms), and nothing like the 2 to 3.5 s waits seen without flow control.
+- **The driver:** 6,616 receive transfers carrying 111,605 packets; handler time 559,798 µs in all (about 85 µs per transfer, 6.8 % of the 8.2 s); `RMNetRxHandlerMaxUs` 3,338 and `RMNetRxLagMaxUs` 6,049 µs, both several times their one-way values; one read came back full (`RMNetRxFullTransfers` 1); `RMNetRxStock` 3 a few seconds after the run (24 before), so the stock of empty receive packets ran low but `RMNetRxDropNoPacket` stayed 0. Transmit: 36,764 packets, `RMNetTxHolds` +75, every drop and error counter 0, nothing pending afterwards, `RMNetQmapCommands` 0.
+- **What it means for the pool-margin concern** (follow-ups, "Pool margin"): under the heaviest load the port has carried, the receive stock came close to empty but no packet was dropped for want of one. The concern stays open, with this as its first evidence: a longer or faster two-way run could exhaust the stock.
+
+**Data.** 173,836,279 bytes recorded (the usage file's total is 683,030,115). With traffic the usage file does not record, about 690 MB of the 1,400 MB is used.
