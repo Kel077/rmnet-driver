@@ -1,5 +1,6 @@
 // The RMNet app's one window: on its Driver tab the driver's status, refreshed every 2 seconds, and the
-// buttons that install, update and remove it; on its Messages tab the modem's text messages (SmsView.swift).
+// buttons that install, update and remove it; on its Messages tab the modem's text messages (SmsView.swift);
+// on its Network and SIM & APN tabs the modem's network, settings and SIM (ModemView.swift).
 // Started by main.swift when the app gets no command-line verb.
 import AppKit
 import Combine
@@ -10,7 +11,8 @@ struct RMNetApp: App {
 
     var body: some Scene {
         Window("RMNet", id: "status") {
-            RMNetWindow(messages: appDelegate.messages, quitNotice: appDelegate.messages.quitNotice)
+            RMNetWindow(messages: appDelegate.messages, quitNotice: appDelegate.messages.quitNotice,
+                        modem: appDelegate.modem, modemQuitNotice: appDelegate.modem.quitNotice)
         }
         .defaultSize(width: 520, height: 480)
     }
@@ -19,21 +21,32 @@ struct RMNetApp: App {
 enum WindowTab: Hashable {
     case driver
     case messages
+    case network
+    case simAndApn
 }
 
-// The window's two tabs: Driver (the status below) and Messages (SmsView.swift). The tab shown is tracked
-// by the selection; the Messages tab asks the modem only while it is the one shown and the window can be
-// seen. The controller is not observed here, so typing a message does not redraw the Driver tab; only its
-// small quit notice is: while a quit waits for a call to the modem, one line above the tabs says so.
+// The window's tabs: Driver (the status below), Messages (SmsView.swift), Network and SIM & APN
+// (ModemView.swift). The tab shown is tracked by the selection; the Messages tab and the modem tabs ask the
+// modem only while one of theirs is shown and the window can be seen. The controllers are not observed
+// here, so typing a message does not redraw the Driver tab; only their small quit notices are: while a
+// quit waits for a call to the modem, a line above the tabs says so.
 struct RMNetWindow: View {
     let messages: SmsController
     @ObservedObject var quitNotice: SmsQuitNotice
+    let modem: ModemController
+    @ObservedObject var modemQuitNotice: ModemQuitNotice
     @State private var tab = WindowTab.driver
 
     var body: some View {
         VStack(spacing: 0) {
             if !quitNotice.line.isEmpty {
                 Text(verbatim: quitNotice.line)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding([.horizontal, .top])
+            }
+            if !modemQuitNotice.line.isEmpty {
+                Text(verbatim: modemQuitNotice.line)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding([.horizontal, .top])
@@ -45,33 +58,69 @@ struct RMNetWindow: View {
                 SmsView(controller: messages)
                     .tabItem { Text("Messages") }
                     .tag(WindowTab.messages)
+                NetworkTab(controller: modem)
+                    .tabItem { Text("Network") }
+                    .tag(WindowTab.network)
+                SimApnTab(controller: modem)
+                    .tabItem { Text("SIM & APN") }
+                    .tag(WindowTab.simAndApn)
             }
         }
         .onAppear { messages.setTabShown(tab == .messages) }
         .onChange(of: tab) { _, shown in messages.setTabShown(shown == .messages) }
         .onDisappear { messages.setTabShown(false) }
+        .onAppear { modem.setTabShown(modemTab(tab)) }
+        .onChange(of: tab) { _, shown in modem.setTabShown(modemTab(shown)) }
+        .onDisappear { modem.setTabShown(nil) }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeOcclusionStateNotification)) { _ in
             messages.setWindowVisible(NSApp.occlusionState.contains(.visible))
+            modem.setWindowVisible(NSApp.occlusionState.contains(.visible))
         }
     }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    // The process's one SmsController (and so its one serial queue to the modem): the window shows it, and
+    // The one serial queue to the modem's AT port, shared by both controllers, so that the window never
+    // opens the port twice at once.
+    private let modemQueue = DispatchQueue(label: "io.rmnetdriver.RMNet.modem", qos: .userInitiated)
+
+    // The process's one SmsController (its queue to the modem is the shared one): the window shows it, and
     // quitting waits for its running call. It lives as long as the app, so a window reopened from the Dock
-    // shows the same messages and result line.
-    let messages = SmsController(
+    // shows the same messages and result line. A quit it cancels is cancelled for the modem tabs too.
+    private(set) lazy var messages: SmsController = SmsController(
         service: SmsService(),
-        replyToQuit: { NSApp.reply(toApplicationShouldTerminate: $0) },
+        queue: modemQueue,
+        replyToQuit: { [unowned self] succeeded in
+            if !succeeded { self.modem.resumeAfterCancelledQuit() }
+            NSApp.reply(toApplicationShouldTerminate: succeeded)
+        },
+        requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
+
+    // The process's one ModemController, for the Network and SIM & APN tabs, kept the same way. Quitting
+    // waits for it first: when its call fails the quit is cancelled; when it succeeds, the messages are
+    // asked next, and they answer the quit if they still have a call running.
+    private(set) lazy var modem: ModemController = ModemController(
+        service: ModemService(),
+        queue: modemQueue,
+        driverProfile: driverProfileNumber,
+        replyToQuit: { [unowned self] succeeded in
+            if !succeeded {
+                NSApp.reply(toApplicationShouldTerminate: false)
+            } else if !self.messages.quitWhenFinished() {
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+        },
         requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     // Every way of quitting (Cmd-Q, the Dock's Quit, closing the last window, logout) comes here. With a
     // call to the modem running, the app ends only when it has finished; a send is never cut short. A send
-    // or delete that does not succeed cancels the quit, so that its result can be read.
+    // or delete that does not succeed cancels the quit, so that its result can be read. The modem tabs'
+    // controller is asked first; the messages only once it has nothing running (see `modem`).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        messages.quitWhenFinished() ? .terminateLater : .terminateNow
+        if modem.quitWhenFinished() { return .terminateLater }
+        return messages.quitWhenFinished() ? .terminateLater : .terminateNow
     }
 }
 
