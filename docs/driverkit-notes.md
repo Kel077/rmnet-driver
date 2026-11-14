@@ -1280,3 +1280,26 @@ Build 317.16.8 (flow control on, transmit queue of 64), cell PCI 893, RSRP -91, 
 ## The owner's steps (2026-11-15, about 01:50, on 317.16.8)
 
 The owner wrote: "i tested 1. 2. 3. 4. 5. all seems good", meaning the README's owner steps: the window looked at; the cable pulled while a ping ran and plugged back; the port switched off and on under Network → RM520N-GL; `RM520N-GL` seen offered under Internet Sharing (sharing not turned on); `Remove…` in the window with the modem attached, then `Install`, then a replug. No driver log was running, so what the stopping instance did with its USB requests in flight was not captured; the result was read afterwards: one entry, 317.16.8, activated and enabled; a new driver instance started at 01:53:15; link up with both families; pings fine; no new crash report; the app's headline `Connected`; SMS listing working. With this, every line of the design's "Done means" is shown except the throughput line.
+
+## Runtime findings (same-half-hour comparison with qmi-darwin, 2026-11-15 02:07 to 02:13)
+
+The design's throughput line allows "within 15 percent of qmi-darwin measured within the same half hour". With the owner at the Mac: our driver measured, then removed (`Remove…`, a replug), qmi-darwin started by the owner (`sudo qmictl run --pdn internet:1:0x81 --scoped`, release build of 0.17.2 at `fe6f25b`), measured, stopped, our driver reinstalled (`Install`, a replug; link up 12 s after the replug).
+
+| | Our driver, 317.16.8, `en33` | qmi-darwin, `utun12` |
+|---|---|---|
+| Start | 02:07:26 | 02:08:53 |
+| Cell | PCI 893, RSRP -92 to -94, SINR 16 | PCI 893, RSRP -92, SINR 14 to 15 |
+| Gate figure (1.4 s to 8.0 s) | **193.3 Mbit/s** | **305.9 Mbit/s** |
+| Best second | 212.5 Mbit/s | 372.7 Mbit/s |
+| Each second | 109, 158, 183, 204, 198, 207, 201, 197 | 306, 324, 363, 353, 358, 334, 181, 235 |
+| Moved | 182.6 MB in | 309.2 MB in |
+
+- **Ours is 63 percent of qmi-darwin's figure: the line is not met**, by either of its two tests. Our run levels off near 200 Mbit/s after its third second; qmi-darwin's runs well above that from its first second on the same cell a minute and a half later. This overturns the reading of the 00:33 run ("the rate is what the cell delivered"): the cell can deliver more than our driver takes.
+- Our driver's counters during its run: `RMNetRxDropNoPacket` 0, `RMNetRxFullTransfers` 0, bulk IN errors 0, recoveries 0. Nothing failed; the driver simply did not go faster.
+- **What is the same** (from qmi-darwin's source, read for parameters only): both request raw IP, QMAP both ways, downlink at most 32 datagrams and 31,744 bytes per transfer, uplink 32 datagrams and 16,384 bytes, and both keep 32 bulk IN reads in flight.
+- **What differs:**
+  - our driver asks for in-band flow control (`RMNetFlowControl` 1, granted); `qmictl run` leaves the field out;
+  - qmi-darwin hands each IN transfer to a `utun` with one batched system call; our driver copies each datagram into a packet buffer, adds an Ethernet header, and hands the packets to macOS through the DriverKit queues.
+- **The flow-control lead:** every download measured since the request was added stayed at or under about 200 Mbit/s (154.8 at 00:33, 193.3 at 02:07, 143.2 with an upload at 01:37); the last downloads without it, on 316.19.56 at 16:27 on 2026-11-14, gave 232 to 303 Mbit/s per sample and a best second of 278. Those runs were hours apart, so this is a lead, not a finding. A download with the key at 0 and at 1 within minutes on the same cell would decide it (two installs, two modem reboots, two capped downloads).
+
+**Data.** The two runs moved 491,774,999 bytes recorded (the usage file's total is 1,175,822,947). With traffic the usage file does not record, about 1,183 MB of the 1,400 MB is used and about 217 MB left; the scripts' ceiling (1,300,000,000) now refuses another `down-long` run.

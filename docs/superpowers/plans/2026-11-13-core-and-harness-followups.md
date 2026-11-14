@@ -292,3 +292,8 @@ Plan `docs/superpowers/plans/2026-11-14-sms-in-the-app.md`, branch `sms`, build 
 
 - Done by the owner on 317.16.8: the window, unplug and replug during a ping, the port switched off and on, Internet Sharing offered, `Remove…` then `Install` then replug. The stop of an instance with USB requests in flight has therefore run on hardware at least once (during the unplug), but without a log.
 - Still open: the throughput line (the same-half-hour comparison with qmi-darwin); a sleep and wake on the current build.
+
+## Sent here by the same-half-hour comparison (2026-11-15)
+
+- **Our download path tops out near 200 Mbit/s where qmi-darwin reached 306 on the same cell** (193.3 against 305.9, 90 seconds apart; `docs/driverkit-notes.md`, "Runtime findings (same-half-hour comparison with qmi-darwin)"). The design's throughput line is not met. Leads, in the order to test them: (1) the in-band flow-control request (every download since it was added stayed at or under about 200; the last ones without it reached 278 in a second): an A/B with `RMNetFlowControl` 0 and 1 within minutes; (2) the host path: a copy of every datagram, an Ethernet header, and the DriverKit RX queues, against qmi-darwin's one batched `utun` call per transfer; the driver's handler time (about 80 µs per transfer, 5 percent busy) does not show a CPU limit, so look at how often packets reach the RX completion queue and whether the stack's intake is the limit.
+- The data left (about 217 MB) allows two capped `down` runs (50 MB each), not `down-long` runs.
