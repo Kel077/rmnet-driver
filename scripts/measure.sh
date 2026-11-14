@@ -72,7 +72,7 @@
 # "<time> <down|up> <bytes in> <bytes out>" with non-negative whole numbers, or if the recorded
 # total plus this run's reservation (its stop threshold plus a margin for what arrives after the
 # stop: 10,000,000 bytes for down and up, 40,000,000 for down-long, 25,000,000 for up-long; for
-# both, its two stop thresholds plus 50,000,000, so 250,000,000) would pass 1,300,000,000 bytes.
+# both, its two stop thresholds plus 50,000,000, so 250,000,000) would pass 6,300,000,000 bytes.
 # It warns when a run moved more than 60,000,000 bytes (down and up), 384,000,000 (down-long),
 # 72,000,000 (up-long; for the long modes, the stop threshold plus 20 percent) or 250,000,000
 # (both: its reservation), in and out together. The run fails if fewer than 1,000,000 bytes
@@ -92,7 +92,7 @@ set -u
 
 cd "$(dirname "$0")/.." || exit 1
 
-BUDGET=1300000000
+BUDGET=6300000000
 SETTLE_BYTES=100000 # after the stop: the counters have settled when they move less than this...
 SETTLE_SECS=6       # ...between two samples 0.25 s apart, or after this long
 MIN_BYTES=1000000
