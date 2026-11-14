@@ -12,7 +12,7 @@ CORE_OBJS := $(patsubst core/src/%.cpp,build/obj/core/%.o,$(CORE_SRCS))
 TEST_OBJS := $(patsubst tests/%.cpp,build/obj/tests/%.o,$(TEST_SRCS))
 HARNESS_OBJS := $(patsubst harness/%.mm,build/obj/harness/%.o,$(HARNESS_SRCS))
 
-.PHONY: test driver-test check-driverkit app-test harness driver clean
+.PHONY: test driver-test check-driverkit app-test script-test harness driver clean
 
 test: build/tests
 	./build/tests $(FILTER)
@@ -86,6 +86,12 @@ build/at-tests: app/AtPort.swift tests/app/AtPortTests.swift
 build/smsui-tests: app/SmsModel.swift app/SmsController.swift tests/app/SmsControllerTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+# The scripts' decisions that need neither the network nor an install: the install script's kept-app
+# and running-driver checks (scripts/install-checks.sh) and soak.sh's status classes (--classify).
+script-test:
+	sh tests/scripts/test-install-checks.sh
+	sh tests/scripts/test-soak-classify.sh
 
 # Unsigned build of the driver and the host app that embeds it. gen.rb writes RMNet.xcodeproj.
 XCODEBUILD := xcodebuild -project RMNet.xcodeproj -configuration Debug -parallelizeTargets \

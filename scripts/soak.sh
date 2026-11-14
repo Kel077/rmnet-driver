@@ -5,6 +5,10 @@
 #   scripts/soak.sh <interface> <minutes>
 #   scripts/soak.sh lo0 <minutes> --usage-file <file> [--status-cmd <program>] [--period <seconds>]
 #                                 [--pid-cmd <program>] [--route-cmd <program>]
+#   scripts/soak.sh --classify <file> [<exit status>]
+#                                 (prints the status class, below, that a sample gets when
+#                                 `RMNet status --json` printed <file> and exited with <exit status>,
+#                                 0 if not given, and exits 0; it reads nothing else and sends nothing)
 #
 # <minutes> may have a fraction (0.5 is 30 s); the run lasts that many minutes rounded to the second.
 #
@@ -33,8 +37,11 @@
 #   up            the status was read and properties.RMNetState is "up";
 #   not-up        the status was read and the driver is attached but its state is not "up"
 #                 (not-attached: the status was read and properties is empty, the driver is not attached);
-#   unreadable    the command failed (exit status not 0), hung for STATUS_TIMEOUT seconds, printed no
-#                 JSON object, printed an "error" key, or printed no "properties" object.
+#   unreadable    the command failed (exit status not 0, except 1 with an "error" key, below), hung for
+#                 STATUS_TIMEOUT seconds, printed no JSON object, or printed no "properties" object.
+# RMNet exits 1 and prints an "error" key when the system gave no listing of its extensions; the
+# registry part ("properties") is still read then, so a status with an "error" key and a "properties"
+# object is classed from the properties.
 # Anything but up counts as "not up" for the early stop, and fails the verdict. After the pings have
 # stopped one more sample is taken (not after a signal), in which RMNetPacketsHeld is judged.
 #
@@ -56,14 +63,19 @@
 #   - each ping lost at most 1 percent by its own summary, and sent at least 90 percent of the
 #     packets its running time allows (one every 0.5 s);
 #   - no new crash report whose name starts with io.rmnetdriver.RMNet.driver appeared in
-#     /Library/Logs/DiagnosticReports or ~/Library/Logs/DiagnosticReports;
+#     /Library/Logs/DiagnosticReports, ~/Library/Logs/DiagnosticReports or the Retired/ directory
+#     under either (a report is new when no report of that name was in any of them at the start, so
+#     one the system moves to Retired/ during the run is not new), and each of them that exists could
+#     be read at the start and at the end (one that cannot is named: a new report there would not be
+#     seen);
 #   - the usage line was written.
 # Exit 0 on PASS, 1 on FAIL, 2 when it refused to start.
 #
 # Data: the cellular data is metered. Before anything is sent it reads the usage file
 # (build/installed/measure-usage.log, the file scripts/measure.sh keeps) with the same strict reader
-# as measure.sh, and refuses (exit 2) if the file is missing or malformed, or if its recorded total
-# plus GUARD_BYTES would pass BUDGET. Once the pings have started it appends exactly one line,
+# as measure.sh, and refuses (exit 2) if the file is missing, empty (0 bytes: it was probably emptied
+# by mistake, and must be restored by hand) or malformed, or if its recorded total plus GUARD_BYTES
+# would pass BUDGET. Once the pings have started it appends exactly one line,
 # "<UTC time> up <bytes in> <bytes out>", also when it stops early or is interrupted. If the counters
 # cannot be read at the end, the line is raised to at least GUARD_BYTES in all. If the line cannot be
 # written, it is printed to be added by hand, and the verdict fails.
@@ -79,6 +91,7 @@
 #                         runs on lo0.
 set -u
 
+CALLER_DIR=$PWD # --classify reads its file relative to where the script was started
 cd "$(dirname "$0")/.." || exit 1
 
 # The ceiling on recorded use, in bytes, the same as measure.sh's. The owner's allowance for testing
@@ -113,6 +126,53 @@ refuse() {
   echo "soak: REFUSED: $*" >&2
   exit 2
 }
+
+# --- The status classes, the same for every sample and for --classify. ---
+
+# One CSV fragment on stdout: class, RMNetState, then each of COUNTERS (empty when absent). $1 is the
+# status command's exit status, $2 the file holding what it printed. The class is unreadable if the
+# exit status is not 0 (but 1 with an "error" key: RMNet's way of saying the system gave no listing,
+# while its registry part is still read) or the output is not a JSON object with a "properties"
+# object; otherwise not-attached if properties is empty, up if properties.RMNetState is "up", and
+# not-up for anything else.
+CLASSIFY_PY='
+import json, sys
+rc, path, names = int(sys.argv[1]), sys.argv[2], sys.argv[3].split()
+try:
+    with open(path) as f:
+        o = json.load(f)
+except Exception:
+    o = None
+def clean(v):
+    return str(v).replace(",", ";").replace("\n", " ").replace("\r", " ")
+no_listing = isinstance(o, dict) and "error" in o
+if (rc != 0 and not (rc == 1 and no_listing)) or not isinstance(o, dict) or not isinstance(o.get("properties"), dict):
+    print(",".join(["unreadable", ""] + [""] * len(names)))
+    sys.exit(0)
+p = o["properties"]
+state = p.get("RMNetState")
+cls = "not-attached" if not p else ("up" if state == "up" else "not-up")
+print(",".join([cls, clean(state if state is not None else "")] + [clean(p[n]) if n in p else "" for n in names]))
+'
+classify_status() {
+  cs_out=$("$PYTHON" -I -c "$CLASSIFY_PY" "$1" "$2" "$COUNTERS" 2>/dev/null) ||
+    cs_out="unreadable,$(echo "$COUNTERS" | sed 's/[^ ]*//g; s/ /,/g'),"
+  echo "$cs_out"
+}
+
+if [ "${1:-}" = --classify ]; then
+  [ $# -eq 2 ] || [ $# -eq 3 ] ||
+    refuse "usage: $0 --classify <file holding the output of RMNet status --json> [<its exit status, 0 if not given>]"
+  cl_rc=${3:-0}
+  case $cl_rc in '' | *[!0-9]*) refuse "the exit status must be a whole number: '$cl_rc'" ;; esac
+  [ -x "$PYTHON" ] || refuse "$PYTHON is missing; it reads the status JSON"
+  case $2 in
+    /*) cl_file=$2 ;;
+    *) cl_file=$CALLER_DIR/$2 ;;
+  esac
+  classify_status "$cl_rc" "$cl_file" | cut -d, -f1
+  exit 0
+fi
 
 # --- Arguments. Every test option is refused off lo0 before anything is read or sent. ---
 
@@ -194,6 +254,10 @@ usage_total() {
 # A missing usage file is never created: on the real port it means the script runs from a checkout
 # that does not hold the record.
 [ -f "$USAGE" ] || refuse "the usage file $USAGE does not exist (is this the checkout that holds the record?)"
+# measure.sh never creates an empty one, so an empty file was emptied: read as 0, it would let runs
+# start against the whole budget again.
+[ -s "$USAGE" ] ||
+  refuse "the usage file $USAGE is empty (0 bytes); it was probably emptied by mistake, and must be restored by hand"
 [ -w "$USAGE" ] || refuse "the usage file $USAGE cannot be written"
 used=$(usage_total "$USAGE") || refuse "the usage file $USAGE cannot be trusted (see above); fix it by hand"
 echo "usage file:     $USAGE, recorded total $used bytes; this run reserves $GUARD_BYTES; ceiling $BUDGET"
@@ -238,13 +302,44 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/soak.XXXXXX") || refuse "cannot create a tempo
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM HUP
 
-# The crash reports already there, so only new ones count.
+# The crash reports in each of CRASH_DIRS and its Retired/ directory, one path per line, so that only
+# new ones count. A directory that exists but cannot be listed is not passed over: it is added to
+# $WORK/crash-unreadable, and the verdict names it.
 crash_list() {
   for d in $CRASH_DIRS; do
-    ls -1 "$d" 2>/dev/null | grep "^$CRASH_PREFIX" | sed "s|^|$d/|"
+    for dd in "$d" "$d/Retired"; do
+      if names=$(ls -1 "$dd" 2>/dev/null); then
+        printf '%s\n' "$names" | grep "^$CRASH_PREFIX" | sed "s|^|$dd/|"
+      elif [ -e "$dd" ]; then
+        echo "$dd" >>"$WORK/crash-unreadable"
+      fi
+    done
   done | sort
 }
+# The verdict's lines about crash reports: each directory that could not be read, at the start or at
+# the end, and each new report. A report is new when no report of its name was listed at the start,
+# in any directory (the system moves old reports to Retired/), and its directory, and the one above
+# a Retired/, could be read both times (one read only at the end would show every report in it as
+# new).
+crash_reasons() {
+  sort -u "$WORK/crash-unreadable" | while IFS= read -r dir; do
+    echo "the crash reports in $dir could not be listed (the directory cannot be read), so a new one there would not be seen"
+  done
+  awk -v skip="$WORK/crash-unreadable" '
+    BEGIN { while ((getline l < skip) > 0) unreadable[l] = 1 }
+    FILENAME == ARGV[1] { n = $0; sub(/.*\//, "", n); before[n] = 1; next }
+    {
+      n = $0; sub(/.*\//, "", n)
+      d = $0; sub(/\/[^\/]*$/, "", d)
+      top = d; sub(/\/Retired$/, "", top)
+      if (!(n in before) && !(d in unreadable) && !(top in unreadable)) print "new crash report: " $0
+    }' "$WORK/crash-before" "$WORK/crash-after"
+}
+: >"$WORK/crash-unreadable"
 crash_list >"$WORK/crash-before"
+sort -u "$WORK/crash-unreadable" | while IFS= read -r dir; do
+  echo "soak: WARNING: $dir cannot be read; a new crash report there would not be seen, and the verdict fails" >&2
+done
 
 # The driver's process IDs, joined with ";" (empty when it is not running).
 driver_pids() {
@@ -337,25 +432,7 @@ read_status() {
   status_pid=
   [ "$aborted" -eq 0 ] || return 1
   [ $n -lt $((STATUS_TIMEOUT * 10)) ] || rc=124
-  "$PYTHON" -I -c '
-import json, sys
-rc, path, names = int(sys.argv[1]), sys.argv[2], sys.argv[3].split()
-try:
-    with open(path) as f:
-        o = json.load(f)
-except Exception:
-    o = None
-def clean(v):
-    return str(v).replace(",", ";").replace("\n", " ").replace("\r", " ")
-if rc != 0 or not isinstance(o, dict) or "error" in o or not isinstance(o.get("properties"), dict):
-    print(",".join(["unreadable", ""] + [""] * len(names)))
-    sys.exit(0)
-p = o["properties"]
-state = p.get("RMNetState")
-cls = "not-attached" if not p else ("up" if state == "up" else "not-up")
-print(",".join([cls, clean(state if state is not None else "")] + [clean(p[n]) if n in p else "" for n in names]))
-' "$rc" "$WORK/status.json" "$COUNTERS" >"$WORK/st" 2>/dev/null ||
-    echo "unreadable,$(echo "$COUNTERS" | sed 's/[^ ]*//g; s/ /,/g')," >"$WORK/st"
+  classify_status "$rc" "$WORK/status.json" >"$WORK/st"
   return 0
 }
 
@@ -608,7 +685,7 @@ for fam in 4 6; do
     echo "$name sent $s packets in $ping_secs s, fewer than $MIN_SENT% of $expected" >>"$WORK/reasons"
   fi
 done
-comm -13 "$WORK/crash-before" "$WORK/crash-after" | sed 's/^/new crash report: /' >>"$WORK/reasons"
+crash_reasons >>"$WORK/reasons"
 
 echo "last sample:    $last_line"
 [ "$final_sample" -eq 1 ] || echo "                (no sample after the pings stopped: $GAUGE not judged)"

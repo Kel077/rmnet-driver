@@ -1,0 +1,22 @@
+{
+  "advice" : [
+    "Plug in the modem."
+  ],
+  "attached" : false,
+  "bundledVersion" : "317.18.40",
+  "canActivate" : true,
+  "canRemoveDirectly" : true,
+  "entries" : [
+    {
+      "awaitingApproval" : false,
+      "enabled" : true,
+      "uninstalling" : false,
+      "version" : "317.18.40"
+    }
+  ],
+  "headline" : "Installed, modem not attached",
+  "modem" : "absent",
+  "properties" : {
+
+  }
+}
