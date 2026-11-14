@@ -1,0 +1,452 @@
+// The modem over its spare AT port (USB interface 3): the network read, the radio, the network mode, the
+// data profiles (with the redial that makes the driver dial with new settings) and the SIM's PIN. The
+// models in ModemNetwork.swift and ModemSettings.swift read the answers and write the lines that change the
+// modem; this file only puts them in order. Each call opens a port, works and closes it, also on failure.
+// After a timeout or an I/O error nothing more is sent on that port (AtPort closes itself after a timeout),
+// so the call ends there; only a redial then opens a second port, to switch the radio back on. Calls block
+// (a redial usually up to about 40 s, longer when the port fails) and must not be made on the main thread.
+//
+// Nothing here logs, prints or stores what goes over the port. A profile's password appears only in the one
+// AT+QICSGP=<id>,… line sent and a PIN only in the one AT+CPIN="…" line; neither is ever put in a failure.
+import Foundation
+
+/// What the service needs of a port: one command at a time, and closing (closing twice is harmless). AtPort
+/// is one; the tests use a scripted port.
+protocol AtCommanding: AnyObject {
+    func command(_ line: String, timeout: TimeInterval) -> Result<[String], AtError>
+    func close()
+}
+
+extension AtPort: AtCommanding {}
+
+/// One open port, and the failure that ended its use. After a timeout or an I/O error nothing more is sent
+/// on it: AtPort has closed itself after a timeout, and after an I/O error the port is not trusted. Each
+/// later command then fails at once with that failure, without sending anything.
+private final class Link {
+    private let port: AtCommanding
+    private(set) var broken: AtError?
+
+    init(_ port: AtCommanding) { self.port = port }
+
+    func command(_ line: String, timeout: TimeInterval) -> Result<[String], AtError> {
+        if let broken { return .failure(broken) }
+        let result = port.command(line, timeout: timeout)
+        if case .failure(let error) = result, !isRefusal(error) { broken = error }
+        return result
+    }
+
+    /// A read whose refusal by the modem only leaves its part unknown: no lines. After a timeout or an I/O
+    /// error (`broken` says which) also no lines.
+    func read(_ line: String) -> [String] {
+        guard case .success(let lines) = command(line, timeout: ModemService.readTimeout) else { return [] }
+        return lines
+    }
+
+    func close() { port.close() }
+}
+
+/// The modem's own error line: it answered, and the port still works.
+private func isRefusal(_ error: AtError) -> Bool {
+    if case .modem = error { return true }
+    return false
+}
+
+private func failure<T>(_ message: String) -> Result<T, ModemFailure> {
+    .failure(ModemFailure(message: message))
+}
+
+private let stillOffAdvice = "Run `RMNet radio on`, or press Radio On in the window."
+
+final class ModemService: ModemServing {
+    fileprivate static let readTimeout: TimeInterval = 3
+    private static let radioTimeout: TimeInterval = 20        // AT+CFUN=: the manual allows 15 s
+    private static let writeTimeout: TimeInterval = 5         // AT+QICSGP= and AT+QNWPREFCFG= writes
+    private static let pinTimeout: TimeInterval = 10          // AT+CPIN="…"
+    private static let registrationWait: TimeInterval = 30
+    private static let registrationInterval: TimeInterval = 1
+    // Reads at 0, 1, …, 30 s; also the bound should the clock go back.
+    private static let registrationReads = Int(registrationWait / registrationInterval) + 1
+    private static let redialPause: TimeInterval = 1          // between AT+CFUN=4 and the change
+
+    private static let modeRead = "AT+QNWPREFCFG=\"mode_pref\""
+    private static let simStateRead = "AT+CPIN?"
+    private static let pinAttemptsRead = "AT+QPINC?"
+    private static let pinLockRead = "AT+CLCK=\"SC\",2"
+
+    private let open: () -> Result<AtCommanding, AtError>
+    private let sleep: (TimeInterval) -> Void
+    private let now: () -> Date
+
+    init(open: @escaping () -> Result<AtCommanding, AtError> = { AtPort.open().map { $0 as AtCommanding } },
+         sleep: @escaping (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+         now: @escaping () -> Date = { Date() }) {
+        self.open = open
+        self.sleep = sleep
+        self.now = now
+    }
+
+    /// Opens a port, runs `body` on it and closes it, also on failure; `openFailed` words a failed open.
+    private func withPort<T>(_ openFailed: (AtError) -> String, _ body: (Link) -> Result<T, ModemFailure>) -> Result<T, ModemFailure> {
+        switch open() {
+        case .failure(let error):
+            return failure(openFailed(error))
+        case .success(let port):
+            defer { port.close() }
+            return body(Link(port))
+        }
+    }
+
+    // MARK: The network
+
+    /// The eleven reads, 3 s each. A refusal leaves its part unknown; a timeout or an I/O error fails the call.
+    func networkInfo() -> Result<NetworkInfo, ModemFailure> {
+        withPort({ describe($0) }) { link in
+            var info = NetworkInfo()
+            info.radio = parseRadio(link.read("AT+CFUN?"))
+            let op = parseOperator(link.read("AT+COPS?"))
+            info.operatorName = op.name
+            info.accessTechnology = op.accessTechnology
+            let provider = parseServiceProvider(link.read("AT+QSPN"))
+            info.networkName = provider.fullName
+            info.plmn = provider.plmn                 // from AT+QSPN only (ruling R1)
+            info.registration = readRegistration(link)
+            info.serving = parseServingCell(link.read("AT+QENG=\"servingcell\""))
+            info.carriers = parseCarriers(link.read("AT+QCAINFO"))
+            info.mode = parseModePreference(link.read(ModemService.modeRead))
+            info.nr5gDisable = parseNr5gDisable(link.read("AT+QNWPREFCFG=\"nr5g_disable_mode\""))
+            if let broken = link.broken { return failure(describe(broken)) }
+            return .success(info)
+        }
+    }
+
+    /// AT+C5GREG?, AT+CEREG?, AT+CGREG?, AT+CREG?, summarized.
+    private func readRegistration(_ link: Link) -> Registration? {
+        summarizeRegistration(fiveG: parseRegistrationStat(link.read("AT+C5GREG?"), prefix: "+C5GREG"),
+                              eps: parseRegistrationStat(link.read("AT+CEREG?"), prefix: "+CEREG"),
+                              ps: parseRegistrationStat(link.read("AT+CGREG?"), prefix: "+CGREG"),
+                              cs: parseRegistrationStat(link.read("AT+CREG?"), prefix: "+CREG"))
+    }
+
+    // MARK: The radio
+
+    func setRadio(on: Bool) -> Result<RadioChange, ModemFailure> {
+        let state = on ? "on" : "off"
+        return withPort({ "\(describe($0)) The radio was not switched \(state)." }) { link in
+            switch link.command(on ? "AT+CFUN=1" : "AT+CFUN=4", timeout: ModemService.radioTimeout) {
+            case .success:
+                guard on else { return .success(RadioChange(on: false, registration: nil, secondsToRegister: nil)) }
+                return .success(waitForRegistration(link, since: now()))
+            case .failure(let error) where isRefusal(error):
+                return failure("The radio could not be switched \(state). \(describe(error))")
+            case .failure(let error):
+                return failure("It is not known whether the radio was switched \(state). \(describe(error))")
+            }
+        }
+    }
+
+    /// After AT+CFUN=1 answered at `start`: reads the registration every second until it is registered (home
+    /// or roaming) or 30 s have passed, or until a read times out or fails (the radio is on all the same).
+    /// The seconds are whole ones, from `start` to the first registered read; nil when it did not register.
+    private func waitForRegistration(_ link: Link, since start: Date) -> RadioChange {
+        var last: Registration? = nil
+        for n in 0..<ModemService.registrationReads {
+            if n > 0 { sleep(ModemService.registrationInterval) }
+            let read = readRegistration(link)
+            if link.broken != nil { break }           // an incomplete read is not kept
+            last = read
+            let elapsed = now().timeIntervalSince(start)
+            if let status = last?.status, status == .home || status == .roaming {
+                return RadioChange(on: true, registration: last, secondsToRegister: Int(max(0, elapsed)))
+            }
+            if elapsed >= ModemService.registrationWait { break }
+        }
+        return RadioChange(on: true, registration: last, secondsToRegister: nil)
+    }
+
+    // MARK: The network mode
+
+    /// Sends `mode` upper-cased in its own order, so that a put-back restores the modem's own string (such as
+    /// NR5G:LTE) exactly (ruling R8); the read-back must be what was sent.
+    func setMode(_ mode: String) -> Result<ModeChange, ModemFailure> {
+        guard canonicalMode(mode) != nil else {
+            return failure("RMNet does not set the network mode \"\(modemTextSafe(mode))\": a mode is auto, or one or more "
+                           + "of wcdma, lte and nr5g joined by \":\", each at most once. Nothing was changed.")
+        }
+        let value = mode.uppercased()      // canonicalMode accepts ASCII names only: this is the RATs as named
+        return withPort({ "\(describe($0)) Nothing was changed." }) { link in
+            let before: String
+            switch link.command(ModemService.modeRead, timeout: ModemService.readTimeout) {
+            case .success(let lines):
+                guard let current = parseModePreference(lines) else {
+                    return failure("The modem did not say which network mode it uses. Nothing was changed.")
+                }
+                before = current
+            case .failure(let error):
+                return failure("The network mode could not be read. \(describe(error)) Nothing was changed.")
+            }
+            switch link.command(modeCommand(value), timeout: ModemService.writeTimeout) {
+            case .success:
+                break
+            case .failure(let error) where isRefusal(error):
+                return failure("The network mode was not changed. \(describe(error))")
+            case .failure(let error):
+                return failure("It is not known whether the network mode changed. \(describe(error)) It was \(before).")
+            }
+            switch link.command(ModemService.modeRead, timeout: ModemService.readTimeout) {
+            case .success(let lines):
+                let after = parseModePreference(lines)
+                guard after == value else {
+                    return failure("The modem answered OK but now reports \(after ?? "no mode"). It was \(before).")
+                }
+                return .success(ModeChange(before: before, after: value))
+            case .failure(let error):
+                return failure("The modem answered OK, but the network mode could not be read back. \(describe(error)) "
+                               + "It was \(before).")
+            }
+        }
+    }
+
+    // MARK: The data profiles
+
+    /// AT+CGDCONT?, then AT+QICSGP=<id> for each profile 1 to 16 listed; a refusal leaves its settings nil.
+    func profiles() -> Result<[DataProfile], ModemFailure> {
+        withPort({ describe($0) }) { link in
+            let listed: [(id: Int, pdpType: String, apn: String)]
+            switch link.command("AT+CGDCONT?", timeout: ModemService.readTimeout) {
+            case .success(let lines): listed = parseProfiles(lines)
+            case .failure(let error): return failure("The data profiles could not be read. \(describe(error))")
+            }
+            var profiles: [DataProfile] = []
+            for p in listed {
+                var settings: ProfileSettings? = nil
+                if (1...16).contains(p.id) {
+                    switch link.command("AT+QICSGP=\(p.id)", timeout: ModemService.readTimeout) {
+                    case .success(let lines): settings = parseProfileSettings(lines)
+                    case .failure(let error) where isRefusal(error): settings = nil
+                    case .failure(let error): return failure("Profile \(p.id) could not be read. \(describe(error))")
+                    }
+                }
+                profiles.append(DataProfile(id: p.id, pdpType: p.pdpType, apn: p.apn, settings: settings))
+            }
+            return .success(profiles)
+        }
+    }
+
+    /// The change and its read-back. With `redial`, when the radio is on: the radio off, a second, the change,
+    /// the read-back, and then always the radio on again (on a new port if this one closed itself) and the
+    /// wait for registration. A redial is never started when the radio was not on.
+    func setProfile(_ id: Int, to settings: ProfileSettings, redial: Bool) -> Result<ProfileChange, ModemFailure> {
+        if let problem = profileProblem(id, settings) { return failure(problem) }
+        return withPort({ "\(describe($0)) Nothing was changed." }) { link in
+            let before: ProfileSettings
+            switch link.command("AT+QICSGP=\(id)", timeout: ModemService.readTimeout) {
+            case .success(let lines):
+                guard let current = parseProfileSettings(lines) else {
+                    return failure("The modem did not give profile \(id)'s settings. Nothing was changed.")
+                }
+                before = current
+            case .failure(let error):
+                return failure("Profile \(id) could not be read. \(describe(error)) Nothing was changed.")
+            }
+
+            var radioOn = false
+            if redial {
+                switch link.command("AT+CFUN?", timeout: ModemService.readTimeout) {
+                case .success(let lines):
+                    guard let radio = parseRadio(lines) else {
+                        return failure("The modem did not say whether the radio is on. Nothing was changed.")
+                    }
+                    radioOn = radio == .on
+                case .failure(let error):
+                    return failure("The radio's state could not be read. \(describe(error)) Nothing was changed.")
+                }
+            }
+
+            guard radioOn else {
+                switch change(link, id, settings) {
+                case .success(let after):
+                    return .success(ProfileChange(id: id, before: before, after: after, redial: redial ? .radioWasOff : .notAsked))
+                case .failure(let problem):
+                    return failure(problem.sentence + (problem.changedNothing ? " Nothing was changed." : ""))
+                }
+            }
+
+            switch link.command("AT+CFUN=4", timeout: ModemService.radioTimeout) {
+            case .success:
+                break
+            case .failure(let error) where isRefusal(error):
+                return failure("The radio could not be switched off for the redial. \(describe(error)) Nothing was changed.")
+            case .failure(let error):
+                // Whether the radio went off is not known: switch it on (harmless if it is on).
+                let start = "The radio could not be switched off for the redial. \(describe(error))"
+                switch switchBackOn(link) {
+                case .success: return failure("\(start) Nothing was changed. The radio is on.")
+                case .failure(let why):
+                    return failure("\(start) Nothing was changed, but the radio may be off. \(describe(why)) \(stillOffAdvice)")
+                }
+            }
+            sleep(ModemService.redialPause)
+            let changed = change(link, id, settings)
+            let radio = switchBackOn(link)
+            switch (changed, radio) {
+            case (.success(let after), .success(let back)):
+                return .success(ProfileChange(id: id, before: before, after: after, redial: .done(back)))
+            case (.success(let after), .failure(let why)):
+                return .success(ProfileChange(id: id, before: before, after: after, redial: .radioLeftOff(describe(why))))
+            case (.failure(let problem), .success):
+                let nothing = problem.changedNothing ? " Nothing was changed." : ""
+                return failure("\(problem.sentence)\(nothing) The radio was switched back on.")
+            case (.failure(let problem), .failure(let why)):
+                let stillOff = problem.changedNothing ? "Nothing was changed, but the radio is still off." : "The radio is still off."
+                return failure("\(problem.sentence) \(stillOff) \(describe(why)) \(stillOffAdvice)")
+            }
+        }
+    }
+
+    /// Why a change did not end as asked. `sentence` never holds the password.
+    private struct ChangeProblem: Error {
+        let sentence: String
+        let changedNothing: Bool          // the modem refused the change itself
+    }
+
+    /// Sends the settings (5 s) and reads them back; the read-back must equal them (the password compared in
+    /// memory only).
+    private func change(_ link: Link, _ id: Int, _ settings: ProfileSettings) -> Result<ProfileSettings, ChangeProblem> {
+        switch link.command(profileCommand(id, settings), timeout: ModemService.writeTimeout) {
+        case .success:
+            break
+        case .failure(let error) where isRefusal(error):
+            return .failure(ChangeProblem(sentence: "The new settings for profile \(id) were refused. \(describe(error))",
+                                          changedNothing: true))
+        case .failure(let error):
+            return .failure(ChangeProblem(sentence: "It is not known whether profile \(id) was changed. \(describe(error))",
+                                          changedNothing: false))
+        }
+        let notReadBack = "Profile \(id) could not be read back after the change."
+        switch link.command("AT+QICSGP=\(id)", timeout: ModemService.readTimeout) {
+        case .success(let lines):
+            guard let after = parseProfileSettings(lines) else {
+                return .failure(ChangeProblem(sentence: "\(notReadBack) The modem did not give its settings.", changedNothing: false))
+            }
+            guard after == settings else {
+                let password = after.password == settings.password ? "" : " Its password is not the one sent."
+                return .failure(ChangeProblem(sentence: "Profile \(id) does not read back as sent: the modem now reports "
+                                              + "\(profileWords(after)).\(password)", changedNothing: false))
+            }
+            return .success(after)
+        case .failure(let error):
+            return .failure(ChangeProblem(sentence: "\(notReadBack) \(describe(error))", changedNothing: false))
+        }
+    }
+
+    /// AT+CFUN=1 after the redial's AT+CFUN=4, then the wait for registration. On `link` while it works; when
+    /// it closed itself (a timeout or an I/O error, before or on this line), it is closed and a new port is
+    /// opened, once. The failure is why the radio is still off.
+    private func switchBackOn(_ link: Link) -> Result<RadioChange, AtError> {
+        if link.broken == nil {
+            switch link.command("AT+CFUN=1", timeout: ModemService.radioTimeout) {
+            case .success: return .success(waitForRegistration(link, since: now()))
+            case .failure(let error) where isRefusal(error): return .failure(error)
+            case .failure: break
+            }
+        }
+        // AtPort keeps the interface after an I/O error: close it, or the new open finds it busy.
+        link.close()
+        switch open() {
+        case .failure(let error):
+            return .failure(error)
+        case .success(let port):
+            defer { port.close() }
+            let second = Link(port)
+            switch second.command("AT+CFUN=1", timeout: ModemService.radioTimeout) {
+            case .success: return .success(waitForRegistration(second, since: now()))
+            case .failure(let error): return .failure(error)
+            }
+        }
+    }
+
+    // MARK: The SIM
+
+    func sim() -> Result<SimInfo, ModemFailure> {
+        withPort({ describe($0) }) { link in
+            readSimState(link).map { readSimDetails(link, $0) }
+        }
+    }
+
+    /// AT+CPIN?: its error line is a state too. Fails on an answer without a +CPIN line, a timeout or an I/O error.
+    private func readSimState(_ link: Link) -> Result<SimState, ModemFailure> {
+        switch link.command(ModemService.simStateRead, timeout: ModemService.readTimeout) {
+        case .success(let lines):
+            guard let state = parseSimState(lines) else { return failure("The modem did not say what state the SIM is in.") }
+            return .success(state)
+        case .failure(.modem(let line)):
+            return .success(simState(fromError: line))
+        case .failure(let error):
+            return failure("The SIM's state could not be read. \(describe(error))")
+        }
+    }
+
+    /// AT+QPINC? and AT+CLCK="SC",2 after the state; one that is refused or fails is nil.
+    private func readSimDetails(_ link: Link, _ state: SimState) -> SimInfo {
+        let attempts = parsePinAttempts(link.read(ModemService.pinAttemptsRead))
+        let lock = parsePinLock(link.read(ModemService.pinLockRead))
+        return SimInfo(state: state, pinLock: lock, pinAttempts: attempts.pin, pukAttempts: attempts.puk)
+    }
+
+    /// Sends the PIN only when the SIM, read again now, asks for it and has the attempts left that the owner was
+    /// shown (at least 1). The PIN goes in the AT+CPIN="…" line and nowhere else.
+    func enterPin(_ pin: String, shownAttempts: Int) -> Result<PinOutcome, ModemFailure> {
+        if let problem = pinProblem(pin) { return failure(problem) }
+        return withPort({ "\(describe($0)) Nothing was sent." }) { link in
+            let state: SimState
+            switch readSimState(link) {
+            case .success(let s): state = s
+            case .failure(let f): return failure("\(f.message) Nothing was sent.")
+            }
+            let attemptLines: [String]
+            switch link.command(ModemService.pinAttemptsRead, timeout: ModemService.readTimeout) {
+            case .success(let lines): attemptLines = lines
+            case .failure(let error) where isRefusal(error): attemptLines = []
+            case .failure(let error): return failure("The attempts left could not be read. \(describe(error)) Nothing was sent.")
+            }
+            guard state == .pin else {
+                return failure("The SIM does not ask for a PIN (\(simStateWords(state))). Nothing was sent.")
+            }
+            guard let left = parsePinAttempts(attemptLines).pin else {
+                return failure("The attempts left could not be read; RMNet does not send a PIN without them. Nothing was sent.")
+            }
+            guard left >= 1 else {
+                return failure("The SIM has no PIN attempts left: it needs its PUK from the carrier, and RMNet does not "
+                               + "enter PUKs. Nothing was sent.")
+            }
+            guard left == shownAttempts else {
+                return failure("The attempts left changed to \(left) since they were shown. Nothing was sent; "
+                               + "check and enter the PIN again.")
+            }
+            let accepted: Bool
+            switch link.command(pinCommand(pin), timeout: ModemService.pinTimeout) {
+            case .success: accepted = true
+            case .failure(let error) where isRefusal(error): accepted = false
+            case .failure(let error):
+                return failure("\(describe(error)) It is not known whether the SIM took the PIN. "
+                               + "Check the attempts left (RMNet sim) before entering it again.")
+            }
+            let after: SimInfo?
+            switch readSimState(link) {
+            case .success(let s): after = readSimDetails(link, s)
+            case .failure: after = nil
+            }
+            return .success(PinOutcome(accepted: accepted, sim: after))
+        }
+    }
+}
+
+/// Reads a secret (a password, a PIN) from the terminal without echo: readpassphrase(3) with RPP_REQUIRE_TTY,
+/// so it reads /dev/tty and never a pipe or a file. nil without a terminal, or when reading fails. The buffer
+/// is wiped after use; the secret is not kept or shown here.
+func readSecret(prompt: String) -> String? {
+    var buffer = [CChar](repeating: 0, count: 1024)
+    defer { buffer.withUnsafeMutableBytes { _ = memset_s($0.baseAddress, $0.count, 0, $0.count) } }
+    guard readpassphrase(prompt, &buffer, buffer.count, RPP_REQUIRE_TTY) != nil else { return nil }
+    return buffer.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+}
