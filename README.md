@@ -83,6 +83,7 @@ On build 317.16.8 (the steps were written for 317.10.17; none has been done on a
 3. Switch the port off and on under Network → RM520N-GL (make the service inactive, then active). Not under Login Items & Extensions → Driver Extensions: that switch leaves a stuck entry.
 4. Look at whether `RM520N-GL` is offered under Internet Sharing as a source. Do not turn sharing on. (The controller has established, read only, that the port and an enabled service `RM520N-GL` exist and that Internet Sharing is off; nobody has looked at the Sharing pane.)
 5. `Remove…` in the window with the modem attached (one password prompt). After "The system accepted the removal", do not press `Remove…` again whatever the window shows; pull the cable to finish. Then `Install` (an approval in System Settings), then plug the modem back.
+6. The `Messages` tab, which nobody has seen: open it and check that the list shows the same messages as `RMNet sms list`, that a long message wraps and can be selected and copied, and that the line above the list shows the update time and how many of the modem's 255 store entries are used. Send one message from it (for example `10086` to `10086`) and see the result line and the reply arriving within 15 seconds. Once, press Cmd-Q right after `Send`: a line above the tabs should say that RMNet quits when the message has been sent, and the app should quit by itself a few seconds later.
 
 ## Design
 
