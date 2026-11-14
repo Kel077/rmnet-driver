@@ -65,10 +65,11 @@ check-driverkit:
 	./scripts/check-personalities.sh
 
 # The app's status model, SMS model, AT answer logic, the Messages tab's controller, the gps verb's
-# NMEA logic and its port reader, the network model and the settings model, tested without Xcode or
-# hardware (neither the AT port nor the NMEA port is opened: the reader reads a pseudo-terminal the test
-# makes, and no window is made).
-app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/nmea-tests build/gpsread-tests build/modemnet-tests build/modemset-tests
+# NMEA logic and its port reader, the network model, the settings model and the modem service (against a
+# scripted port), tested without Xcode or hardware (neither the AT port nor the NMEA port is opened: the
+# reader reads a pseudo-terminal the test makes, and no window is made).
+app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/nmea-tests build/gpsread-tests \
+		build/modemnet-tests build/modemset-tests build/modemsvc-tests
 	./build/app-tests
 	./build/sms-tests
 	./build/at-tests
@@ -77,6 +78,7 @@ app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build
 	./build/gpsread-tests
 	./build/modemnet-tests
 	./build/modemset-tests
+	./build/modemsvc-tests
 
 build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
 	@mkdir -p build
@@ -107,6 +109,12 @@ build/modemnet-tests: app/ModemNetwork.swift tests/app/ModemNetworkTests.swift
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 build/modemset-tests: app/ModemNetwork.swift app/ModemSettings.swift tests/app/ModemSettingsTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+# SmsService.swift brings describe(_: AtError).
+build/modemsvc-tests: app/AtPort.swift app/SmsModel.swift app/SmsService.swift app/ModemNetwork.swift \
+		app/ModemSettings.swift app/ModemService.swift tests/app/ModemServiceTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
