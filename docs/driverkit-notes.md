@@ -1283,6 +1283,8 @@ The owner wrote: "i tested 1. 2. 3. 4. 5. all seems good", meaning the README's 
 
 ## Runtime findings (same-half-hour comparison with qmi-darwin, 2026-11-15 02:07 to 02:13)
 
+> **Correction (2026-11-15, 02:48).** qmi-darwin's figures in this section are double. macOS counted every packet received on `utun12` twice in `netstat -I`, which `measure.sh` reads; qmi-darwin's real rate at 02:08 was about **153 Mbit/s**, not 305.9 (best second about 186, not 372.7; about 155 MB moved, not 309.2). Our driver's figures are right (`en33`'s counters equal the driver's own). So our driver was about 25 percent *faster* than qmi-darwin on the same cell, and the throughput line is met by its qmi-darwin test. The conclusions below ("ours is 63 percent", "the cell can deliver more than our driver takes", the flow-control lead as a reason for a gap) rest on the wrong figure and do not hold. The evidence is in "Runtime findings (receive speed, and qmi-darwin's double-counted interface)".
+
 The design's throughput line allows "within 15 percent of qmi-darwin measured within the same half hour". With the owner at the Mac: our driver measured, then removed (`Remove…`, a replug), qmi-darwin started by the owner (`sudo qmictl run --pdn internet:1:0x81 --scoped`, release build of 0.17.2 at `fe6f25b`), measured, stopped, our driver reinstalled (`Install`, a replug; link up 12 s after the replug).
 
 | | Our driver, 317.16.8, `en33` | qmi-darwin, `utun12` |
@@ -1306,6 +1308,8 @@ The design's throughput line allows "within 15 percent of qmi-darwin measured wi
 
 ## Runtime findings (flow control off against on, download, 2026-11-15 02:17 to 02:20)
 
+> **Correction (2026-11-15, 02:48).** "qmi-darwin's 306 to 373" below were double counts (real: about 153 to 186; see the correction in the section before). The conclusion "the host path is the stronger lead" is withdrawn: there was no gap to explain. Full 8-second downloads later the same night gave 196.5 Mbit/s with flow control off and 183.9 to 197.4 with it on, so flow control costs nothing measurable either; these 50 MB runs ended while TCP was still ramping. See "Runtime findings (receive speed, and qmi-darwin's double-counted interface)".
+
 To test the lead from the comparison with qmi-darwin: one capped download (`scripts/measure.sh en33 down`, stop at 50 MB) with the build as committed (flow control asked, 317.16.8), then a build with `RMNetFlowControl` 0 in the working tree only (317.18.17, one modem reboot), then the committed build back (317.18.19, one more reboot; flow control asked and granted again). Same cell throughout (PCI 893, RSRP -89 to -90, SINR 12 to 15).
 
 | | Flow control on, 02:17:41 | Flow control off, 02:18:59 |
@@ -1320,3 +1324,35 @@ To test the lead from the comparison with qmi-darwin: one capped download (`scri
 - After the last reboot the first IPv4 ping was sent before the port had its IPv4 address ("No route to host"); a few seconds later the address was there and pings worked.
 
 **Data.** The two runs moved 111,344,554 bytes recorded (the usage file's total is 1,287,167,501). About 1,295 MB of the 1,400 MB is used, about 105 MB left; the scripts' ceiling (1,300,000,000) now refuses every capped run.
+
+## Runtime findings (receive speed, and qmi-darwin's double-counted interface, 2026-11-15 02:31 to 02:52)
+
+The owner added 5 GB at 02:24 ("start fixing. i'm giving you 5gb over next two hours") to close what looked like a gap to qmi-darwin. Diagnosis came first; it found no gap. Every run is `scripts/measure.sh <port> down-long` (4 streams, 8 s, capped), on build 317.18.19 or 317.18.40 (the committed code, flow control asked and granted) unless a row says otherwise.
+
+| Time | What changed | Gate figure | Best second | What else was seen |
+|---|---|---|---|---|
+| 02:31 | nothing; pings and `nettop` alongside | 185.6 | 211.0 | receive windows 2.6 to 4.2 MB, round trip about 33 ms; pings rose to 77 to 214 ms in the first two seconds only |
+| 02:32 | `netstat -s` before and after | 186.7 | | 123,639 frames on `en33` but 26,582 IP packets counted: macOS merges about 4.6 TCP segments per packet on this port (`kern.skywalk.flowswitch.rx_agg_tcp` 16384); about 8,400 packets out |
+| 02:33 | two runs at once, 8 streams | 208.2 in total | 225.6 | the total stays near 200, not each stream; about 880 transfers a second of about 28 KB |
+| 02:36 | `rx_agg_tcp` 0 (set by the owner, restored to 16384 afterwards) | 197.4 | 212.5 | 158,584 IP packets for 136,759 frames: no merging; 12,461 acknowledgements. Merging is not the limit. |
+| 02:38 | flow control off (317.18.37, `RMNetFlowControl` 0 in the working tree only) | 196.5 | 218.5 | flow control is not the limit |
+| 02:39 | `nettop` per connection every second (flow control off) | 189.2 | | out of order 0, retransmitted 0, duplicates 0 or about 800 bytes, round trip 18 to 22 ms, receive buffers 1.3 to 2.5 MB |
+| 02:41 | 317.18.40, flow control on; cell PCI 32, RSRP -91, SINR 9 | 183.9 | 206.4 | 6,327 transfers, 126,269 datagrams (about 28.8 KB and 20 datagrams a transfer) |
+
+- **No loss, no reordering, no window or round-trip limit, and the driver busy about 6 percent.** The senders settle near 200 Mbit/s in total with no loss and little queue, which is how a rate-estimating sender behaves at a bottleneck it does not own. Nothing measured from the Mac points at the host; the plateau is what the cell gave that night as far as anything shows. (On 2026-11-14 at 16:27 the same port had a best second of 278.)
+- `RMNetRxFullTransfers` counts reads of exactly 31,744 bytes. The modem packs whole datagrams, so a "full" transfer is about 21 datagrams and rarely reaches 31,744; a count of 0 says little. The transfers averaged 19.6 datagrams and 28 KB, close to full.
+
+**qmi-darwin, measured again** (started by the owner at about 02:46 after `Remove…` and a replug; the first start at 02:44 got IPv6 only, "ipv4 failed: 3GPP #36", while the old call was still being torn down; the second got IPv4 on `utun12`):
+
+| Time | Cell | `measure.sh` printed (from `netstat -I utun12`) | qmictl's own `usb_in_bytes` | Real rate |
+|---|---|---|---|---|
+| 02:47:13 | PCI 893, RSRP -90 to -91, SINR 16 | 292.9 Mbit/s, 299,539,452 bytes in, 210,724 packets | 149,980,756 bytes, 105,362 packets, 5,639 transfers | about 146 Mbit/s |
+| 02:50:18 | PCI 893 | 273,261,744 bytes in | 136,826,352 bytes; the four TCP connections' own byte counts at their last sample 125,396,561 | about 137 Mbit/s |
+
+- **macOS counted every packet received on `utun12` twice.** Exactly twice the packets that qmictl delivered; interface bytes / modem-side bytes 1.997. Pings through `utun12`: 10 replies added 20 received packets to the interface, 20 added 40, and no ping saw a duplicate reply. So the traffic is delivered once and only the interface counters double. Whose fault it is (macOS's accounting on the batched `utun` write path qmi-darwin uses, or the way qmi-darwin calls it) is not proven; it does not change the result.
+- **`en33`'s counters are right:** its input packets equal `RMNetRxPackets` exactly (140,837 and 140,837 in the 02:33 run).
+- **Corrected comparison.** qmi-darwin 0.17.2: about 153 (02:08, PCI 893), 146 and 137 Mbit/s (02:47 and 02:50, PCI 893, SINR 16). Our driver: 193.3 (02:07, PCI 893), 183.9 to 197.4 in the runs above (02:31 to 02:41). Ours is about 25 percent faster, also when qmi-darwin had the better cell. The design's throughput line ("at least 200 Mbit/s, or within 15 percent of qmi-darwin measured within the same half hour") is met by its second test; the 200 Mbit/s test alone is not.
+- **Ruling: no driver change for receive speed.** The gap it was meant to close does not exist.
+- The ratio check above is the one to repeat before trusting `measure.sh` on any interface other than `en33`.
+
+**Data.** The usage file records 2,093,606,693 bytes since 02:24 (total 3,380,774,194; the scripts' ceiling is 6,300,000,000). It over-records: the two runs at 02:33 each recorded the port's whole traffic (about 202 MB counted twice) and the two qmi-darwin runs were recorded at their doubled counts (about 286 MB too much), as was the 02:08 run (about 155 MB too much). With pings and background traffic, about 2.75 GB of the 6.4 GB allowed for testing is really used, about 3.65 GB left. The usage file is not edited; it errs on the safe side.

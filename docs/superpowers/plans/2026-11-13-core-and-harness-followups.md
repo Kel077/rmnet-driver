@@ -291,9 +291,18 @@ Plan `docs/superpowers/plans/2026-11-14-sms-in-the-app.md`, branch `sms`, build 
 ## The owner's steps done (2026-11-15)
 
 - Done by the owner on 317.16.8: the window, unplug and replug during a ping, the port switched off and on, Internet Sharing offered, `Remove…` then `Install` then replug. The stop of an instance with USB requests in flight has therefore run on hardware at least once (during the unplug), but without a log.
-- Still open: the throughput line (the same-half-hour comparison with qmi-darwin); a sleep and wake on the current build.
+- Still open: a sleep and wake on the current build. (The throughput line was settled by the same-half-hour comparison; see "Receive speed (2026-11-15)".)
 
 ## Sent here by the same-half-hour comparison (2026-11-15)
 
+> **Withdrawn (2026-11-15, 02:48).** The two items below rest on qmi-darwin figures that were double: macOS counted every packet received on qmi-darwin's `utun12` twice, so it ran at about 153 Mbit/s, not 306, and our driver was about 25 percent faster. There is no gap and neither lead is open. See "Receive speed (2026-11-15)" below.
+
 - **Our download path tops out near 200 Mbit/s where qmi-darwin reached 306 on the same cell** (193.3 against 305.9, 90 seconds apart; `docs/driverkit-notes.md`, "Runtime findings (same-half-hour comparison with qmi-darwin)"). The design's throughput line is not met. Leads, in the order to test them: (1) the in-band flow-control request (every download since it was added stayed at or under about 200; the last ones without it reached 278 in a second): an A/B with `RMNetFlowControl` 0 and 1 within minutes; (2) the host path: a copy of every datagram, an Ethernet header, and the DriverKit RX queues, against qmi-darwin's one batched `utun` call per transfer; the driver's handler time (about 80 µs per transfer, 5 percent busy) does not show a CPU limit, so look at how often packets reach the RX completion queue and whether the stack's intake is the limit.
 - **Flow control tested (02:17 to 02:20):** a capped download with the request off gave a best second of 190.2 Mbit/s against 159.4 with it on, same cell, minutes apart; neither near qmi-darwin's 306. Lead (1) is at most a small part; lead (2), the host path, is now the main one. Investigating it needs measurements: the data left (about 105 MB) and the scripts' ceiling allow none.
+
+## Receive speed (2026-11-15)
+
+- **Settled: the throughput line is met by its qmi-darwin test.** Corrected figures: qmi-darwin 0.17.2 about 153, 146 and 137 Mbit/s (02:08, 02:47, 02:50); our driver 193.3 (02:07) and 183.9 to 197.4 (02:31 to 02:41). Not met by the 200 Mbit/s test alone. `docs/driverkit-notes.md`, "Runtime findings (receive speed, and qmi-darwin's double-counted interface)".
+- **No driver change for receive speed.** Receive merging off, flow control off and 8 streams each left the total near 200, with no loss, no reordering and the driver about 6 percent busy.
+- Open, small: whose fault the `utun` double counting is (macOS's accounting on the batched write path, or qmi-darwin's use of it). It matters only to anyone measuring qmi-darwin from `netstat -I`; the README warns about it.
+- Open, small: `scripts/measure.sh` trusts the interface's counters. On an interface whose counters are not the driver's own, compare one run against another count (qmictl's `usb_in_bytes`, `nettop`'s per-connection bytes) first.
