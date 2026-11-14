@@ -20,7 +20,7 @@ These came from the whole-branch review and from running against the modem. Stat
   - whether a neighbour solicitation for the Mac's own address ever reaches the driver, and if so whether answering it causes harm; **open:** not looked for (Task 6 report, Step 4).
   - whether the modem accepts 4 to 7 bytes of padding on the last uplink frame (the exact-multiple-of-1024 case), which needs a throughput run to hit; **open:** the Task 7 upload showed no uplink error (`RMNetUsbBulkOutErrors` and `RMNetTxDropUsb` 0), but nothing counts whether that case occurred.
 - **Decide when IPv4 counts as up.** Today the address TLV alone sets `has_v4`. If the gateway or mask were missing, DHCP would offer a zero router and mask.
-  - **Open.** Unchanged: `parse_wds_current_settings` still sets `has_v4` from the address TLV alone.
+  - **Settled in Core (`ec486d5`), under review.** `parse_wds_current_settings` sets `has_v4`, and takes the address, gateway and mask, only when all three TLVs are present; a family with any of them missing is treated as not up, so the other family carries the link and the retry applies (`ipv4_without_gateway_or_mask_is_not_up`, `parse_settings_ipv4_needs_address_mask_and_gateway`).
 - **Do not copy the harness's synchronous bulk write** into the driver. It blocks its queue for up to 5 seconds.
   - **Settled.** Not copied: every bulk transfer in `driver/usb_io.cpp` is an asynchronous `AsyncIO` (`2bd8077`).
 - **Move QMUX frame splitting into Core.** The harness splits a control read into frames itself; `qmi_decode` does not report how many bytes it consumed.
@@ -28,9 +28,9 @@ These came from the whole-branch review and from running against the modem. Stat
 - **Count QMAP command frames.** The modem sent none during testing, so flow-control replies are unproven on hardware.
   - **Settled as counting, open on hardware.** `2bd8077` counts them (`RMNetQmapCommands`, flow disable and enable, replies); none arrived in any task, Task 7's runs included.
 - **Add a liveness check for the Up state.** A modem that goes silent leaves the session Up.
-  - **Open.** None exists; it is in the next plan.
+  - **Settled in Core (`ec486d5`), under review, not yet seen on hardware.** In `Up`, 30 s (`kLivenessIntervalMs`) after link up and after each answered probe, `Session` sends WDS Get Current Settings on the first live family; any response counts, and none within 10 s takes the link down and goes to Backoff; a probe and a retry never run together, and a disconnect or reconfigure indication abandons the probe.
 - **Handle a reconfigure for the second family during a refresh.** It is currently lost, leaving that family's settings stale until the next event.
-  - **Open.** Unchanged: `Session` acts on a reconfigure indication only in the Up state, so one arriving while Refreshing is still dropped.
+  - **Settled in Core (`ec486d5`), under review.** A reconfigure indication for the other family during `Refreshing` is remembered and that family is refreshed right after the current one, before `link_up()` (`reconfigure_for_the_other_family_during_a_refresh_is_not_lost`).
 
 ## Left open by the driver plan
 
