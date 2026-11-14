@@ -26,7 +26,8 @@
 
 ## Review Focus
 
-- A modem that stops answering while the link is up: the link goes down within 45 seconds and the session starts again from sync; it does not stay up, and a probe does not disturb a call that is working.
+- A modem that stops answering while the link is up: the link goes down within 45 seconds and the session starts again from sync; it does not stay up, and a probe does not disturb a call that is working. (Amended 2026-11-14 after Task 1's review: with one address family missing, a retry of that family may be outstanding when the modem goes silent; its Start Network request has a 60-second timeout and the probe waits for it, so in that case the bound is about 100 seconds. The session has one outstanding request at a time, and that is kept.)
+- A timer that fails to re-arm during the stop sequence must not leave `Stop` waiting. (Added 2026-11-14 after Task 2's review: Task 2 may change the two conditions in `AdvanceStop` that wait on the timer so that a failed arm counts as no timer.)
 - A request already outstanding (a retry of a missing family, a refresh) when a probe falls due, and an indication that arrives while a probe is outstanding: no request is lost, sent twice, or answered into the wrong handler.
 - Wake from sleep: whatever state USB is in, the port ends either up with fresh addresses or down; never up with the addresses of the call that existed before sleep.
 - A timer that fails to re-arm: ticks resume; a hold, a stop or a recovery deadline does not hang on it.
