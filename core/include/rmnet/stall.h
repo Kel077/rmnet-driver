@@ -23,6 +23,8 @@ enum class StallOutcome : uint8_t {
   Counted,     // a new stall, fewer than kUplinkStallsStuck in a row
   Stuck,       // kUplinkStallsStuck in a row: restart; the count starts again
   StuckAgain,  // stuck again with no success since the restart; the count starts again
+               // and the restart stays remembered, so the next third stall in a row with no
+               // success or clear() between is StuckAgain again
 };
 
 class UplinkStallCounter {

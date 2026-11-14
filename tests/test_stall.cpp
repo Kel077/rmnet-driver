@@ -88,3 +88,14 @@ TEST(a_failure_with_an_old_sequence_number_never_counts) {
   CHECK_EQ(c.stalls(), 0u);
   CHECK(c.failed(c.submitted()) == StallOutcome::Counted);
 }
+
+TEST(a_stale_failure_does_not_hide_a_later_stall) {
+  UplinkStallCounter c;
+  uint64_t seq[8];
+  for (int i = 0; i < 8; ++i) seq[i] = c.submitted();
+  CHECK(c.failed(seq[0]) == StallOutcome::Counted);  // the mark moves to 8
+  uint64_t ninth = c.submitted();
+  CHECK(c.failed(seq[1]) == StallOutcome::None);     // stale: must leave the mark at 8
+  CHECK(c.failed(ninth) == StallOutcome::Counted);
+  CHECK_EQ(c.stalls(), 2u);
+}
