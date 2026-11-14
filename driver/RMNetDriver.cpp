@@ -201,7 +201,7 @@ struct RxBridge final : RxSink {
 };
 
 // What PublishCounters last published, in its order.
-enum : uint32_t { kCounterCount = 52 };
+enum : uint32_t { kCounterCount = 53 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -280,9 +280,28 @@ struct RMNetDriver_IVars {
   uint64_t lastWakeUpMs;
   uint64_t wakeRetries;
   uint32_t lastPowerFlags;
+  uint32_t txQueueCapacity;  // the TX submission queue's capacity once made (0 until then)
   bool countersPublished;
   uint64_t counters[kCounterCount];
 };
+
+namespace {
+
+// Creates the TX submission queue with `capacity` into ivars->txSubmit, which is set only on success
+// (and txQueueCapacity with it). Whatever a failed Create may have handed back is released here.
+kern_return_t CreateTxSubmitQueue(RMNetDriver_IVars* ivars, IOService* owner, uint32_t capacity) {
+  IOUserNetworkTxSubmissionQueue* q = nullptr;
+  kern_return_t ret = IOUserNetworkTxSubmissionQueue::Create(ivars->pool, owner, capacity, 0, ivars->queue, &q);
+  if (ret != kIOReturnSuccess) {
+    OSSafeReleaseNULL(q);
+    return ret;
+  }
+  ivars->txSubmit = q;
+  ivars->txQueueCapacity = capacity;
+  return kIOReturnSuccess;
+}
+
+}  // namespace
 
 bool RMNetDriver::FirstCall(uint32_t flag) {
   if (!ivars || (ivars->logged & flag)) return false;
@@ -379,7 +398,7 @@ kern_return_t RMNetDriver::Start_Impl(IOService* provider) {
     TearDown(provider);  // passes Stop to the superclass, at once or once USB has quiesced
     return ret;
   }
-  LOG("started");
+  LOG("started; TX submission queue capacity %u", ivars->txQueueCapacity);
   return kIOReturnSuccess;
 }
 
@@ -424,7 +443,12 @@ kern_return_t RMNetDriver::CreateInterface(const uint8_t* hostMac) {
   kern_return_t ret = IOUserNetworkPacketBufferPool::CreateWithOptions(this, "RMNetPool", &opts, &ivars->pool);
   if (ret != kIOReturnSuccess) return ret;
 
-  ret = IOUserNetworkTxSubmissionQueue::Create(ivars->pool, this, kTxQueueCapacity, 0, ivars->queue, &ivars->txSubmit);
+  ret = CreateTxSubmitQueue(ivars, this, kTxQueueCapacity);
+  if (ret != kIOReturnSuccess) {
+    // Nothing documents which capacities Create accepts; kQueueCapacity has worked on every load.
+    LOG("TX submission queue of %u refused 0x%x; trying %u", kTxQueueCapacity, ret, kQueueCapacity);
+    ret = CreateTxSubmitQueue(ivars, this, kQueueCapacity);
+  }
   if (ret != kIOReturnSuccess) return ret;
   ret = IOUserNetworkTxCompletionQueue::Create(ivars->pool, this, kQueueCapacity, 0, ivars->queue, &ivars->txComplete);
   if (ret != kIOReturnSuccess) return ret;
@@ -677,13 +701,13 @@ void RMNetDriver::ResumeUsb() {
   bool first = !ivars->resumePending;
   ivars->resumePending = false;
   if (!first) {
-    ivars->wakeRetries++;
     if (ivars->usb->device_gone()) {
       // As at the wake call: take the link down, with the state "detached".
       LOG("wake %llu: the device went while its resume was pending; nothing more", ivars->wakes);
       OnUsbFatal("device gone before usb resumed");
       return;
     }
+    ivars->wakeRetries++;
   }
   bool lastTry = NowMs() - ivars->wakeStartMs >= kResumeRetryMs;
   UsbIo::Resume r = ivars->usb->resume(lastTry);
@@ -1128,7 +1152,8 @@ void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
 // RMNetWakeRetries counts resume attempts after the first of their wake (the bus not ready);
 // RMNetSleepCompletions counts USB completions that arrived while UsbIo was held, and
 // RMNetSleepLastStatus is the last status among them other than success; RMNetLastPowerFlags is the
-// flags of the last SetPowerState call.
+// flags of the last SetPowerState call. RMNetTxQueueCapacity is the TX submission queue's capacity,
+// kTxQueueCapacity or, if the system refused that, kQueueCapacity (not a counter; it never changes).
 void RMNetDriver::PublishCounters() {
   const DataCounters& c = ivars->core->counters();
   uint32_t txPending = ivars->txPendingCount - ivars->txPendingNext;
@@ -1193,6 +1218,7 @@ void RMNetDriver::PublishCounters() {
       {"RMNetSleepCompletions", u.sleep_completions},
       {"RMNetSleepLastStatus", u.sleep_last_status},
       {"RMNetLastPowerFlags", ivars->lastPowerFlags},
+      {"RMNetTxQueueCapacity", ivars->txQueueCapacity},
   };
   bool changed = !ivars->countersPublished;
   for (uint32_t i = 0; i < kCounterCount; i++) {

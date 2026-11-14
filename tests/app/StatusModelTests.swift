@@ -240,7 +240,7 @@ struct StatusModelTests {
         let props = ["RMNetState": "up", "RMNetIPv4": "10.62.238.140/29 gw 10.62.238.141", "RMNetIPv6": "none",
                      "RMNetProfile": "1", "RMNetTxPackets": "12", "RMNetRxPackets": "7", "RMNetTxDropBusy": "0",
                      "RMNetSomethingNew": "abc"]
-        let rows = tableRows(status([enabled], attached: true, props), bundledVersion: "316.21.4")
+        let rows = tableRows(status([enabled], attached: true, props), bundledVersion: "316.21.4", listingKnown: true)
         let names = rows.map { $0.name }
         check(names == ["State", "IPv4", "IPv6", "Profile", "Installed driver version", "Bundled version",
                         "RMNetRxPackets", "RMNetSomethingNew", "RMNetTxPackets"],

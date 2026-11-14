@@ -219,7 +219,7 @@ let fixedProperties = ["RMNetState", "RMNetIPv4", "RMNetIPv6", "RMNetProfile"]
 // is not "0", sorted by name (the counters; their list is not fixed here). Unless `listingKnown`
 // (the system's last answer was a listing), the installed version is "unknown", not the entries
 // last listed.
-func tableRows(_ s: DriverStatus, bundledVersion: String, listingKnown: Bool = true) -> [TableRow] {
+func tableRows(_ s: DriverStatus, bundledVersion: String, listingKnown: Bool) -> [TableRow] {
     let p = s.properties
     let listed = s.entries.map { $0.version }.joined(separator: ", ")
     let installed = !listingKnown ? "unknown" : listed.isEmpty ? "none" : listed

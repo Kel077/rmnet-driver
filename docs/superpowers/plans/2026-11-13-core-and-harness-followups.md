@@ -78,7 +78,7 @@ Before the same-day comparison with the userspace tool:
 None of these has run on hardware.
 
 - **Empty packets held across an interface disable and enable.** The driver now holds up to 32 empty receive packets (`RMNetRxStock`) and up to 32 kept transmit frames while idle or held, where before it held 0 or 1; whether the framework reclaims driver-held packets on `SetInterfaceEnable(false)` is unknown, and if it does they would be used twice. Needs the port switched off and on with `RMNetRxStock` above 0 (the owner's step).
-- **Pool margin.** The driver alone can hold `rxOut` 256 + `rxStock` 32 + `txDone` and kept frames 256 = 544 packets against `kPacketCount` 512, with the four queues of 256 on top; no array can overflow, but during an upload the hold keeps the transmit queue full, so a download at the same time could find no empty packets (`RMNetRxDropNoPacket`), and the standing queue of about 288 frames adds latency in front of acknowledgements. If hardware shows it: raise `kPacketCount` to 1024, or give the transmit queue a smaller capacity. **Changed 2026-11-14 (hardening), changed in code, not yet seen on hardware:** the TX submission queue now has `kTxQueueCapacity` 64 (the other three queues keep `kQueueCapacity` 256), so the queues hold 64 + 3 × 256 = 832 packets at most against 1,088 before, and the standing queue in front of the driver during an upload is about 64 + 32 kept frames = 96 instead of about 288; the rest waits in macOS's interface queue, which schedules flows fairly. The driver's own holding (`rxOut` 256 + `rxStock` 32 + `txDone` and kept frames 256 = 544) is unchanged, and so is `kPacketCount` (512). Whether the capacity really bounds what waits inside the driver's queue is measured after the install.
+- **Pool margin.** The driver alone can hold `rxOut` 256 + `rxStock` 32 + `txDone` and kept frames 256 = 544 packets against `kPacketCount` 512, with the four queues of 256 on top; no array can overflow, but during an upload the hold keeps the transmit queue full, so a download at the same time could find no empty packets (`RMNetRxDropNoPacket`), and the standing queue of about 288 frames adds latency in front of acknowledgements. If hardware shows it: raise `kPacketCount` to 1024, or give the transmit queue a smaller capacity. **Changed 2026-11-14 (hardening), changed in code, not yet seen on hardware:** the TX submission queue now has `kTxQueueCapacity` 64 (the other three queues keep `kQueueCapacity` 256), so the queues hold 64 + 3 × 256 = 832 packets at most against 4 × 256 = 1,024 before, and the standing queue in front of the driver during an upload is about 64 + 32 kept frames = 96 instead of about 256 + 32 = 288 (if the system refuses 64, `Start` falls back to 256, `RMNetTxQueueCapacity` shows it, and both figures are as before: 1,024 and 288); the rest waits in macOS's interface queue, which schedules flows fairly. The driver's own holding (`rxOut` 256 + `rxStock` 32 + `txDone` and kept frames 256 = 544) is unchanged, and so is `kPacketCount` (512). Whether the capacity really bounds what waits inside the driver's queue is measured after the install.
 - **An "uplink usable" callback.** A failed bulk OUT completion, the end of a bulk OUT recovery (`UsbIo::end_out_recovery`) and a link down without a pause restart a held drain only on the next 100 ms tick; a `UsbIoListener` callback raised after `UsbIo::bulk_out_complete` has decided on recovery, and at the end of `UsbIo::end_out_recovery`, would remove that wait.
 - **A host harness for `CoreHost`'s hold.** No automated test covers `CoreHost::transmit` returning false, the re-offer of the kept frame, or frame order; nor the kept QMAP command replies.
 - **The burst tool's remaining signal cases.** A second signal inside the interrupt handler of `scripts/uplink-burst.py` ends with a traceback, though the usage line is written; SIGQUIT and SIGKILL leave no line.
@@ -108,7 +108,7 @@ Small hardening left open:
 - `RMNetPoolPacketCount` publishes a fixed total.
 - `DrainTx` also flushes when it stops for lack of `txDone` room.
 - A successful read during a recovery resets the recovery count.
-- `measure.sh`: TERM exits 130.
+- `measure.sh`: TERM exits 130. **Changed 2026-11-14 (hardening), Task 3 (`9966996`): done:** TERM now exits 143 and HUP 129 (INT stays 130); the usage record on an interruption is unchanged.
 - `measure.sh`: the FAILED message blames curl when the interface vanished.
 - `measure.sh`: the gate window starts up to one sample late.
 - `measure.sh`: a counter reset loses up to 0.25 s of traffic.
@@ -186,7 +186,7 @@ Open:
 
 - **A pause that keeps coming back.** A modem that keeps its flow-control pause makes the session restart about every 30 s with no "second time is fatal" rule; between restarts the link looks up and passes no uplink traffic. Never seen.
 - **A gap in the design.** Goal 5 names "the network dropping the connection", but no "Done means" line covers it; a network-side drop with the modem still attached has never been seen on hardware (Core's tests and the disconnect indication at modem reboots cover the logic).
-- **Testing the driver.** Nothing under `driver/` has a test; the cheapest worthwhile step is to move the uplink stall counter (`out_seq_`, `out_stall_mark_`, `out_stalls_`, `out_stuck_restarted_`) into a small plain C++ struct under `core/` and unit-test it (`CoreHost` would need a `UsbIo` interface to be testable on the host). **Changed 2026-11-14 (hardening): started:** the stall counter is `rmnet::UplinkStallCounter` in Core (`core/include/rmnet/stall.h`) with unit tests (`tests/test_stall.cpp`, Task 1, `90755d8`), and `UsbIo` uses it in place of the four fields (this task). `CoreHost`, `UsbIo` and the rest of `driver/` still have no test.
+- **Testing the driver.** Nothing under `driver/` has a test; the cheapest worthwhile step is to move the uplink stall counter (`out_seq_`, `out_stall_mark_`, `out_stalls_`, `out_stuck_restarted_`) into a small plain C++ struct under `core/` and unit-test it (`CoreHost` would need a `UsbIo` interface to be testable on the host). **Changed 2026-11-14 (hardening): started:** the stall counter is `rmnet::UplinkStallCounter` in Core (`core/include/rmnet/stall.h`) with unit tests (`tests/test_stall.cpp`, Task 1, `90755d8`), and `UsbIo` uses it in place of the four fields (Task 2 of the hardening plan, `1f3beb1`). `CoreHost`, `UsbIo` and the rest of `driver/` still have no test.
 
 Minor, one line each:
 
@@ -201,7 +201,7 @@ Minor, one line each:
 - Driver: whether the 5 s uplink timeout runs from submission or from the head of the queue is unknown.
 - Driver: a pause-timeout restart does not reset the stall count.
 - Driver: a timeout during a bulk OUT recovery still counts as a stall.
-- App: the table keeps the last known versions when the listing turns unknown.
+- App: the table keeps the last known versions when the listing turns unknown. **Changed 2026-11-14 (hardening), Task 3 (`9966996`): done:** the installed-version row reads `unknown` while the listing is unknown (and while the first listing is pending); the bundled row comes from the app's own bundle and stays.
 - App: with no embedded driver, the "cannot" text gives the wrong reason.
 - App: `Remove…` does nothing, silently, if the listing turns unknown while the confirmation is open.
 - App: a properties request that never answers leaks one delegate every 10 s.
@@ -221,15 +221,15 @@ Minor, one line each:
 
 From the final fix wave's re-review (items (1), (2) and (4) of its eight Minor residuals were README statements, corrected in the "Done means" table and the app section):
 
-- App: `ExtensionManager`'s "cannot" text says the bundled version "is not listed" when it is listed as uninstalling.
+- App: `ExtensionManager`'s "cannot" text says the bundled version "is not listed" when it is listed as uninstalling. **Changed 2026-11-14 (hardening), Task 3 (`9966996`): done:** the text comes from `cannotRemoveText`, a pure function in `app/StatusModel.swift` with checks, which says the system is already removing it.
 - Driver: the corrected comment in `RMNetDriver.cpp` says the transfers end in `kIOReturnNotReady`, but the interrupt read ends in `kIOReturnAborted` and the re-post is refused with not-ready. **Changed 2026-11-14 (hardening): done:** the comment at `RMNetDriver::OnUsbFatal` says so.
-- App: one vacuous check and one dead branch in the status model.
-- App: the not-QMI advice lines are dropped while every entry is uninstalling.
-- App: `installTitle` compares versions as numbers and `canRemoveDirectly` as text.
+- App: one vacuous check and one dead branch in the status model. **Changed 2026-11-14 (hardening), Task 3 (`9966996`): done:** the check is replaced by four that can fail; that dead branch and a second one (the one-entry uninstalling line in `advice`) are removed.
+- App: the not-QMI advice lines are dropped while every entry is uninstalling. **Changed 2026-11-14 (hardening), Task 3 (`9966996`): done:** they are now kept.
+- App: `installTitle` compares versions as numbers and `canRemoveDirectly` as text. **Changed 2026-11-14 (hardening), Task 3 (`9966996`): done:** both, `removalPlan`'s stuck branch and the install confirmation now use `compareVersions`.
 
 From the soak fix's re-review (`scripts/soak.sh`):
 
-- `pgrep -f io.rmnetdriver.RMNet.driver` also matches the `log stream` process of `scripts/driver-log.sh`, so starting or stopping the log during a soak gives a false "driver restarted" FAIL (anchor the pattern on the dext path).
+- `pgrep -f io.rmnetdriver.RMNet.driver` also matches the `log stream` process of `scripts/driver-log.sh`, so starting or stopping the log during a soak gives a false "driver restarted" FAIL (anchor the pattern on the dext path). **Changed 2026-11-14 (hardening), Task 3 (`9966996`): done:** the pattern is anchored on the dext's own path (`^[^ ]*\.dext/io\.rmnetdriver\.RMNet\.driver( |$)`); checked read-only on this Mac, it finds only the driver's process.
 - The default-route check cannot see a VPN tunnel carried over the port.
 - A signal during the first sample leaves a hanging status command running.
 - The first sample's seconds are measured from a different start.
