@@ -64,7 +64,7 @@ TEST(builders_match_capture) {
   n = rmnet::build_ctl_sync(b, sizeof b, 1);                                   CHECK_BYTES(b, n, kCtlSyncReq);
   n = rmnet::build_ctl_get_client_id(b, sizeof b, 2, rmnet::QmiService::WDA);  CHECK_BYTES(b, n, kCtlGetWdaReq);
   n = rmnet::build_ctl_release_client_id(b, sizeof b, 5, rmnet::QmiService::WDS, 16); CHECK_BYTES(b, n, kCtlRelease6Req);
-  n = rmnet::build_wda_set_data_format(b, sizeof b, 1, 1, 4);                  CHECK_BYTES(b, n, kWdaSetFormatReq);
+  n = rmnet::build_wda_set_data_format(b, sizeof b, 1, 1, 4, false);           CHECK_BYTES(b, n, kWdaSetFormatReq);
   n = rmnet::build_wds_bind_mux(b, sizeof b, 15, 2, 4, 0x81);                  CHECK_BYTES(b, n, kWdsBind4Req);
   n = rmnet::build_wds_set_ip_family(b, sizeof b, 15, 3, 4);                   CHECK_BYTES(b, n, kWdsFamily4Req);
   n = rmnet::build_wds_start_network(b, sizeof b, 15, 4, 1, 4);                CHECK_BYTES(b, n, kWdsStart4Req);
@@ -149,4 +149,32 @@ TEST(parse_settings_ipv4_needs_address_mask_and_gateway) {   // the capture's IP
     CHECK(rmnet::parse_wds_current_settings(decode_bytes(without_tlv(hex(kWdsSettings4Resp), missing)), &s));
     CHECK(!s.has_v4); CHECK_BYTES(s.v4_addr, 4, "00 00 00 00"); CHECK_EQ(s.mtu, 1500u);
   }
+}
+
+// In-band flow control: request TLV 0x1A, response TLV 0x1B (one byte each).
+
+TEST(set_data_format_without_flow_control_is_the_recorded_request) {
+  uint8_t b[128];
+  size_t n = rmnet::build_wda_set_data_format(b, sizeof b, 1, 1, 4, false);
+  CHECK_BYTES(b, n, kWdaSetFormatReq);
+}
+TEST(set_data_format_with_flow_control_adds_one_tlv) {   // 1a 01 00 01 after the endpoint TLV
+  uint8_t b[128];
+  size_t n = rmnet::build_wda_set_data_format(b, sizeof b, 1, 1, 4, true);
+  CHECK_BYTES(b, n, kWdaSetFormatReqFlow);
+}
+TEST(data_format_reports_the_modems_flow_control) {
+  rmnet::DataFormat f{};
+  CHECK(rmnet::parse_wda_data_format(decode(kWdaSetFormatResp), &f));        // ends 1b 01 00 00
+  CHECK_EQ(f.flow_control, 0);
+  std::vector<uint8_t> on = hex(kWdaSetFormatResp); on.back() = 0x01;        // ends 1b 01 00 01
+  f.flow_control = 7;
+  CHECK(rmnet::parse_wda_data_format(decode_bytes(on), &f)); CHECK_EQ(f.flow_control, 1);
+  f.flow_control = 7;
+  CHECK(rmnet::parse_wda_data_format(decode_bytes(without_tlv(on, 0x1b)), &f)); CHECK_EQ(f.flow_control, 0);
+  // Two bytes, 1b 02 00 01 00: the TLV that ends the frame grows by one, and both lengths with it.
+  std::vector<uint8_t> two = on; two.push_back(0x00);
+  two[two.size() - 4] = 0x02; two[1] += 1; two[11] += 1;
+  CHECK(!rmnet::parse_wda_data_format(decode_bytes(two), &f));
+  CHECK(rmnet::data_format_usable(f));                                        // f is the last good parse
 }

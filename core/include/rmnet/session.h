@@ -27,6 +27,12 @@
 //
 // Refreshing, a reconfigure indication for the other family is remembered, and that family is
 // refreshed after the current one, before the link comes back up.
+//
+// In-band flow control: configured with flow_control, Set Data Format asks for it. If that request
+// does not end in a usable data format (an error result, an unparsable or unusable answer, or its
+// timeout), flow control is refused: Set Data Format is sent again at once without it, as the same
+// bring-up step (no backoff, nothing reported), and every later request of this Session omits it,
+// across stop() and start(). A request without it that fails goes to Backoff as any other step.
 #pragma once
 
 #include <stddef.h>
@@ -41,6 +47,7 @@ struct SessionConfig {
   uint32_t iface_number = 4;
   uint8_t mux_id = 0x81;
   uint8_t profile = 1;
+  bool flow_control = false;  // ask the modem for in-band (QMAP) flow control
 };
 
 struct LinkConfig {
@@ -101,6 +108,8 @@ class Session {
   void on_qmi(const uint8_t* data, size_t len, uint64_t now_ms);
   void tick(uint64_t now_ms);  // the host calls this at least every 250 ms
   SessionState state() const;
+  bool flow_control_asked() const;    // the last Set Data Format request asked for flow control
+  bool flow_control_refused() const;  // a request that asked for it failed; no later one asks
 
  private:
   // What the outstanding request is, so its response goes to the right handler.
@@ -134,6 +143,8 @@ class Session {
               size_t len, uint64_t now_ms, uint32_t timeout_ms);
   void transmit(size_t len);
 
+  void send_set_data_format(uint64_t now_ms);
+  void refuse_flow_control(uint64_t now_ms);
   void begin_sync(uint64_t now_ms);
   void send_sync(uint64_t now_ms);
   void begin_family(uint8_t index, uint64_t now_ms);
@@ -181,6 +192,8 @@ class Session {
   uint32_t next_retry_wait_ms_;  // the wait after the next failed retry
   uint64_t probe_from_ms_;       // Up: the next probe is due kLivenessIntervalMs after this
   bool refresh_other_;           // Refreshing: the other family asked for a refresh too
+  bool flow_asked_;              // the last Set Data Format request carried the flow control TLV
+  bool flow_refused_;            // kept for the life of the Session, across stop() and start()
   uint8_t buf_[128];  // every request the session builds fits
 };
 

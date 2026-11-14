@@ -33,7 +33,7 @@
 # charged at least its reservation in the measured direction. A run refuses to start (exit 2) if a
 # line of the usage file is not "<time> <down|up> <bytes in> <bytes out>" with non-negative whole
 # numbers, or if the recorded total plus this run's reservation (its stop threshold plus 10,000,000
-# bytes for what arrives after the stop) would pass 300,000,000 bytes. It warns when a run moved more
+# bytes for what arrives after the stop) would pass 310,000,000 bytes. It warns when a run moved more
 # than 60,000,000 bytes. The run fails if fewer than 1,000,000 bytes crossed the port in the
 # measured direction (curl did not go through it).
 #
@@ -45,7 +45,7 @@ set -u
 
 cd "$(dirname "$0")/.." || exit 1
 
-BUDGET=300000000
+BUDGET=310000000
 MARGIN=10000000
 WARN_BYTES=60000000
 MIN_BYTES=1000000

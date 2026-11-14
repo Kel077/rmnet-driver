@@ -50,9 +50,15 @@ Session::Session(const SessionConfig& cfg, SessionDelegate& delegate)
       next_retry_wait_ms_(kFamilyRetryFirstMs),
       probe_from_ms_(0),
       refresh_other_(false),
+      flow_asked_(false),
+      flow_refused_(false),
       buf_() {}
 
 SessionState Session::state() const { return state_; }
+
+bool Session::flow_control_asked() const { return flow_asked_; }
+
+bool Session::flow_control_refused() const { return flow_refused_; }
 
 void Session::start(uint64_t now_ms) {
   if (state_ != SessionState::Idle) return;
@@ -94,6 +100,10 @@ void Session::tick(uint64_t now_ms) {
     case SessionState::Connecting:
     case SessionState::Refreshing:
       if (pending_.active && elapsed(now_ms, pending_.sent_ms) >= pending_.timeout_ms) {
+        if (pending_.step == Step::SetDataFormat && flow_asked_) {
+          refuse_flow_control(now_ms);
+          return;
+        }
         enter_backoff(now_ms);
       }
       return;
@@ -135,15 +145,18 @@ void Session::on_response(const QmiMessage& m, uint64_t now_ms) {
       if (!parse_ctl_get_client_id(m, &service, &client) || service != QmiService::WDA) break;
       has_wda_client_ = true;
       wda_client_ = client;
-      uint16_t tx = next_txid();
-      size_t n = build_wda_set_data_format(buf_, sizeof buf_, client, tx, cfg_.iface_number);
-      expect(Step::SetDataFormat, QmiService::WDA, client, tx, kWdaSetDataFormat, n, now_ms,
-             kRequestTimeoutMs);
+      send_set_data_format(now_ms);
       return;
     }
     case Step::SetDataFormat: {
       DataFormat f;
-      if (!parse_wda_data_format(m, &f) || !data_format_usable(f)) break;
+      if (!parse_wda_data_format(m, &f) || !data_format_usable(f)) {
+        if (flow_asked_) {
+          refuse_flow_control(now_ms);
+          return;
+        }
+        break;
+      }
       link_.format = f;
       begin_family(0, now_ms);
       return;
@@ -316,6 +329,24 @@ void Session::expect(Step step, QmiService service, uint8_t client, uint16_t txi
 
 void Session::transmit(size_t len) {
   if (len > 0) delegate_.send_qmi(buf_, len);
+}
+
+// Asks for flow control while configured with it and it has not been refused.
+void Session::send_set_data_format(uint64_t now_ms) {
+  flow_asked_ = cfg_.flow_control && !flow_refused_;
+  uint16_t tx = next_txid();
+  size_t n = build_wda_set_data_format(buf_, sizeof buf_, wda_client_, tx, cfg_.iface_number,
+                                       flow_asked_);
+  expect(Step::SetDataFormat, QmiService::WDA, wda_client_, tx, kWdaSetDataFormat, n, now_ms,
+         kRequestTimeoutMs);
+}
+
+// A Set Data Format request that asked for flow control failed: asks again at once without it,
+// with a new transaction ID (so a late answer to the first request matches nothing) and a fresh
+// timeout.
+void Session::refuse_flow_control(uint64_t now_ms) {
+  flow_refused_ = true;
+  send_set_data_format(now_ms);
 }
 
 void Session::begin_sync(uint64_t now_ms) {

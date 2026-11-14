@@ -91,7 +91,9 @@ enum : uint32_t { kPauseMaxMs = 30000 };
 class CoreHost final : public rmnet::SessionDelegate {
  public:
   // profile: the data profile the session asks the modem for (SessionConfig::profile).
-  CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile);
+  // flow_control: whether the session asks the modem for in-band flow control
+  // (SessionConfig::flow_control).
+  CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile, bool flow_control);
   CoreHost(const CoreHost&) = delete;
   CoreHost& operator=(const CoreHost&) = delete;
 
@@ -121,6 +123,8 @@ class CoreHost final : public rmnet::SessionDelegate {
   const rmnet::LinkConfig& link_config() const { return link_; }
 
   rmnet::SessionState state() const { return session_.state(); }
+  bool flow_control_asked() const { return session_.flow_control_asked(); }
+  bool flow_control_refused() const { return session_.flow_control_refused(); }
 
   // The data path. None of these calls the Session.
   // Applying a link change: down clears the emulator's link and the uplink pause; up (also again
@@ -157,6 +161,7 @@ class CoreHost final : public rmnet::SessionDelegate {
 
  private:
   void note_state();
+  void note_flow_refusal();
   void log_sent(const uint8_t* data, size_t len);
   void log_received(const uint8_t* data, size_t len);
   void forget_logged_settings();
@@ -208,6 +213,7 @@ class CoreHost final : public rmnet::SessionDelegate {
   rmnet::LinkConfig link_;
   LinkChange change_;
   uint32_t syncs_sent_;
+  bool logged_flow_refused_;  // the session's flow control refusal (kept for its life) was logged
   // The IP family (4 or 6) each WDS client asked for in Start Network, for the log.
   uint8_t start_client_[2];
   bool start_client_known_[2];

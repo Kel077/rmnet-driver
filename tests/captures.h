@@ -12,6 +12,9 @@ inline const char* kCtlGetWdaReq = "01 0f 00 00 00 00 00 02 22 00 04 00 01 01 00
 inline const char* kCtlGetWdaResp = "01 17 00 80 00 00 01 02 22 00 0c 00 02 04 00 00 00 00 00 01 02 00 1a 01";
 // >> wda cid=1 request tx=1 msg=0x0020
 inline const char* kWdaSetFormatReq = "01 4c 00 00 1a 01 00 01 00 20 00 40 00 10 01 00 00 11 04 00 02 00 00 00 12 04 00 05 00 00 00 13 04 00 05 00 00 00 15 04 00 20 00 00 00 16 04 00 00 7c 00 00 17 08 00 02 00 00 00 04 00 00 00 1b 04 00 20 00 00 00 1c 04 00 00 40 00 00";
+// Not recorded: kWdaSetFormatReq with TLV 0x1A "Flow Control" = 01 after the endpoint TLV (0x17),
+// so the QMUX length is 0x50 (was 0x4c) and the TLV length 0x44 (was 0x40).
+inline const char* kWdaSetFormatReqFlow = "01 50 00 00 1a 01 00 01 00 20 00 44 00 10 01 00 00 11 04 00 02 00 00 00 12 04 00 05 00 00 00 13 04 00 05 00 00 00 15 04 00 20 00 00 00 16 04 00 00 7c 00 00 17 08 00 02 00 00 00 04 00 00 00 1a 01 00 01 1b 04 00 20 00 00 00 1c 04 00 00 40 00 00";
 // << wda cid=1 response tx=1 msg=0x0020
 inline const char* kWdaSetFormatResp = "01 5a 00 80 1a 01 02 01 00 20 00 4e 00 02 04 00 00 00 00 00 10 01 00 00 11 04 00 02 00 00 00 12 04 00 05 00 00 00 13 04 00 05 00 00 00 14 04 00 00 00 00 00 15 04 00 20 00 00 00 16 04 00 00 7c 00 00 17 04 00 20 00 00 00 18 04 00 00 40 00 00 1a 04 00 00 00 00 00 1b 01 00 00";
 // >> ctl cid=0 request tx=3 msg=0x0022

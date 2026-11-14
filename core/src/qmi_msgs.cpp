@@ -19,11 +19,13 @@ constexpr uint8_t kTlvWdaDlAgg = 0x13;          // libqmi: "Downlink Data Aggreg
 constexpr uint8_t kTlvWdaDlMaxDatagrams = 0x15; // libqmi: "Downlink Data Aggregation Max Datagrams"
 constexpr uint8_t kTlvWdaDlMaxSize = 0x16;      // libqmi: "Downlink Data Aggregation Max Size"
 constexpr uint8_t kTlvWdaEndpoint = 0x17;       // libqmi: "Endpoint Info"
+constexpr uint8_t kTlvWdaFlowControlIn = 0x1A;  // libqmi: "Flow Control"
 constexpr uint8_t kTlvWdaUlMaxDatagramsIn = 0x1B; // libqmi: "Uplink Data Aggregation Max Datagrams"
 constexpr uint8_t kTlvWdaUlMaxSizeIn = 0x1C;      // libqmi: "Uplink Data Aggregation Max Size"
 // WDA "Set Data Format" response: 0x11 to 0x16 as in the request, then the uplink limits.
 constexpr uint8_t kTlvWdaUlMaxDatagramsOut = 0x17; // libqmi: "Uplink Data Aggregation Max Datagrams"
 constexpr uint8_t kTlvWdaUlMaxSizeOut = 0x18;      // libqmi: "Uplink Data Aggregation Max Size"
+constexpr uint8_t kTlvWdaFlowControlOut = 0x1B;    // libqmi: "Flow Control"
 
 constexpr uint32_t kLinkLayerRawIp = 2;       // libqmi: QMI_WDA_LINK_LAYER_PROTOCOL_RAW_IP
 constexpr uint32_t kAggQmap = 5;              // libqmi: QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAP
@@ -166,7 +168,7 @@ size_t build_ctl_release_client_id(uint8_t* buf, size_t cap, uint8_t txid, QmiSe
 }
 
 size_t build_wda_set_data_format(uint8_t* buf, size_t cap, uint8_t client, uint16_t txid,
-                                 uint32_t iface_number) {
+                                 uint32_t iface_number, bool flow_control) {
   QmiBuilder b(buf, cap, service_request(QmiService::WDA, client, txid, kWdaSetDataFormat));
   b.tlv_u8(kTlvWdaQosFormat, 0);
   b.tlv_u32(kTlvWdaLinkLayer, kLinkLayerRawIp);
@@ -175,6 +177,7 @@ size_t build_wda_set_data_format(uint8_t* buf, size_t cap, uint8_t client, uint1
   b.tlv_u32(kTlvWdaDlMaxDatagrams, kDlMaxDatagrams);
   b.tlv_u32(kTlvWdaDlMaxSize, kDlMaxSize);
   tlv_endpoint(&b, kTlvWdaEndpoint, iface_number);
+  if (flow_control) b.tlv_u8(kTlvWdaFlowControlIn, 1);
   b.tlv_u32(kTlvWdaUlMaxDatagramsIn, kUlMaxDatagrams);
   b.tlv_u32(kTlvWdaUlMaxSizeIn, kUlMaxSize);
   return b.finish();
@@ -189,6 +192,12 @@ bool parse_wda_data_format(const QmiMessage& m, DataFormat* out) {
       !optional_u32(m, kTlvWdaUlMaxDatagramsOut, &f.ul_max_datagrams) ||
       !optional_u32(m, kTlvWdaUlMaxSizeOut, &f.ul_max_size)) {
     return false;
+  }
+  Span v;
+  f.flow_control = 0;
+  if (qmi_find_tlv(m.tlvs, kTlvWdaFlowControlOut, &v)) {
+    if (v.len != 1) return false;
+    f.flow_control = v.data[0];
   }
   *out = f;
   return true;

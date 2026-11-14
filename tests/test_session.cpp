@@ -822,3 +822,167 @@ TEST(probe_reply_settings_never_reach_a_later_link_up) {
   CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2);
   CHECK(m.cfg.settings.has_v4); CHECK_BYTES(m.cfg.settings.v4_addr, 4, "0a 66 f6 e6");   // from bring-up, not the probe
 }
+
+// In-band flow control: Set Data Format asks for it when configured, and falls back at once,
+// without it, if the modem does not accept it.
+
+namespace {
+
+rmnet::SessionConfig flow_config() {
+  rmnet::SessionConfig c;
+  c.flow_control = true;
+  return c;
+}
+
+// `capture` with its transaction ID set to the last request's (8 bits for CTL, 16 otherwise).
+std::vector<uint8_t> answering_last(FakeModem& m, const char* capture) {
+  std::vector<uint8_t> f = hex(capture);
+  if (f[4] == 0) f[7] = static_cast<uint8_t>(m.last_txid());
+  else f = with_txid(capture, m.last_txid());
+  return f;
+}
+
+// Feeds the capture's bring-up responses from `first` on, each answering the request just sent.
+void answer_from(rmnet::Session& s, FakeModem& m, uint64_t now, const char* first) {
+  bool on = false;
+  for (const char* r : kBringUpResponses) {
+    on = on || r == first;
+    if (on) feed_frame(s, answering_last(m, r), now);
+  }
+}
+
+// The request the session must send, as hex text: `capture` with the last request's transaction ID.
+std::string expected_request(FakeModem& m, const char* capture) {
+  std::vector<uint8_t> f = with_txid(capture, m.last_txid());
+  return minitest::to_hex(f.data(), f.size());
+}
+
+// A Set Data Format response on WDA `client` with transaction `txid` that failed with `error`.
+std::vector<uint8_t> set_format_error_frame(uint8_t client, uint16_t txid, uint16_t error) {
+  std::vector<uint8_t> buf(64);
+  rmnet::QmiBuilder b(buf.data(), buf.size(),
+                      {rmnet::QmiService::WDA, client, rmnet::QmiKind::Response, txid, rmnet::kWdaSetDataFormat});
+  const uint8_t result[4] = {0x01, 0x00, static_cast<uint8_t>(error), static_cast<uint8_t>(error >> 8)};
+  b.tlv(0x02, result, sizeof result);
+  buf.resize(b.finish());
+  buf[3] = 0x80;  // from the modem
+  return buf;
+}
+
+constexpr uint16_t kSomeError = 0x0030;
+
+// The recorded response, with the modem granting flow control (TLV 0x1B = 01).
+std::vector<uint8_t> granted_format_response(uint16_t txid) {
+  std::vector<uint8_t> f = with_txid(kWdaSetFormatResp, txid);
+  f.back() = 0x01;
+  return f;
+}
+
+}  // namespace
+
+TEST(asks_for_flow_control_when_configured) {
+  FakeModem m; rmnet::Session s(flow_config(), m);
+  CHECK(!s.flow_control_asked());                                             // nothing sent yet
+  bring_up_to(s, m, kCtlGetWdaResp);
+  CHECK_BYTES(m.last(), expected_request(m, kWdaSetFormatReqFlow).c_str());
+  CHECK(s.flow_control_asked()); CHECK(!s.flow_control_refused());
+}
+
+TEST(does_not_ask_by_default) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_to(s, m, kCtlGetWdaResp);
+  CHECK_BYTES(m.last(), expected_request(m, kWdaSetFormatReq).c_str());
+  CHECK(!s.flow_control_asked()); CHECK(!s.flow_control_refused());
+}
+
+TEST(a_granted_flow_control_reaches_link_up) {
+  FakeModem m; rmnet::Session s(flow_config(), m); bring_up_to(s, m, kCtlGetWdaResp);
+  feed_frame(s, granted_format_response(m.last_txid()), 100);
+  answer_from(s, m, 100, kCtlGetWds4Resp);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1);
+  CHECK_EQ(m.cfg.format.flow_control, 1);
+  CHECK(s.flow_control_asked()); CHECK(!s.flow_control_refused());
+}
+
+TEST(a_refused_flow_control_falls_back_at_once) {
+  FakeModem m; rmnet::Session s(flow_config(), m); bring_up_to(s, m, kCtlGetWdaResp);
+  uint16_t first = m.last_txid(); size_t sent = m.sent.size();
+  feed_frame(s, set_format_error_frame(1, first, kSomeError), 100);
+  CHECK_EQ(m.sent.size(), sent + 1);                                          // the fallback, at once: no teardown,
+  CHECK(m.last_txid() != first);                                              // no backoff wait, a new transaction
+  CHECK_BYTES(m.last(), expected_request(m, kWdaSetFormatReq).c_str());       // and no flow control TLV
+  CHECK(s.state() == rmnet::SessionState::Configuring); CHECK_EQ(m.downs, 0);
+  CHECK(s.flow_control_refused()); CHECK(!s.flow_control_asked());
+  feed_frame(s, with_txid(kWdaSetFormatResp, first), 150);                    // a late answer to the first request
+  CHECK_EQ(m.sent.size(), sent + 1); CHECK(s.state() == rmnet::SessionState::Configuring);
+  answer_from(s, m, 200, kWdaSetFormatResp);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1);
+  CHECK_EQ(m.cfg.format.flow_control, 0);                                     // the answer without the field
+  CHECK(m.cfg.settings.has_v4); CHECK(m.cfg.settings.has_v6);
+}
+
+TEST(an_unusable_answer_with_flow_control_falls_back) {
+  std::vector<uint8_t> unusable = hex(kWdaSetFormatResp); unusable[27] = 0x01;          // link layer 1 instead of 2
+  std::vector<uint8_t> unparsable = hex(kWdaSetFormatResp);                   // TLV 0x1B two bytes: 1b 02 00 00 00
+  unparsable.push_back(0x00); unparsable[unparsable.size() - 4] = 0x02; unparsable[1] += 1; unparsable[11] += 1;
+  for (const std::vector<uint8_t>& bad : {unusable, unparsable}) {
+    FakeModem m; rmnet::Session s(flow_config(), m); bring_up_to(s, m, kCtlGetWdaResp);
+    uint16_t first = m.last_txid(); size_t sent = m.sent.size();
+    std::vector<uint8_t> f = bad; f[7] = static_cast<uint8_t>(first); f[8] = static_cast<uint8_t>(first >> 8);
+    feed_frame(s, f, 100);
+    CHECK_EQ(m.sent.size(), sent + 1); CHECK(m.last_txid() != first);
+    CHECK_BYTES(m.last(), expected_request(m, kWdaSetFormatReq).c_str());
+    CHECK(s.state() == rmnet::SessionState::Configuring); CHECK(s.flow_control_refused());
+    answer_from(s, m, 200, kWdaSetFormatResp);
+    CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1);
+  }
+}
+
+TEST(a_timeout_with_flow_control_falls_back) {
+  FakeModem m; rmnet::Session s(flow_config(), m); bring_up_to(s, m, kCtlGetWdaResp);   // asked at t=100
+  uint16_t first = m.last_txid(); size_t sent = m.sent.size();
+  s.tick(10099); CHECK_EQ(m.sent.size(), sent);
+  s.tick(10100);
+  CHECK_EQ(m.sent.size(), sent + 1); CHECK(m.last_txid() != first);
+  CHECK_BYTES(m.last(), expected_request(m, kWdaSetFormatReq).c_str());
+  CHECK(s.state() == rmnet::SessionState::Configuring); CHECK(s.flow_control_refused());
+  s.tick(20099); CHECK(s.state() == rmnet::SessionState::Configuring);        // a fresh 10 s for the fallback
+  answer_from(s, m, 20099, kWdaSetFormatResp);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1);
+}
+
+TEST(a_refusal_is_remembered_across_a_restart) {
+  FakeModem m; rmnet::Session s(flow_config(), m); bring_up_to(s, m, kCtlGetWdaResp);
+  feed_frame(s, set_format_error_frame(1, m.last_txid(), kSomeError), 100);
+  answer_from(s, m, 100, kWdaSetFormatResp);
+  CHECK(s.state() == rmnet::SessionState::Up);
+  s.stop(); s.start(1000);
+  feed_frame(s, answering_last(m, kCtlSyncResp), 1100);
+  feed_frame(s, answering_last(m, kCtlGetWdaResp), 1100);
+  CHECK_BYTES(m.last(), expected_request(m, kWdaSetFormatReq).c_str());
+  CHECK(!s.flow_control_asked()); CHECK(s.flow_control_refused());
+}
+
+TEST(a_failure_without_flow_control_is_as_before) {
+  {                                                                           // not configured: as today
+    FakeModem m; rmnet::Session s({}, m); bring_up_to(s, m, kCtlGetWdaResp);
+    feed_frame(s, set_format_error_frame(1, m.last_txid(), kSomeError), 100);
+    CHECK(s.state() == rmnet::SessionState::Backoff); CHECK(!s.flow_control_refused());
+    CHECK_EQ(m.last()[8], 0x23); CHECK_EQ(m.last()[15], 0x1a);               // the teardown (release the WDA
+                                                                              // client), not a new request
+    s.tick(2099); CHECK(s.state() == rmnet::SessionState::Backoff);
+    s.tick(2100); CHECK(s.state() == rmnet::SessionState::Syncing);
+  }
+  {                                                                           // refused, then the fallback fails
+    FakeModem m; rmnet::Session s(flow_config(), m); bring_up_to(s, m, kCtlGetWdaResp);
+    feed_frame(s, set_format_error_frame(1, m.last_txid(), kSomeError), 100);
+    feed_frame(s, set_format_error_frame(1, m.last_txid(), kSomeError), 200);
+    CHECK(s.state() == rmnet::SessionState::Backoff); CHECK(s.flow_control_refused());
+    s.tick(2199); CHECK(s.state() == rmnet::SessionState::Backoff);
+    s.tick(2200); CHECK(s.state() == rmnet::SessionState::Syncing);
+  }
+  {                                                                           // refused, then the fallback times out
+    FakeModem m; rmnet::Session s(flow_config(), m); bring_up_to(s, m, kCtlGetWdaResp);
+    s.tick(10100); s.tick(20099); CHECK(s.state() == rmnet::SessionState::Configuring);
+    s.tick(20100); CHECK(s.state() == rmnet::SessionState::Backoff);
+  }
+}

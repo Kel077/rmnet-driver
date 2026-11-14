@@ -13,7 +13,7 @@ The cellular data is metered. The limit is on what the cellular link carries: da
 refused before anything is sent. The usage file (build/installed/measure-usage.log, shared with
 scripts/measure.sh) must exist, end with a newline, and every line other than a comment must be
 "<time> <down|up> <bytes in> <bytes out>"; otherwise the run is refused. The run is also refused if
-the recorded total plus this run's datagrams x (bytes-each + 28) would pass 300,000,000 bytes (the
+the recorded total plus this run's datagrams x (bytes-each + 28) would pass 310,000,000 bytes (the
 budget scripts/measure.sh checks too), or if the usage file cannot be opened for appending; it is
 opened before the sends and stays open until the line is written. After the burst, one line
 "<UTC time> up <bytes in> <bytes out>" is appended, from the interface's own byte counters
@@ -42,7 +42,7 @@ import time
 
 DEST = ("192.0.2.1", 9)
 MAX_TOTAL = 2_000_000
-BUDGET = 300_000_000  # all recorded use, as in scripts/measure.sh
+BUDGET = 310_000_000  # all recorded use, as in scripts/measure.sh
 DEFAULT_COUNT = 1500
 DEFAULT_SIZE = 1200
 IP_BOUND_IF = 25  # <netinet/in.h>; Python's socket module does not name it

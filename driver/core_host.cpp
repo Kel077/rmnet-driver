@@ -52,9 +52,10 @@ bool SameSettings(const rmnet::RuntimeSettings& a, const rmnet::RuntimeSettings&
          memcmp(a.v6_dns, b.v6_dns, sizeof a.v6_dns) == 0 && a.v6_dns_count == b.v6_dns_count && a.mtu == b.mtu;
 }
 
-rmnet::SessionConfig ConfigWithProfile(uint8_t profile) {
+rmnet::SessionConfig MakeSessionConfig(uint8_t profile, bool flow_control) {
   rmnet::SessionConfig cfg{};
   cfg.profile = profile;
+  cfg.flow_control = flow_control;
   return cfg;
 }
 
@@ -80,10 +81,10 @@ const char* SessionStateName(rmnet::SessionState s) {
   return "?";
 }
 
-CoreHost::CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile)
+CoreHost::CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t profile, bool flow_control)
     : usb_(usb),
       rx_(rx),
-      session_(ConfigWithProfile(profile), *this),
+      session_(MakeSessionConfig(profile, flow_control), *this),
       eth_(macs),
       agg_(nullptr, 0, 0, 0),
       uplink_slot_(-1),
@@ -112,6 +113,7 @@ CoreHost::CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t p
       link_(),
       change_{false, false},
       syncs_sent_(0),
+      logged_flow_refused_(false),
       start_client_(),
       start_client_known_(),
       logged_settings_(),
@@ -148,13 +150,23 @@ void CoreHost::forget_logged_settings() {
 
 void CoreHost::tick(uint64_t now_ms) {
   session_.tick(now_ms);
+  note_flow_refusal();
   note_state();
 }
 
 void CoreHost::on_control(const uint8_t* data, size_t len, uint64_t now_ms) {
   log_received(data, len);
   session_.on_qmi(data, len, now_ms);
+  note_flow_refusal();
   note_state();
+}
+
+// One line when the session finds flow control refused (an error, an unusable answer or a
+// timeout); it has already asked again without it. Only on_qmi and tick can refuse it.
+void CoreHost::note_flow_refusal() {
+  if (logged_flow_refused_ || !session_.flow_control_refused()) return;
+  logged_flow_refused_ = true;
+  LOG("flow control refused: data format asked again without it");
 }
 
 CoreHost::LinkChange CoreHost::take_link_change() {
@@ -242,10 +254,11 @@ void CoreHost::log_received(const uint8_t* data, size_t len) {
   if (m.hdr.service == rmnet::QmiService::WDA && m.hdr.msg_id == rmnet::kWdaSetDataFormat) {
     rmnet::DataFormat f;
     if (rmnet::parse_wda_data_format(m, &f)) {
+      // Logged before the session sees the answer, so flow_control_asked is about this request.
       LOG("data format: link layer %u, ul agg %u (%u datagrams, %u bytes), dl agg %u (%u datagrams, %u bytes), "
-          "usable %d",
+          "usable %d, flow control asked %u, modem says %u",
           f.link_layer, f.ul_agg, f.ul_max_datagrams, f.ul_max_size, f.dl_agg, f.dl_max_datagrams, f.dl_max_size,
-          rmnet::data_format_usable(f));
+          rmnet::data_format_usable(f), session_.flow_control_asked() ? 1u : 0u, static_cast<unsigned>(f.flow_control));
     } else {
       LOG("data format refused (error 0x%x)", r.error);
     }

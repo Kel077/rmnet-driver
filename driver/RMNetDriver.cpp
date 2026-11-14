@@ -41,6 +41,7 @@ constexpr uint32_t kMtu = 1500;
 constexpr uint32_t kMinMtu = 576;
 constexpr uint8_t kDefaultProfile = 1;
 constexpr const char* kProfileKey = "RMNetProfile";
+constexpr const char* kFlowControlKey = "RMNetFlowControl";
 constexpr uint32_t kTxBatch = 32;
 constexpr uint32_t kTxHold = 256;  // sent packets the completion queue has not taken yet
 constexpr uint32_t kRxHold = 256;  // filled packets the completion queue has not taken yet
@@ -129,6 +130,32 @@ uint8_t ReadProfile(IOService* service) {
   return profile;
 }
 
+// Whether the session asks the modem for in-band flow control, from the service's RMNetFlowControl
+// property (the personality in Info.plist sets it): the integer 1 asks. 0, any other value, or no
+// such property does not ask; anything but 0 or 1 is logged.
+bool ReadFlowControl(IOService* service) {
+  OSDictionary* props = nullptr;
+  kern_return_t ret = service->CopyProperties(&props);
+  bool flowControl = false;
+  if (ret != kIOReturnSuccess || !props) {
+    LOG("RMNetFlowControl: properties not readable (0x%x); not asking for flow control", ret);
+  } else {
+    OSObject* obj = props->getObject(kFlowControlKey);
+    OSNumber* num = OSDynamicCast(OSNumber, obj);
+    if (!obj) {
+      LOG("RMNetFlowControl: no such property; not asking for flow control");
+    } else if (!num) {
+      LOG("RMNetFlowControl: not an integer; not asking for flow control");
+    } else if (num->unsigned64BitValue() > 1) {
+      LOG("RMNetFlowControl: %llu is not 0 or 1; not asking for flow control", num->unsigned64BitValue());
+    } else {
+      flowControl = num->unsigned64BitValue() == 1;
+    }
+  }
+  OSSafeReleaseNULL(props);
+  return flowControl;
+}
+
 uint64_t NowNs() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 uint64_t NowMs() { return NowNs() / 1000000ull; }
 
@@ -201,7 +228,7 @@ struct RxBridge final : RxSink {
 };
 
 // What PublishCounters last published, in its order.
-enum : uint32_t { kCounterCount = 53 };
+enum : uint32_t { kCounterCount = 56 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -380,8 +407,10 @@ kern_return_t RMNetDriver::Start_Impl(IOService* provider) {
     uint8_t profile = ReadProfile(this);
     LOG("profile %u", profile);
     PublishProfile(profile);
+    bool flowControl = ReadFlowControl(this);
+    LOG("flow control %u", flowControl ? 1u : 0u);
     ivars->rxBridge = new RxBridge(this);
-    if (ivars->rxBridge) ivars->core = new CoreHost(*ivars->usb, *ivars->rxBridge, macs, profile);
+    if (ivars->rxBridge) ivars->core = new CoreHost(*ivars->usb, *ivars->rxBridge, macs, profile, flowControl);
     if (!ivars->core) ret = kIOReturnNoMemory;
   }
   if (ret == kIOReturnSuccess) ret = CreateInterface(macs.host);
@@ -1154,6 +1183,9 @@ void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
 // RMNetSleepLastStatus is the last status among them other than success; RMNetLastPowerFlags is the
 // flags of the last SetPowerState call. RMNetTxQueueCapacity is the TX submission queue's capacity,
 // kTxQueueCapacity or, if the system refused that, kQueueCapacity (not a counter; it never changes).
+// In-band flow control (not counters either): RMNetFlowControlAsked is 1 if the last Set Data Format
+// request asked for it, RMNetFlowControlRefused 1 once the modem refused it (no later request asks),
+// and RMNetFlowControlOn the modem's answer in the data format in use.
 void RMNetDriver::PublishCounters() {
   const DataCounters& c = ivars->core->counters();
   uint32_t txPending = ivars->txPendingCount - ivars->txPendingNext;
@@ -1219,6 +1251,9 @@ void RMNetDriver::PublishCounters() {
       {"RMNetSleepLastStatus", u.sleep_last_status},
       {"RMNetLastPowerFlags", ivars->lastPowerFlags},
       {"RMNetTxQueueCapacity", ivars->txQueueCapacity},
+      {"RMNetFlowControlAsked", ivars->core->flow_control_asked() ? 1u : 0u},
+      {"RMNetFlowControlRefused", ivars->core->flow_control_refused() ? 1u : 0u},
+      {"RMNetFlowControlOn", ivars->core->link_config().format.flow_control != 0 ? 1u : 0u},
   };
   bool changed = !ivars->countersPublished;
   for (uint32_t i = 0; i < kCounterCount; i++) {

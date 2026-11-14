@@ -38,17 +38,22 @@ size_t build_ctl_release_client_id(uint8_t* buf, size_t cap, uint8_t txid, QmiSe
                                    uint8_t client);
 
 // WDA. The data format the modem settled on, as its Set Data Format response reports it.
+// flow_control: the modem's in-band (QMAP) flow control answer, 0 off, 1 on.
 struct DataFormat {
   uint32_t link_layer, ul_agg, dl_agg, dl_max_datagrams, dl_max_size, ul_max_datagrams,
       ul_max_size;
+  uint8_t flow_control;
 };
+// With flow_control, the request also asks for in-band flow control (TLV 0x1A = 1); without it,
+// the request is the one recorded from the modem.
 size_t build_wda_set_data_format(uint8_t* buf, size_t cap, uint8_t client, uint16_t txid,
-                                 uint32_t iface_number);
-// False unless the response succeeded. A field whose TLV is absent reads as 0.
+                                 uint32_t iface_number, bool flow_control);
+// False unless the response succeeded. A field whose TLV is absent reads as 0. The flow control
+// TLV must be exactly one byte.
 bool parse_wda_data_format(const QmiMessage& m, DataFormat* out);
 // Raw IP (2), QMAP (5) both ways, at least one datagram each way, dl_max_size from 2048 to
 // 31744 and ul_max_size from 2048 to 16384 (the sizes requested, so a response cannot make the
-// caller's buffers larger than asked for).
+// caller's buffers larger than asked for). flow_control is not looked at.
 bool data_format_usable(const DataFormat& f);
 
 // WDS.
