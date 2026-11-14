@@ -31,6 +31,9 @@ constexpr uint32_t kRecoveryTicks = 10;  // a recovery not finished after this m
 constexpr uint32_t kUplinkTimeoutMs = 5000;  // a write the modem does not take frees its buffer
 // The modem answers an empty GET_ENCAPSULATED_RESPONSE with a STALL. Accept the legacy code too.
 constexpr IOReturn kLegacyPipeStalled = (IOReturn)0xe000404f;
+// No header names the status of a bulk transfer that reached its timeout. kIOReturnTimeout is
+// assumed, and the legacy transaction timeout code is accepted too. Neither seen on hardware.
+constexpr IOReturn kLegacyTransactionTimeout = (IOReturn)0xe0004051;
 
 kern_return_t MakeBuffer(IOUSBHostInterface* intf, IOOptionBits dir, uint32_t size,
                          IOBufferMemoryDescriptor** buf, uint8_t** addr) {
@@ -56,6 +59,8 @@ bool Halts(IOReturn status) {
 }
 
 bool Gone(IOReturn status) { return status == kIOReturnNotAttached || status == kIOReturnNoDevice; }
+
+bool TimedOut(IOReturn status) { return status == kIOReturnTimeout || status == kLegacyTransactionTimeout; }
 
 uint16_t PacketSize(IOUSBHostPipe* pipe, const IOUSBEndpointDescriptor* ep, uint16_t fallback) {
   uint8_t speed = 0;
@@ -109,7 +114,11 @@ UsbIo::UsbIo(UsbIoListener& listener)
       out_recoveries_(0),
       in_recovery_ticks_(0),
       out_recovery_ticks_(0),
-      out_timeouts_(0),
+      out_stalls_(0),
+      out_seq_(0),
+      out_stall_mark_(0),
+      out_submit_seq_(),
+      out_stuck_restarted_(false),
       head_(0),
       count_(0),
       out_busy_(false),
@@ -575,37 +584,50 @@ bool UsbIo::send_uplink(int slot, uint32_t len) {
   }
   uplink_[slot] = Uplink::InFlight;
   uplinks_busy_++;
+  out_submit_seq_[slot] = ++out_seq_;
   return true;
 }
 
 // A failure that halts the endpoint starts a recovery of the pipe, as for bulk IN: no uplink
 // transfer is started (acquire_uplink gives none), the pipe is aborted asynchronously, and once
 // no transfer is in flight the stall is cleared. kMaxRecoveries in a row with no successful
-// transfer between them is fatal. Aborts and timeouts leave the endpoint usable. A timeout
-// (kUplinkTimeoutMs) means the modem did not take the data: kUplinkTimeoutsFatal of them in a row
-// with no successful transfer between them is fatal, so an uplink that only ever times out cannot
-// stay up (the drain would otherwise refill the freed buffers forever).
+// transfer between them is fatal. Aborts and timeouts leave the endpoint usable.
+//
+// A stalled uplink: a transfer that timed out (TimedOut), or was aborted while running and not by
+// a recovery (abort() leaves Running first, so the driver's own aborts never count), means the
+// modem did not take the data. The transfers queued together on the NAKing endpoint all time out
+// together, so a failure counts as a new stall only if its transfer was submitted after the
+// previous counted stall completed (out_submit_seq_ above out_stall_mark_). kUplinkTimeoutsFatal
+// stalls in a row with no successful transfer between make the uplink stuck: the first time the
+// owner is asked to restart the session (on_uplink_stuck) and the count starts again; stuck again
+// with no successful transfer since that is fatal. A success resets both.
 void UsbIo::bulk_out_complete(uint32_t i, IOReturn status, uint32_t) {
   if (i >= kUplinkSlots || uplink_[i] != Uplink::InFlight) return;
   uplink_[i] = Uplink::Free;
   uplinks_busy_--;
   note(status);
   bool ok = status == kIOReturnSuccess;
-  bool timed_out = status == kIOReturnTimeout;
+  bool running = phase_ == Phase::Running && !failed_;
+  bool timed_out = TimedOut(status);
+  bool stray_abort = status == kIOReturnAborted && running && !out_recovering_;
   bool expected_abort = status == kIOReturnAborted && out_recovering_;
-  if (timed_out) stats_.bulk_out_timeouts++;
+  if (timed_out || stray_abort) stats_.bulk_out_timeouts++;
   if (!ok && !expected_abort) {
     stats_.bulk_out_errors++;
     if (phase_ == Phase::Running && Worth(stats_.bulk_out_errors)) {
       LOG("uplink transfer failed: 0x%x (%llu bulk out errors)", status, stats_.bulk_out_errors);
     }
   }
-  if (phase_ != Phase::Running || failed_) return;  // the owner is not called while stopping
+  if (!running) return;  // the owner is not called while stopping
+  bool new_stall = false;
   if (ok) {
     out_recoveries_ = 0;
-    out_timeouts_ = 0;
-  } else if (timed_out) {
-    out_timeouts_++;
+    out_stalls_ = 0;
+    out_stuck_restarted_ = false;
+  } else if ((timed_out || stray_abort) && out_submit_seq_[i] > out_stall_mark_) {
+    new_stall = true;
+    out_stalls_++;
+    out_stall_mark_ = out_seq_;
   }
   listener_.on_bulk_out_done(static_cast<int>(i), ok);
   if (phase_ != Phase::Running || failed_) return;
@@ -613,13 +635,20 @@ void UsbIo::bulk_out_complete(uint32_t i, IOReturn status, uint32_t) {
     fail("bulk out: device not attached");
     return;
   }
-  if (out_timeouts_ >= kUplinkTimeoutsFatal) {
-    LOG("uplink: %u transfers in a row timed out after %u ms (%llu timeouts)", out_timeouts_,
-        kUplinkTimeoutMs, stats_.bulk_out_timeouts);
-    fail("uplink is not accepting data");
-    return;
+  if (new_stall && out_stalls_ >= kUplinkTimeoutsFatal) {
+    LOG("uplink: %u stalls in a row (last 0x%x), %llu failed transfers; %{public}s", out_stalls_, status,
+        stats_.bulk_out_timeouts, out_stuck_restarted_ ? "stuck again since the restart" : "asking for a session restart");
+    out_stalls_ = 0;
+    if (out_stuck_restarted_) {
+      fail("uplink is not accepting data");
+      return;
+    }
+    out_stuck_restarted_ = true;
+    stats_.uplink_stuck_restarts++;
+    listener_.on_uplink_stuck();
+    if (phase_ != Phase::Running || failed_) return;
   }
-  if (Halts(status) && !out_recovering_) begin_out_recovery();
+  if (Halts(status) && !timed_out && !out_recovering_) begin_out_recovery();
   if (out_recovering_ && uplinks_busy_ == 0 && phase_ == Phase::Running && !failed_) end_out_recovery();
 }
 

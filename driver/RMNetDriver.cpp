@@ -183,6 +183,7 @@ struct UsbBridge final : UsbIoListener {
   void on_fatal(const char* what) override { driver->OnUsbFatal(what); }
   void on_bulk_in(const uint8_t* data, size_t len) override { driver->OnBulkIn(data, len); }
   void on_bulk_out_done(int slot, bool ok) override { driver->OnBulkOutDone(slot, ok); }
+  void on_uplink_stuck() override { driver->OnUplinkStuck(); }
   RMNetDriver* driver;
 };
 
@@ -195,7 +196,7 @@ struct RxBridge final : RxSink {
 };
 
 // What PublishCounters last published, in its order.
-enum : uint32_t { kCounterCount = 44 };
+enum : uint32_t { kCounterCount = 45 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -223,6 +224,7 @@ struct RMNetDriver_IVars {
   uint64_t abortStartMs;
   bool usbFailed;
   bool usbDetached;  // usbFailed, and UsbIo had seen the device gone (not attached / no device)
+  bool uplinkStuck;  // UsbIo asked for a session restart; acted on once its call has returned
   bool coreStopped;  // session.stop() was called; the Session is not called again
   bool linkActive;  // the link status last reported to the stack
   uint32_t mtu;     // what getMaxTransferUnit answers
@@ -515,7 +517,8 @@ void RMNetDriver::AdvanceStop() {
   if (ivars->stopPhase == RMNetDriver_IVars::kStopDraining) {
     bool late = now - ivars->stopStartMs >= kStopDrainMs;
     // Without the timer there is no clock for the deadline; nothing was ever posted then.
-    if (usb && !usb->sending_done() && !late && ivars->timer) return;
+    // A failed arm counts as no timer: no tick may come to end the wait.
+    if (usb && !usb->sending_done() && !late && ivars->timer && !ivars->timerArmFailed) return;
     if (usb) {
       usb->abort();
       LOG("stop: control messages sent %u, dropped %u%{public}s; aborted with %u requests outstanding",
@@ -526,7 +529,7 @@ void RMNetDriver::AdvanceStop() {
   }
   if (ivars->stopPhase == RMNetDriver_IVars::kStopAborting) {
     if (usb && usb->outstanding() > 0) {
-      if (now - ivars->abortStartMs < kStopAbortMs && ivars->timer) return;
+      if (now - ivars->abortStartMs < kStopAbortMs && ivars->timer && !ivars->timerArmFailed) return;
       // Close also aborts; the objects are left to free(), which may run before they return.
       LOG("stop: %u aborted requests still outstanding after %llu ms; passing Stop on anyway",
           usb->outstanding(), now - ivars->abortStartMs);
@@ -939,6 +942,13 @@ void RMNetDriver::OnBulkIn(const uint8_t* data, size_t len) {
 // CoreHost runs first, so a QMAP command reply it kept takes the freed buffer before the drain.
 // Only after a success: UsbIo reports a failed transfer before it starts a stall recovery, so a
 // drain then could submit to a halted pipe; the timer tick restarts it instead.
+// UsbIo found the uplink stuck for the first time since a successful transfer. Called from inside
+// UsbIo::bulk_out_complete: only recorded here; BulkOutComplete_Impl restarts the session once
+// that call has returned.
+void RMNetDriver::OnUplinkStuck() {
+  ivars->uplinkStuck = true;
+}
+
 void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
   if (ivars->stopping || !ivars->core) return;
   ivars->core->on_bulk_out_done(slot, ok);
@@ -955,7 +965,8 @@ void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
 // RMNetRxTransfers, the total gives the mean (the transfers handled before the receive path's
 // first log lines are not timed). RMNetQmapCommandRepliesKept is the command replies CoreHost
 // keeps now for want of an uplink buffer, from 0 to kKeptReplies. RMNetTimerArmFailures counts failed
-// WakeAtTime calls; RMNetUsbBulkOutTimeouts uplink transfers that ended in their 5 s timeout;
+// WakeAtTime calls; RMNetUsbBulkOutTimeouts uplink transfers that timed out or were aborted by no
+// one in the driver; RMNetUplinkStuckRestarts the session restarts asked for by a stuck uplink;
 // RMNetUplinkPauseTimeouts QMAP pauses that lasted kPauseMaxMs and asked for a session restart.
 void RMNetDriver::PublishCounters() {
   const DataCounters& c = ivars->core->counters();
@@ -1013,6 +1024,7 @@ void RMNetDriver::PublishCounters() {
       {"RMNetTimerArmFailures", ivars->timerArmFailures},
       {"RMNetUsbBulkOutTimeouts", u.bulk_out_timeouts},
       {"RMNetUplinkPauseTimeouts", c.uplink_pause_timeouts},
+      {"RMNetUplinkStuckRestarts", u.uplink_stuck_restarts},
   };
   bool changed = !ivars->countersPublished;
   for (uint32_t i = 0; i < kCounterCount; i++) {
@@ -1074,6 +1086,10 @@ void RMNetDriver::BulkOutComplete_Impl(OSAction* action, IOReturn status, uint32
   if (!ivars || !ivars->usb) return;
   uint32_t slot = *static_cast<uint32_t*>(action->GetReference());
   ivars->usb->bulk_out_complete(slot, status, actualByteCount);
+  if (ivars->uplinkStuck) {
+    ivars->uplinkStuck = false;
+    RestartSession("uplink stuck");  // refused while stopping or after a fatal USB error
+  }
   if (ivars->stopping) AdvanceStop();
   EnsureTimer();
 }
@@ -1105,7 +1121,11 @@ void RMNetDriver::TimerFired_Impl(OSAction*, uint64_t) {
   if (ivars->stopping) {
     // The timer is the clock of the stop sequence until it passes Stop on.
     AdvanceStop();
-    if (ivars->stopPhase != RMNetDriver_IVars::kStopDone) ArmTimer();
+    if (ivars->stopPhase != RMNetDriver_IVars::kStopDone) {
+      ArmTimer();
+      // No tick will come: finish now rather than wait for a completion that may never arrive.
+      if (ivars->timerArmFailed) AdvanceStop();
+    }
     return;
   }
   if (!ivars->core) return;

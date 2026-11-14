@@ -36,6 +36,10 @@ class UsbIoListener {
   virtual void on_bulk_in(const uint8_t* data, size_t len) = 0;
   // The uplink transfer from `slot` completed; the slot is free again.
   virtual void on_bulk_out_done(int slot, bool ok) = 0;
+  // The uplink is stuck (kUplinkTimeoutsFatal stalls, no successful transfer between them) for
+  // the first time since a successful transfer: the owner should restart the session, after the
+  // current call returns. A second time with no success between is on_fatal instead.
+  virtual void on_uplink_stuck() = 0;
  protected:
   ~UsbIoListener() = default;
 };
@@ -47,8 +51,11 @@ enum : uint32_t {
   kMaxUplink = 16384,    // the largest uplink transfer Core accepts
 };
 
-// Bulk OUT transfers that ended in their timeout (kUplinkTimeoutMs, 5 s), in a row with no
-// successful transfer between them, after which the uplink is given up (on_fatal).
+// Bulk OUT stalls in a row, with no successful transfer between them, after which the uplink is
+// stuck: the first time the owner restarts the session (on_uplink_stuck), the second time with no
+// success since then the uplink is given up (on_fatal). A stall is a transfer that timed out
+// (kUplinkTimeoutMs, 5 s) or was aborted by no one in this driver; the transfers queued together
+// during one stall count once (UsbIo::bulk_out_complete).
 enum { kUplinkTimeoutsFatal = 3 };
 
 // Completion actions made by the driver (its CreateAction* methods). UsbIo takes a reference
@@ -71,7 +78,10 @@ struct UsbIoStats {
   // Reads that came back filled to their length: the read size, not the modem's aggregation,
   // ended the transfer.
   uint64_t full_reads;
-  uint64_t bulk_out_timeouts;  // uplink transfers that ended in their timeout (also in bulk_out_errors)
+  // Uplink transfers that ended in their timeout, or were aborted while running and not by a
+  // recovery (also in bulk_out_errors), whether or not they counted as a new stall.
+  uint64_t bulk_out_timeouts;
+  uint64_t uplink_stuck_restarts;  // times the uplink was stuck and a session restart was asked for
 };
 
 class UsbIo {
@@ -97,8 +107,9 @@ class UsbIo {
   // it is aborted asynchronously, and ClearStall runs only once nothing is pending on it. While
   // bulk OUT recovers, acquire_uplink gives no buffer (uplink_recovering() says why). A failed
   // abort, or a recovery not finished within about 1 s (tick), is fatal. A timed-out uplink
-  // transfer does not halt the pipe; kUplinkTimeoutsFatal of them in a row, with no successful
-  // transfer between, are fatal ("uplink is not accepting data").
+  // transfer does not halt the pipe; kUplinkTimeoutsFatal stalls in a row, with no successful
+  // transfer between, ask for a session restart, and again after it are fatal ("uplink is not
+  // accepting data").
   //
   // Bulk IN: posts every idle read, each `read_len` bytes (rounded up to the endpoint's packet
   // size, at most kMaxDownlink). Later re-posts use the newest length. Reads keep being re-posted
@@ -223,7 +234,15 @@ class UsbIo {
   uint32_t out_recoveries_;  // recoveries in a row with no successful transfer between
   uint32_t in_recovery_ticks_;   // ticks since the current bulk IN recovery began
   uint32_t out_recovery_ticks_;  // ticks since the current bulk OUT recovery began
-  uint32_t out_timeouts_;  // bulk OUT timeouts in a row with no successful transfer between
+  // Bulk OUT stalls. Each submitted transfer gets the next number (out_seq_) in out_submit_seq_.
+  // A failed transfer counts as a new stall only if its number is above out_stall_mark_, which is
+  // out_seq_ when the previous counted stall completed; a success resets out_stalls_ and
+  // out_stuck_restarted_.
+  uint32_t out_stalls_;
+  uint64_t out_seq_;
+  uint64_t out_stall_mark_;
+  uint64_t out_submit_seq_[kUplinkSlots];
+  bool out_stuck_restarted_;  // stuck once already with no successful transfer since
   uint32_t head_;   // oldest queued slot
   uint32_t count_;  // queued slots, the head one in flight when out_busy_
   bool out_busy_;

@@ -18,7 +18,7 @@
 // recovering) is kept, up to kKeptReplies in order, and sent when a transfer completes
 // (on_bulk_out_done, before the driver restarts its drain) or on data_tick. Kept replies are
 // discarded, and counted as reply drops, on a link down, at stop and on drop_kept_replies.
-// A pause that no flow enable lifts within kPauseMaxMs (timed by data_tick) makes CoreHost ask the
+// A pause that no flow enable lifts within kPauseMaxMs of link-up time (timed by data_tick) makes CoreHost ask the
 // driver for a session restart (take_restart_wanted); it never restarts the session itself.
 // No per-packet logging: counters carry it.
 #pragma once
@@ -127,8 +127,8 @@ class CoreHost final : public rmnet::SessionDelegate {
   // format, starts the bulk reads, and sends a router advertisement if IPv6 is new.
   void data_link_down();
   void data_link_up(uint64_t now_ms);
-  // Sends kept command replies a buffer is free for; times a pause (kPauseMaxMs, then a restart
-  // is wanted); then the periodic router advertisement, every kRouterAdvertMs while up with IPv6.
+  // Sends kept command replies a buffer is free for; times a pause while the data link is up
+  // (kPauseMaxMs, then a restart is wanted); then the periodic router advertisement, every kRouterAdvertMs while up with IPv6.
   void data_tick(uint64_t now_ms);
   // True once after data_tick found the uplink paused for kPauseMaxMs: the driver should restart
   // the session (restart), after the Core call has returned. Only data_tick sets it.

@@ -287,12 +287,13 @@ void CoreHost::data_link_up(uint64_t now_ms) {
 
 void CoreHost::data_tick(uint64_t now_ms) {
   send_kept_replies();  // the backstop: a completion normally sends them first
-  // A pause is timed from the first tick that sees it (at most one tick late).
-  if (paused_ && !pause_timed_) {
+  // A pause is timed only while the data link is up, from the first tick that sees both (at most
+  // one tick late): a flow disable during a sync or a backoff restarts no session.
+  if (paused_ && data_up_ && !pause_timed_) {
     pause_timed_ = true;
     pause_start_ms_ = now_ms;
   }
-  if (paused_ && !pause_expired_ && now_ms - pause_start_ms_ >= kPauseMaxMs) {
+  if (paused_ && data_up_ && pause_timed_ && !pause_expired_ && now_ms - pause_start_ms_ >= kPauseMaxMs) {
     pause_expired_ = true;
     restart_wanted_ = true;
     counters_.uplink_pause_timeouts++;
