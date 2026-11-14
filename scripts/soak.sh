@@ -81,9 +81,10 @@ set -u
 
 cd "$(dirname "$0")/.." || exit 1
 
-# The owner's whole allowance for testing on the metered SIM, in bytes. This script has its own
-# ceiling because measure.sh's 300,000,000 is nearly reached by what is recorded already.
-BUDGET=400000000
+# The ceiling on recorded use, in bytes, the same as measure.sh's. The owner's allowance for testing
+# on the metered SIM is 1.4 GB: 400 MB, plus 1 GB added on 2026-11-15; the ceiling leaves the rest as
+# a margin for traffic the usage file does not record.
+BUDGET=1300000000
 GUARD_BYTES=40000000 # the most one soak may move; also its reservation against BUDGET
 PERIOD=10            # seconds between samples
 STATUS_TIMEOUT=15    # seconds before a status command that has not answered is killed
