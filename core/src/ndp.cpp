@@ -1,7 +1,9 @@
 // The emulated router's side of IPv6 neighbour discovery (RFC 4861, RDNSS RFC 8106).
 // The router is fe80::1 at the router MAC. It answers router solicitations with
-// an advertisement built from the modem's settings and answers every neighbour
-// solicitation with the router MAC, so all traffic goes to the emulated router.
+// an advertisement built from the modem's settings, and neighbour solicitations
+// with the router MAC whatever unicast address they ask for, so all traffic goes
+// to the emulated router. Duplicate-address checks (source ::) and solicitations
+// for a multicast target, ::, or ::1 get no answer.
 #include <string.h>
 
 #include "rmnet/ethernet.h"

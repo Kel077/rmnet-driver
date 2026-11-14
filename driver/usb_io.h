@@ -104,13 +104,16 @@ class UsbIo final : public UsbPort {
   kern_return_t start();
   bool send(const uint8_t* data, size_t len) override;
 
-  // A bulk pipe whose endpoint halts is recovered without blocking: nothing new is posted on it,
-  // it is aborted asynchronously, and ClearStall runs only once nothing is pending on it. While
-  // bulk OUT recovers, acquire_uplink gives no buffer (uplink_recovering() says why). A failed
-  // abort, or a recovery not finished within about 1 s (tick), is fatal. A timed-out uplink
-  // transfer does not halt the pipe; rmnet::kUplinkStallsStuck stalls in a row, with no successful
-  // transfer between, ask for a session restart, and again after it are fatal ("uplink is not
-  // accepting data").
+  // UsbPort overrides for the bulk pipes (usb_port.h): start_bulk for bulk IN, the uplink methods
+  // for bulk OUT.
+  //
+  // On either bulk pipe, an endpoint that halts is recovered without blocking: nothing new is
+  // posted on the pipe, it is aborted asynchronously, and ClearStall runs only once nothing is
+  // pending on it. While bulk OUT recovers, acquire_uplink gives no buffer (uplink_recovering()
+  // says why). A failed abort, or a recovery not finished within about 1 s (tick), is fatal. A
+  // timed-out uplink transfer does not halt the pipe; rmnet::kUplinkStallsStuck stalls in a row,
+  // with no successful transfer between, ask for a session restart, and again after it are fatal
+  // ("uplink is not accepting data").
   void start_bulk(uint32_t read_len) override;
   int acquire_uplink() override;
   uint8_t* uplink_buffer(int slot) const override;

@@ -223,7 +223,7 @@ struct StatusModelTests {
         let cannotNoDriver = cannotRemoveText(status([enabled]), bundledVersion: "")
         check(cannotNoDriver.contains("carries no driver") && !cannotNoDriver.contains("not listed"),
               "cannotRemoveText: with no embedded driver, says the app carries none", cannotNoDriver)
-        check(cannotNoDriver == "This app carries no driver (the version of its embedded driver cannot be read), so it cannot remove the listed one. "
+        check(cannotNoDriver == "This app carries no driver (the version of its embedded driver cannot be read), so it cannot remove the listed driver. "
                 + keptAppsLine([enabled]),
               "cannotRemoveText: with no embedded driver, the reason then the kept app", cannotNoDriver)
 
@@ -278,7 +278,7 @@ struct StatusModelTests {
                 == "Nothing was sent: the system's listing is not known right now. Press Update again once the listing has refreshed.",
               "notSentText: listing not known", notSentText(action: "Update", busy: false, known: false))
         check(notSentText(action: "Remove", busy: false, known: true)
-                == "Nothing was sent: the listing has changed. Check it and press Remove again.",
+                == "Nothing was sent: the listing has changed. Remove is available again only when the new listing allows it.",
               "notSentText: listing changed", notSentText(action: "Remove", busy: false, known: true))
 
         // --- table rows ------------------------------------------------------------------------

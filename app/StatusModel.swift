@@ -183,7 +183,7 @@ func notSentText(action: String, busy: Bool, known: Bool) -> String {
     if !known {
         return "Nothing was sent: the system's listing is not known right now. Press \(action) again once the listing has refreshed."
     }
-    return "Nothing was sent: the listing has changed. Check it and press \(action) again."
+    return "Nothing was sent: the listing has changed. \(action) is available again only when the new listing allows it."
 }
 
 // The listing in words: "316.19.56 (enabled)", "none".
@@ -219,7 +219,7 @@ func removalPlan(_ s: DriverStatus, bundledVersion: String) -> RemovalPlan {
 // With no bundled version the app has no driver to install first or to deactivate, whatever is listed.
 func cannotRemoveText(_ s: DriverStatus, bundledVersion: String) -> String {
     if bundledVersion.isEmpty {
-        return "This app carries no driver (the version of its embedded driver cannot be read), so it cannot remove the listed one. "
+        return "This app carries no driver (the version of its embedded driver cannot be read), so it cannot remove the listed driver. "
             + keptAppsLine(s.entries)
     }
     let removing = s.entries.contains(where: { isBundled($0, bundledVersion) && $0.uninstalling })
