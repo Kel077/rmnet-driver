@@ -24,6 +24,11 @@ enum AtError: Error, Equatable {
 // With `prompt`, the answer is instead the "> " prompt (no line end after it), recognised only after
 // the echo; an error line before it still ends the answer. When the port does not echo (`echo` nil),
 // there is no gate.
+//
+// The result after a payload (`afterPayload:`) has no gate: by then the prompt has passed the gate,
+// so every earlier command has finished. Whether and how the modem echoes the payload is not known,
+// so the echo is not required; a line that is the payload or a piece of it (the echo broken by a line
+// end) is skipped if it comes.
 struct AtAnswerCollector {
     enum Outcome: Equatable {
         case waiting
@@ -33,6 +38,7 @@ struct AtAnswerCollector {
     }
 
     private let echo: String?
+    private let payload: String?
     private let wantsPrompt: Bool
     private var echoSeen = false
     private var buffer: [UInt8] = []  // bytes of the line not yet ended
@@ -41,7 +47,14 @@ struct AtAnswerCollector {
 
     init(echo: String?, prompt: Bool = false) {
         self.echo = echo
+        self.payload = nil
         self.wantsPrompt = prompt
+    }
+
+    init(afterPayload payload: String) {
+        self.echo = nil
+        self.payload = payload
+        self.wantsPrompt = false
     }
 
     // Feeds bytes that arrived; once the outcome is no longer `.waiting`, further bytes are ignored.
@@ -69,17 +82,22 @@ struct AtAnswerCollector {
             return  // before the prompt only an error line counts
         } else if line == "OK" {
             outcome = .answer(lines)
+        } else if let payload, isPieceOf(payload, line) {
+            return  // the payload's echo, whole or in pieces
         } else {
             lines.append(line)
         }
     }
 
+    // A bare ">" (a leftover prompt) also counts.
+    private func isPieceOf(_ payload: String, _ line: String) -> Bool {
+        let text = AtAnswerCollector.withoutPrompt(line)
+        return text.isEmpty || payload.range(of: text) != nil
+    }
+
     static func isErrorResult(_ line: String) -> Bool {
         line == "ERROR" || line.hasPrefix("+CME ERROR:") || line.hasPrefix("+CMS ERROR:")
     }
-
-    // Whether the port echoes, from the lines of its answer to "AT" collected without a gate.
-    static func portEchoes(answerToAT lines: [String]) -> Bool { lines.contains("AT") }
 
     private static func clean(_ bytes: ArraySlice<UInt8>) -> String {
         String(decoding: bytes.filter { $0 >= 0x20 || $0 == 0x09 }, as: UTF8.self)
@@ -93,15 +111,49 @@ struct AtAnswerCollector {
     }
 }
 
+// Whether the port echoes, from successive answers to "AT" collected without a gate. An answer counts
+// only if it is empty (no echo) or exactly the line "AT" (echo); anything else (a late answer of an
+// earlier command, an error line) means: read away what is pending and probe again. The verdict is
+// settled when two counted answers in a row agree. Pure: no I/O.
+struct AtEchoProbe {
+    enum Step: Equatable {
+        case probeAgain
+        case settled(echoes: Bool)
+    }
+
+    private var last: Bool?
+
+    mutating func record(_ outcome: AtAnswerCollector.Outcome) -> Step {
+        guard let verdict = AtEchoProbe.verdict(outcome) else {
+            last = nil
+            return .probeAgain
+        }
+        if last == verdict { return .settled(echoes: verdict) }
+        last = verdict
+        return .probeAgain
+    }
+
+    private static func verdict(_ outcome: AtAnswerCollector.Outcome) -> Bool? {
+        switch outcome {
+        case .answer([]): return false
+        case .answer(["AT"]): return true
+        default: return nil
+        }
+    }
+}
+
 // The port. Each public method holds a lock, so calls from two threads cannot interleave; calls are
 // synchronous and must not be made on the main thread. The class starts no threads of its own.
 //
 // Timeouts. `timeout` is the time allowed for the answer after the line has been written. Before each
 // command the port reads away what the modem sent unasked, for at most 0.5 s in all; each write may
 // take up to 2 s. Worst cases:
-// - `open()`: registry lookups, then 0.5 s drain + 2 s write + 3 s for the answer to "AT".
+// - `open()`: registry lookups, then the echo probes (drains, "AT" writes, answers) within 3 s, plus
+//   one 2 s write begun just before those 3 s ran out: 5 s.
 // - `command`: 0.5 s + 2 s + `timeout`.
-// - `send`: 0.5 s + 2 s + min(10 s, `timeout`) for the prompt + 2 s (payload, or ESC) + `timeout`.
+// - `send`: 0.5 s drain + 2 s line write + min(10 s, `timeout`) for the prompt + 2 s payload write,
+//   then either `timeout` for the result or a 2 s ESC write: 4.5 s + min(10 s, `timeout`) +
+//   max(`timeout`, 2 s). (A failed line write goes straight to the ESC write: 6.5 s.)
 // After `.timeout` the port has closed itself: a later call returns `.io(kIOReturnNotOpen)` and the
 // caller opens a new port. So does any failure that may leave the modem at the "> " prompt.
 final class AtPort {
@@ -190,24 +242,28 @@ final class AtPort {
         interface = nil
     }
 
-    // Sends "AT" and looks for its echo before the "OK".
+    // Probes with "AT" until two answers in a row agree on whether the port echoes (AtEchoProbe),
+    // within `openTimeout` in all; otherwise `.timeout`.
     private func learnEcho() -> AtError? {
         lock.lock()
         defer { lock.unlock() }
-        discardUnsolicited()
-        if let failure = write(Array("AT\r".utf8)) { return failure }
-        var collector = AtAnswerCollector(echo: nil)
-        switch wait(&collector, until: Date().addingTimeInterval(AtPort.openTimeout)) {
-        case .success(.answer(let lines)):
-            echoes = AtAnswerCollector.portEchoes(answerToAT: lines)
-            return nil
-        case .success(.modemError(let line)):
-            return .modem(line)
-        case .success:
-            return .timeout  // not reached: a collector without prompt ends only with an answer or an error
-        case .failure(let failure):
-            return failure
+        let deadline = Date().addingTimeInterval(AtPort.openTimeout)
+        var probe = AtEchoProbe()
+        while deadline.timeIntervalSinceNow > 0 {
+            discardUnsolicited(until: deadline)
+            if let failure = write(Array("AT\r".utf8)) { return failure }
+            var collector = AtAnswerCollector(echo: nil)
+            switch wait(&collector, until: deadline) {
+            case .success(let outcome):
+                if case .settled(let verdict) = probe.record(outcome) {
+                    echoes = verdict
+                    return nil
+                }
+            case .failure(let failure):
+                return failure
+            }
         }
+        return .timeout
     }
 
     // MARK: Commands
@@ -231,7 +287,8 @@ final class AtPort {
         defer { lock.unlock() }
         guard output != nil else { return .failure(.io(kIOReturnNotOpen)) }
         discardUnsolicited()
-        if let failure = write(Array(line.utf8) + [UInt8(ascii: "\r")]) { return closingOnTimeout(.failure(failure)) }
+        // If the line reached the modem despite the failure, the modem may be at the prompt.
+        if let failure = write(Array(line.utf8) + [UInt8(ascii: "\r")]) { return leavePrompt(after: failure) }
 
         var promptCollector = AtAnswerCollector(echo: echoes ? line : nil, prompt: true)
         switch wait(&promptCollector, until: Date().addingTimeInterval(min(timeout, AtPort.promptLimit))) {
@@ -246,7 +303,7 @@ final class AtPort {
         }
 
         if let failure = write(Array(payload.utf8) + [AtPort.ctrlZ]) { return leavePrompt(after: failure) }
-        var collector = AtAnswerCollector(echo: echoes ? payload : nil)
+        var collector = AtAnswerCollector(afterPayload: payload)
         return closingOnTimeout(answer(wait(&collector, until: Date().addingTimeInterval(timeout))))
     }
 
@@ -293,9 +350,10 @@ final class AtPort {
     }
 
     // Reads what the modem sent unasked (or late, after an earlier timeout) and throws it away: until
-    // a quiet interval, for at most `drainLimit` in all. A read error is left for the command to meet.
-    private func discardUnsolicited() {
-        let deadline = Date().addingTimeInterval(AtPort.drainLimit)
+    // a quiet interval, for at most `drainLimit` in all (and not past `limit`). A read error is left for
+    // the command to meet.
+    private func discardUnsolicited(until limit: Date = .distantFuture) {
+        let deadline = min(Date().addingTimeInterval(AtPort.drainLimit), limit)
         while true {
             let left = deadline.timeIntervalSinceNow
             if left <= 0 { return }

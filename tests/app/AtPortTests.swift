@@ -44,6 +44,33 @@ func expect(_ input: String, echo: String?, prompt: Bool = false, _ want: AtAnsw
     }
 }
 
+// The result after a payload, fed in every chunking.
+func expectAfterPayload(_ input: String, payload: String, _ want: AtAnswerCollector.Outcome, _ name: String) {
+    for (how, chunks) in chunkings(Array(input.utf8)) {
+        var c = AtAnswerCollector(afterPayload: payload)
+        for chunk in chunks { c.feed(chunk) }
+        check(c.outcome == want, "\(name) (\(how))", "want \(want), got \(c.outcome)")
+    }
+}
+
+// Successive answers to the echo probe's "AT", each collected without a gate (as open() does) in
+// every chunking; `want` is the probe's step after each answer.
+func expectProbe(_ answers: [String], _ want: [AtEchoProbe.Step], _ name: String) {
+    for index in 0..<3 {
+        var probe = AtEchoProbe()
+        var steps: [AtEchoProbe.Step] = []
+        var how = ""
+        for answer in answers {
+            let (h, chunks) = chunkings(Array(answer.utf8))[index]
+            how = h
+            var c = AtAnswerCollector(echo: nil)
+            for chunk in chunks { c.feed(chunk) }
+            steps.append(probe.record(c.outcome))
+        }
+        check(steps == want, "probe: \(name) (\(how))", "want \(want), got \(steps)")
+    }
+}
+
 @main
 struct AtPortTests {
     static func main() {
@@ -86,25 +113,54 @@ struct AtPortTests {
                .modemError("+CMS ERROR: 304"), "an error instead of the prompt")
         expect("AT+CMGS=23\r\r\nOK\r\n", echo: "AT+CMGS=23", prompt: true, .waiting, "OK is not a prompt")
 
-        // --- the payload's echo, then the result ---------------------------------------------------
+        // --- the result after the payload: no gate, the payload's echo skipped if it comes ---------
         let pdu = "0011000B916407281553F80000AA0AE8329BFD4697D9EC37"
-        expect(pdu + "\u{1A}\r\n+CMGS: 7\r\n\r\nOK\r\n", echo: pdu, .answer(["+CMGS: 7"]),
-               "payload echo with Ctrl-Z, then +CMGS: 7, OK")
-        expect("\r\nOK\r\n" + pdu + "\u{1A}\r\n+CMGS: 7\r\n\r\nOK\r\n", echo: pdu, .answer(["+CMGS: 7"]),
-               "a stale OK before the payload echo is discarded")
-        expect("> " + pdu + "\u{1A}\r\n+CMGS: 7\r\n\r\nOK\r\n", echo: pdu, .answer(["+CMGS: 7"]),
-               "payload echo on the prompt's line")
-        expect(pdu + "\u{1A}\r\n+CMS ERROR: 500\r\n", echo: pdu, .modemError("+CMS ERROR: 500"),
-               "payload echo, then an error")
+        expectAfterPayload(pdu + "\u{1A}\r\n+CMGS: 7\r\n\r\nOK\r\n", payload: pdu, .answer(["+CMGS: 7"]),
+                           "payload echoed whole with Ctrl-Z, then +CMGS: 7, OK")
+        expectAfterPayload("\r\n+CMGS: 7\r\n\r\nOK\r\n", payload: pdu, .answer(["+CMGS: 7"]),
+                           "payload not echoed at all")
+        expectAfterPayload(String(pdu.prefix(20)) + "\r\n" + String(pdu.dropFirst(20)) + "\u{1A}\r\n+CMGS: 7\r\n\r\nOK\r\n",
+                           payload: pdu, .answer(["+CMGS: 7"]), "payload echo broken by a line end: the pieces are skipped")
+        expectAfterPayload(String(pdu.prefix(9)) + "\r\n" + String(pdu.dropFirst(9).prefix(15)) + "\r\n"
+                           + String(pdu.dropFirst(24)) + "\u{1A}\r\n+CMGS: 7\r\n\r\nOK\r\n",
+                           payload: pdu, .answer(["+CMGS: 7"]), "payload echo in three pieces")
+        expectAfterPayload("\r\n+CMTI: \"ME\",0\r\n+CMGS: 7\r\n\r\nOK\r\n", payload: pdu,
+                           .answer(["+CMTI: \"ME\",0", "+CMGS: 7"]),
+                           "an unsolicited line before +CMGS: 7 is an answer line (the caller looks for +CMGS:)")
+        expectAfterPayload("> " + pdu + "\u{1A}\r\n+CMGS: 7\r\n\r\nOK\r\n", payload: pdu, .answer(["+CMGS: 7"]),
+                           "payload echo on the prompt's line")
+        expectAfterPayload(pdu + "\u{1A}\r\n+CMS ERROR: 500\r\n", payload: pdu, .modemError("+CMS ERROR: 500"),
+                           "payload echo, then an error")
+        expectAfterPayload("\r\n+CMS ERROR: 500\r\n", payload: pdu, .modemError("+CMS ERROR: 500"),
+                           "no payload echo, an error")
 
         // --- a port that does not echo ---------------------------------------------------------------
         expect("\r\nQuectel\r\nRM520N-GL\r\n\r\nOK\r\n", echo: nil, .answer(["Quectel", "RM520N-GL"]), "no echo: answer")
         expect("\r\n+CME ERROR: 10\r\n", echo: nil, .modemError("+CME ERROR: 10"), "no echo: error")
         expect("\r\n> ", echo: nil, prompt: true, .prompt, "no echo: prompt")
 
-        // --- learning whether the port echoes -----------------------------------------------------
-        check(AtAnswerCollector.portEchoes(answerToAT: ["AT"]), "portEchoes: echo line")
-        check(!AtAnswerCollector.portEchoes(answerToAT: []), "portEchoes: nothing before OK")
+        // --- learning whether the port echoes: two agreeing probes -------------------------------
+        let echoAnswer = "AT\r\r\nOK\r\n"
+        let silentAnswer = "\r\nOK\r\n"
+        expectProbe([echoAnswer], [.probeAgain], "one echo answer does not settle")
+        expectProbe([echoAnswer, echoAnswer], [.probeAgain, .settled(echoes: true)], "echo: two agreeing probes")
+        expectProbe([silentAnswer, silentAnswer], [.probeAgain, .settled(echoes: false)], "no echo: two agreeing probes")
+        expectProbe(["\r\n+CMGS: 5\r\n\r\nOK\r\n" + echoAnswer, echoAnswer, echoAnswer],
+                    [.probeAgain, .probeAgain, .settled(echoes: true)],
+                    "a late +CMGS: 5 / OK before the probe's echo does not settle on no echo")
+        expectProbe(["\r\nOK\r\n" + echoAnswer, echoAnswer, echoAnswer],
+                    [.probeAgain, .probeAgain, .settled(echoes: true)],
+                    "a late lone OK before the probe's echo does not settle on no echo")
+        expectProbe(["\r\n+CMS ERROR: 500\r\n", echoAnswer, echoAnswer],
+                    [.probeAgain, .probeAgain, .settled(echoes: true)],
+                    "a late +CMS ERROR: 500 before the probe makes it probe again, not fail")
+        expectProbe([silentAnswer, echoAnswer, silentAnswer], [.probeAgain, .probeAgain, .probeAgain],
+                    "disagreeing probes do not settle")
+        expectProbe([echoAnswer, "\r\nERROR\r\n", echoAnswer, echoAnswer],
+                    [.probeAgain, .probeAgain, .probeAgain, .settled(echoes: true)],
+                    "an answer that does not count breaks the run")
+        expectProbe(["AT\r\r\n+X: 1\r\n\r\nOK\r\n", echoAnswer], [.probeAgain, .probeAgain],
+                    "an echo with more lines does not count")
 
         print("at-test: \(checks) checks passed")
     }
