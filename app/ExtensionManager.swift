@@ -113,9 +113,7 @@ final class ExtensionManager {
         case .nothingListed:
             completion(.notSent("The system lists no driver it is not already removing; there is nothing to remove."))
         case .cannot:
-            completion(.notSent("This app carries version \(bundledVersion.isEmpty ? "unknown" : bundledVersion), "
-                                + "which is not listed, and the listing does not allow installing it first. "
-                                + keptAppsLine(status.entries)))
+            completion(.notSent(cannotRemoveText(status, bundledVersion: bundledVersion)))
         case .deactivate:
             deactivateNow()
         case .activateThenDeactivate:

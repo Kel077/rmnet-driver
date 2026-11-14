@@ -266,7 +266,17 @@ cleanup() {
   rm -rf "$WORK"
 }
 trap cleanup EXIT
-trap 'echo "measure: interrupted" >&2; exit 130' INT TERM HUP
+# A signal ends the run with 128 plus its number: INT 130, TERM 143, HUP 129.
+interrupted() {
+  echo "measure: interrupted" >&2
+  exit "$1"
+}
+on_signals() {
+  trap 'interrupted 130' INT
+  trap 'interrupted 143' TERM
+  trap 'interrupted 129' HUP
+}
+on_signals
 
 if [ "$DIR" = up ]; then
   dd if=/dev/zero of="$WORK/body" bs=1000000 count=4 2>/dev/null || die "cannot write the upload body"
@@ -275,7 +285,9 @@ fi
 CURL="/usr/bin/curl --noproxy * --interface $IFACE --resolve $HOST:$PORT:$ADDR -s --max-time $STOP_SECS"
 set -f # keep the * in $CURL from being expanded
 # A signal while the transfers start is held until all of them are known.
-trap 'signalled=1' INT TERM HUP
+trap 'signalled=130' INT
+trap 'signalled=143' TERM
+trap 'signalled=129' HUP
 started=1
 t_start=$(now)
 echo "0 0 0" >"$SAMPLES"
@@ -289,11 +301,8 @@ for k in 1 2 3 4; do
   pids="$pids $!"
 done
 set +f
-trap 'echo "measure: interrupted" >&2; exit 130' INT TERM HUP
-if [ "$signalled" -eq 1 ]; then
-  echo "measure: interrupted" >&2
-  exit 130
-fi
+on_signals
+[ "$signalled" -eq 0 ] || interrupted "$signalled"
 
 reason=
 t=0

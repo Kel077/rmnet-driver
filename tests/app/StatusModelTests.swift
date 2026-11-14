@@ -101,6 +101,15 @@ struct StatusModelTests {
         check(!canRemoveDirectly(status([enabled]), bundledVersion: "316.21.4"), "canRemoveDirectly: one differing entry")
         check(!canRemoveDirectly(status([enabled, enabled]), bundledVersion: "316.19.56"), "canRemoveDirectly: two entries")
         check(!canRemoveDirectly(status([]), bundledVersion: "316.19.56"), "canRemoveDirectly: no entry")
+        // 317.9 and 317.9.0 are the same version, as installTitle sees them ("Reinstall").
+        let short = ExtensionEntry(version: "317.9", enabled: true, awaitingApproval: false, uninstalling: false)
+        check(canRemoveDirectly(status([short]), bundledVersion: "317.9.0"), "canRemoveDirectly: 317.9 listed, 317.9.0 bundled")
+        check(removalPlan(status([short]), bundledVersion: "317.9.0") == .deactivate,
+              "removalPlan: 317.9 listed, 317.9.0 bundled deactivates it")
+        let shortOff = ExtensionEntry(version: "317.9", enabled: false, awaitingApproval: false, uninstalling: false)
+        let other = ExtensionEntry(version: "317.10.17", enabled: true, awaitingApproval: false, uninstalling: false)
+        check(removalPlan(status([shortOff, other]), bundledVersion: "317.9.0") == .deactivate,
+              "removalPlan: stuck, 317.9 listed switched off, 317.9.0 bundled deactivates it")
 
         // --- canActivate -----------------------------------------------------------------------
         let switchedOff = ExtensionEntry(version: "316.19.56", enabled: false, awaitingApproval: false, uninstalling: false)
@@ -120,6 +129,13 @@ struct StatusModelTests {
               "\(leavingAdvice)")
         check(!leavingAdvice.contains { $0.contains("build/installed/") || $0.contains("Use Remove") },
               "advice: uninstalling names no kept app and no Remove", "\(leavingAdvice)")
+        let leavingNotQMI = advice(status([leaving], .notQMI), bundledVersion: "316.21.4")
+        check(leavingNotQMI.contains("AT+QCFG=\"usbnet\",0") && leavingNotQMI.contains("AT+CFUN=1,1"),
+              "advice: only uninstalling entries, modem not in QMI mode, still names the two AT commands", "\(leavingNotQMI)")
+        check(leavingNotQMI.last == removalUnderWayLine
+                && !leavingNotQMI.contains { $0.contains("build/installed/") || $0.contains("Use Remove") },
+              "advice: only uninstalling entries, modem not in QMI mode, ends with the removal line and names no Remove",
+              "\(leavingNotQMI)")
 
         // --- removalPlan, for an app carrying B = 316.21.4 (A = 316.19.56) --------------------
         let b = "316.21.4"
@@ -167,8 +183,27 @@ struct StatusModelTests {
         check(mixed.contains { $0.contains("build/installed/RMNet-316.19.56.app") }, "advice: [A enabled, B uninstalling] names A's kept app", "\(mixed)")
         check(!mixed.contains { $0.contains("RMNet-316.21.4.app") }, "advice: [A enabled, B uninstalling] leaves B out", "\(mixed)")
         check(keptAppsLine([bLeaving]) == "", "keptAppsLine: only uninstalling entries gives nothing")
-        check(!advice(status([leaving, bLeaving]), bundledVersion: b).contains { $0.hasSuffix("cleared. ") },
-              "advice: no dangling text when no kept app is named")
+        // Wherever Install is off and the advice is not only the removal line, at least one entry is
+        // not uninstalling, so the can't-activate line names a kept app.
+        let stuck: [(String, [ExtensionEntry])] = [
+            ("[A switched off]", [switchedOff]), ("[A enabled, B enabled]", [enabled, bEnabled]),
+            ("[A enabled, B uninstalling]", [enabled, bLeaving]), ("[A switched off, A uninstalling]", [switchedOff, leaving]),
+        ]
+        for (name, entries) in stuck {
+            let line = advice(status(entries), bundledVersion: b).first { $0.hasPrefix("Install and Update are off") }
+            let kept = keptAppsLine(entries)
+            check(!kept.isEmpty && line == "Install and Update are off until this is cleared. " + kept,
+                  "advice: the can't-activate line names the kept apps for \(name)", "\(line ?? "no line")")
+        }
+
+        // --- what Remove says when it can send nothing -------------------------------------------
+        let cannotLeaving = cannotRemoveText(status([enabled, bLeaving]), bundledVersion: b)
+        check(cannotLeaving.contains("version 316.21.4, which the system is already removing")
+                && !cannotLeaving.contains("not listed") && cannotLeaving.contains("build/installed/RMNet-316.19.56.app"),
+              "cannotRemoveText: the bundled version listed as uninstalling is said to be being removed", cannotLeaving)
+        let cannotAbsent = cannotRemoveText(status([switchedOff]), bundledVersion: b)
+        check(cannotAbsent.contains("version 316.21.4, which is not listed") && cannotAbsent.contains("build/installed/RMNet-316.19.56.app"),
+              "cannotRemoveText: the bundled version not listed is said to be not listed", cannotAbsent)
 
         // --- versions and the install button's title (A2) ----------------------------------------
         let versions: [(String, String, Int)] = [
@@ -213,6 +248,15 @@ struct StatusModelTests {
         check(rows[0].value == "up" && rows[1].value == "10.62.238.140/29 gw 10.62.238.141",
               "tableRows: state and IPv4 values", "\(rows)")
         check(rows[4].value == "316.19.56" && rows[5].value == "316.21.4", "tableRows: versions", "\(rows)")
+        let unknownRows = tableRows(status([enabled], attached: true, props), bundledVersion: "316.21.4", listingKnown: false)
+        check(unknownRows.map { $0.name } == names, "tableRows: the same rows when the listing is unknown", "\(unknownRows)")
+        check(unknownRows[4].value == "unknown", "tableRows: the installed version is unknown when the listing is unknown",
+              "\(unknownRows[4])")
+        check(unknownRows[5].value == "316.21.4" && unknownRows[0].value == "up",
+              "tableRows: the bundled version and the registry rows stay when the listing is unknown", "\(unknownRows)")
+        let unknownNone = tableRows(status([]), bundledVersion: "316.21.4", listingKnown: false)
+        check(unknownNone[4].value == "unknown", "tableRows: an unknown listing with no last entry says unknown, not none",
+              "\(unknownNone[4])")
 
         // --- property strings ------------------------------------------------------------------
         check(propertyString(NSNumber(value: 0)) == "0", "propertyString: number 0")

@@ -69,7 +69,8 @@ private func isSwitchedOff(_ e: ExtensionEntry) -> Bool {
 let removalUnderWayLine = "The system is removing the driver; the removal finishes when the modem is unplugged or the Mac restarts. Install is available after that."
 
 // The lines shown under the headline, most specific first; the last line is the warning, except
-// while every listed entry is uninstalling, when the one line is `removalUnderWayLine`.
+// while every listed entry is uninstalling, when it is `removalUnderWayLine` (after the two AT
+// commands if the modem is not in QMI mode).
 func advice(_ s: DriverStatus, bundledVersion: String) -> [String] {
     var lines: [String] = []
     if case .notQMI = s.modem {
@@ -80,14 +81,13 @@ func advice(_ s: DriverStatus, bundledVersion: String) -> [String] {
     // A listing made only of entries the system is removing: the removal is under way, and the
     // window says only that (no Remove to press, Install off until the entries are gone).
     if !s.entries.isEmpty && s.entries.allSatisfy({ $0.uninstalling }) {
-        return [removalUnderWayLine]
+        return lines + [removalUnderWayLine]
     }
+    // From here at least one listed entry is not uninstalling (or none is listed).
     if s.entries.count > 1 || s.entries.contains(where: isSwitchedOff) {
         lines.append("The driver was switched off in System Settings, so the system keeps an old entry and refuses every new installation.")
     } else if let entry = s.entries.first {
-        if entry.uninstalling {
-            lines.append("The system is removing the driver; it goes when the modem is unplugged or the Mac restarts.")
-        } else if entry.awaitingApproval {
+        if entry.awaitingApproval {
             lines.append("Open System Settings, General, Login Items & Extensions, Driver Extensions, and turn RMNet on.")
         } else if !bundledVersion.isEmpty && compareVersions(bundledVersion, entry.version) != 0 {
             lines.append("\(installTitle(s, bundledVersion: bundledVersion)) will replace version \(entry.version) with version \(bundledVersion). The new build loads when the modem is next plugged in or the Mac restarts.")
@@ -97,17 +97,23 @@ func advice(_ s: DriverStatus, bundledVersion: String) -> [String] {
         lines.append("The modem is in QMI mode but the driver has not attached. If this lasts, unplug the modem and plug it in again.")
     }
     if !canActivate(s) {
-        let kept = keptAppsLine(s.entries)
-        lines.append("Install and Update are off until this is cleared." + (kept.isEmpty ? "" : " " + kept))
+        // Some entry is not uninstalling, so keptAppsLine names at least one kept app.
+        lines.append("Install and Update are off until this is cleared. " + keptAppsLine(s.entries))
     }
     lines.append("Do not switch the driver off in System Settings while the modem is attached. Use Remove here.")
     return lines
 }
 
 // Deactivation works only from an app that embeds the installed version, and only with one entry,
-// which the system is not already removing.
+// which the system is not already removing. Versions are compared as installTitle compares them, so
+// 317.9 and 317.9.0 are the same version.
 func canRemoveDirectly(_ s: DriverStatus, bundledVersion: String) -> Bool {
-    s.entries.count == 1 && s.entries[0].version == bundledVersion && !s.entries[0].uninstalling
+    s.entries.count == 1 && isBundled(s.entries[0], bundledVersion) && !s.entries[0].uninstalling
+}
+
+// True when the entry is the version this app carries (compared field by field, see compareVersions).
+private func isBundled(_ e: ExtensionEntry, _ bundledVersion: String) -> Bool {
+    compareVersions(e.version, bundledVersion) == 0
 }
 
 // Whether an activation may be sent. Not when the listing shows the stuck state: more than one
@@ -182,9 +188,18 @@ func removalPlan(_ s: DriverStatus, bundledVersion: String) -> RemovalPlan {
     if canRemoveDirectly(s, bundledVersion: bundledVersion) { return .deactivate }
     if !canActivate(s) {
         // An entry the system is already removing is never deactivated a second time.
-        return s.entries.contains(where: { $0.version == bundledVersion && !$0.uninstalling }) ? .deactivate : .cannot
+        return s.entries.contains(where: { isBundled($0, bundledVersion) && !$0.uninstalling }) ? .deactivate : .cannot
     }
     return bundledVersion.isEmpty ? .cannot : .activateThenDeactivate
+}
+
+// Why Remove sends nothing when the plan is `.cannot`, and which kept apps can remove what is listed.
+func cannotRemoveText(_ s: DriverStatus, bundledVersion: String) -> String {
+    let removing = !bundledVersion.isEmpty && s.entries.contains(where: { isBundled($0, bundledVersion) && $0.uninstalling })
+    return "This app carries version \(bundledVersion.isEmpty ? "unknown" : bundledVersion), "
+        + (removing ? "which the system is already removing" : "which is not listed")
+        + ", and the listing does not allow installing it first. "
+        + keptAppsLine(s.entries)
 }
 
 // A registry property as text: strings as they are, numbers in decimal, data as Foundation prints
@@ -201,16 +216,19 @@ struct TableRow {
 let fixedProperties = ["RMNetState", "RMNetIPv4", "RMNetIPv6", "RMNetProfile"]
 
 // The window's table: state, addresses, profile, the two versions, then every other property that
-// is not "0", sorted by name (the counters; their list is not fixed here).
-func tableRows(_ s: DriverStatus, bundledVersion: String) -> [TableRow] {
+// is not "0", sorted by name (the counters; their list is not fixed here). Unless `listingKnown`
+// (the system's last answer was a listing), the installed version is "unknown", not the entries
+// last listed.
+func tableRows(_ s: DriverStatus, bundledVersion: String, listingKnown: Bool = true) -> [TableRow] {
     let p = s.properties
-    let installed = s.entries.map { $0.version }.joined(separator: ", ")
+    let listed = s.entries.map { $0.version }.joined(separator: ", ")
+    let installed = !listingKnown ? "unknown" : listed.isEmpty ? "none" : listed
     var rows = [
         TableRow(name: "State", value: p["RMNetState"] ?? (s.attached ? "" : "not attached")),
         TableRow(name: "IPv4", value: p["RMNetIPv4"] ?? ""),
         TableRow(name: "IPv6", value: p["RMNetIPv6"] ?? ""),
         TableRow(name: "Profile", value: p["RMNetProfile"] ?? ""),
-        TableRow(name: "Installed driver version", value: installed.isEmpty ? "none" : installed),
+        TableRow(name: "Installed driver version", value: installed),
         TableRow(name: "Bundled version", value: bundledVersion.isEmpty ? "unknown" : bundledVersion),
     ]
     for key in p.keys.sorted() where !fixedProperties.contains(key) && p[key] != "0" {

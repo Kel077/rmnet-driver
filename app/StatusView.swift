@@ -96,7 +96,7 @@ final class StatusController: ObservableObject {
                         return
                     }
                     let now = found.map(ExtensionEntry.init)
-                    if now.count == 1, now[0].version == version, now[0].enabled {
+                    if now.count == 1, compareVersions(now[0].version, version) == 0, now[0].enabled {
                         self.finish(updating
                             ? "Version \(version) is installed. It loads when the modem is next plugged in or the Mac restarts; until then the old build may still be attached."
                             : "Version \(version) is installed.")
@@ -204,7 +204,7 @@ struct StatusView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            Table(tableRows(status, bundledVersion: controller.bundledVersion)) {
+            Table(tableRows(status, bundledVersion: controller.bundledVersion, listingKnown: controller.known)) {
                 TableColumn("Name", value: \.name)
                 TableColumn("Value") { row in Text(row.value).textSelection(.enabled) }
             }

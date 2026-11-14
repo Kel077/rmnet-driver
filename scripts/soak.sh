@@ -25,9 +25,11 @@
 # Every 10 seconds one line is appended to build/logs/soak-<time>.csv: the time, the seconds since
 # the start, the port's byte counters (as netstat shows them, and moved since the start), the status
 # class, RMNetState, the counters listed in COUNTERS below (empty when the driver does not publish
-# one), and driver_pid, the process ID of the driver (`pgrep -f io.rmnetdriver.RMNet.driver`; several
-# are joined with ";"). The status comes from `RMNet status --json` and is one of three things, kept
-# apart:
+# one), and driver_pid, the process ID of the driver (`pgrep -f "$DRIVER_PROC"`, a pattern that
+# matches only a command line whose first word ends in .dext/io.rmnetdriver.RMNet.driver, the driver
+# extension's own executable, and not `log stream` of scripts/driver-log.sh or any other command that
+# merely names the driver; several are joined with ";"). The status comes from `RMNet status --json`
+# and is one of three things, kept apart:
 #   up            the status was read and properties.RMNetState is "up";
 #   not-up        the status was read and the driver is attached but its state is not "up"
 #                 (not-attached: the status was read and properties is empty, the driver is not attached);
@@ -92,7 +94,9 @@ STATUS_CMD=/Applications/RMNet.app/Contents/MacOS/RMNet
 USAGE=build/installed/measure-usage.log
 TARGET4=223.5.5.5
 TARGET6=2400:3200::1
-DRIVER_PROC=io.rmnetdriver.RMNet.driver
+# The driver's process: its executable, /Library/SystemExtensions/<UUID>/io.rmnetdriver.RMNet.driver.dext/
+# io.rmnetdriver.RMNet.driver, is the first word of its command line (an extended regular expression).
+DRIVER_PROC='^[^ ]*\.dext/io\.rmnetdriver\.RMNet\.driver( |$)'
 CRASH_PREFIX=io.rmnetdriver.RMNet.driver
 CRASH_DIRS="/Library/Logs/DiagnosticReports $HOME/Library/Logs/DiagnosticReports"
 NETSTAT=/usr/sbin/netstat
