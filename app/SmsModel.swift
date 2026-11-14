@@ -483,13 +483,49 @@ private func decodeDeliver(_ hex: String) -> Deliver? {
     return Deliver(sender: sender, timestamp: serviceCentreTime(time), text: body.text, concat: body.concat)
 }
 
+// MARK: - Text from the modem, safe to show
+
+/// Characters a sender could use to move the cursor, erase or forge lines, or reorder what is shown:
+/// the C0 controls, DEL, the C1 controls and the bidirectional embeddings, overrides and isolates.
+private func isUnsafeForDisplay(_ v: UInt32) -> Bool {
+    v <= 0x1F || (0x7F...0x9F).contains(v) || (0x202A...0x202E).contains(v) || (0x2066...0x2069).contains(v)
+}
+
+/// Text received from the network, made safe for every place it is shown (a terminal, JSON, the window).
+/// Each unsafe character becomes U+FFFD. With `keepLineEnds` (a message's text), CR LF and a lone CR
+/// become LF, LF stays, and tab stays; without it (a sender) every control character is replaced.
+func displaySafe(_ s: String, keepLineEnds: Bool) -> String {
+    let scalars = Array(s.unicodeScalars)
+    var out = String.UnicodeScalarView()
+    var i = 0
+    while i < scalars.count {
+        let c = scalars[i]
+        i += 1
+        if keepLineEnds {
+            if c == "\r" {
+                if i < scalars.count, scalars[i] == "\n" { i += 1 }
+                out.append("\n")
+                continue
+            }
+            if c == "\n" || c == "\t" {
+                out.append(c)
+                continue
+            }
+        }
+        out.append(isUnsafeForDisplay(c.value) ? "\u{FFFD}" : c)
+    }
+    return String(out)
+}
+
+/// The sender and the text of a readable part are display-safe (`displaySafe`).
 func decodePart(_ stored: StoredPdu) -> SmsPart {
     guard let d = decodeDeliver(stored.hex) else {
         return SmsPart(index: stored.index, status: stored.status, sender: "", timestamp: nil, text: "",
                        concat: nil, readable: false)
     }
-    return SmsPart(index: stored.index, status: stored.status, sender: d.sender, timestamp: d.timestamp,
-                   text: d.text, concat: d.concat, readable: true)
+    return SmsPart(index: stored.index, status: stored.status, sender: displaySafe(d.sender, keepLineEnds: false),
+                   timestamp: d.timestamp, text: displaySafe(d.text, keepLineEnds: true), concat: d.concat,
+                   readable: true)
 }
 
 /// Reads back an SMS-SUBMIT (TS 23.040 §9.2.2.2) with the same address and user data routines the
@@ -523,6 +559,9 @@ private struct PartGroup { let key: GroupKey; var earliest: Date?; var members: 
 /// same text is a duplicate: the lower index gives the text and both indices are listed. Parts are taken
 /// in order of time, then index, so the result does not depend on the order of the listing.
 /// Messages come newest first; entries without a time last, by index.
+/// A known limit: two different multi-part messages from one sender that reuse a reference and total
+/// within 15 minutes, with parts that interleave in time or with a part missing, can exchange parts and
+/// show as complete. No simple rule tells them apart; it needs a sender that reuses a reference that soon.
 func assemble(_ parts: [SmsPart]) -> [SmsMessage] {
     var messages: [SmsMessage] = []
     var candidates: [SmsPart] = []

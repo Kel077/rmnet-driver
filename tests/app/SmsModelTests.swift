@@ -235,6 +235,38 @@ struct SmsModelTests {
         let kept = decode(classic, index: 17, status: .unread)
         check(kept.index == 17 && kept.status == .unread, "decodePart keeps index and status")
 
+        // --- text from the modem is display-safe ---------------------------------------------------
+        let r = "\u{FFFD}"
+        // UCS-2: SMSC 00; first 04; sender 0B 91 7238880900F1; PID 00; DCS 08; classic time; UDL 28 (40
+        // octets, 20 units): A ESC [ 2 J BEL BS U+009B U+202E U+2066 b TAB c CR LF d CR e DEL NUL.
+        let hostileUcs2 = decode("00040B917238880900F1000899309251619580" + "28"
+            + "0041001B005B0032004A00070008009B202E2066006200090063000D000A0064000D0065007F0000")
+        check(hostileUcs2.readable && hostileUcs2.text == "A\(r)[2J\(r)\(r)\(r)\(r)\(r)b\tc\nd\ne\(r)\(r)",
+              "UCS-2: ESC, BEL, BS, U+009B, bidi controls, DEL, NUL replaced; CR LF and CR to LF; tab kept",
+              hostileUcs2.text.debugDescription)
+        // 8-bit (DCS 04): UDL 23 (35 octets): "x", the 32 C1 bytes 80-9F, "y", E9 (é).
+        let hostileLatin1 = decode("00040B917238880900F1000499309251619580" + "23" + "78"
+            + "808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9F" + "79E9")
+        check(hostileLatin1.readable && hostileLatin1.text == "x" + String(repeating: r, count: 32) + "y\u{E9}",
+              "8-bit: bytes 80-9F replaced, é kept", hostileLatin1.text.debugDescription)
+        // Alphanumeric sender, 14 semi-octets = 8 septets: a CR b LF c ESC-0A (form feed) d, packed
+        // 61 0D 62 0A 63 1B 0A 64 -> E1865831DE28C8 (packed by hand: septet n at bits 7n..7n+6).
+        let hostileSender = decode("00040ED0E1865831DE28C80000993092516195800AE8329BFD4697D9EC37")
+        check(hostileSender.readable && hostileSender.sender == "a\(r)b\(r)c\(r)d" && hostileSender.text == "hellohello",
+              "alphanumeric sender: CR, LF and FF replaced", hostileSender.sender.debugDescription)
+        // The function itself.
+        check(displaySafe("a\r\nb\rc\nd", keepLineEnds: true) == "a\nb\nc\nd", "displaySafe: CR LF and CR to LF")
+        check(displaySafe("a\tb", keepLineEnds: true) == "a\tb", "displaySafe: tab kept in a text")
+        check(displaySafe("a\tb\r\nc", keepLineEnds: false) == "a\(r)b\(r)\(r)c", "displaySafe: a sender keeps no control")
+        check(displaySafe("\u{1B}]0;title\u{07}", keepLineEnds: true) == "\(r)]0;title\(r)", "displaySafe: OSC replaced")
+        check(displaySafe("\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}\u{2066}\u{2067}\u{2068}\u{2069}", keepLineEnds: true)
+                == String(repeating: r, count: 9), "displaySafe: every bidi embedding, override and isolate replaced")
+        check(displaySafe("\u{1F}\u{20}\u{7E}\u{7F}\u{9F}\u{A0}", keepLineEnds: true) == "\(r) ~\(r)\(r)\u{A0}",
+              "displaySafe: the edges of the ranges")
+        let ordinary = "你好世界 😀👍🏽 café Ñandú Ærø ﷺ ٱلسلام"
+        check(displaySafe(ordinary, keepLineEnds: true) == ordinary && displaySafe(ordinary, keepLineEnds: false) == ordinary,
+              "displaySafe: Chinese, emoji, accented and Arabic text untouched")
+
         // An invalid time stamp leaves the message readable without a time.
         // Month octet 31 = month 13.
         let month13 = decode("07917283010010F5040BC87238880900F10000993192516195800AE8329BFD4697D9EC37")
@@ -245,8 +277,10 @@ struct SmsModelTests {
         check(february30.readable && february30.timestamp == nil, "30 February: readable, no time", "\(february30)")
 
         // --- the alphabet table, position by position ---------------------------------------------
+        // decodePart shows the lone CR (septet 0x0D) as LF; everything else is as the table has it.
         let table = decode(wholeTable)
-        check(table.readable && Array(table.text.unicodeScalars) == Array(wholeTableText.unicodeScalars),
+        let shownTableText = wholeTableText.replacingOccurrences(of: "\r", with: "\n")
+        check(table.readable && Array(table.text.unicodeScalars) == Array(shownTableText.unicodeScalars),
               "the 127 basic septets decode to TS 23.038's characters in order",
               "\(Array(table.text.unicodeScalars).count) scalars: \(table.text.debugDescription)")
         // "@£$_¤¡¿ÄΔ" by hand from TS 23.038: @ 00, £ 01, $ 02, _ 11, ¤ 24, ¡ 40, ¿ 60, Ä 5B, Δ 10.

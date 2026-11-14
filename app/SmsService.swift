@@ -24,11 +24,14 @@ final class SmsService: SmsServing {
         case .success(let lines):
             return .success(assemble(parseListing(lines).map(decodePart)))
         case .failure(let error):
-            return .failure(SmsFailure(message: "The messages could not be listed: \(describe(error))"))
+            return .failure(SmsFailure(message: "The messages could not be listed. \(describe(error))"))
         }
     }
 
-    func delete(indices: [Int]) -> Result<Int, SmsFailure> {
+    // Each index once, the first of each kept; the count is of the deletes the modem answered "OK".
+    func delete(indices given: [Int]) -> Result<Int, SmsFailure> {
+        var seen = Set<Int>()
+        let indices = given.filter { seen.insert($0).inserted }
         guard !indices.isEmpty else { return .success(0) }
         guard indices.allSatisfy({ $0 >= 0 }) else {
             return .failure(SmsFailure(message: "A stored index is negative. Nothing was deleted."))
@@ -42,8 +45,14 @@ final class SmsService: SmsServing {
         var deleted = 0
         for index in indices {
             if case .failure(let error) = port.command("AT+CMGD=\(index)", timeout: SmsService.deleteTimeout) {
-                return .failure(SmsFailure(message: "Stored part \(index) could not be deleted: \(describe(error)) "
-                                           + "\(deleted) of \(indices.count) stored part(s) were deleted before it."))
+                let before = "\(deleted) of \(indices.count) stored part(s) were deleted before it."
+                // Only the modem's own refusal says the entry is still there; after no answer in time or an
+                // I/O error the modem may have deleted it.
+                if case .modem = error {
+                    return .failure(SmsFailure(message: "Stored part \(index) could not be deleted. \(describe(error)) \(before)"))
+                }
+                return .failure(SmsFailure(message: "Deleting stored part \(index) failed. \(describe(error)) "
+                                           + "It is not known whether it was deleted; \(before)"))
             }
             deleted += 1
         }
@@ -93,7 +102,7 @@ final class SmsService: SmsServing {
         switch port.command("AT+CMGF?") {
         case .success(let l): lines = l
         case .failure(let error):
-            return SmsFailure(message: "The message format could not be read: \(describe(error))")
+            return SmsFailure(message: "The message format could not be read. \(describe(error))")
         }
         let mode = lines.lazy
             .filter { $0.hasPrefix("+CMGF:") }
@@ -104,7 +113,7 @@ final class SmsService: SmsServing {
             return nil
         case 1:
             if case .failure(let error) = port.command("AT+CMGF=0") {
-                return SmsFailure(message: "The modem could not be put in PDU mode: \(describe(error))")
+                return SmsFailure(message: "The modem could not be put in PDU mode. \(describe(error))")
             }
             return nil
         default:
@@ -128,7 +137,7 @@ private func sendFailure(part: Int, of total: Int, reason: String, known: Bool) 
         state = "It is not known whether that part was sent; \(part) of \(total) parts were sent before it, "
             + "so the message is incomplete at the receiver."
     }
-    return known ? "\(which) was refused: \(reason) \(state)" : "\(which) failed: \(reason) \(state)"
+    return known ? "\(which) was refused. \(reason) \(state)" : "\(which) failed. \(reason) \(state)"
 }
 
 // One sentence for each way the AT port can fail.

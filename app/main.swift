@@ -162,20 +162,24 @@ func parseSms(_ words: [String]) -> SmsCommand? {
         return .send(number: rest[0], text: rest.dropFirst().joined(separator: " "))
     case "delete":
         let indices = rest.compactMap { Int($0) }.filter { $0 >= 0 }
-        return !rest.isEmpty && indices.count == rest.count ? .delete(indices: indices) : nil
+        guard !rest.isEmpty, indices.count == rest.count else { return nil }
+        var seen = Set<Int>()
+        return .delete(indices: indices.filter { seen.insert($0).inserted })  // each once, first kept
     default:
         return nil
     }
 }
 
-func localTime(_ date: Date) -> String {
+let localTimeFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.calendar = Calendar(identifier: .gregorian)
     formatter.timeZone = .current
     formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-    return formatter.string(from: date)
-}
+    return formatter
+}()
+
+func localTime(_ date: Date) -> String { localTimeFormatter.string(from: date) }
 
 func printMessages(_ messages: [SmsMessage]) {
     print(messages.isEmpty ? "sms: no messages" : "sms: \(messages.count) message(s)")
@@ -211,7 +215,8 @@ func printMessagesJSON(_ messages: [SmsMessage]) {
     print(String(data: data, encoding: .utf8)!)
 }
 
-// Runs on a background queue; returns the exit code.
+// Runs on a background queue; returns the exit code. Sender and text are printed as they are: the model
+// made them display-safe in decodePart, and nothing else from the modem is printed.
 func runSms(_ command: SmsCommand, service: SmsServing) -> Int32 {
     switch command {
     case .list(let json):
@@ -224,6 +229,9 @@ func runSms(_ command: SmsCommand, service: SmsServing) -> Int32 {
             return 1
         }
     case .send(let number, let text):
+        // From before the port opens until the result is printed, Ctrl-C, a hang-up or a plain kill do
+        // not stop the verb in the middle of a part (at the modem's "> " prompt) or of a multi-part send.
+        for sig in [SIGINT, SIGTERM, SIGHUP] { signal(sig, SIG_IGN) }
         switch service.send(to: number, text: text) {
         case .success(let parts):
             print("sms: sent to \(number) in \(parts) part(s)")
@@ -247,8 +255,10 @@ func runSms(_ command: SmsCommand, service: SmsServing) -> Int32 {
 // MARK: - Entry point
 
 let args = CommandLine.arguments
-// The Finder (and `open`) may pass a process serial number argument; that still means the window.
-let verbs = args.dropFirst().filter { !$0.hasPrefix("-psn_") }
+// The Finder (and `open`) may pass a process serial number as the first argument; that still means the
+// window. Only the first argument is dropped, so a word of a message's text is never lost.
+var verbs = Array(args.dropFirst())
+if verbs.first?.hasPrefix("-psn_") == true { verbs.removeFirst() }
 
 if verbs.isEmpty {
     MainActor.assumeIsolated { RMNetApp.main() }
