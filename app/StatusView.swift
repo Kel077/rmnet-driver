@@ -128,8 +128,14 @@ final class StatusController: ObservableObject {
     var plan: RemovalPlan { removalPlan(status, bundledVersion: bundledVersion) }
     var removeEnabled: Bool { !busy && known && plan != .nothingListed }
 
+    // Install and remove check their button again at the press: the listing may have changed since the
+    // window drew it (a refresh every 2 s, the confirmation open meanwhile). If nothing is sent, the
+    // progress line says why.
     func install() {
-        guard installEnabled else { return }
+        guard installEnabled else {
+            progress = notSentText(action: installButtonTitle, busy: busy, known: known)
+            return
+        }
         let updating = !status.entries.isEmpty
         let version = bundledVersion
         busy = true
@@ -152,7 +158,7 @@ final class StatusController: ObservableObject {
                         return
                     }
                     let now = found.map(ExtensionEntry.init)
-                    if now.count == 1, compareVersions(now[0].version, version) == 0, now[0].enabled {
+                    if installConfirmed(now, version: version) {
                         self.finish(updating
                             ? "Version \(version) is installed. It loads when the modem is next plugged in or the Mac restarts; until then the old build may still be attached."
                             : "Version \(version) is installed.")
@@ -164,7 +170,10 @@ final class StatusController: ObservableObject {
     }
 
     func remove() {
-        guard removeEnabled else { return }
+        guard removeEnabled else {
+            progress = notSentText(action: "Remove", busy: busy, known: known)
+            return
+        }
         let version = bundledVersion
         busy = true
         manager.remove(

@@ -83,9 +83,13 @@ func advice(_ s: DriverStatus, bundledVersion: String) -> [String] {
     if !s.entries.isEmpty && s.entries.allSatisfy({ $0.uninstalling }) {
         return lines + [removalUnderWayLine]
     }
-    // From here at least one listed entry is not uninstalling (or none is listed).
-    if s.entries.count > 1 || s.entries.contains(where: isSwitchedOff) {
+    // From here at least one listed entry is not uninstalling (or none is listed). Switched off is
+    // said only of a listing that shows a switched-off entry; more than one entry otherwise can be a
+    // replacement still under way, and the listing is given as it is.
+    if s.entries.contains(where: isSwitchedOff) {
         lines.append("The driver was switched off in System Settings, so the system keeps an old entry and refuses every new installation.")
+    } else if s.entries.count > 1 {
+        lines.append("The system lists more than one entry for the driver: \(describeListing(s.entries)). This can be a replacement still under way; while it lasts, the system refuses a new installation.")
     } else if let entry = s.entries.first {
         if entry.awaitingApproval {
             lines.append("Open System Settings, General, Login Items & Extensions, Driver Extensions, and turn RMNet on.")
@@ -164,6 +168,24 @@ func installTitle(_ s: DriverStatus, bundledVersion: String) -> String {
     }
 }
 
+// Whether the listing read again after an installation of `version` shows it installed: exactly one
+// entry, of that version (compared as installTitle compares, so 317.9 and 317.9.0 are the same
+// version), enabled.
+func installConfirmed(_ entries: [ExtensionEntry], version: String) -> Bool {
+    entries.count == 1 && compareVersions(entries[0].version, version) == 0 && entries[0].enabled
+}
+
+// Why a press of the install button (`action` is its title) or of Remove sent nothing: the button was
+// on when the window drew it, but by the press another request was running, the listing was no
+// longer known, or the listing no longer allowed the request.
+func notSentText(action: String, busy: Bool, known: Bool) -> String {
+    if busy { return "Nothing was sent: another request is still running." }
+    if !known {
+        return "Nothing was sent: the system's listing is not known right now. Press \(action) again once the listing has refreshed."
+    }
+    return "Nothing was sent: the listing has changed. Check it and press \(action) again."
+}
+
 // The listing in words: "316.19.56 (enabled)", "none".
 func describeListing(_ entries: [ExtensionEntry]) -> String {
     if entries.isEmpty { return "none" }
@@ -194,9 +216,14 @@ func removalPlan(_ s: DriverStatus, bundledVersion: String) -> RemovalPlan {
 }
 
 // Why Remove sends nothing when the plan is `.cannot`, and which kept apps can remove what is listed.
+// With no bundled version the app has no driver to install first or to deactivate, whatever is listed.
 func cannotRemoveText(_ s: DriverStatus, bundledVersion: String) -> String {
-    let removing = !bundledVersion.isEmpty && s.entries.contains(where: { isBundled($0, bundledVersion) && $0.uninstalling })
-    return "This app carries version \(bundledVersion.isEmpty ? "unknown" : bundledVersion), "
+    if bundledVersion.isEmpty {
+        return "This app carries no driver (the version of its embedded driver cannot be read), so it cannot remove the listed one. "
+            + keptAppsLine(s.entries)
+    }
+    let removing = s.entries.contains(where: { isBundled($0, bundledVersion) && $0.uninstalling })
+    return "This app carries version \(bundledVersion), "
         + (removing ? "which the system is already removing" : "which is not listed")
         + ", and the listing does not allow installing it first. "
         + keptAppsLine(s.entries)
