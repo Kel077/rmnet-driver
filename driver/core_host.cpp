@@ -161,8 +161,10 @@ void CoreHost::on_control(const uint8_t* data, size_t len, uint64_t now_ms) {
   note_state();
 }
 
-// One line when the session finds flow control refused (an error, an unusable answer or a
-// timeout); it has already asked again without it. Only on_qmi and tick can refuse it.
+// One line when the session finds flow control refused by the modem (an error, an unusable answer
+// or a timeout); it has already asked again without it. on_qmi and tick are where the modem's
+// refusal shows; give_up_flow_control also sets the refusal, but marks this line as logged, since
+// the driver logs the give-up itself.
 void CoreHost::note_flow_refusal() {
   if (logged_flow_refused_ || !session_.flow_control_refused()) return;
   logged_flow_refused_ = true;
