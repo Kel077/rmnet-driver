@@ -20,6 +20,7 @@
 
 #include "RMNetDriver.h"
 #include "core_host.h"
+#include "idle_suspend.h"
 #include "usb_io.h"
 
 #define LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "RMNet: " fmt, ##__VA_ARGS__)
@@ -44,6 +45,7 @@ constexpr uint32_t kMinMtu = 576;
 constexpr uint8_t kDefaultProfile = 1;
 constexpr const char* kProfileKey = "RMNetProfile";
 constexpr const char* kFlowControlKey = "RMNetFlowControl";
+constexpr const char* kIdleSuspendKey = "RMNetIdleSuspendMs";
 constexpr const char* kInterfaceKey = "bInterfaceNumber";
 constexpr uint32_t kTxBatch = 32;
 constexpr uint32_t kTxHold = 256;  // sent packets the completion queue has not taken yet
@@ -228,6 +230,88 @@ bool ReadFlowControl(IOService* service) {
   return flowControl;
 }
 
+// The idle suspend timeout from the service's RMNetIdleSuspendMs property (no shipped personality sets
+// it): an integer number of milliseconds, at most kIdleSuspendMaxMs (idle_suspend_ms: a larger value,
+// a negative integer among them since it reads as a huge one, is taken as that, with a log line).
+// 0, no such property, or anything but an integer is off (0), with a log line.
+uint32_t ReadIdleSuspendMs(IOService* service) {
+  OSDictionary* props = nullptr;
+  kern_return_t ret = service->CopyProperties(&props);
+  uint32_t ms = 0;
+  if (ret != kIOReturnSuccess || !props) {
+    LOG("RMNetIdleSuspendMs: properties not readable (0x%x); idle suspend off", ret);
+  } else {
+    OSObject* obj = props->getObject(kIdleSuspendKey);
+    OSNumber* num = OSDynamicCast(OSNumber, obj);
+    if (!obj) {
+      LOG("RMNetIdleSuspendMs: no such property; idle suspend off");
+    } else if (!num) {
+      LOG("RMNetIdleSuspendMs: not an integer; idle suspend off");
+    } else {
+      uint64_t value = num->unsigned64BitValue();
+      ms = idle_suspend_ms(value);
+      if (value > ms) LOG("RMNetIdleSuspendMs: %llu is above %u; taken as %u", value, (unsigned)kIdleSuspendMaxMs, ms);
+    }
+  }
+  OSSafeReleaseNULL(props);
+  return ms;
+}
+
+// Whether the modem offers remote wakeup: bit 5 of bmAttributes of the configuration descriptor the
+// interface belongs to (kIOUSBConfigurationDescriptorAttributeRemoteWakeCapable). Read at every Start,
+// whether or not idle suspend is asked for, with the same CopyConfigurationDescriptor that
+// CheckQmiInterface and UsbIo::open make; it changes nothing on the modem. A descriptor that cannot be
+// read counts as no remote wakeup, with a log line.
+bool ReadRemoteWakeup(IOService* provider) {
+  IOUSBHostInterface* intf = OSDynamicCast(IOUSBHostInterface, provider);
+  const IOUSBConfigurationDescriptor* cfg = intf ? intf->CopyConfigurationDescriptor() : nullptr;
+  if (!cfg) {
+    LOG("remote wakeup: no configuration descriptor; taken as not offered");
+    return false;
+  }
+  uint8_t attributes = cfg->bmAttributes;
+  IOUSBHostFreeDescriptor(cfg);
+  bool offered = (attributes & kIOUSBConfigurationDescriptorAttributeRemoteWakeCapable) != 0;
+  LOG("configuration bmAttributes 0x%02x: remote wakeup %{public}s", attributes, offered ? "offered" : "not offered");
+  return offered;
+}
+
+// Publishes RMNetIdleSuspendMs (the timeout in force, over a personality's value, as PublishProfile
+// does), RMNetRemoteWakeup and RMNetIdleSuspend. A failure is logged and does not fail Start.
+void PublishIdleSuspend(IOService* service, const IdleSuspendState& s, bool remoteWakeup) {
+  OSDictionary* props = OSDictionary::withCapacity(3);
+  OSNumber* ms = OSNumber::withNumber(static_cast<uint64_t>(s.ms), 32);
+  OSNumber* wake = OSNumber::withNumber(static_cast<uint64_t>(remoteWakeup ? 1 : 0), 32);
+  OSString* text = OSString::withCString(s.text);
+  if (props && ms && wake && text) {
+    props->setObject(kIdleSuspendKey, ms);
+    props->setObject("RMNetRemoteWakeup", wake);
+    props->setObject("RMNetIdleSuspend", text);
+    kern_return_t ret = service->SetProperties(props);
+    if (ret != kIOReturnSuccess) LOG("SetProperties (idle suspend) 0x%x", ret);
+  }
+  OSSafeReleaseNULL(text);
+  OSSafeReleaseNULL(wake);
+  OSSafeReleaseNULL(ms);
+  OSSafeReleaseNULL(props);
+}
+
+// Opt-in USB idle suspend (driver/idle_suspend.h), decided once at Start, after UsbIo has opened the
+// interface and its pipes and before anything is posted on them (UsbIo::start, the bulk reads). The
+// remote wakeup bit is read and published either way. Only when RMNetIdleSuspendMs asks for a timeout
+// and the modem offers remote wakeup does UsbIo set the idle policies (UsbIo::set_idle_policy), and
+// only when all of them succeed does its tick sample the port status; otherwise no SetIdlePolicy and
+// no GetPortStatus call is made. Nothing here fails Start.
+void SetUpIdleSuspend(IOService* service, IOService* provider, UsbIo& usb) {
+  uint32_t ms = ReadIdleSuspendMs(service);
+  bool remoteWakeup = ReadRemoteWakeup(provider);
+  IdlePolicyResult result{IdlePolicyCall::None, 0};
+  if (idle_suspend_wanted(ms, remoteWakeup)) result = usb.set_idle_policy(ms);
+  IdleSuspendState s = idle_suspend_state(ms, remoteWakeup, result);
+  LOG("idle suspend %{public}s (asked %u ms, remote wakeup %u)", s.text, ms, remoteWakeup ? 1u : 0u);
+  PublishIdleSuspend(service, s, remoteWakeup);
+}
+
 uint64_t NowNs() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 uint64_t NowMs() { return NowNs() / 1000000ull; }
 
@@ -254,7 +338,7 @@ struct RxBridge final : RxSink {
 };
 
 // What PublishCounters last published, in its order.
-enum : uint32_t { kCounterCount = 61 };
+enum : uint32_t { kCounterCount = 63 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -419,8 +503,9 @@ void RMNetDriver::free() {
 
 // Order (docs/driverkit-notes.md 3.9): check the provider (CheckQmiInterface: IOKit matched its
 // number, so what guards is its class, subclass and protocol 0xff and the QMI endpoints; nothing is
-// opened before the check), open USB and read the serial number, create Core, the interface with
-// the MAC derived from the serial, the timer, then DTR and the interrupt read, then the session. A
+// opened before the check), open USB and read the serial number, decide idle suspend (SetUpIdleSuspend:
+// off, and no USB call, unless the personality asks), create Core, the interface with the MAC derived
+// from the serial, the timer, then DTR and the interrupt read, then the session. A
 // failure tears down what was made and fails Start. Failures to report the link status or publish
 // properties do not fail Start (see ReportLink and PublishStatus).
 kern_return_t RMNetDriver::Start_Impl(IOService* provider) {
@@ -452,6 +537,7 @@ kern_return_t RMNetDriver::Start_Impl(IOService* provider) {
     PublishProfile(profile);
     bool flowControl = ReadFlowControl(this);
     LOG("flow control %u", flowControl ? 1u : 0u);
+    SetUpIdleSuspend(this, provider, *ivars->usb);  // off unless the personality asks for it
     ivars->rxBridge = new RxBridge(this);
     if (ivars->rxBridge) {
       ivars->core = new CoreHost(*ivars->usb, *ivars->rxBridge, macs, profile, flowControl, qmiInterface);
@@ -1291,6 +1377,10 @@ void RMNetDriver::OnUplinkUsable() {
 // however often it is offered again; RMNetTickTxDrains the ticks that drained because the drain
 // was held (txHeld, which a QMAP pause also sets), waited for an uplink buffer, or had sent packets
 // left to complete; RMNetTickRxFlushes the ticks that found refused receive packets still waiting.
+// Idle suspend (only while it is on, else both 0): RMNetSuspendedTicks counts the ticks whose
+// GetPortStatus found the modem's port suspended, each about 100 ms suspended; RMNetPortStatusFailures
+// the GetPortStatus calls that failed. RMNetIdleSuspendMs, RMNetRemoteWakeup and RMNetIdleSuspend are
+// published once, at Start (SetUpIdleSuspend).
 void RMNetDriver::PublishCounters() {
   const DataCounters& c = ivars->core->counters();
   uint32_t txPending = ivars->txPendingCount - ivars->txPendingNext;
@@ -1366,6 +1456,8 @@ void RMNetDriver::PublishCounters() {
       {"RMNetRxCompleteRefused", ivars->rxCompleteRefused},
       {"RMNetTickTxDrains", ivars->tickTxDrains},
       {"RMNetTickRxFlushes", ivars->tickRxFlushes},
+      {"RMNetSuspendedTicks", u.suspended_ticks},
+      {"RMNetPortStatusFailures", u.port_status_failures},
   };
   bool changed = !ivars->countersPublished;
   for (uint32_t i = 0; i < kCounterCount; i++) {

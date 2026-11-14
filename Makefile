@@ -28,9 +28,13 @@ build/obj/tests/%.o: tests/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(TEST_FLAGS) -Icore/include -Itests -MMD -MP -c $< -o $@
 
-# CoreHost (driver/core_host.cpp) on the host, behind fakes of UsbPort and RxSink, built with Core's
-# flags, tests and runner included. `make driver-test FILTER=kept` runs only tests whose name contains it.
-DRIVER_TEST_OBJS := build/obj/driver/core_host.o build/obj/driver-tests/test_core_host.o \
+# CoreHost (driver/core_host.cpp) on the host, behind fakes of UsbPort and RxSink, and the driver's
+# DriverKit-free decisions (driver/idle_suspend.h), built with Core's flags, tests and runner included.
+# Every tests/driver/test_*.cpp is built. `make driver-test FILTER=kept` runs only tests whose name
+# contains it.
+DRIVER_TEST_SRCS := $(wildcard tests/driver/test_*.cpp)
+DRIVER_TEST_OBJS := build/obj/driver/core_host.o \
+	$(patsubst tests/driver/%.cpp,build/obj/driver-tests/%.o,$(DRIVER_TEST_SRCS)) \
 	build/obj/driver-tests/test_main.o
 
 driver-test: build/driver-tests
@@ -43,7 +47,7 @@ build/obj/driver/core_host.o: driver/core_host.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CORE_FLAGS) -Icore/include -MMD -MP -c $< -o $@
 
-build/obj/driver-tests/test_core_host.o: tests/driver/test_core_host.cpp
+build/obj/driver-tests/%.o: tests/driver/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CORE_FLAGS) -Icore/include -Idriver -Itests -MMD -MP -c $< -o $@
 
