@@ -43,6 +43,10 @@ class UsbIoListener {
   // the first time since a successful transfer: the owner should restart the session, after the
   // current call returns. A second time with no success between is on_fatal instead.
   virtual void on_uplink_stuck() = 0;
+  // A held uplink may go on: a transfer that failed without starting a recovery freed its buffer,
+  // or a bulk OUT recovery ended and the pipe is open again. Raised only while running, not held,
+  // not failed, and never from inside send or send_uplink.
+  virtual void on_uplink_usable() = 0;
  protected:
   ~UsbIoListener() = default;
 };
@@ -110,10 +114,11 @@ class UsbIo final : public UsbPort {
   // On either bulk pipe, an endpoint that halts is recovered without blocking: nothing new is
   // posted on the pipe, it is aborted asynchronously, and ClearStall runs only once nothing is
   // pending on it. While bulk OUT recovers, acquire_uplink gives no buffer (uplink_recovering()
-  // says why). A failed abort, or a recovery not finished within about 1 s (tick), is fatal. A
-  // timed-out uplink transfer does not halt the pipe; rmnet::kUplinkStallsStuck stalls in a row,
-  // with no successful transfer between, ask for a session restart, and again after it are fatal
-  // ("uplink is not accepting data").
+  // says why); its end is reported through on_uplink_usable, as is a failed uplink transfer that
+  // starts no recovery. A failed abort, or a recovery not finished within about 1 s (tick), is
+  // fatal. A timed-out uplink transfer does not halt the pipe; rmnet::kUplinkStallsStuck stalls in
+  // a row, with no successful transfer between, ask for a session restart, and again after it are
+  // fatal ("uplink is not accepting data").
   void start_bulk(uint32_t read_len) override;
   int acquire_uplink() override;
   uint8_t* uplink_buffer(int slot) const override;
@@ -147,8 +152,8 @@ class UsbIo final : public UsbPort {
   //   As a refused post at the wake always was: the hold ends and the failure is reported through
   //   on_fatal.
   // - Every post made, in this attempt or earlier ones: Done. Only then does the hold end; the
-  //   bulk OUT recovery whose transfers have returned is finished, the queued control messages are
-  //   sent and any waiting response is read.
+  //   bulk OUT recovery whose transfers have returned is finished (raising on_uplink_usable, from
+  //   inside resume), the queued control messages are sent and any waiting response is read.
   // hold resets the attempts: the next resume is the first of a new wake. finish_sending on a held
   // UsbIo ends the hold and drops the messages waiting behind it; stopping then goes on as it does
   // when not held.
@@ -215,6 +220,7 @@ class UsbIo final : public UsbPort {
   void end_in_recovery();
   void begin_out_recovery();
   void end_out_recovery();
+  void report_uplink_usable();
   void fail(const char* what);
   void note(IOReturn status);
   void note_held(const char* what, IOReturn status);

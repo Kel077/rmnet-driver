@@ -91,6 +91,7 @@ enum : uint32_t {
   kLogRxCompleteFull = 1u << 28,
   kLogPoolCount = 1u << 29,
   kLogTxHold = 1u << 30,
+  kLogUplinkUsable = 1u << 31,
 };
 
 // True if the provider is the modem's QMI interface: number 4, class, subclass and protocol 0xff.
@@ -170,6 +171,7 @@ struct UsbBridge final : UsbIoListener {
   void on_bulk_in(const uint8_t* data, size_t len) override { driver->OnBulkIn(data, len); }
   void on_bulk_out_done(int slot, bool ok) override { driver->OnBulkOutDone(slot, ok); }
   void on_uplink_stuck() override { driver->OnUplinkStuck(); }
+  void on_uplink_usable() override { driver->OnUplinkUsable(); }
   RMNetDriver* driver;
 };
 
@@ -182,7 +184,7 @@ struct RxBridge final : RxSink {
 };
 
 // What PublishCounters last published, in its order.
-enum : uint32_t { kCounterCount = 56 };
+enum : uint32_t { kCounterCount = 61 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -219,22 +221,35 @@ struct RMNetDriver_IVars {
   // The data path's packets. Empty packets taken from the RX submission queue in one call wait in
   // rxStock (the last one, rxStock[rxStockCount - 1], is the buffer CoreHost is filling) until they
   // are filled; filled ones wait in rxOut, and sent ones in txDone, until their completion queue
-  // takes them (leftovers go first next time, so the pool does not shrink).
+  // takes them (leftovers go first next time, so the pool does not shrink). rxOutCounted and
+  // txDoneCounted: how many of those leftovers, the oldest at the front, are already counted as
+  // refused (rxCompleteRefused, txCompleteRefused), so a packet refused again is not counted again.
   IOUserNetworkPacket* rxStock[kRxStock];
   uint32_t rxStockCount;
   IOUserNetworkPacket* rxOut[kRxHold];
   uint32_t rxOutCount;
+  uint32_t rxOutCounted;
   IOUserNetworkPacket* txDone[kTxHold];
   uint32_t txDoneCount;
+  uint32_t txDoneCounted;
+  uint64_t rxCompleteRefused;  // filled receive packets the RX completion queue refused, each once
+  uint64_t txCompleteRefused;  // sent packets the TX completion queue refused, each once
   bool txHeld;  // frames may wait in the TX submission queue (paused, or no room in txDone)
   // Frames of a batch taken from the TX submission queue that are not yet placed: txPending[txPendingNext]
   // up to txPendingCount, offered first, in order, before a new batch is taken. txWaitUplink: the
-  // drain stopped because every uplink buffer was in flight; a completed transfer restarts it.
+  // drain stopped because every uplink buffer was in flight; a transfer that frees one (a success,
+  // or a failure UsbIo reports as uplink usable), the end of a recovery, a link down or the tick
+  // restarts it.
   IOUserNetworkPacket* txPending[kTxBatch];
   uint32_t txPendingCount;
   uint32_t txPendingNext;
   bool txWaitUplink;
   uint64_t txHolds;  // hold episodes: times txWaitUplink went from false to true
+  uint64_t uplinkUsable;   // on_uplink_usable callbacks received
+  // Timer ticks that drained because txHeld, txWaitUplink or txDoneCount > 0; and ticks that found
+  // filled receive packets waiting in rxOut before their first FlushRx.
+  uint64_t tickTxDrains;
+  uint64_t tickRxFlushes;
   uint32_t ticks;
   uint64_t rxLagMaxUs;  // the longest a successful bulk read waited between completing and its handler
   // The longest and the summed time of the handler of a successful bulk read (BulkInComplete_Impl
@@ -778,7 +793,10 @@ void RMNetDriver::RestartSession(const char* why) {
 // added: the emulator, the MTU and the properties are updated, a router advertisement goes out if
 // IPv6 is new, and the link stays active. The data path is updated last, after the link is
 // reported, because starting the bulk reads can fail and stop the session (OnUsbFatal, which
-// applies its own link down).
+// applies its own link down). After a link down a drain held for want of an uplink buffer runs at
+// once, unless lifting a pause has already drained: with the link down its kept frames need no
+// buffer, and go through CoreHost::transmit to be dropped as link down (CoreHost::restart says the
+// same); after a bounce (down, then up) they are only offered again.
 void RMNetDriver::ApplyCore() {
   CoreHost::LinkChange c = ivars->core->take_link_change();
   if (c.down) {
@@ -816,6 +834,7 @@ void RMNetDriver::ApplyCore() {
   PublishStatus();
   FlushRx();  // a router advertisement
   if (ivars->core->take_uplink_resumed()) DrainTx();
+  if (c.down && ivars->txWaitUplink) DrainTx();  // still held: no pause was lifted
 }
 
 // Publishes the profile in use as RMNetProfile, over the personality's value, so the registry shows
@@ -956,7 +975,8 @@ IOReturn RMNetDriver::setPowerState(unsigned long powerState, IOService* whatDev
 
 // During a hold (txWaitUplink) a drain would only be refused again: the frame it waits with is
 // first in txPending. Only sent packets are completed then; the next successful uplink completion
-// (OnBulkOutDone) or the timer tick restarts the drain.
+// (OnBulkOutDone), the uplink becoming usable again (OnUplinkUsable), a link down (ApplyCore) or
+// the timer tick restarts the drain.
 void RMNetDriver::TxPacketsAvailable_Impl(OSAction*) {
   LOG_FIRST(kLogTxAvailable, "TxPacketsAvailable");
   EnsureTimer();
@@ -981,16 +1001,18 @@ void RMNetDriver::RxPacketsAvailable_Impl(OSAction*) {
 // queued until it resumes. If the completion queue refuses packets, they are kept and returned
 // first next time; with no room to keep a whole batch, the rest waits for the next timer tick.
 // When every uplink buffer is in flight, the frame CoreHost did not take and the rest of its batch
-// stay in txPending and the drain stops (txWaitUplink); the next completed uplink transfer, or the
-// timer tick, restarts it, and those frames are offered first, in order, before a new batch is
-// taken. The frames behind them stay in the TX submission queue, which is the backpressure.
+// stay in txPending and the drain stops (txWaitUplink); the next successful uplink transfer
+// (OnBulkOutDone), a failed one that started no recovery or the end of a recovery
+// (OnUplinkUsable), a link down (ApplyCore), or the timer tick, restarts it, and those frames are
+// offered first, in order, before a new batch is taken. The frames behind them stay in the TX
+// submission queue, which is the backpressure.
 // A taken batch always fits txDone: it is taken only with kTxBatch free there, and nothing else
 // adds to txDone until all of it is placed.
 void RMNetDriver::DrainTx() {
   FlushTxDone();
   if (ivars->stopping || !ivars->core || !ivars->txSubmit) return;
   // Core is not called while asleep or while the wake's resume is pending; the first tick after the
-  // resume drains.
+  // resume drains (or, sooner, OnUplinkUsable, when the resume ends a bulk OUT recovery).
   if (ivars->asleep || ivars->resumePending) {
     ivars->txHeld = true;
     return;
@@ -1037,6 +1059,11 @@ void RMNetDriver::DrainTx() {
   FlushRx();  // emulator replies
 }
 
+// Completes sent packets in one call; what the completion queue refuses is kept, in order, and
+// offered first next time. RMNetTxCompleteRefused counts each packet the first time it is refused,
+// by keeping a count of the kept packets already counted (txDoneCounted): the queue takes from the
+// front, so the refused ones are the newest n - done, and of them the kept ones already counted
+// are the oldest, txDoneCounted - done of them if positive; only the rest are new refusals.
 void RMNetDriver::FlushTxDone() {
   uint32_t n = ivars->txDoneCount;
   if (n == 0 || !ivars->txComplete) return;
@@ -1046,6 +1073,9 @@ void RMNetDriver::FlushTxDone() {
     LOG_FIRST(kLogTxCompleteFull, "tx completion queue took %u of %u packets; the rest are kept", done, n);
     memmove(&ivars->txDone[0], &ivars->txDone[done], (n - done) * sizeof(ivars->txDone[0]));
   }
+  uint32_t stillCounted = ivars->txDoneCounted > done ? ivars->txDoneCounted - done : 0;
+  ivars->txCompleteRefused += (n - done) - stillCounted;
+  ivars->txDoneCounted = n - done;
   ivars->txDoneCount = n - done;
 }
 
@@ -1076,6 +1106,9 @@ void RMNetDriver::RxCommit(size_t len) {
 }
 
 // Hands filled packets up in one call; what the completion queue refuses is kept, in order.
+// RMNetRxCompleteRefused counts each packet the first time it is refused, as FlushTxDone does, by
+// keeping a count of the kept packets already counted (rxOutCounted): of the n - done refused now
+// (the newest), the rxOutCounted - done at the front, if positive, were counted already.
 void RMNetDriver::FlushRx() {
   uint32_t n = ivars->rxOutCount;
   if (n == 0 || !ivars->rxComplete) return;
@@ -1085,6 +1118,9 @@ void RMNetDriver::FlushRx() {
     LOG_FIRST(kLogRxCompleteFull, "rx completion queue took %u of %u packets; the rest are kept", done, n);
     memmove(&ivars->rxOut[0], &ivars->rxOut[done], (n - done) * sizeof(ivars->rxOut[0]));
   }
+  uint32_t stillCounted = ivars->rxOutCounted > done ? ivars->rxOutCounted - done : 0;
+  ivars->rxCompleteRefused += (n - done) - stillCounted;
+  ivars->rxOutCounted = n - done;
   ivars->rxOutCount = n - done;
 }
 
@@ -1118,11 +1154,27 @@ void RMNetDriver::OnUplinkStuck() {
 // A completed uplink transfer frees its buffer: a drain that stopped for want of one restarts.
 // CoreHost runs first, so a QMAP command reply it kept takes the freed buffer before the drain.
 // Only after a success: UsbIo reports a failed transfer before it starts a stall recovery, so a
-// drain then could submit to a halted pipe; the timer tick restarts it instead.
+// drain then could submit to a halted pipe; once UsbIo has decided on the recovery, its
+// on_uplink_usable (OnUplinkUsable) restarts it instead.
 void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
   if (ivars->stopping || !ivars->core) return;
   ivars->core->on_bulk_out_done(slot, ok);
   if (ok && ivars->txWaitUplink) DrainTx();
+}
+
+// UsbIo says a held uplink may go on (UsbIoListener::on_uplink_usable): a failed transfer freed its
+// buffer and started no recovery, or a bulk OUT recovery ended. Raised from inside
+// UsbIo::bulk_out_complete, or from inside UsbIo::resume when the wake ends a recovery; only while
+// UsbIo runs, is not held, has not failed and is not recovering, so the drain cannot submit to a
+// halted pipe. A drain held for want of a buffer (txWaitUplink) or for another reason (txHeld)
+// restarts at once instead of on the next tick; DrainTx itself still holds while asleep, while
+// the wake's resume is pending and while the modem pauses the uplink.
+void RMNetDriver::OnUplinkUsable() {
+  ivars->uplinkUsable++;
+  LOG_FIRST(kLogUplinkUsable, "first uplink usable callback: drain %{public}s",
+            ivars->txWaitUplink ? "waiting for a buffer" : (ivars->txHeld ? "held" : "not held"));
+  if (ivars->stopping || !ivars->core) return;
+  if (ivars->txWaitUplink || ivars->txHeld) DrainTx();
 }
 
 // The data path counters, as properties next to RMNetState, once a second when they changed.
@@ -1150,6 +1202,12 @@ void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
 // and RMNetFlowControlOn the modem's answer in the data format in use now: 0 whenever the session is
 // not up. RMNetFlowControlRefused also becomes 1 when the driver gives flow control up after a pause
 // that reached kPauseMaxMs.
+// The waits for the timer: RMNetUplinkUsable counts UsbIo's uplink-usable callbacks (a failed
+// transfer that started no recovery, or the end of a recovery); RMNetTxCompleteRefused and
+// RMNetRxCompleteRefused the packets the TX and RX completion queues refused, each packet once
+// however often it is offered again; RMNetTickTxDrains the ticks that drained because the drain
+// was held (txHeld, which a QMAP pause also sets), waited for an uplink buffer, or had sent packets
+// left to complete; RMNetTickRxFlushes the ticks that found refused receive packets still waiting.
 void RMNetDriver::PublishCounters() {
   const DataCounters& c = ivars->core->counters();
   uint32_t txPending = ivars->txPendingCount - ivars->txPendingNext;
@@ -1220,6 +1278,11 @@ void RMNetDriver::PublishCounters() {
       {"RMNetFlowControlAsked", ivars->core->flow_control_asked() ? 1u : 0u},
       {"RMNetFlowControlRefused", ivars->core->flow_control_refused() ? 1u : 0u},
       {"RMNetFlowControlOn", flowControlOn ? 1u : 0u},
+      {"RMNetUplinkUsable", ivars->uplinkUsable},
+      {"RMNetTxCompleteRefused", ivars->txCompleteRefused},
+      {"RMNetRxCompleteRefused", ivars->rxCompleteRefused},
+      {"RMNetTickTxDrains", ivars->tickTxDrains},
+      {"RMNetTickRxFlushes", ivars->tickRxFlushes},
   };
   bool changed = !ivars->countersPublished;
   for (uint32_t i = 0; i < kCounterCount; i++) {
@@ -1334,6 +1397,11 @@ void RMNetDriver::TimerFired_Impl(OSAction*, uint64_t) {
     ArmTimer();
     return;
   }
+  // Filled receive packets waiting here were refused by the RX completion queue (every path that
+  // fills rxOut ends with a FlushRx), and wait for this tick unless an RxPacketsAvailable or a
+  // completion flushes first. Counted before the tick's first FlushRx (ApplyCore's, then the one
+  // below), so a tick whose ApplyCore hands them up counts too.
+  if (ivars->rxOutCount > 0) ivars->tickRxFlushes++;
   uint64_t now = NowMs();
   if (ivars->usb) ivars->usb->tick();  // bounds a bulk pipe recovery; may report on_fatal
   if (!ivars->coreStopped) {
@@ -1352,7 +1420,10 @@ void RMNetDriver::TimerFired_Impl(OSAction*, uint64_t) {
     RestartSession("uplink paused with no flow enable");
   }
   FlushRx();
-  if (ivars->txHeld || ivars->txWaitUplink || ivars->txDoneCount > 0) DrainTx();
+  if (ivars->txHeld || ivars->txWaitUplink || ivars->txDoneCount > 0) {
+    ivars->tickTxDrains++;
+    DrainTx();
+  }
   if (++ivars->ticks % kCounterTicks == 0) PublishCounters();
   ArmTimer();
 }

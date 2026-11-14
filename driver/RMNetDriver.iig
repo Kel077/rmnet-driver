@@ -78,6 +78,7 @@ public:
     void OnBulkIn(const uint8_t * data, size_t len) LOCALONLY;
     void OnBulkOutDone(int slot, bool ok) LOCALONLY;
     void OnUplinkStuck() LOCALONLY;
+    void OnUplinkUsable() LOCALONLY;
     uint8_t * RxBuffer(size_t * cap) LOCALONLY;
     void RxCommit(size_t len) LOCALONLY;
     void FlushRx() LOCALONLY;
