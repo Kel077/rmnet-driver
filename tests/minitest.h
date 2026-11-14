@@ -63,10 +63,31 @@ std::string show(const T& v) {
   return out.str();
 }
 
+// a == b, except for two integers of different signedness (bool aside), which compare by value:
+// plain == would convert a negative signed value to unsigned first, and -Wsign-compare rejects it.
+// A negative signed value is never equal to an unsigned one; otherwise both are compared as the
+// unsigned type of the wider of the two.
+template <typename A, typename B>
+bool equal(const A& a, const B& b) {
+  constexpr bool a_int = std::is_integral_v<A> && !std::is_same_v<A, bool>;
+  constexpr bool b_int = std::is_integral_v<B> && !std::is_same_v<B, bool>;
+  if constexpr (a_int && b_int && std::is_signed_v<A> != std::is_signed_v<B>) {
+    if constexpr (std::is_signed_v<A>) {
+      if (a < 0) return false;
+      using U = std::conditional_t<(sizeof(A) > sizeof(B)), std::make_unsigned_t<A>, B>;
+      return static_cast<U>(a) == static_cast<U>(b);
+    } else {
+      return equal(b, a);
+    }
+  } else {
+    return a == b;
+  }
+}
+
 template <typename A, typename B>
 void check_eq(const char* file, int line, const char* a_expr, const char* b_expr, const A& a,
               const B& b) {
-  if (a == b) return;
+  if (equal(a, b)) return;
   fail(file, line,
        std::string("CHECK_EQ(") + a_expr + ", " + b_expr + ") failed: " + show(a) + " != " +
            show(b));
@@ -82,7 +103,8 @@ inline std::string to_hex(const uint8_t* p, size_t n) {
   return s;
 }
 
-// Parses whitespace-separated hex bytes, e.g. "01 0b 00". Aborts on malformed text.
+// Parses whitespace-separated hex bytes, e.g. "01 0b 00". Space, tab, \n and \r separate bytes, so
+// text pasted with CRLF line ends parses too. Aborts on malformed text.
 inline std::vector<uint8_t> hex(const char* text) {
   auto nibble = [](char c) -> int {
     if (c >= '0' && c <= '9') return c - '0';
@@ -92,7 +114,7 @@ inline std::vector<uint8_t> hex(const char* text) {
   };
   std::vector<uint8_t> out;
   for (const char* p = text; *p;) {
-    if (*p == ' ' || *p == '\n' || *p == '\t') {
+    if (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') {
       ++p;
       continue;
     }
@@ -136,6 +158,16 @@ using minitest::hex;
 #define CHECK(cond)                                                          \
   do {                                                                       \
     if (!(cond)) ::minitest::fail(__FILE__, __LINE__, "CHECK(" #cond ") failed"); \
+  } while (0)
+
+// Fails like CHECK, then returns from the test function: for a check the rest of the test depends
+// on, such as a size before an index, so a regression fails one test instead of crashing the run.
+#define REQUIRE(cond)                                                          \
+  do {                                                                         \
+    if (!(cond)) {                                                             \
+      ::minitest::fail(__FILE__, __LINE__, "REQUIRE(" #cond ") failed");      \
+      return;                                                                  \
+    }                                                                          \
   } while (0)
 
 #define CHECK_EQ(a, b) ::minitest::check_eq(__FILE__, __LINE__, #a, #b, (a), (b))

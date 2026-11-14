@@ -56,6 +56,7 @@ const uint8_t kRouterIp[16] = {0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 const uint8_t kAllNodesIp[16] = {0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
 const uint8_t kAllNodesMac[6] = {0x33, 0x33, 0, 0, 0, 1};
 const uint8_t kUnspecifiedIp[16] = {};
+const uint8_t kLoopbackIp[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
 
 uint8_t* put_lla_option(uint8_t* o, uint8_t type, const uint8_t mac[6]) {
   o[0] = type;
@@ -161,6 +162,9 @@ TxResult EthernetEmulator::tx_nd(const uint8_t* ip, size_t len, uint8_t* reply, 
   uint8_t target[16];
   memcpy(target, icmp + 8, 16);
   if (target[0] == 0xff) return drop();  // a multicast target is invalid (RFC 4861 7.1.1)
+  if (memcmp(target, kUnspecifiedIp, 16) == 0 || memcmp(target, kLoopbackIp, 16) == 0) {
+    return drop();  // :: and ::1 are never assigned to an interface (RFC 4291 2.5.2, 2.5.3)
+  }
   if (cap < kNaFrameLen) return drop();
 
   uint8_t* out_ip = reply + kEthHeaderLen;

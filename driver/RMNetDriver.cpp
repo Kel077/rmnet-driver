@@ -15,6 +15,7 @@
 #include <NetworkingDriverKit/NetworkingDriverKit.h>
 
 #include "rmnet/ethernet.h"
+#include "rmnet/util.h"
 
 #include "RMNetDriver.h"
 #include "core_host.h"
@@ -158,53 +159,6 @@ bool ReadFlowControl(IOService* service) {
 
 uint64_t NowNs() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 uint64_t NowMs() { return NowNs() / 1000000ull; }
-
-uint8_t PrefixLength(const uint8_t mask[4]) {
-  uint8_t n = 0;
-  for (int i = 0; i < 4; i++) {
-    for (int b = 7; b >= 0; b--) {
-      if (mask[i] & (1u << b)) n++;
-    }
-  }
-  return n;
-}
-
-// "a.b.c.d/n gw e.f.g.h"
-void FormatIPv4(const rmnet::RuntimeSettings& s, char* out, size_t cap) {
-  snprintf(out, cap, "%u.%u.%u.%u/%u gw %u.%u.%u.%u", s.v4_addr[0], s.v4_addr[1], s.v4_addr[2], s.v4_addr[3],
-           PrefixLength(s.v4_mask), s.v4_gateway[0], s.v4_gateway[1], s.v4_gateway[2], s.v4_gateway[3]);
-}
-
-// RFC 5952 text form (longest run of two or more zero groups shortened to ::), then "/n".
-void FormatIPv6(const rmnet::RuntimeSettings& s, char* out, size_t cap) {
-  uint16_t g[8];
-  for (int i = 0; i < 8; i++) g[i] = static_cast<uint16_t>(s.v6_addr[2 * i] << 8 | s.v6_addr[2 * i + 1]);
-  int best = -1, best_len = 0;
-  for (int i = 0; i < 8;) {
-    if (g[i] != 0) {
-      i++;
-      continue;
-    }
-    int j = i;
-    while (j < 8 && g[j] == 0) j++;
-    if (j - i > best_len && j - i >= 2) {
-      best = i;
-      best_len = j - i;
-    }
-    i = j;
-  }
-  size_t n = 0;
-  for (int i = 0; i < 8 && n < cap; i++) {
-    if (i == best) {
-      n += snprintf(out + n, cap - n, "::");
-      i += best_len - 1;
-      continue;
-    }
-    bool sep = i > 0 && !(best >= 0 && i == best + best_len);
-    n += snprintf(out + n, cap - n, sep ? ":%x" : "%x", g[i]);
-  }
-  if (n < cap) snprintf(out + n, cap - n, "/%u", s.v6_prefix_len);
-}
 
 }  // namespace
 
@@ -885,8 +839,8 @@ void RMNetDriver::PublishStatus() {
   snprintf(state, sizeof state, "%s", name);
   if (ivars->linkActive) {
     const rmnet::RuntimeSettings& s = ivars->core->link_config().settings;
-    if (s.has_v4) FormatIPv4(s, v4, sizeof v4);
-    if (s.has_v6) FormatIPv6(s, v6, sizeof v6);
+    if (s.has_v4) rmnet::format_ipv4(s, v4, sizeof v4);
+    if (s.has_v6) rmnet::format_ipv6(s, v6, sizeof v6);
   }
   char key[sizeof ivars->published];
   snprintf(key, sizeof key, "%s|%s|%s", state, v4, v6);

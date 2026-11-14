@@ -17,7 +17,8 @@ TEST(router_solicit_gets_router_advert) {
   CHECK_BYTES(d.source_lla, 6, "02 68 7a 43 12 f7"); CHECK_EQ(d.mtu, 1500u);
   CHECK_EQ(d.prefix, "2001:db8:8af4:b260::"); CHECK_EQ(d.prefix_len, 64); CHECK_EQ(d.prefix_flags, 0xc0);
   CHECK_EQ(d.valid_lifetime, 7200u); CHECK_EQ(d.preferred_lifetime, 3600u);
-  CHECK_EQ(d.rdnss.size(), 2u); CHECK_EQ(d.rdnss[0], "2001:db8:2000:0:270::1"); CHECK_EQ(d.rdnss_lifetime, 1800u);
+  CHECK_EQ(d.rdnss_lifetime, 1800u);
+  REQUIRE(d.rdnss.size() == 2); CHECK_EQ(d.rdnss[0], "2001:db8:2000:0:270::1");
 }
 TEST(router_solicit_from_unspecified_goes_to_all_nodes) {
   rmnet::EthernetEmulator e(rmnet::derive_macs("bfeed1a5")); auto s = link_settings(); e.set_link(&s); uint8_t r[256];
@@ -41,6 +42,17 @@ TEST(neighbour_solicit_gets_advert_with_router_mac) {
     CHECK(d.checksum_ok); CHECK_EQ(d.type, 136); CHECK_EQ(d.hop_limit, 255); CHECK_EQ(d.na_flags, 0xe0);
     CHECK_EQ(d.target, target); CHECK_EQ(d.ip_src, target); CHECK_EQ(d.ip_dst, kHostGlobal);
     CHECK_BYTES(d.target_lla, 6, "02 68 7a 43 12 f7"); CHECK_BYTES(d.eth_dst, 6, "02 68 7a 43 12 f6");
+  }
+}
+TEST(neighbour_solicit_for_unspecified_or_loopback_gets_no_answer) {
+  rmnet::EthernetEmulator e(rmnet::derive_macs("bfeed1a5")); auto s = link_settings(); e.set_link(&s); uint8_t r[256];
+  for (const char* target : {"::", "::1"}) {
+    auto q = neighbour_solicit(kHostGlobal, target);
+    CHECK(e.handle_tx(q.data(), q.size(), r, sizeof r).action == rmnet::TxAction::Drop);
+  }
+  for (const char* target : {"fe80::1", "2001:db8:8af4:b260:a089:88dc:137d:6253"}) {  // still answered
+    auto q = neighbour_solicit(kHostGlobal, target);
+    CHECK(e.handle_tx(q.data(), q.size(), r, sizeof r).action == rmnet::TxAction::Reply);
   }
 }
 TEST(dad_solicit_gets_no_answer) {

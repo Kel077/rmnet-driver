@@ -13,7 +13,8 @@ TEST(discover_gets_offer_with_modem_settings) {
   CHECK_EQ(d.op, 2); CHECK_EQ(d.xid, 0x12345678u); CHECK_EQ(d.type, 2); CHECK_EQ(d.yiaddr, "10.102.246.230");
   CHECK_BYTES(d.chaddr, 6, "02 68 7a 43 12 f6");
   CHECK_EQ(d.server_id, "10.102.246.229"); CHECK_EQ(d.lease, 3600u); CHECK_EQ(d.mask, "255.255.255.252");
-  CHECK_EQ(d.router, "10.102.246.229"); CHECK_EQ(d.dns.size(), 2u); CHECK_EQ(d.dns[0], "203.0.113.193"); CHECK_EQ(d.mtu, 1500);
+  CHECK_EQ(d.router, "10.102.246.229"); CHECK_EQ(d.mtu, 1500);
+  REQUIRE(d.dns.size() == 2); CHECK_EQ(d.dns[0], "203.0.113.193");
 }
 TEST(request_for_our_address_gets_ack) {
   rmnet::EthernetEmulator e(rmnet::derive_macs("bfeed1a5")); auto s = link_settings(); e.set_link(&s); uint8_t r[600];
