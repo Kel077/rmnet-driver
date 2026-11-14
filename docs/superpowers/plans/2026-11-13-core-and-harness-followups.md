@@ -265,3 +265,18 @@ Plan `docs/superpowers/plans/2026-11-14-in-band-flow-control.md`, branch `flow-c
 - A timeout of the request that asks counts as a refusal for the life of the driver instance (by the plan): a slow first answer turns flow control off until the next load.
 - The capped test tools' ceiling is 310,000,000 recorded bytes and is reached again (309,701,068).
 - `AT+CFUN=0` / `AT+CFUN=1` makes the modem choose a cell again without a USB re-enumeration; `AT+QGDNRCNT?` reads the modem's own sent and received byte counts. Both are useful in tests and change nothing lasting.
+
+## Sent here by the SMS plan (2026-11-15)
+
+Plan `docs/superpowers/plans/2026-11-14-sms-in-the-app.md`, branch `sms`, build 317.16.8 installed. Results: `docs/driverkit-notes.md`, "Text messages in the app, on the modem".
+
+- **For the owner:** look at the `Messages` tab (nobody has seen it); send one message from it; quit during a send once (the app should wait, then quit; a failed send should cancel the quit); check that the window can be reopened after a cancelled quit (Window menu or Dock).
+- **A lasting modem setting was changed:** `AT+QCFG="ims",1`, with the owner's yes on 2026-11-14. Without it this SIM has no SMS on 5G standalone (`+CMS ERROR: 350` on a send, nothing delivered). Undo with `AT+QCFG="ims",0` and a reboot.
+- New messages are found by listing (every 15 s while the `Messages` tab is shown); there is no notification, by the owner's choice for this version. The modem's `+CMTI` lines go to the console's port.
+- Listing marks messages read on the modem, so the window and `sms list` disagree about `unread`.
+- The store is never emptied by the app; at 90 % the window and the verb warn. Whether the modem tells the network that room is free again after deletes from a full store is not tested.
+- Multi-part messages: two different messages from one sender that reuse a reference and total within 15 minutes, with interleaved or missing parts, can exchange parts (documented at the grouping code). A surrogate pair split across two parts shows as two replacement characters. A CR LF split across two parts shows as two line breaks.
+- Stored entries that are not received messages (sent copies, status reports) are listed as not readable.
+- The AT port: a stale lone `OK` can still settle "no echo" at open if the probe's own `OK` comes more than 50 ms after its echo; unsolicited lines in the middle of an answer are returned as answer lines (the parsers ignore unknown lines); a failure before the send prompt is worded "not known".
+- The window: if the text view goes away during an input-method composition, `Send` stays off until the next keystroke; the delete confirmation's identity check is as fresh as the last listing; `kill` (SIGTERM) to the window process ends it mid-send; the controller's checks do not cover a quit during a failing listing or a second quit after a cancelled one (a reviewer ran both by hand: fine).
+- The verbs: an alphanumeric sender can make its own header line of `sms list` look odd (it cannot start or rewrite a line); U+2028 and U+2029 survive in texts.
