@@ -1303,3 +1303,20 @@ The design's throughput line allows "within 15 percent of qmi-darwin measured wi
 - **The flow-control lead:** every download measured since the request was added stayed at or under about 200 Mbit/s (154.8 at 00:33, 193.3 at 02:07, 143.2 with an upload at 01:37); the last downloads without it, on 316.19.56 at 16:27 on 2026-11-14, gave 232 to 303 Mbit/s per sample and a best second of 278. Those runs were hours apart, so this is a lead, not a finding. A download with the key at 0 and at 1 within minutes on the same cell would decide it (two installs, two modem reboots, two capped downloads).
 
 **Data.** The two runs moved 491,774,999 bytes recorded (the usage file's total is 1,175,822,947). With traffic the usage file does not record, about 1,183 MB of the 1,400 MB is used and about 217 MB left; the scripts' ceiling (1,300,000,000) now refuses another `down-long` run.
+
+## Runtime findings (flow control off against on, download, 2026-11-15 02:17 to 02:20)
+
+To test the lead from the comparison with qmi-darwin: one capped download (`scripts/measure.sh en33 down`, stop at 50 MB) with the build as committed (flow control asked, 317.16.8), then a build with `RMNetFlowControl` 0 in the working tree only (317.18.17, one modem reboot), then the committed build back (317.18.19, one more reboot; flow control asked and granted again). Same cell throughout (PCI 893, RSRP -89 to -90, SINR 12 to 15).
+
+| | Flow control on, 02:17:41 | Flow control off, 02:18:59 |
+|---|---|---|
+| Best second | **159.4 Mbit/s** | **190.2 Mbit/s** |
+| Gate figure | 146.8 Mbit/s over 1.39 s | 179.4 Mbit/s over 1.69 s |
+| Each 0.28 s sample | 107, 205, 104, 168, 161, 154, 133, 143, 147, 158 | 57, 93, 107, 124, 134, 146, 169, 175, 205, 187, 194 |
+| Moved | 53.1 MB | 57.9 MB (one stream at its own 15 MB limit) |
+
+- Without the request the run was faster by about a fifth in its best second, and it was still rising when the 50 MB cap stopped it; with it the rate hovered around 150 from the start. So the request may cost some download speed. One pair of short runs cannot say how much.
+- **Neither came near qmi-darwin's 306 to 373 on the same cell half an hour earlier.** Flow control is therefore not the main reason our driver levels off near 200 Mbit/s; the host path is the stronger lead (a copy of every datagram, an Ethernet header, the DriverKit RX queues), against qmi-darwin's one batched `utun` call per transfer.
+- After the last reboot the first IPv4 ping was sent before the port had its IPv4 address ("No route to host"); a few seconds later the address was there and pings worked.
+
+**Data.** The two runs moved 111,344,554 bytes recorded (the usage file's total is 1,287,167,501). About 1,295 MB of the 1,400 MB is used, about 105 MB left; the scripts' ceiling (1,300,000,000) now refuses every capped run.
