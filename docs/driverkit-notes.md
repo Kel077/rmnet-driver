@@ -1356,3 +1356,15 @@ The owner added 5 GB at 02:24 ("start fixing. i'm giving you 5gb over next two h
 - The ratio check above is the one to repeat before trusting `measure.sh` on any interface other than `en33`.
 
 **Data.** The usage file records 2,093,606,693 bytes since 02:24 (total 3,380,774,194; the scripts' ceiling is 6,300,000,000). It over-records: the two runs at 02:33 each recorded the port's whole traffic (about 202 MB counted twice) and the two qmi-darwin runs were recorded at their doubled counts (about 286 MB too much), as was the 02:08 run (about 155 MB too much). With pings and background traffic, about 2.75 GB of the 6.4 GB allowed for testing is really used, about 3.65 GB left. The usage file is not edited; it errs on the safe side.
+
+## Runtime findings (cleanup build, 2026-11-15 04:43 to 04:47)
+
+Build 317.20.43, from `cleanup` at `bee6b41` (plan `docs/superpowers/plans/2026-11-15-cleanup.md`): the address helpers moved into Core, `CoreHost` reaches USB through the `UsbPort` interface, the wake-retry and no-result data-format log lines changed, and the unused DNS slot of a one-server settings reply is zeroed. Installed with `scripts/install-driver.sh` (its new kept-app check passed: only 317.18.40 was listed and its app is kept), loaded with `AT+CFUN=1,1` at 04:44:05, under the shared modem lock.
+
+- The port was up in both families 30 s after the reboot, on the new build (the running driver's CDHash matches the installed one). `RMNetFlowControlOn` 1, `RMNetFlowControlRefused` 0.
+- The moved helpers print as before: `RMNetIPv4 = 10.93.33.100/29 gw 10.93.33.101`, `RMNetIPv6 = 2001:db8:8ae9:25b5:b1dc:dffc:6574:41f1/64`. The driver's log lines were not captured (`log show` keeps none of the dext's default-level lines; `scripts/driver-log.sh` must run before the event).
+- Pings 3 of 3 in each family; `sms list` works (29 messages, 74 of 255 parts); no new crash report.
+- `scripts/measure.sh en33 up`: **23.0 Mbit/s** (best second 24.8), 20.0 MB moved, `RMNetTxHolds` 0 → 67, no drop. `scripts/measure.sh en33 down`: **58.4 Mbit/s** (best second 93.2), 53.0 MB moved. Cell PCI 32, RSRP -97, RSRQ -11, SINR 4 (weaker than every earlier run). The driver's receive work stayed what it was: about 76 µs per transfer, 14.5 datagrams per transfer, `RMNetRxDropNoPacket` 0; no error or drop counter moved except `RMNetTxDropFiltered` (multicast, by design). `AT+CFUN=0` then `AT+CFUN=1` re-selected the same cell (SINR 5), so a second download was skipped. The low download is the cell's: nothing on the receive path changed in this build, and the driver was no busier per transfer.
+- The radio cycle took the link down and up once (`RMNetTxDropLinkDown` 11, frames sent while it was down); the port came back with new addresses in both families within 8 s.
+
+**Data.** 72,994,373 bytes recorded for the two runs (usage file total 3,453,768,567; the scripts' ceiling 6,300,000,000). With pings and the radio cycle, about 75 MB of the owner's allowance, about 3.57 GB left of 6.4 GB.

@@ -56,7 +56,7 @@ Port up but passing nothing (belongs with the Up-state liveness work):
   - **Settled in code (2026-11-14, 317.8.44), not seen on hardware.** A pause not lifted within `kPauseMaxMs` (30 s, timed by `data_tick`) asks the driver to restart the session (`CoreHost::take_restart_wanted`, `RMNetDriver::RestartSession`, `CoreHost::restart`); `RMNetUplinkPauseTimeouts` counts them. The pause is timed only while the data link is up. No command frame has ever arrived, so this has never run.
 
 Carrier MTU:
-- A carrier MTU below 1500 never reaches the interface for IPv4: `setMaxTransferUnit` returns Unsupported and `getMaxTransferUnit` is read only at registration (`RMNetDriver::ApplyCore` and `RMNetDriver::getMaxTransferUnit`, `driver/RMNetDriver.cpp`); the router advertisement covers IPv6. Latent: every call so far had 1500.
+- A carrier MTU below 1500 never reaches the interface for IPv4: `setMaxTransferUnit` returns Unsupported and `getMaxTransferUnit` is read only at registration (`RMNetDriver::ApplyCore` and `RMNetDriver::getMaxTransferUnit`, `driver/RMNetDriver.cpp`); the router advertisement covers IPv6. Latent: every call so far had 1500. **Checked (cleanup plan, 2026-11-15):** the emulated DHCP server already sends option 26 with the carrier MTU (`ipconfig getpacket en33` shows `interface_mtu 0x5dc`), and the router advertisement covers IPv6; whether macOS lowers the interface for a smaller value cannot be shown on this carrier (always 1500).
 
 Never run on hardware (add to the list above):
 - A failed `Start` after `usb->start()` (the failure branch at the end of `RMNetDriver::Start_Impl`): `Start_Impl` returns the error while the stop sequence still waits on a request through the timer; whether DriverKit can free the object first is unknown, and `free()` releases the timer without `Cancel`.
@@ -80,17 +80,17 @@ None of these has run on hardware.
 - **Empty packets held across an interface disable and enable.** The driver now holds up to 32 empty receive packets (`RMNetRxStock`) and up to 32 kept transmit frames while idle or held, where before it held 0 or 1; whether the framework reclaims driver-held packets on `SetInterfaceEnable(false)` is unknown, and if it does they would be used twice. Needs the port switched off and on with `RMNetRxStock` above 0 (the owner's step).
 - **Pool margin.** The driver alone can hold `rxOut` 256 + `rxStock` 32 + `txDone` and kept frames 256 = 544 packets against `kPacketCount` 512, with the four queues of 256 on top; no array can overflow, but during an upload the hold keeps the transmit queue full, so a download at the same time could find no empty packets (`RMNetRxDropNoPacket`), and the standing queue of about 288 frames adds latency in front of acknowledgements. If hardware shows it: raise `kPacketCount` to 1024, or give the transmit queue a smaller capacity. **Changed 2026-11-14 (hardening), changed in code, not yet seen on hardware:** the TX submission queue now has `kTxQueueCapacity` 64 (the other three queues keep `kQueueCapacity` 256), so the queues hold 64 + 3 × 256 = 832 packets at most against 4 × 256 = 1,024 before, and the standing queue in front of the driver during an upload is about 64 + 32 kept frames = 96 instead of about 256 + 32 = 288 (if the system refuses 64, `Start` falls back to 256, `RMNetTxQueueCapacity` shows it, and both figures are as before: 1,024 and 288); the rest waits in macOS's interface queue, which schedules flows fairly. The driver's own holding (`rxOut` 256 + `rxStock` 32 + `txDone` and kept frames 256 = 544) is unchanged, and so is `kPacketCount` (512). Whether the capacity really bounds what waits inside the driver's queue is measured after the install. **Seen on hardware 2026-11-14 (317.11.33):** the system accepted 64 (`RMNetTxQueueCapacity` 64); two 1.84 MB bursts passed with no drop, the second in under 0.5 s; the pings alongside still waited up to 3.5 s, and that wait is inside the modem, not in the driver (`docs/driverkit-notes.md`, "Runtime findings (hardening build)"; see "Sent here by the hardening plan" below). So the queue change is harmless for a burst and its benefit is not shown; a download during an upload, and a sustained upload, were not run. **Seen 2026-11-15 (two-way load, 317.16.8):** `RMNetRxDropNoPacket` stayed 0 (no shortage of empty receive packets); `RMNetRxHandlerMaxUs` 3,338 and `RMNetRxLagMaxUs` 6,049 µs. *(Corrected 02:00: a first version read `RMNetRxStock` 24 to 3 as the stock nearly empty; the stock refills in batches when it reaches 0, so that value means nothing on its own.)*
 - **An "uplink usable" callback.** A failed bulk OUT completion, the end of a bulk OUT recovery (`UsbIo::end_out_recovery`) and a link down without a pause restart a held drain only on the next 100 ms tick; a `UsbIoListener` callback raised after `UsbIo::bulk_out_complete` has decided on recovery, and at the end of `UsbIo::end_out_recovery`, would remove that wait.
-- **A host harness for `CoreHost`'s hold.** No automated test covers `CoreHost::transmit` returning false, the re-offer of the kept frame, or frame order; nor the kept QMAP command replies.
-- **The burst tool's remaining signal cases.** A second signal inside the interrupt handler of `scripts/uplink-burst.py` ends with a traceback, though the usage line is written; SIGQUIT and SIGKILL leave no line.
+- **A host harness for `CoreHost`'s hold.** No automated test covers `CoreHost::transmit` returning false, the re-offer of the kept frame, or frame order; nor the kept QMAP command replies. **Closed (cleanup plan, 2026-11-15):** `make driver-test` (`tests/driver/test_core_host.cpp`, 7 tests) covers the refused and re-offered frame, frame order, the kept replies (one sent per completed transfer) and the pause limit; `CoreHost` reaches USB through `UsbPort` (`driver/usb_port.h`).
+- **The burst tool's remaining signal cases.** A second signal inside the interrupt handler of `scripts/uplink-burst.py` ends with a traceback, though the usage line is written; SIGQUIT and SIGKILL leave no line. **Partly closed (cleanup plan, 2026-11-15):** a second signal no longer ends in a traceback (the handler ignores the three signals before it raises); SIGQUIT and SIGKILL still leave no line.
 
 Small hardening left open:
 - The frame-length minimum tests. **Changed 2026-11-14 (hardening), Task 1 (`90755d8`): closed:** `frame_length_at_its_minimum_lengths` (`qmi_frame_length` at its minimum lengths).
 - A refresh during a retry abandons an allocated client until the next sync.
 - The Get Client ID retry path has no test. **Changed 2026-11-14 (hardening), Task 1 (`90755d8`): closed:** `retry_of_a_family_that_never_got_a_client_starts_from_get_client_id`.
 - `tick` could check `!pending_.active ||`.
-- An empty CDHash is reported as "older build running" by the install script.
-- The install script's stop check sees only the `activated enabled` entry.
-- `PrefixLength` is duplicated, and it and `FormatIPv6` are untested.
+- An empty CDHash is reported as "older build running" by the install script. **Closed (cleanup plan, 2026-11-15):** `running_line` in `scripts/install-checks.sh` says the CDHash cannot be read (tested by `make script-test`).
+- The install script's stop check sees only the `activated enabled` entry. **Closed (cleanup plan, 2026-11-15):** every listed version that is not uninstalling must have a kept app (`missing_kept_apps`, tested).
+- `PrefixLength` is duplicated, and it and `FormatIPv6` are untested. **Closed (cleanup plan, 2026-11-15):** `rmnet::prefix_length`, `format_ipv4`, `format_ipv6` in Core (`core/include/rmnet/util.h`) with tests.
 - "usb failed" is published for about 4 s on re-enumeration.
   - **Settled in code (2026-11-14, 317.8.44).** `RMNetState` says `detached` instead when UsbIo had seen a not-attached or no-device status (`UsbIo::device_gone`). Not yet seen: the instance replaced at the 317.8.44 load was the older 316.19.56, which still said `usb failed`; the next reload is the first that can show it.
   - **Reopened (2026-11-14, sleep and wake task).** The reload of 317.8.44 showed it never fires on a modem reboot: the re-post fails with `0xe00002d8`, which is `kIOReturnNotReady`, not `kIOReturnNotAttached` (`0xe00002d9`), and the interrupt read itself ends `kIOReturnAborted`. `Gone()` in `driver/usb_io.cpp` matches neither. Decide whether `kIOReturnNotReady` from a submission means gone (it may also come from a bus not yet awake after a sleep).
@@ -103,18 +103,18 @@ Small hardening left open:
   - **Soak run (2026-11-14, 317.9.11), memory not watched.** `scripts/soak.sh en33 30` passed (`docs/driverkit-notes.md`, "Runtime findings (30-minute soak)"), but it records no process memory, and no `Stop` happened during it. `RMNetPacketsHeld` was 0 in the first and the last sample.
 - `acquire_uplink` ignores `failed_`. **Changed 2026-11-14 (hardening): done:** it refuses after a failure, as while recovering.
 - `logged_bad_qmap_` is dead. **Changed 2026-11-14 (hardening): done:** removed.
-- `Worth` is duplicated.
+- `Worth` is duplicated. **Closed (cleanup plan, 2026-11-15):** `rmnet::worth`.
 - A failed `setDataOffAndLen` is ignored.
 - `RMNetPoolPacketCount` publishes a fixed total.
 - `DrainTx` also flushes when it stops for lack of `txDone` room.
 - A successful read during a recovery resets the recovery count.
 - `measure.sh`: TERM exits 130. **Changed 2026-11-14 (hardening), Task 3 (`9966996`): done:** TERM now exits 143 and HUP 129 (INT stays 130); the usage record on an interruption is unchanged.
-- `measure.sh`: the FAILED message blames curl when the interface vanished.
+- `measure.sh`: the FAILED message blames curl when the interface vanished. **Closed (cleanup plan, 2026-11-15):** it says the interface was gone when the last counter read found no row for it.
 - `measure.sh`: the gate window starts up to one sample late.
 - `measure.sh`: a counter reset loses up to 0.25 s of traffic.
 - `measure.sh`: overhead can take a run a few MB past its reservation.
 - `measure.sh`: a SIGKILLed run leaves no record.
-- `measure.sh`: an empty usage file is accepted as 0.
+- `measure.sh`: an empty usage file is accepted as 0. **Closed (cleanup plan, 2026-11-15):** measure.sh, soak.sh and uplink-burst.py refuse a 0-byte usage file; measure.sh writes a comment line when it creates one.
 - `measure.sh`: a loopback run charges the real usage file unless `MEASURE_USAGE_FILE` is set.
 
 ### Left by the re-review of the final fix wave
@@ -140,7 +140,7 @@ Also open from that wave: the driver now reads `RMNetProfile` and passes it to C
 
 None of these is a known defect. Each is a missing test or a small hardening.
 
-Tests that would pin existing behaviour:
+Tests that would pin existing behaviour: **Closed (cleanup plan, 2026-11-15):** every line below has a test (27 tests, `docs/superpowers/plans/2026-11-15-cleanup.md` Task 2); none found a defect.
 
 - QMUX: a non-CTL frame with an invalid kind byte; a TLV chain with a 1 or 2 byte tail.
 - QMI messages: short IPv6 and MTU TLVs; an IPv6 reply not clobbering IPv4 DNS; a failed parse leaving fields unchanged.
@@ -153,12 +153,12 @@ Tests that would pin existing behaviour:
 
 Small hardening:
 
-- Drop a neighbour solicitation whose target is `::` or `::1`.
+- Drop a neighbour solicitation whose target is `::` or `::1`. **Closed (cleanup plan, 2026-11-15):** dropped next to the multicast check, with tests.
 - A status-1 indication for a family whose own Start Network is still unanswered is forgotten if the start then succeeds.
 - `family_has_settings` relies on which address TLVs a reply carries, not on which client replied.
 - `qmap_write_header` truncates silently if its length precondition is broken; every caller checks first.
-- Two tests index a list right after checking its size (`d.dns[0]`, `d.rdnss[0]`), so a regression would crash the run instead of failing one test.
-- `CHECK_EQ` needs the `u` suffix for unsigned comparisons; `hex()` does not accept `\r`.
+- Two tests index a list right after checking its size (`d.dns[0]`, `d.rdnss[0]`), so a regression would crash the run instead of failing one test. **Closed (cleanup plan, 2026-11-15):** `REQUIRE` in `tests/minitest.h` returns from the test; both tests use it.
+- `CHECK_EQ` needs the `u` suffix for unsigned comparisons; `hex()` does not accept `\r`. **Closed (cleanup plan, 2026-11-15):** `minitest::equal` compares mixed signedness; `hex()` accepts `\r`.
 - Harness only: echo replies are not checked for destination; `sent` counts requests that never left; gateways print twice under `-v`.
 
 ## Sent here by the recovery plan's Task 3, sleep and wake (2026-11-14)
@@ -186,7 +186,7 @@ Open:
 
 - **A pause that keeps coming back.** A modem that keeps its flow-control pause makes the session restart about every 30 s with no "second time is fatal" rule; between restarts the link looks up and passes no uplink traffic. Never seen.
 - **A gap in the design (seen once on hardware 2026-11-14 22:25: radio off and on with the modem attached; link down at once, up again 11 s after the radio returned; notes, "Runtime findings (in-band flow control)").** Goal 5 names "the network dropping the connection", but no "Done means" line covers it; a network-side drop with the modem still attached has never been seen on hardware (Core's tests and the disconnect indication at modem reboots cover the logic).
-- **Testing the driver.** Nothing under `driver/` has a test; the cheapest worthwhile step is to move the uplink stall counter (`out_seq_`, `out_stall_mark_`, `out_stalls_`, `out_stuck_restarted_`) into a small plain C++ struct under `core/` and unit-test it (`CoreHost` would need a `UsbIo` interface to be testable on the host). **Changed 2026-11-14 (hardening): started:** the stall counter is `rmnet::UplinkStallCounter` in Core (`core/include/rmnet/stall.h`) with unit tests (`tests/test_stall.cpp`, Task 1, `90755d8`), and `UsbIo` uses it in place of the four fields (Task 2 of the hardening plan, `1f3beb1`). `CoreHost`, `UsbIo` and the rest of `driver/` still have no test.
+- **Testing the driver.** Nothing under `driver/` has a test; the cheapest worthwhile step is to move the uplink stall counter (`out_seq_`, `out_stall_mark_`, `out_stalls_`, `out_stuck_restarted_`) into a small plain C++ struct under `core/` and unit-test it (`CoreHost` would need a `UsbIo` interface to be testable on the host). **Changed 2026-11-14 (hardening): started:** the stall counter is `rmnet::UplinkStallCounter` in Core (`core/include/rmnet/stall.h`) with unit tests (`tests/test_stall.cpp`, Task 1, `90755d8`), and `UsbIo` uses it in place of the four fields (Task 2 of the hardening plan, `1f3beb1`). `CoreHost`, `UsbIo` and the rest of `driver/` still have no test. **Changed (cleanup plan, 2026-11-15):** `CoreHost` now has host tests (`make driver-test`); `UsbIo` and `RMNetDriver` still have none.
 
 Minor, one line each:
 
@@ -202,18 +202,18 @@ Minor, one line each:
 - Driver: a pause-timeout restart does not reset the stall count.
 - Driver: a timeout during a bulk OUT recovery still counts as a stall.
 - App: the table keeps the last known versions when the listing turns unknown. **Changed 2026-11-14 (hardening), Task 3 (`9966996`): done:** the installed-version row reads `unknown` while the listing is unknown (and while the first listing is pending); the bundled row comes from the app's own bundle and stays.
-- App: with no embedded driver, the "cannot" text gives the wrong reason.
-- App: `Remove…` does nothing, silently, if the listing turns unknown while the confirmation is open.
-- App: a properties request that never answers leaks one delegate every 10 s.
+- App: with no embedded driver, the "cannot" text gives the wrong reason. **Closed (cleanup plan, 2026-11-15):** the text says the app carries no driver.
+- App: `Remove…` does nothing, silently, if the listing turns unknown while the confirmation is open. **Closed (cleanup plan, 2026-11-15):** `notSentText` says why nothing was sent.
+- App: a properties request that never answers leaks one delegate every 10 s. **Closed (cleanup plan, 2026-11-15):** the timeout forgets the request's delegate.
 - App: the buttons stay off while an approval is pending.
-- App: the "switched off" advice fires for any two-entry listing, an update in progress included.
+- App: the "switched off" advice fires for any two-entry listing, an update in progress included. **Closed (cleanup plan, 2026-11-15):** said only when an entry is really switched off; several entries otherwise get a neutral line.
 - App: the window asks the system for the listing every 2 s.
 - Sleep: a re-enumeration during the sleep shows `usb failed`.
 - Sleep: uplink packets that complete while held are counted neither as sent nor as dropped.
 - Sleep: "control request failed" is logged for requests aborted at suspend.
 - Sleep: nothing tests hold, resume, or stopping while held.
-- `soak.sh`: a sample whose status has an `error` key is classed unreadable even when the registry part says `up`.
-- `soak.sh`: the crash-report listing hides a permission failure and does not list `Retired/`.
+- `soak.sh`: a sample whose status has an `error` key is classed unreadable even when the registry part says `up`. **Closed (cleanup plan, 2026-11-15):** classed from the registry properties when they are there (`soak.sh --classify`, tested).
+- `soak.sh`: the crash-report listing hides a permission failure and does not list `Retired/`. **Closed (cleanup plan, 2026-11-15):** it looks in `Retired/` and names (and fails on) a directory it cannot read.
 - `soak.sh`: the usage reader is a copy of `measure.sh`'s.
 - The liveness probe writes three log lines every 30 s. **Changed 2026-11-14 (hardening): done, seen on hardware (317.11.33):** an unchanged `settings IPv…` line is no longer logged; ten probes wrote two lines each.
 
@@ -245,12 +245,12 @@ Plan `docs/superpowers/plans/2026-11-14-hardening-while-away.md`, branch `harden
 - **The 64-entry transmit queue under a sustained upload: not measured.** Only bursts were run on 317.11.33. The capped measurement tools refuse (300 MB ceiling). If a later upload measurement is slower than the 38 Mbit/s recorded on 316.19.56 under comparable signal, set `kTxQueueCapacity` back to 256 before looking anywhere else. **Measured 2026-11-15 (317.16.8, flow control on):** an 8-second upload gave 33.6 Mbit/s with a best second of 56.6 and no drop, in the range of the 38 Mbit/s recorded before the change (another cell and hour); nothing points to the queue as a loss (`docs/driverkit-notes.md`, "Runtime findings (measurements with the new budget)").
 - **Settled:** `IOUserNetworkTxSubmissionQueue::Create` accepts a capacity of 64 on macOS 27.0; the fallback to 256 exists and has not run.
 - **The wake retry has not run in any form on 317.11.33** (no sleep since the load). The first sleep and wake on this build runs its first-attempt path, which the reviews found identical to the old code; the not-ready branch needs a bus that is not ready.
-- "usb resumed on retry N" (`driver/RMNetDriver.cpp`, `ResumeUsb`) prints `wakeRetries`, the retries since the instance started, not those of this wake.
+- "usb resumed on retry N" (`driver/RMNetDriver.cpp`, `ResumeUsb`) prints `wakeRetries`, the retries since the instance started, not those of this wake. **Closed (cleanup plan, 2026-11-15):** the line gives this wake's retry and the total, labelled.
 - The "N bulk reads posted" figure in the `usb resumed` line counts posts across attempts and can exceed 32 after a retried resume; exact on the first-attempt path.
 - The wake retry is driven by the timer tick only: if the timer cannot be armed while a resume is pending, nothing retries until another entry re-arms it, and the next attempt is then already the last.
 - Reads and interrupt notifications that complete while a resume is pending are discarded (the rule for every completion while held); the session restarts from sync after the resume.
-- App: the install confirmation's version comparison (`app/StatusView.swift`) uses `compareVersions` but has no check, because it lives in the view.
-- `make test FILTER=stall` runs 3 of the 6 stall tests (the other names do not contain "stall"); `make test` runs all.
+- App: the install confirmation's version comparison (`app/StatusView.swift`) uses `compareVersions` but has no check, because it lives in the view. **Closed (cleanup plan, 2026-11-15):** `installConfirmed` in the model, with checks.
+- `make test FILTER=stall` runs 3 of the 6 stall tests (the other names do not contain "stall"); `make test` runs all. **Closed (cleanup plan, 2026-11-15):** the three tests were renamed; it runs all 7.
 - `scripts/measure.sh`: two different signals arriving while the transfers start, the last one sets the exit code.
 
 ## Sent here by the flow-control plan (2026-11-14)
@@ -261,7 +261,7 @@ Plan `docs/superpowers/plans/2026-11-14-in-band-flow-control.md`, branch `flow-c
 - **Not measured with flow control on:** a long upload, a download during an upload, download speed. The earlier figures (38 Mbit/s up at 16:27, 232 to 303 Mbit/s down) are from builds that did not ask. **Measured 2026-11-15:** a short and an 8-second upload (25.0 and 33.6 Mbit/s; every ping alongside answered within 148 ms) and the 8-second download (154.8 Mbit/s, best second 177.2; the driver busy about 5 % of the time). A download during an upload is still not measured.
 - **An uplink stall without flow control (seen once, 20:44, PCI 32):** after a 1.84 MB burst the modem's sent counter stood still for about 7 s and two uplink transfers reached the 5 s timeout; the stall counter counted them, no restart was needed, and the link recovered by itself. First time the uplink timeout path ran on hardware (two of the three stalls that would ask for a restart).
 - **Why the request helps is unknown.** If a later firmware or another modem answers `0x1B` = 1 and behaves differently, the key `RMNetFlowControl` 0 restores the old request.
-- A Set Data Format response with no result TLV is logged `data format refused (error 0x0)` (`driver/core_host.cpp`); the `qmi rx` line before it shows result `-`.
+- A Set Data Format response with no result TLV is logged `data format refused (error 0x0)` (`driver/core_host.cpp`); the `qmi rx` line before it shows result `-`. **Closed (cleanup plan, 2026-11-15):** logged `data format answer has no result`.
 - A timeout of the request that asks counts as a refusal for the life of the driver instance (by the plan): a slow first answer turns flow control off until the next load.
 - The capped test tools' ceiling is 310,000,000 recorded bytes and is reached again (309,701,068).
 - `AT+CFUN=0` / `AT+CFUN=1` makes the modem choose a cell again without a USB re-enumeration; `AT+QGDNRCNT?` reads the modem's own sent and received byte counts. Both are useful in tests and change nothing lasting.
@@ -306,3 +306,11 @@ Plan `docs/superpowers/plans/2026-11-14-sms-in-the-app.md`, branch `sms`, build 
 - **No driver change for receive speed.** Receive merging off, flow control off and 8 streams each left the total near 200, with no loss, no reordering and the driver about 6 percent busy.
 - Open, small: whose fault the `utun` double counting is (macOS's accounting on the batched write path, or qmi-darwin's use of it). It matters only to anyone measuring qmi-darwin from `netstat -I`; the README warns about it.
 - Open, small: `scripts/measure.sh` trusts the interface's counters. On an interface whose counters are not the driver's own, compare one run against another count (qmictl's `usb_in_bytes`, `nettop`'s per-connection bytes) first.
+
+## Sent here by the cleanup plan (2026-11-15)
+
+Plan `docs/superpowers/plans/2026-11-15-cleanup.md`, branch `cleanup` (tip `bee6b41` plus this record), build 317.20.43. The items it closed are marked in place above. Results on the modem: `docs/driverkit-notes.md`, "Runtime findings (cleanup build)".
+
+- Fixed in passing: `parse_wds_current_settings` copied uninitialised bytes into the unused second DNS slot when a reply carried one server, so `CoreHost`'s "settings IPv…" line could repeat with nothing changed. The local arrays are zeroed now, with two tests.
+- Left as they are (the final review's triage): the test fake's `release_uplink` frees a slot in any state; `EthernetEmulator::tx_nd`'s own comment still says it answers "whatever target was asked" (the file header states the drops); `soak.sh` fails its verdict when a crash-report directory cannot be read (all four are readable on this Mac; refusing before the pings would be cheaper if it ever happens); `uplink-burst.py`'s double-signal handling has no committed test; `installConfirmed` ignores an uninstalling entry, as the old inline test did.
+- Download on 2026-11-15 at 04:45 was 58.4 Mbit/s on PCI 32 at SINR 4; nothing in the driver pointed at a limit. Repeat on a better cell before reading anything into it.
