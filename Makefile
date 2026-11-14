@@ -62,14 +62,18 @@ build/obj/harness/%.o: harness/%.mm
 
 check-driverkit:
 	./scripts/check-driverkit-compile.sh
+	./scripts/check-personalities.sh
 
-# The app's status model, SMS model, AT answer logic and the Messages tab's controller, tested without
-# Xcode or hardware (the AT port itself is not opened, and no window is made).
-app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests
+# The app's status model, SMS model, AT answer logic, the Messages tab's controller, the gps verb's
+# NMEA logic and its port reader, tested without Xcode or hardware (neither the AT port nor the NMEA
+# port is opened: the reader reads a pseudo-terminal the test makes, and no window is made).
+app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/nmea-tests build/gpsread-tests
 	./build/app-tests
 	./build/sms-tests
 	./build/at-tests
 	./build/smsui-tests
+	./build/nmea-tests
+	./build/gpsread-tests
 
 build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
 	@mkdir -p build
@@ -84,6 +88,14 @@ build/at-tests: app/AtPort.swift tests/app/AtPortTests.swift
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 build/smsui-tests: app/SmsModel.swift app/SmsController.swift tests/app/SmsControllerTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+build/nmea-tests: app/Nmea.swift tests/app/NmeaTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+build/gpsread-tests: app/Nmea.swift app/GpsCommand.swift tests/app/GpsReadTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
