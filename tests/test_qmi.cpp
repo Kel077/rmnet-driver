@@ -75,3 +75,30 @@ TEST(result_reports_error) {
   rmnet::QmiMessage m; CHECK(rmnet::qmi_decode({buf, n}, &m));
   auto r = rmnet::qmi_result(m); CHECK(r.present); CHECK(!r.ok); CHECK_EQ(r.error, 0x001a);
 }
+
+// Pinned behaviour (the deferred list of 2026-11-13).
+
+TEST(service_frame_with_an_invalid_kind_byte_does_not_decode) {
+  // A service frame's kind byte is 0, 2 or 4 (request, response, indication). 1 is CTL's response
+  // and means nothing here; nor do 3, 6 or 0x80.
+  auto f = hex(kWdsConnected4Ind); rmnet::QmiMessage m;
+  CHECK(rmnet::qmi_decode({f.data(), f.size()}, &m));                         // byte 6 is 04, an indication
+  for (uint8_t kind : {0x01, 0x03, 0x06, 0x80}) {
+    auto g = f; g[6] = kind;
+    CHECK(!rmnet::qmi_decode({g.data(), g.size()}, &m));
+  }
+}
+TEST(tlv_chain_with_a_1_or_2_byte_tail_does_not_decode) {
+  // The capture's Bind Mux response (one result TLV) with 1 or 2 more bytes, counted in both
+  // lengths: too few for another TLV's type and u16 length.
+  for (const char* tail : {"05", "05 00"}) {
+    auto f = hex(kWdsBind4Resp), t = hex(tail);
+    f.insert(f.end(), t.begin(), t.end());
+    f[1] = static_cast<uint8_t>(f[1] + t.size()); f[11] = static_cast<uint8_t>(f[11] + t.size());
+    rmnet::QmiMessage m; CHECK(!rmnet::qmi_decode({f.data(), f.size()}, &m));
+    // qmi_find_tlv over the same chain still finds the TLV before the tail, and nothing in it.
+    rmnet::Span tlvs = {f.data() + 13, f.size() - 13}, v;
+    CHECK(rmnet::qmi_find_tlv(tlvs, 0x02, &v)); CHECK_EQ(v.len, 4u);
+    CHECK(!rmnet::qmi_find_tlv(tlvs, 0x05, &v));
+  }
+}

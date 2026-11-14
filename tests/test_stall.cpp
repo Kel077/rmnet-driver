@@ -46,7 +46,7 @@ TEST(a_success_between_stalls_starts_the_count_again) {
   CHECK(stall_once(c) == StallOutcome::Stuck);
 }
 
-TEST(a_success_after_stuck_forgets_the_restart) {
+TEST(stall_a_success_after_stuck_forgets_the_restart) {
   UplinkStallCounter c;
   for (int i = 0; i < 2; ++i) stall_once(c);
   CHECK(stall_once(c) == StallOutcome::Stuck);
@@ -57,7 +57,7 @@ TEST(a_success_after_stuck_forgets_the_restart) {
   CHECK(stall_once(c) == StallOutcome::Stuck);  // not StuckAgain: a success came between
 }
 
-TEST(clear_ignores_transfers_submitted_before_it) {
+TEST(stall_clear_ignores_transfers_submitted_before_it) {
   UplinkStallCounter c;
   for (int i = 0; i < 2; ++i) stall_once(c);
   CHECK(stall_once(c) == StallOutcome::Stuck);
@@ -73,7 +73,7 @@ TEST(clear_ignores_transfers_submitted_before_it) {
   CHECK(stall_once(c) == StallOutcome::Stuck);
 }
 
-TEST(a_failure_with_an_old_sequence_number_never_counts) {
+TEST(stall_a_failure_with_an_old_sequence_number_never_counts) {
   UplinkStallCounter c;
   uint64_t old_seq = c.submitted();  // 1
   uint64_t newer = c.submitted();    // 2

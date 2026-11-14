@@ -1,0 +1,31 @@
+{
+  "advice" : [
+
+  ],
+  "attached" : true,
+  "bundledVersion" : "317.18.40",
+  "canActivate" : true,
+  "canRemoveDirectly" : true,
+  "entries" : [
+    {
+      "awaitingApproval" : false,
+      "enabled" : true,
+      "uninstalling" : false,
+      "version" : "317.18.40"
+    }
+  ],
+  "headline" : "Connected",
+  "modem" : "qmi",
+  "properties" : {
+    "RMNetIPv4" : "192.0.2.10\/30",
+    "RMNetPacketsHeld" : "0",
+    "RMNetRxDropBadQmap" : "0",
+    "RMNetRxDropNoPacket" : "0",
+    "RMNetState" : "up",
+    "RMNetTimerArmFailures" : "0",
+    "RMNetTxDropBusy" : "0",
+    "RMNetUsbBulkInErrors" : "0",
+    "RMNetUsbRecoveries" : "0"
+  },
+  "qmiInterface" : 4
+}

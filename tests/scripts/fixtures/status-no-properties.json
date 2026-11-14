@@ -1,0 +1,18 @@
+{
+  "advice": [],
+  "attached": true,
+  "bundledVersion": "317.18.40",
+  "canActivate": true,
+  "canRemoveDirectly": true,
+  "entries": [
+    {
+      "awaitingApproval": false,
+      "enabled": true,
+      "uninstalling": false,
+      "version": "317.18.40"
+    }
+  ],
+  "headline": "Connected",
+  "modem": "qmi",
+  "qmiInterface": 4
+}

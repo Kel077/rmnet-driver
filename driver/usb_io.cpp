@@ -10,6 +10,7 @@
 #include <USBDriverKit/USBDriverKit.h>  // umbrella: also declares IOUSBHostFreeDescriptor
 
 #include "rmnet/qmi.h"
+#include "rmnet/util.h"
 
 #define LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "RMNet: " fmt, ##__VA_ARGS__)
 
@@ -47,10 +48,6 @@ kern_return_t MakeBuffer(IOUSBHostInterface* intf, IOOptionBits dir, uint32_t si
   *addr = reinterpret_cast<uint8_t*>(seg.address);
   return ret;
 }
-
-// Errors are logged when their count is a power of two (1, 2, 4, 8, ...): the first ones in
-// full, then ever more rarely. The counters carry the rest.
-bool Worth(uint64_t n) { return n != 0 && (n & (n - 1)) == 0; }
 
 // The SDK (IOUSBHostPipe.iig, ClearStall): any IO error other than a timeout halts a bulk
 // endpoint. Aborts are ours (a recovery, or stop); a device that is gone cannot be recovered.
@@ -511,7 +508,7 @@ void UsbIo::bulk_in_complete(uint32_t i, IOReturn status, uint32_t bytes) {
     // Expected: the recovery aborted it.
   } else {
     stats_.bulk_in_errors++;
-    if (Worth(stats_.bulk_in_errors)) {
+    if (rmnet::worth(stats_.bulk_in_errors)) {
       LOG("bulk read %u failed: 0x%x (%llu bulk read errors)", i, status, stats_.bulk_in_errors);
     }
     if (Gone(status)) {
@@ -600,7 +597,7 @@ bool UsbIo::send_uplink(int slot, uint32_t len) {
     note(ret);
     uplink_[slot] = Uplink::Free;
     stats_.bulk_out_errors++;
-    if (Worth(stats_.bulk_out_errors)) {
+    if (rmnet::worth(stats_.bulk_out_errors)) {
       LOG("uplink transfer not submitted: 0x%x (%llu bulk out errors)", ret, stats_.bulk_out_errors);
     }
     return false;
@@ -649,7 +646,7 @@ void UsbIo::bulk_out_complete(uint32_t i, IOReturn status, uint32_t) {
   if (timed_out || stray_abort) stats_.bulk_out_timeouts++;
   if (!ok && !expected_abort) {
     stats_.bulk_out_errors++;
-    if (phase_ == Phase::Running && Worth(stats_.bulk_out_errors)) {
+    if (phase_ == Phase::Running && rmnet::worth(stats_.bulk_out_errors)) {
       LOG("uplink transfer failed: 0x%x (%llu bulk out errors)", status, stats_.bulk_out_errors);
     }
   }
@@ -749,7 +746,7 @@ void UsbIo::hold() {
 void UsbIo::note_held(const char* what, IOReturn status) {
   stats_.sleep_completions++;
   if (status != kIOReturnSuccess) stats_.sleep_last_status = static_cast<uint32_t>(status);
-  if (Worth(stats_.sleep_completions)) {
+  if (rmnet::worth(stats_.sleep_completions)) {
     LOG("while held: %{public}s completed 0x%x (%llu completions while held)", what, status,
         stats_.sleep_completions);
   }
@@ -828,7 +825,7 @@ UsbIo::Resume UsbIo::resume_refused(const char* what, const char* fatal, IORetur
     return Resume::Failed;
   }
   resume_.refusals++;
-  if (Worth(resume_.refusals)) {
+  if (rmnet::worth(resume_.refusals)) {
     LOG("resume: %{public}s not posted: 0x%x (attempt %u, %u refusals this wake); usb stays held, tried again",
         what, status, resume_.attempts, resume_.refusals);
   }

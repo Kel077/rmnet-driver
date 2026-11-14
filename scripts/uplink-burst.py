@@ -11,7 +11,8 @@ keeps the frames it cannot send at once (RMNetTxHolds) or drops them (RMNetTxDro
 The cellular data is metered. The limit is on what the cellular link carries: datagrams x
 (bytes-each + 28 bytes of IPv4 and UDP headers) must be at most 2,000,000, or the request is
 refused before anything is sent. The usage file (build/installed/measure-usage.log, shared with
-scripts/measure.sh) must exist, end with a newline, and every line other than a comment must be
+scripts/measure.sh) must exist, must not be empty (0 bytes: it was probably emptied by mistake, and
+must be restored by hand), must end with a newline, and every line other than a comment must be
 "<time> <down|up> <bytes in> <bytes out>"; otherwise the run is refused. The run is also refused if
 the recorded total plus this run's datagrams x (bytes-each + 28) would pass 6,300,000,000 bytes (the
 budget scripts/measure.sh checks too), or if the usage file cannot be opened for appending; it is
@@ -21,9 +22,10 @@ opened before the sends and stays open until the line is written. After the burs
 at the end, or went backwards (the interface was recreated), the run is charged its payload plus
 headers instead, and that is said.
 
-An interrupt (SIGINT, SIGTERM or SIGHUP) during the sends stops them; from the end of the sends
-(the send loop's last step) until the usage line is written, these signals are ignored, so what was
-sent is recorded.
+An interrupt (SIGINT, SIGTERM or SIGHUP) during the sends stops them; its handler first sets all
+three to be ignored, so a second signal cannot interrupt the cleanup. From the end of the sends (the
+send loop's last step) until the usage line is written, these signals are ignored, so what was sent
+is recorded, once.
 
 --usage-file replaces the usage file for a test. It is accepted only with the interface lo0, and
 lo0 requires it, so a loopback run never writes to the real usage file.
@@ -99,6 +101,11 @@ def check_usage(path):
         refuse("the usage file %s does not exist" % path)
     with open(path, "rb") as f:
         data = f.read()
+    # scripts/measure.sh never creates an empty one, so an empty file was emptied: read as 0, it
+    # would let runs start against the whole budget again.
+    if not data:
+        refuse("the usage file %s is empty (0 bytes); it was probably emptied by mistake, and must be "
+               "restored by hand" % path)
     if data and not data.endswith(b"\n"):
         refuse("the usage file %s does not end with a newline; an appended line would join its last line" %
                path)
@@ -165,11 +172,21 @@ def main():
     first_error = None
     interrupted = False
 
+    def ignore(signum, frame):
+        pass
+
     def stop_sending(signum, frame):
+        # The three signals are ignored before the raise, so a second one cannot interrupt the
+        # cleanup (the except and finally below) and end the run with a traceback. A handler that
+        # does nothing, not SIG_IGN: a second signal already pending when this one is handled then
+        # reaches it quietly, where under SIG_IGN Python 3.9 prints "Signal N ignored due to race
+        # condition". The except and finally set SIG_IGN, as before.
+        for sig in SIGNALS:
+            signal.signal(sig, ignore)
         raise KeyboardInterrupt
 
-    signal.signal(signal.SIGTERM, stop_sending)  # SIGINT already raises KeyboardInterrupt
-    signal.signal(signal.SIGHUP, stop_sending)
+    for sig in SIGNALS:
+        signal.signal(sig, stop_sending)
     payload = b"\0" * size
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     started = time.monotonic()

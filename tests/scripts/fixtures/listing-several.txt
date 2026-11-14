@@ -1,0 +1,12 @@
+7 extension(s)
+--- com.apple.system_extension.network_extension (Go to 'System Settings > General > Login Items & Extensions > Network Extensions' to modify these system extension(s))
+enabled	active	teamID	bundleID (version)	name	[state]
+*	*	ABCDE12345	com.example.vpn.network-extension (2.1/210)	Example VPN	[activated enabled]
+--- com.apple.system_extension.driver_extension (Go to 'System Settings > General > Login Items & Extensions > Driver Extensions' to modify these system extension(s))
+enabled	active	teamID	bundleID (version)	name	[state]
+*	*	FGHIJ67890	com.example.hidfilter (1.1.24/1.1.24)	Example HID Driver Extension	[activated enabled]
+		ABCDE12345	io.rmnetdriver.RMNet.driver (1.0/317.17.5)	io.rmnetdriver.RMNet.driver	[terminated waiting to uninstall on reboot]
+*	*	ABCDE12345	io.rmnetdriver.RMNet.driver (1.0/317.18.40)	io.rmnetdriver.RMNet.driver	[activated enabled]
+		ABCDE12345	io.rmnetdriver.RMNet.driver (1.0/317.16.8)	io.rmnetdriver.RMNet.driver	[activated disabled]
+		ABCDE12345	io.rmnetdriver.RMNet.driver (1.0/317.19.2)	io.rmnetdriver.RMNet.driver	[activated waiting for user]
+*	*	ABCDE12345	io.rmnetdriver.RMNet.driver2 (1.0/9.9.9)	io.rmnetdriver.RMNet.driver2	[activated enabled]

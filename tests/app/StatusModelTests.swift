@@ -1,5 +1,5 @@
-// Tests for app/StatusModel.swift: the headline, the advice, canRemoveDirectly, the table rows and
-// the JSON form. Built with swiftc by `make app-test`; needs no Xcode project and no hardware.
+// Tests for app/StatusModel.swift: the headline, the advice, canRemoveDirectly, the removal texts,
+// the install confirmation, the table rows and the JSON form. Built with swiftc by `make app-test`; needs no Xcode project and no hardware.
 // Stops at the first failure, prints which check failed and exits 1.
 import Foundation
 
@@ -84,6 +84,22 @@ struct StatusModelTests {
         let off = advice(status([ExtensionEntry(version: "316.19.56", enabled: false, awaitingApproval: false, uninstalling: false)]),
                          bundledVersion: "316.19.56")
         check(off.contains { $0.contains("switched off in System Settings") }, "advice: installed, not enabled says it was switched off", "\(off)")
+
+        // More than one entry with none switched off (a replacement under way, say): the listing in
+        // words, not the switched-off line. A switched-off entry among them keeps the switched-off line.
+        let moreThanOne = "The system lists more than one entry for the driver"
+        let bothOn = advice(status([enabled, ExtensionEntry(version: "316.21.4", enabled: true, awaitingApproval: false, uninstalling: false)]),
+                            bundledVersion: "316.19.56")
+        check(!bothOn.contains { $0.contains("switched off") }, "advice: two enabled entries do not say switched off", "\(bothOn)")
+        check(bothOn.contains("The system lists more than one entry for the driver: 316.19.56 (enabled), 316.21.4 (enabled). This can be a replacement still under way; while it lasts, the system refuses a new installation."),
+              "advice: two enabled entries say the system lists more than one entry", "\(bothOn)")
+        check(bothOn.last == alwaysLine, "advice: two enabled entries end with the standing line", "\(bothOn)")
+        let replacing = advice(status([enabled, ExtensionEntry(version: "316.21.4", enabled: false, awaitingApproval: true, uninstalling: false)]),
+                               bundledVersion: "316.21.4")
+        check(!replacing.contains { $0.contains("switched off") } && replacing.contains { $0.hasPrefix(moreThanOne) },
+              "advice: an enabled entry and one awaiting approval are not called switched off", "\(replacing)")
+        check(two.contains { $0.contains("switched off in System Settings") } && !two.contains { $0.hasPrefix(moreThanOne) },
+              "advice: one switched-off entry among two keeps the switched-off line only", "\(two)")
 
         let differs = advice(status([enabled], attached: true, ["RMNetState": "up"]), bundledVersion: "316.21.4")
         check(differs.contains { $0.contains("Update will replace version 316.19.56 with version 316.21.4") },
@@ -204,6 +220,12 @@ struct StatusModelTests {
         let cannotAbsent = cannotRemoveText(status([switchedOff]), bundledVersion: b)
         check(cannotAbsent.contains("version 316.21.4, which is not listed") && cannotAbsent.contains("build/installed/RMNet-316.19.56.app"),
               "cannotRemoveText: the bundled version not listed is said to be not listed", cannotAbsent)
+        let cannotNoDriver = cannotRemoveText(status([enabled]), bundledVersion: "")
+        check(cannotNoDriver.contains("carries no driver") && !cannotNoDriver.contains("not listed"),
+              "cannotRemoveText: with no embedded driver, says the app carries none", cannotNoDriver)
+        check(cannotNoDriver == "This app carries no driver (the version of its embedded driver cannot be read), so it cannot remove the listed driver. "
+                + keptAppsLine([enabled]),
+              "cannotRemoveText: with no embedded driver, the reason then the kept app", cannotNoDriver)
 
         // --- versions and the install button's title (A2) ----------------------------------------
         let versions: [(String, String, Int)] = [
@@ -235,6 +257,29 @@ struct StatusModelTests {
         check(describeListing([]) == "none", "describeListing: none")
         check(describeListing([switchedOff, bEnabled]) == "316.19.56 (not enabled), 316.21.4 (enabled)",
               "describeListing: two entries", describeListing([switchedOff, bEnabled]))
+
+        // --- installConfirmed: the listing read after an installation ----------------------------
+        check(installConfirmed([enabled], version: "316.19.56"), "installConfirmed: one enabled entry of the version")
+        check(installConfirmed([short], version: "317.9.0"), "installConfirmed: 317.9 listed, 317.9.0 installed")
+        check(!installConfirmed([switchedOff], version: "316.19.56"), "installConfirmed: one entry of the version, not enabled")
+        check(!installConfirmed([waiting], version: "316.19.56"), "installConfirmed: one entry of the version, awaiting approval")
+        check(!installConfirmed([enabled, bEnabled], version: "316.19.56"), "installConfirmed: two entries")
+        check(!installConfirmed([enabled, enabled], version: "316.19.56"), "installConfirmed: two entries of the version")
+        check(!installConfirmed([enabled], version: "316.21.4"), "installConfirmed: one enabled entry of another version")
+        check(!installConfirmed([], version: "316.19.56"), "installConfirmed: nothing listed")
+
+        // --- notSentText: why a button press sent nothing ----------------------------------------
+        let busyText = "Nothing was sent: another request is still running."
+        check(notSentText(action: "Remove", busy: true, known: true) == busyText, "notSentText: busy",
+              notSentText(action: "Remove", busy: true, known: true))
+        check(notSentText(action: "Remove", busy: true, known: false) == busyText, "notSentText: busy comes before an unknown listing",
+              notSentText(action: "Remove", busy: true, known: false))
+        check(notSentText(action: "Update", busy: false, known: false)
+                == "Nothing was sent: the system's listing is not known right now. Press Update again once the listing has refreshed.",
+              "notSentText: listing not known", notSentText(action: "Update", busy: false, known: false))
+        check(notSentText(action: "Remove", busy: false, known: true)
+                == "Nothing was sent: the listing has changed. Remove is available again only when the new listing allows it.",
+              "notSentText: listing changed", notSentText(action: "Remove", busy: false, known: true))
 
         // --- table rows ------------------------------------------------------------------------
         let props = ["RMNetState": "up", "RMNetIPv4": "10.62.238.140/29 gw 10.62.238.141", "RMNetIPv6": "none",

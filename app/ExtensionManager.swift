@@ -50,11 +50,13 @@ func describe(_ error: Error) -> String {
 }
 
 final class ExtensionManager {
-    // Requests in flight keep their delegates here until they finish.
+    // Requests in flight keep their delegates here until they answer, or until a properties request's
+    // timeout forgets them.
     private var delegates: [ObjectIdentifier: RequestDelegate] = [:]
 
     // Lists the system's entries for the driver. With a timeout, a request that has not answered by
-    // then reports `.noAnswer`, and a later answer is ignored.
+    // then is forgotten (its delegate dropped, so it is not kept forever) and reports `.noAnswer`; a
+    // later answer is ignored.
     func properties(timeout: TimeInterval? = nil, completion: @escaping (PropertiesAnswer) -> Void) {
         let request = OSSystemExtensionRequest.propertiesRequest(forExtensionWithIdentifier: driverID, queue: .main)
         let d = RequestDelegate()
@@ -67,9 +69,13 @@ final class ExtensionManager {
         d.onProperties = { answer(.listed($0)) }
         // A properties request normally answers with properties; a finish without them is not a listing.
         d.onFinish = { answer(.notListed($0)) }
-        submit(request, d)
+        let forget = submit(request, d)
         if let timeout = timeout {
-            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { answer(.noAnswer) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+                guard !answered else { return }
+                forget()
+                answer(.noAnswer)
+            }
         }
     }
 
@@ -142,7 +148,12 @@ final class ExtensionManager {
         }
     }
 
-    private func submit(_ request: OSSystemExtensionRequest, _ d: RequestDelegate) {
+    // Submits the request and keeps its delegate in `delegates` until the request answers (the request
+    // holds its delegate weakly). Returns a function that forgets the request before it answers: the
+    // delegate is dropped from `delegates` and its callbacks cleared, so an answer that comes later
+    // reaches nothing. Only a properties request with a timeout calls it.
+    @discardableResult
+    private func submit(_ request: OSSystemExtensionRequest, _ d: RequestDelegate) -> () -> Void {
         let id = ObjectIdentifier(d)
         let finish = d.onFinish
         let found = d.onProperties
@@ -160,6 +171,14 @@ final class ExtensionManager {
         delegates[id] = d
         request.delegate = d
         OSSystemExtensionManager.shared.submitRequest(request)
+        return { [weak self, weak d] in
+            // The callbacks first: dropping the delegate from `delegates` may free it.
+            d?.onReplace = nil
+            d?.onNeedsApproval = nil
+            d?.onProperties = nil
+            d?.onFinish = nil
+            self?.delegates[id] = nil
+        }
     }
 }
 

@@ -9,10 +9,13 @@
 # A driver can only be deactivated by an app that embeds that exact driver version, so a copy of
 # every app that asks for activation is kept in build/installed/RMNet-<version>.app (README,
 # "Removing the driver"): the new app is kept before it asks, and the app it replaces is kept
-# before it is removed if the system lists any entry with its version. Nothing here deactivates.
+# before it is removed if the system lists any entry with its version. Before that, the script stops,
+# changing nothing, if any other listed version (an uninstalling entry aside) has no kept app.
+# Nothing here deactivates.
 set -eu
 
 cd "$(dirname "$0")/.." || exit 1
+. ./scripts/install-checks.sh # missing_kept_apps, running_line
 
 TEAM=ABCDE12345
 BUILD="$PWD/build/xcode-signed"
@@ -44,7 +47,8 @@ read_listing() {
 }
 
 # The versions of every entry in $listing for the driver, whatever its state, one per line.
-# With "activated enabled" as $1, only that entry's version.
+# With "activated enabled" as $1, only that entry's version. (Which versions lack a kept app is
+# decided by missing_kept_apps, in scripts/install-checks.sh.)
 listed_versions() {
   printf '%s\n' "$listing" | grep "	$DRIVER_ID (" | grep -- "${1:-}" |
     sed -n 's/.*(\([^/]*\)\/\([0-9.]*\)).*/\2/p'
@@ -94,18 +98,30 @@ built=$(/usr/bin/defaults read "$NEW/Contents/Info" CFBundleVersion 2>/dev/null 
 step "keep the app being replaced"
 read_listing "before anything is changed"
 old=$(driver_version "$APP")
+# Every listed version but an uninstalling entry's needs a kept app, or it could not be deactivated:
+# the active one, one waiting for approval, a switched-off one. The app being replaced is kept just
+# below, so its own version may still be missing here; any other missing one stops the script
+# before anything is changed.
+missing=$(printf '%s\n' "$listing" | missing_kept_apps /dev/stdin "$KEEP" "$DRIVER_ID") || {
+  echo "install-driver: the listing could not be checked for kept apps; nothing was changed" >&2
+  exit 1
+}
+others=
+for ver in $missing; do
+  [ "$ver" = "$old" ] || others="$others $ver"
+done
+if [ -n "$others" ]; then
+  echo "install-driver: listed driver version(s)$others have no kept app in $KEEP ($APP is ${installed:-missing})" >&2
+  echo "install-driver: without one they cannot be deactivated; see README, Removing the driver; nothing was changed" >&2
+  exit 1
+fi
 if [ -n "$old" ] && listed_versions | grep -qxF "$old"; then
   keep_app "$APP"
 fi
-active=$(active_version)
-if [ -z "$active" ]; then
-  echo "no active $DRIVER_ID"
-elif [ -d "$KEEP/RMNet-$active.app" ]; then
-  echo "already kept: $KEEP/RMNet-$active.app"
+if [ -z "$(listed_versions)" ]; then
+  echo "no $DRIVER_ID listed"
 else
-  echo "install-driver: active driver $active has no matching app ($APP is ${installed:-missing})" >&2
-  echo "install-driver: without one it cannot be deactivated; see README, Removing the driver" >&2
-  exit 1
+  echo "every listed $DRIVER_ID version but an uninstalling one has a kept app in $KEEP"
 fi
 
 step "copy to $APP"
@@ -124,13 +140,6 @@ active=$(active_version)
 step "check the running driver"
 new=$(codesign -dvvv "$APP/Contents/Library/SystemExtensions/io.rmnetdriver.RMNet.driver.dext" 2>&1 | sed -n 's/^CDHash=//p')
 running=$(ioreg -r -n RMNetDriver -d 1 -w0 | sed -n 's/.*"IOUserServerCDHash" = "\([0-9a-f]*\)".*/\1/p' | head -1)
-if [ -z "$running" ]; then
-  echo "no RMNetDriver attached (modem not attached in QMI mode?)"
-elif [ "$running" = "$new" ]; then
-  echo "version $VERSION is the running driver"
-else
-  echo "an older build is still running; version $VERSION loads when the modem re-enumerates"
-  echo "(unplug it, or send AT+CFUN=1,1)"
-fi
+running_line "$new" "$running" "$VERSION"
 
 step "done"

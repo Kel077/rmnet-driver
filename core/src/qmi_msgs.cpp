@@ -285,7 +285,7 @@ bool parse_wds_current_settings(const QmiMessage& m, RuntimeSettings* out) {
     s.has_v4 = true;
   }
 
-  uint8_t dns4[2][4];
+  uint8_t dns4[2][4] = {};  // zeroed: with one server, the second slot is copied as it is
   uint8_t n4 = 0;
   const uint8_t dns4_types[2] = {kTlvV4DnsPrimary, kTlvV4DnsSecondary};
   for (uint8_t type : dns4_types) {
@@ -308,7 +308,7 @@ bool parse_wds_current_settings(const QmiMessage& m, RuntimeSettings* out) {
   if (!optional_bytes(m, kTlvV6Gateway, sizeof v6, v6, &found)) return false;
   if (found) memcpy(s.v6_gateway, v6, 16);
 
-  uint8_t dns6[2][16];
+  uint8_t dns6[2][16] = {};  // zeroed, as dns4
   uint8_t n6 = 0;
   const uint8_t dns6_types[2] = {kTlvV6DnsPrimary, kTlvV6DnsSecondary};
   for (uint8_t type : dns6_types) {

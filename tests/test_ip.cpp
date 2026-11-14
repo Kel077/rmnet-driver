@@ -42,3 +42,45 @@ TEST(udp4_checksum_validates) {                    // a UDP datagram with the ch
   CHECK_EQ(c, 0x57b1);
   CHECK_EQ(rmnet::udp4_checksum(s, d, u, sizeof u), 0);
 }
+
+// Pinned behaviour (the deferred list of 2026-11-13): the builders' refusals.
+
+TEST(ip_builders_refuse_a_buffer_one_byte_short_and_write_nothing) {
+  const uint8_t s4[4] = {10, 102, 246, 230}, d4[4] = {223, 5, 5, 5}, data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  auto s6 = hex("20 01 0d b8 8a f4 b2 60 61 fc 0d be 3a b2 6e 08"), d6 = hex("24 00 32 00 00 00 00 00 00 00 00 00 00 00 00 01");
+  std::vector<uint8_t> p(64, 0xee);
+  auto untouched = [&] { return std::all_of(p.begin(), p.end(), [](uint8_t b) { return b == 0xee; }); };
+  CHECK_EQ(rmnet::build_ipv4_header(p.data(), 19, 17, s4, d4, 8, 64), 0u);
+  CHECK_EQ(rmnet::build_ipv6_header(p.data(), 39, 17, s6.data(), d6.data(), 8, 64), 0u);
+  CHECK_EQ(rmnet::build_icmp4_echo(p.data(), 35, s4, d4, 1, 1, data, 8), 0u);                 // needs 20 + 8 + 8
+  CHECK_EQ(rmnet::build_icmp6_echo(p.data(), 55, s6.data(), d6.data(), 1, 1, data, 8), 0u);   // needs 40 + 8 + 8
+  CHECK(untouched());
+  CHECK_EQ(rmnet::build_ipv4_header(p.data(), 20, 17, s4, d4, 8, 64), 20u);
+  CHECK_EQ(rmnet::build_ipv6_header(p.data(), 40, 17, s6.data(), d6.data(), 8, 64), 40u);
+  CHECK_EQ(rmnet::build_icmp4_echo(p.data(), 36, s4, d4, 1, 1, data, 8), 36u);
+  CHECK_EQ(rmnet::build_icmp6_echo(p.data(), 56, s6.data(), d6.data(), 1, 1, data, 8), 56u);
+}
+TEST(ip_builders_refuse_lengths_past_their_16_bit_length_fields) {
+  const uint8_t s4[4] = {10, 102, 246, 230}, d4[4] = {223, 5, 5, 5};
+  auto s6 = hex("20 01 0d b8 8a f4 b2 60 61 fc 0d be 3a b2 6e 08"), d6 = hex("24 00 32 00 00 00 00 00 00 00 00 00 00 00 00 01");
+  std::vector<uint8_t> p(70000), data(65536, 0x5a);
+  // IPv4: the total length counts the 20-byte header, so the payload is at most 65515.
+  CHECK_EQ(rmnet::build_ipv4_header(p.data(), p.size(), 17, s4, d4, 65516, 64), 0u);
+  CHECK_EQ(rmnet::build_ipv4_header(p.data(), p.size(), 17, s4, d4, SIZE_MAX, 64), 0u);
+  CHECK_EQ(rmnet::build_ipv4_header(p.data(), p.size(), 17, s4, d4, 65515, 64), 20u); CHECK_BYTES(p.data() + 2, 2, "ff ff");
+  // IPv6: the payload length leaves out the 40-byte header, so the payload is at most 65535.
+  CHECK_EQ(rmnet::build_ipv6_header(p.data(), p.size(), 17, s6.data(), d6.data(), 65536, 64), 0u);
+  CHECK_EQ(rmnet::build_ipv6_header(p.data(), p.size(), 17, s6.data(), d6.data(), SIZE_MAX, 64), 0u);
+  CHECK_EQ(rmnet::build_ipv6_header(p.data(), p.size(), 17, s6.data(), d6.data(), 65535, 64), 40u);
+  CHECK_BYTES(p.data() + 4, 2, "ff ff");
+  // Echo requests: data of at most 65535 - 20 - 8 = 65507 bytes (IPv4) and 65535 - 8 = 65527 (IPv6).
+  // REQUIRE first: without that refusal, the SIZE_MAX call would copy SIZE_MAX bytes.
+  CHECK_EQ(rmnet::build_icmp4_echo(p.data(), p.size(), s4, d4, 1, 1, data.data(), 65507), 65535u);
+  CHECK_BYTES(p.data() + 2, 2, "ff ff");
+  REQUIRE(rmnet::build_icmp4_echo(p.data(), p.size(), s4, d4, 1, 1, data.data(), 65508) == 0u);
+  CHECK_EQ(rmnet::build_icmp4_echo(p.data(), p.size(), s4, d4, 1, 1, data.data(), SIZE_MAX), 0u);
+  CHECK_EQ(rmnet::build_icmp6_echo(p.data(), p.size(), s6.data(), d6.data(), 1, 1, data.data(), 65527), 65575u);
+  CHECK_BYTES(p.data() + 4, 2, "ff ff");
+  REQUIRE(rmnet::build_icmp6_echo(p.data(), p.size(), s6.data(), d6.data(), 1, 1, data.data(), 65528) == 0u);
+  CHECK_EQ(rmnet::build_icmp6_echo(p.data(), p.size(), s6.data(), d6.data(), 1, 1, data.data(), SIZE_MAX), 0u);
+}

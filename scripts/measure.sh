@@ -68,7 +68,9 @@
 # an interrupted run waits the same way. If the counters cannot be read at the end, the run is
 # charged at least its reservation in the measured direction (both: at least 200,000,000 in, its
 # in threshold plus the margin, and 50,000,000 out, its out threshold, which is its reservation in
-# all). A run refuses to start (exit 2) if a line of the usage file is not
+# all). A missing usage file is created with one comment line ("# created <UTC time>; ..."), so a
+# file this script made is never empty. A run refuses to start (exit 2) if the usage file is empty
+# (0 bytes: it was probably emptied by mistake, and must be restored by hand), if a line of it is not
 # "<time> <down|up> <bytes in> <bytes out>" with non-negative whole numbers, or if the recorded
 # total plus this run's reservation (its stop threshold plus a margin for what arrives after the
 # stop: 10,000,000 bytes for down and up, 40,000,000 for down-long, 25,000,000 for up-long; for
@@ -76,13 +78,19 @@
 # It warns when a run moved more than 60,000,000 bytes (down and up), 384,000,000 (down-long),
 # 72,000,000 (up-long; for the long modes, the stop threshold plus 20 percent) or 250,000,000
 # (both: its reservation), in and out together. The run fails if fewer than 1,000,000 bytes
-# crossed the port in the measured direction (curl did not go through it). both checks each side
+# crossed the port in the measured direction: the message says the port was gone at the end when
+# the last reading of its counters found no line for it, and otherwise that the transfers did not go
+# through it. both checks each side
 # on its own, since one direction's acknowledgements alone can pass 1,000,000 bytes in the other:
 # the download fails if its four streams together delivered fewer than 1,000,000 bytes (their own
 # counts), the upload if fewer than 1,000,000 bytes plus 3 percent of the bytes in left the port;
 # the message names the side. A run killed outright (SIGKILL) records nothing and leaves its
 # temporary directory (${TMPDIR:-/tmp}/measure.*) behind, with the upload body in it for up,
 # up-long and both (up to 20,000,000 bytes).
+#
+# On an interface whose name starts with utun it warns, before any transfer, that macOS was seen
+# counting every received packet twice on qmi-darwin's utun (2026-11-15), so the figures and the
+# recorded bytes may be double; the run is otherwise the same.
 #
 # For testing with no network: MEASURE_TEST_PORT=<port> sends every transfer to 127.0.0.1:<port>
 # over plain HTTP, MEASURE_NETSTAT=<program> replaces netstat, and MEASURE_USAGE_FILE=<file> replaces
@@ -209,6 +217,13 @@ for v in MEASURE_NETSTAT MEASURE_TEST_PORT MEASURE_USAGE_FILE; do
   echo "test setting:     $v=$val"
 done
 
+case $IFACE in
+  utun*)
+    echo "measure: WARNING: on qmi-darwin's utun interface macOS was seen counting every received packet" >&2
+    echo "measure: twice (2026-11-15), so this run's figures and its recorded bytes may be double" >&2
+    ;;
+esac
+
 # "bytes-in bytes-out" of the interface, from its link-level line. Counted from the end of the line
 # (Ibytes Opkts Oerrs Obytes Coll), because an interface with no link address (lo0) has no Address column.
 counters() {
@@ -241,10 +256,18 @@ usage_total() {
 mkdir -p "$(dirname "$USAGE")" || die "cannot create the directory of $USAGE"
 if [ ! -e "$USAGE" ]; then
   echo "" >&2
-  echo "measure: NOTE: the usage file $USAGE does not exist; creating it EMPTY, so the recorded" >&2
-  echo "measure: total starts at 0. If measurements were recorded before, restore the file first." >&2
+  echo "measure: NOTE: the usage file $USAGE does not exist; creating it with one comment line, so the" >&2
+  echo "measure: recorded total starts at 0. If measurements were recorded before, restore the file first." >&2
   echo "" >&2
-  : >"$USAGE" || die "cannot create $USAGE"
+  echo "# created $(date -u +%Y-%m-%dT%H:%M:%SZ); one line per run: time direction bytes-in bytes-out" >"$USAGE" ||
+    die "cannot create $USAGE"
+fi
+# A file this script creates is never empty, so an empty one was emptied: read as 0, it would let
+# runs start against the whole budget again.
+if [ ! -s "$USAGE" ]; then
+  echo "measure: REFUSED: the usage file $USAGE is empty (0 bytes); it was probably emptied by mistake," >&2
+  echo "measure: and must be restored by hand (nothing was sent, nothing was recorded)" >&2
+  exit 2
 fi
 if ! used=$(usage_total "$USAGE"); then
   echo "measure: REFUSED: the usage file $USAGE cannot be trusted (see above); fix it by hand" >&2
@@ -507,6 +530,9 @@ if [ "$DIR" = both ]; then
 fi
 if [ "$DIR" = down ]; then measured=$acc_in; else measured=$acc_out; fi
 if [ "$measured" -lt $MIN_BYTES ]; then
-  die "FAILED: only $measured bytes crossed $IFACE in the measured direction; curl did not go through it"
+  if [ "$last_ok" -eq 0 ]; then
+    die "FAILED: $IFACE was gone at the end of the run; $measured bytes were counted in the measured direction before that, and the run was charged at least its reservation"
+  fi
+  die "FAILED: only $measured bytes crossed $IFACE in the measured direction; the transfers did not go through it"
 fi
 exit 0

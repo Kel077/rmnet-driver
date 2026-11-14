@@ -1,0 +1,4 @@
+driver extension: unknown (no answer from the system in 10 s)
+modem: 2c7c:0801 attached, QMI interface 4 (class, subclass, protocol ff)
+driver: RMNetDriver attached
+  RMNetState = up
