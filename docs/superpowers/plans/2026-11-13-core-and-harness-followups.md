@@ -94,6 +94,7 @@ Small hardening left open:
 - "usb failed" is published for about 4 s on re-enumeration.
   - **Settled in code (2026-11-14, 317.8.44).** `RMNetState` says `detached` instead when UsbIo had seen a not-attached or no-device status (`UsbIo::device_gone`). Not yet seen: the instance replaced at the 317.8.44 load was the older 316.19.56, which still said `usb failed`; the next reload is the first that can show it.
   - **Reopened (2026-11-14, sleep and wake task).** The reload of 317.8.44 showed it never fires on a modem reboot: the re-post fails with `0xe00002d8`, which is `kIOReturnNotReady`, not `kIOReturnNotAttached` (`0xe00002d9`), and the interrupt read itself ends `kIOReturnAborted`. `Gone()` in `driver/usb_io.cpp` matches neither. Decide whether `kIOReturnNotReady` from a submission means gone (it may also come from a bus not yet awake after a sleep).
+  - **Decided (2026-11-14, the recovery plan's final review): `kIOReturnNotReady` does not count as gone, and `Gone()` stays as it is.** See that review's section below.
 - A failed `WakeAtTime` ends all ticks, and while stopping can stall `Stop`. Since the uplink-hold plan's fix wave it matters more: `TxPacketsAvailable_Impl` returns early while a hold is on, so after a failed bulk OUT completion, the end of a recovery or a link down, the 100 ms tick is the only thing that restarts a held drain. With no tick and no transfer in flight, the uplink would stay held for good. Not seen.
   - **Settled in code (2026-11-14, 317.8.44), not seen on hardware.** A failed arm is remembered and `RMNetDriver::EnsureTimer` retries it from every completion handler, `TxPacketsAvailable_Impl` and `RxPacketsAvailable_Impl`, also while stopping, never after the stop sequence has cancelled the timer; `RMNetTimerArmFailures` counts failures. A failed arm also counts as no timer in `AdvanceStop`'s two waits, and a failed re-arm in the stopping tick advances the stop at once, so `Stop` finishes without its timer (fix round 1, after 317.8.44).
 - The first-time log line "first qmap command reply kept" (`CoreHost::keep_reply`), like `first qmap command` and `first uplink transfer`, can fall inside a bulk-read handler that `RMNetRxHandlerMaxUs` times, so one of them could set the maximum once.
@@ -165,10 +166,53 @@ Small hardening:
 - **Sleep and wake.** Build 317.9.11 holds `UsbIo` at power off and resumes it and restarts the session at power on (`docs/driverkit-notes.md` 3.8, "As built").
   - **Seen on hardware (2026-11-14, 17:22 to 17:23), for one case:** the device stayed attached and its requests stayed pending. Two power-offs and two wakes (for three sleep entries in `pmset -g log`; which one did not reach the driver is unknown), the same driver instance throughout, `RMNetSleepCompletions` 0, link up 0.58 s after the last wake with new addresses in both families, both pings 5 of 5, every USB error counter 0 (`docs/driverkit-notes.md`, "Runtime findings (sleep and wake)").
   - **Open (not seen):** a sleep during which the stack cancels or fails transfers; a re-enumeration on wake; a bus that answers not-ready at the wake call; a sleep longer than half a minute; a `Stop` while asleep.
-- **A bus not ready at the wake call is fatal.** If posting the interrupt read or a bulk read at resume fails (for example with `kIOReturnNotReady`), the port goes down as `usb failed` and stays down until a re-enumeration or a manual reload; nothing retries. That meets "fresh addresses or down", but a retry after a short delay may be needed if it is ever seen. Not seen in the one test.
+- **A bus not ready at the wake call is fatal.** If posting the interrupt read or a bulk read at resume fails (for example with `kIOReturnNotReady`), the port goes down as `usb failed` and stays down until a re-enumeration or a manual reload; nothing retries. That meets "fresh addresses or down", but a retry after a short delay may be needed if it is ever seen. Not seen in the one test. **Raised from minor by the recovery plan's final review; open** (below).
 - **Uplink transfers that complete while held** are counted neither as sent nor as dropped (`RMNetTxPackets`, `RMNetTxDropUsb`), and reads that complete while held are discarded unread.
 
 ## Sent here by the recovery plan's Task 5, the soak (2026-11-14)
 
 - **The 30-minute soak has been run.** `scripts/soak.sh en33 30` on 317.9.11, 17:25 to 17:55: `soak: PASS`, the state `up` in all 181 samples, every listed error and drop counter 0 first and last, 0.0 % loss on 3,560 IPv4 and 3,559 IPv6 pings, about 15.2 MB moved (`docs/driverkit-notes.md`, "Runtime findings (30-minute soak)"). Under light traffic only (two 1,000-byte pings a second in each family); sustained heavy traffic has not been soaked.
 - **The liveness probe is noisy in the log.** Every 30 s, idle or not, it logs three lines: `qmi tx WDS client 15 msg 0x002d`, the `result ok` response, and `settings IPv4: ...` (61 probes, 183 lines, in the soak's 30 minutes, and nothing else). A candidate to quieten: log the probe's exchange and an unchanged settings line only when something differs or fails.
+
+## Sent here by the recovery plan's final review (2026-11-14)
+
+Decisions (the controller's rulings for the one fix wave):
+
+- **`detached` and not-ready (decided).** `kIOReturnNotReady` does not count as "device gone": held completions, and a submission right at the wake, can plausibly return not-ready from a device still attached, and counting it as gone would turn a recoverable wake into a permanently detached port; so on a modem reboot the old instance shows `usb failed` for a few milliseconds before `Stop`, and the window may show "Link down" once. `Gone()` in `driver/usb_io.cpp` is unchanged.
+- **No retry at the wake (decided: recorded, not built; the gap stays open, raised from minor).** If a re-post is refused when the driver resumes, the port goes down as `usb failed` and nothing retries until a re-enumeration or a manual reload; a retry of `resume` and the restart from the tick for about 5 s would close it. Not built because the bus was ready at the wake on 2026-11-14 and the new resume state could not be exercised here.
+- **The window's 2-second refresh stays (decided).** The plan asked for it; it asks the system for the listing every 2 s.
+
+Open:
+
+- **A pause that keeps coming back.** A modem that keeps its flow-control pause makes the session restart about every 30 s with no "second time is fatal" rule; between restarts the link looks up and passes no uplink traffic. Never seen.
+- **A gap in the design.** Goal 5 names "the network dropping the connection", but no "Done means" line covers it; a network-side drop with the modem still attached has never been seen on hardware (Core's tests and the disconnect indication at modem reboots cover the logic).
+- **Testing the driver.** Nothing under `driver/` has a test; the cheapest worthwhile step is to move the uplink stall counter (`out_seq_`, `out_stall_mark_`, `out_stalls_`, `out_stuck_restarted_`) into a small plain C++ struct under `core/` and unit-test it (`CoreHost` would need a `UsbIo` interface to be testable on the host).
+
+Minor, one line each:
+
+- Core: the probe's "contents ignored" check is weak.
+- Core: the teardown after the probe's redial is unchecked.
+- Core: only one reconfigure order is tested.
+- Core tests: `without_tlv` is duplicated.
+- Driver: "timer armed again" can flood the log.
+- Driver: `usbDetached` is fixed at the moment of the fatal report.
+- Driver: with a failed timer arm, a held drain or an abort that never returns waits for unrelated traffic.
+- Driver: the host stack's own aborts count as an uplink stall.
+- Driver: whether the 5 s uplink timeout runs from submission or from the head of the queue is unknown.
+- Driver: a pause-timeout restart does not reset the stall count.
+- Driver: a timeout during a bulk OUT recovery still counts as a stall.
+- App: the table keeps the last known versions when the listing turns unknown.
+- App: with no embedded driver, the "cannot" text gives the wrong reason.
+- App: `Remove…` does nothing, silently, if the listing turns unknown while the confirmation is open.
+- App: a properties request that never answers leaks one delegate every 10 s.
+- App: the buttons stay off while an approval is pending.
+- App: the "switched off" advice fires for any two-entry listing, an update in progress included.
+- App: the window asks the system for the listing every 2 s.
+- Sleep: a re-enumeration during the sleep shows `usb failed`.
+- Sleep: uplink packets that complete while held are counted neither as sent nor as dropped.
+- Sleep: "control request failed" is logged for requests aborted at suspend.
+- Sleep: nothing tests hold, resume, or stopping while held.
+- `soak.sh`: a sample whose status has an `error` key is classed unreadable even when the registry part says `up`.
+- `soak.sh`: the crash-report listing hides a permission failure and does not list `Retired/`.
+- `soak.sh`: the usage reader is a copy of `measure.sh`'s.
+- The liveness probe writes three log lines every 30 s.

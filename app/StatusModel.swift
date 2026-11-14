@@ -66,13 +66,21 @@ private func isSwitchedOff(_ e: ExtensionEntry) -> Bool {
     !e.enabled && !e.awaitingApproval && !e.uninstalling
 }
 
-// The lines shown under the headline, most specific first; the last line is always the warning.
+let removalUnderWayLine = "The system is removing the driver; the removal finishes when the modem is unplugged or the Mac restarts. Install is available after that."
+
+// The lines shown under the headline, most specific first; the last line is the warning, except
+// while every listed entry is uninstalling, when the one line is `removalUnderWayLine`.
 func advice(_ s: DriverStatus, bundledVersion: String) -> [String] {
     var lines: [String] = []
     if case .notQMI = s.modem {
         lines.append("The modem is attached but not in QMI mode. Send it these two AT commands, then wait for it to come back:")
         lines.append("AT+QCFG=\"usbnet\",0")
         lines.append("AT+CFUN=1,1")
+    }
+    // A listing made only of entries the system is removing: the removal is under way, and the
+    // window says only that (no Remove to press, Install off until the entries are gone).
+    if !s.entries.isEmpty && s.entries.allSatisfy({ $0.uninstalling }) {
+        return [removalUnderWayLine]
     }
     if s.entries.count > 1 || s.entries.contains(where: isSwitchedOff) {
         lines.append("The driver was switched off in System Settings, so the system keeps an old entry and refuses every new installation.")
@@ -81,23 +89,25 @@ func advice(_ s: DriverStatus, bundledVersion: String) -> [String] {
             lines.append("The system is removing the driver; it goes when the modem is unplugged or the Mac restarts.")
         } else if entry.awaitingApproval {
             lines.append("Open System Settings, General, Login Items & Extensions, Driver Extensions, and turn RMNet on.")
-        } else if !bundledVersion.isEmpty && entry.version != bundledVersion {
-            lines.append("Update will replace version \(entry.version) with version \(bundledVersion). The new build loads when the modem is next plugged in or the Mac restarts.")
+        } else if !bundledVersion.isEmpty && compareVersions(bundledVersion, entry.version) != 0 {
+            lines.append("\(installTitle(s, bundledVersion: bundledVersion)) will replace version \(entry.version) with version \(bundledVersion). The new build loads when the modem is next plugged in or the Mac restarts.")
         }
     }
     if s.entries.count == 1, !s.attached, case .qmi = s.modem, headline(s) == "Connecting" {
         lines.append("The modem is in QMI mode but the driver has not attached. If this lasts, unplug the modem and plug it in again.")
     }
     if !canActivate(s) {
-        lines.append("Install and Update are off until this is cleared. \(keptAppsLine(s.entries))")
+        let kept = keptAppsLine(s.entries)
+        lines.append("Install and Update are off until this is cleared." + (kept.isEmpty ? "" : " " + kept))
     }
     lines.append("Do not switch the driver off in System Settings while the modem is attached. Use Remove here.")
     return lines
 }
 
-// Deactivation works only from an app that embeds the installed version, and only with one entry.
+// Deactivation works only from an app that embeds the installed version, and only with one entry,
+// which the system is not already removing.
 func canRemoveDirectly(_ s: DriverStatus, bundledVersion: String) -> Bool {
-    s.entries.count == 1 && s.entries[0].version == bundledVersion
+    s.entries.count == 1 && s.entries[0].version == bundledVersion && !s.entries[0].uninstalling
 }
 
 // Whether an activation may be sent. Not when the listing shows the stuck state: more than one
@@ -107,11 +117,45 @@ func canActivate(_ s: DriverStatus) -> Bool {
     s.entries.count <= 1 && !s.entries.contains(where: { isSwitchedOff($0) || $0.uninstalling })
 }
 
-// Which kept app removes each listed version.
+// Which kept app removes each listed version. Entries the system is already removing are left out:
+// they need no Remove. Empty when no other entry is listed.
 func keptAppsLine(_ entries: [ExtensionEntry]) -> String {
-    let apps = entries.map { "\($0.version) from build/installed/RMNet-\($0.version).app" }
+    let apps = entries.filter { !$0.uninstalling }.map { "\($0.version) from build/installed/RMNet-\($0.version).app" }
+    if apps.isEmpty { return "" }
     return "Use Remove once for each listed version, from the app that carries it, kept in the project folder: "
         + apps.joined(separator: "; ") + "."
+}
+
+// Compares two versions such as "317.9.11" and "317.10.2" field by field (fields split on dots):
+// two numeric fields compare as numbers, any other pair as text, and a missing field counts as "0".
+// Returns -1 when `a` is older, 0 when equal, 1 when newer.
+func compareVersions(_ a: String, _ b: String) -> Int {
+    let x = a.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+    let y = b.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+    for i in 0..<max(x.count, y.count) {
+        let p = i < x.count ? x[i] : "0"
+        let q = i < y.count ? y[i] : "0"
+        if let m = Int(p), let n = Int(q) {
+            if m != n { return m < n ? -1 : 1 }
+        } else if p != q {
+            return p < q ? -1 : 1
+        }
+    }
+    return 0
+}
+
+// The install button's title, and the word the advice uses for it: Install when nothing is listed
+// (entries the system is removing do not count), else by the bundled version against the listed
+// one: Update when newer, Reinstall when equal, Replace when older. Update when the bundled version
+// is unknown (the button is off then).
+func installTitle(_ s: DriverStatus, bundledVersion: String) -> String {
+    guard let listed = s.entries.first(where: { !$0.uninstalling }) else { return "Install" }
+    if bundledVersion.isEmpty { return "Update" }
+    switch compareVersions(bundledVersion, listed.version) {
+    case 1: return "Update"
+    case 0: return "Reinstall"
+    default: return "Replace"
+    }
 }
 
 // The listing in words: "316.19.56 (enabled)", "none".
@@ -127,17 +171,18 @@ func describeListing(_ entries: [ExtensionEntry]) -> String {
 
 // What Remove… sends for a listing, with this app carrying `bundledVersion`.
 enum RemovalPlan: Equatable {
-    case nothingListed           // nothing to remove; the button is off
-    case deactivate              // the bundled version is listed: deactivate it
+    case nothingListed           // nothing to remove (no entry, or every entry is uninstalling); the button is off
+    case deactivate              // the bundled version is listed and not uninstalling: deactivate it
     case activateThenDeactivate  // one entry of another version: replace it with the bundled one first
-    case cannot                  // stuck, and the bundled version is not listed: send nothing
+    case cannot                  // stuck, and the bundled version is not listed apart from uninstalling: send nothing
 }
 
 func removalPlan(_ s: DriverStatus, bundledVersion: String) -> RemovalPlan {
-    if s.entries.isEmpty { return .nothingListed }
+    if s.entries.allSatisfy({ $0.uninstalling }) { return .nothingListed }  // true for no entry too
     if canRemoveDirectly(s, bundledVersion: bundledVersion) { return .deactivate }
     if !canActivate(s) {
-        return s.entries.contains(where: { $0.version == bundledVersion }) ? .deactivate : .cannot
+        // An entry the system is already removing is never deactivated a second time.
+        return s.entries.contains(where: { $0.version == bundledVersion && !$0.uninstalling }) ? .deactivate : .cannot
     }
     return bundledVersion.isEmpty ? .cannot : .activateThenDeactivate
 }

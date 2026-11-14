@@ -116,8 +116,10 @@ struct StatusModelTests {
         check(!advice(status([enabled]), bundledVersion: "316.19.56").contains { $0.contains("Install and Update are off") },
               "advice: no can't-activate line when activation is allowed")
         let leavingAdvice = advice(status([leaving]), bundledVersion: "316.21.4")
-        check(leavingAdvice.contains { $0.contains("build/installed/RMNet-316.19.56.app") },
-              "advice: uninstalling names the kept app", "\(leavingAdvice)")
+        check(leavingAdvice == [removalUnderWayLine], "advice: only uninstalling entries gives only the removal line",
+              "\(leavingAdvice)")
+        check(!leavingAdvice.contains { $0.contains("build/installed/") || $0.contains("Use Remove") },
+              "advice: uninstalling names no kept app and no Remove", "\(leavingAdvice)")
 
         // --- removalPlan, for an app carrying B = 316.21.4 (A = 316.19.56) --------------------
         let b = "316.21.4"
@@ -127,7 +129,7 @@ struct StatusModelTests {
             ("[A enabled, B enabled]", [enabled, bEnabled], .deactivate),
             ("[A switched off, B enabled]", [switchedOff, bEnabled], .deactivate),
             ("[B enabled]", [bEnabled], .deactivate),
-            ("[A uninstalling]", [leaving], .cannot),
+            ("[A uninstalling]", [leaving], .nothingListed),
             ("no entry", [], .nothingListed),
         ]
         for (name, entries, want) in plans {
@@ -135,6 +137,64 @@ struct StatusModelTests {
             check(got == want, "removalPlan: \(name)", "want \(want), got \(got)")
         }
         check(removalPlan(status([enabled]), bundledVersion: "") == .cannot, "removalPlan: unknown bundled version")
+
+        // --- a removal under way, for an app carrying B (A1) -------------------------------------
+        let bLeaving = ExtensionEntry(version: b, enabled: true, awaitingApproval: false, uninstalling: true)
+        struct Under { var name: String; var entries: [ExtensionEntry]; var plan: RemovalPlan
+                       var canActivate: Bool; var canRemoveDirectly: Bool; var title: String }
+        let under: [Under] = [
+            Under(name: "[B enabled]", entries: [bEnabled], plan: .deactivate,
+                  canActivate: true, canRemoveDirectly: true, title: "Reinstall"),
+            Under(name: "[B uninstalling]", entries: [bLeaving], plan: .nothingListed,
+                  canActivate: false, canRemoveDirectly: false, title: "Install"),
+            Under(name: "[A uninstalling]", entries: [leaving], plan: .nothingListed,
+                  canActivate: false, canRemoveDirectly: false, title: "Install"),
+            Under(name: "[A enabled, B uninstalling]", entries: [enabled, bLeaving], plan: .cannot,
+                  canActivate: false, canRemoveDirectly: false, title: "Update"),
+        ]
+        for u in under {
+            let s = status(u.entries, attached: true, ["RMNetState": "up"])
+            let plan = removalPlan(s, bundledVersion: b)
+            check(plan == u.plan, "removal under way: plan for \(u.name)", "want \(u.plan), got \(plan)")
+            check(canActivate(s) == u.canActivate, "removal under way: canActivate for \(u.name)")
+            check(canRemoveDirectly(s, bundledVersion: b) == u.canRemoveDirectly, "removal under way: canRemoveDirectly for \(u.name)")
+            let title = installTitle(s, bundledVersion: b)
+            check(title == u.title, "removal under way: title for \(u.name)", "want \(u.title), got \(title)")
+        }
+        check(advice(status([bLeaving], attached: true, ["RMNetState": "up"]), bundledVersion: b) == [removalUnderWayLine],
+              "advice: [B uninstalling] gives only the removal line")
+        let mixed = advice(status([enabled, bLeaving]), bundledVersion: b)
+        check(mixed.contains { $0.contains("build/installed/RMNet-316.19.56.app") }, "advice: [A enabled, B uninstalling] names A's kept app", "\(mixed)")
+        check(!mixed.contains { $0.contains("RMNet-316.21.4.app") }, "advice: [A enabled, B uninstalling] leaves B out", "\(mixed)")
+        check(keptAppsLine([bLeaving]) == "", "keptAppsLine: only uninstalling entries gives nothing")
+        check(!advice(status([leaving, bLeaving]), bundledVersion: b).contains { $0.hasSuffix("cleared. ") },
+              "advice: no dangling text when no kept app is named")
+
+        // --- versions and the install button's title (A2) ----------------------------------------
+        let versions: [(String, String, Int)] = [
+            ("317.10.2", "317.9.11", 1), ("317.9.11", "317.10.2", -1), ("317.9.11", "317.9.11", 0),
+            ("317.9", "317.9.0", 0), ("317.9.1", "317.9", 1), ("317.9a", "317.9b", -1), ("318", "317.99.99", 1),
+        ]
+        for (x, y, want) in versions {
+            check(compareVersions(x, y) == want, "compareVersions(\(x), \(y))", "want \(want), got \(compareVersions(x, y))")
+        }
+        let installed = ExtensionEntry(version: "317.9.11", enabled: true, awaitingApproval: false, uninstalling: false)
+        let titles: [(String, String)] = [("317.10.2", "Update"), ("317.9.11", "Reinstall"), ("317.9.10", "Replace")]
+        for (bundled, want) in titles {
+            let got = installTitle(status([installed]), bundledVersion: bundled)
+            check(got == want, "installTitle: bundled \(bundled) over 317.9.11", "want \(want), got \(got)")
+            check(canActivate(status([installed])), "installTitle: the button stays on for \(want)")
+        }
+        check(installTitle(status([]), bundledVersion: "317.9.11") == "Install", "installTitle: nothing listed")
+        check(installTitle(status([installed]), bundledVersion: "") == "Update", "installTitle: unknown bundled version")
+        let older = advice(status([installed], attached: true, ["RMNetState": "up"]), bundledVersion: "317.9.10")
+        check(older.contains { $0.hasPrefix("Replace will replace version 317.9.11 with version 317.9.10") },
+              "advice: an older bundled version says Replace", "\(older)")
+        let newer = advice(status([installed], attached: true, ["RMNetState": "up"]), bundledVersion: "317.10.2")
+        check(newer.contains { $0.hasPrefix("Update will replace version 317.9.11 with version 317.10.2") },
+              "advice: a newer bundled version says Update", "\(newer)")
+        let same = advice(status([installed], attached: true, ["RMNetState": "up"]), bundledVersion: "317.9.11")
+        check(same == [alwaysLine], "advice: the same version says nothing about replacing", "\(same)")
 
         // --- describeListing ---------------------------------------------------------------------
         check(describeListing([]) == "none", "describeListing: none")

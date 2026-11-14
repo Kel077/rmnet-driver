@@ -64,6 +64,7 @@ void Session::stop() {
   pending_.active = false;
   cancel_retry();
   refresh_other_ = false;
+  next_backoff_ms_ = kFirstBackoffMs;  // a session started again begins as a fresh one
   state_ = SessionState::Idle;
   if (link_is_up_) {
     link_is_up_ = false;

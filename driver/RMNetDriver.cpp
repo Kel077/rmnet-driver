@@ -57,7 +57,6 @@ enum : uint32_t {
   kLogFree = 1u << 1,
   kLogStart = 1u << 2,
   kLogStop = 1u << 3,
-  kLogSetPowerState = 1u << 4,  // unused: SetPowerState logs every call
   kLogSetInterfaceEnable = 1u << 5,
   kLogSetPromiscuous = 1u << 6,
   kLogSetAllMulticast = 1u << 7,
@@ -504,6 +503,7 @@ void RMNetDriver::TearDown(IOService* provider) {
   ivars->stopProvider = provider;
   provider->retain();
   ivars->stopStartMs = NowMs();
+  ivars->wakeUpPending = false;  // no link up can follow now: none is measured from an old wake
   // Not again if OnUsbFatal already stopped the session: Core is not called after stop().
   if (ivars->core && !ivars->coreStopped) {
     ivars->coreStopped = true;
@@ -595,6 +595,9 @@ kern_return_t RMNetDriver::SetPowerState_Impl(uint32_t powerFlags) {
     }
     if (!ivars->stopping && ivars->core && ivars->usb) PublishCounters();
   }
+  // Like every other entry into the driver, retries a failed arm. At a wake this is what restarts
+  // everything periodic: the liveness probe, the sync resends.
+  EnsureTimer();
   return SetPowerState(powerFlags, SUPERDISPATCH);  // must reach the superclass to acknowledge
 }
 
@@ -638,8 +641,7 @@ void RMNetDriver::PowerOn(uint32_t powerFlags) {
   LOG("wake %llu: resuming usb and restarting the session", ivars->wakes);
   if (!ivars->usb->resume()) return;  // a read that could not be posted already reported usb failed
   ivars->wakeUpPending = true;
-  RestartSession("wake");
-  EnsureTimer();  // everything periodic hangs on the tick: the liveness probe, the sync resends
+  RestartSession("wake");  // SetPowerState_Impl then retries a failed timer arm (EnsureTimer)
 }
 
 // Reports the link status last decided (ivars->linkActive). A failure is logged and does not
@@ -664,12 +666,15 @@ void RMNetDriver::OnControl(const uint8_t* data, size_t len) {
 // uplink keeps timing out, the device has gone). The session cannot continue: stop it and report
 // the link down. It is not restarted; a re-enumeration starts afresh. RMNetState says "detached"
 // rather than "usb failed" when UsbIo had seen a not-attached or no-device status by then: the
-// device went away (every modem reboot shows this a few seconds before Stop).
+// device went away. A modem reboot does not show that: its transfers end in kIOReturnNotReady
+// (0xe00002d8), which does not count as gone (a device still attached can return it around a wake),
+// so the old instance shows "usb failed" for a few milliseconds before Stop.
 void RMNetDriver::OnUsbFatal(const char* what) {
   bool gone = ivars->usb && ivars->usb->device_gone();
   LOG("usb failed: %{public}s%{public}s", what, gone ? " (device gone)" : "");
   ivars->usbFailed = true;
   ivars->usbDetached = gone;
+  ivars->wakeUpPending = false;  // the session is not restarted, so the wake's link up never comes
   if (ivars->stopping || !ivars->core) return;
   ivars->core->drop_kept_replies();  // they will never find an uplink buffer (not the Session)
   if (ivars->coreStopped) return;
@@ -1026,10 +1031,6 @@ void RMNetDriver::OnBulkIn(const uint8_t* data, size_t len) {
   if (ivars->core->take_uplink_resumed()) DrainTx();
 }
 
-// A completed uplink transfer frees its buffer: a drain that stopped for want of one restarts.
-// CoreHost runs first, so a QMAP command reply it kept takes the freed buffer before the drain.
-// Only after a success: UsbIo reports a failed transfer before it starts a stall recovery, so a
-// drain then could submit to a halted pipe; the timer tick restarts it instead.
 // UsbIo found the uplink stuck for the first time since a successful transfer. Called from inside
 // UsbIo::bulk_out_complete: only recorded here; BulkOutComplete_Impl restarts the session once
 // that call has returned.
@@ -1037,6 +1038,10 @@ void RMNetDriver::OnUplinkStuck() {
   ivars->uplinkStuck = true;
 }
 
+// A completed uplink transfer frees its buffer: a drain that stopped for want of one restarts.
+// CoreHost runs first, so a QMAP command reply it kept takes the freed buffer before the drain.
+// Only after a success: UsbIo reports a failed transfer before it starts a stall recovery, so a
+// drain then could submit to a halted pipe; the timer tick restarts it instead.
 void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
   if (ivars->stopping || !ivars->core) return;
   ivars->core->on_bulk_out_done(slot, ok);

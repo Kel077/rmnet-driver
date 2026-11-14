@@ -67,7 +67,7 @@ final class StatusController: ObservableObject {
         }
     }
 
-    var installTitle: String { status.entries.isEmpty ? "Install" : "Update" }
+    var installButtonTitle: String { installTitle(status, bundledVersion: bundledVersion) }
     var installEnabled: Bool { !busy && known && canActivate(status) && !bundledVersion.isEmpty }
     var plan: RemovalPlan { removalPlan(status, bundledVersion: bundledVersion) }
     var removeEnabled: Bool { !busy && known && plan != .nothingListed }
@@ -216,7 +216,7 @@ struct StatusView: View {
             }
             HStack {
                 Spacer()
-                Button(controller.installTitle) { controller.install() }
+                Button(controller.installButtonTitle) { controller.install() }
                     .disabled(!controller.installEnabled)
                 Button("Remove…") {
                     // With nothing it can send, Remove only says which app can.

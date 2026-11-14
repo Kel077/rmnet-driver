@@ -609,7 +609,9 @@ void quiet(rmnet::Session& s, FakeModem& m, uint64_t from, uint64_t to) {
 
 // The worst case for a silent modem: a retry falls due just before the next probe and goes out to
 // a modem that no longer answers. Its Start Network waits 60 s, the probe follows and waits 10 s:
-// the link goes down 100 s after the last answered probe.
+// the link goes down about 100 s after the modem goes silent (here, the last answered probe; a
+// retry that first re-runs its earlier steps with slow answers can make it about 130 s from the
+// last answered probe).
 TEST(silent_modem_during_a_retry_is_noticed_after_the_retry_times_out) {
   FakeModem m; rmnet::Session s({}, m);
   up_with_slow_third_retry(s, m, 50000);                                      // last answered probe 60100; retry due 90000
@@ -623,7 +625,7 @@ TEST(silent_modem_during_a_retry_is_noticed_after_the_retry_times_out) {
   s.tick(150100); CHECK_EQ(m.sent.size(), sent + 1);                          // the probe, not a second retry
   CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);
   quiet(s, m, 150200, 160000);
-  s.tick(160100);                                                             // 100000 ms after the last answered probe
+  s.tick(160100);                                                             // 100000 ms after the modem went silent
   CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(m.downs, 1);
   s.tick(160200); CHECK_EQ(m.downs, 1);
 }
@@ -639,4 +641,71 @@ TEST(retry_and_probe_due_on_the_same_tick_send_the_retry_first) {
   s.tick(90200); CHECK_EQ(m.sent.size(), sent + 2);
   CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);                     // then the probe, on the next tick
   CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0);
+}
+
+// Restarting: stop() then start(), as CoreHost::restart does at a wake or after an uplink stall.
+
+namespace {
+
+// Feeds the capture's bring-up responses at `now`, each with the transaction ID of the request
+// just sent (8 bits for CTL, 16 otherwise), so a session restarted mid-life can be brought up.
+// `after_wds4_client` runs once the IPv4 WDS client is granted.
+template <typename F>
+void bring_up_again(rmnet::Session& s, FakeModem& m, uint64_t now, F after_wds4_client) {
+  for (const char* r : kBringUpResponses) {
+    std::vector<uint8_t> f = hex(r);
+    if (f[4] == 0) f[7] = static_cast<uint8_t>(m.last_txid());
+    else f = with_txid(r, m.last_txid());
+    feed_frame(s, f, now);
+    if (r == kCtlGetWds4Resp) after_wds4_client();
+  }
+}
+
+// Ticks every second from `t` until the session is in `want`; returns that time.
+uint64_t tick_until(rmnet::Session& s, uint64_t t, rmnet::SessionState want) {
+  while (s.state() != want && t < 10000000) s.tick(t += 1000);
+  return t;
+}
+
+}  // namespace
+
+TEST(restart_from_up_with_a_probe_outstanding_ignores_its_late_answer) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m);
+  s.tick(30100); CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);      // the probe is outstanding
+  uint16_t probe = m.last_txid(); size_t before = m.sent.size();
+  s.stop();
+  CHECK_EQ(m.sent.size(), before + 5); CHECK_EQ(m.downs, 1);                  // the teardown went out:
+  CHECK_EQ(m.sent[before + 0][5], 16); CHECK_EQ(m.sent[before + 0][9], 0x21); // Stop Network on IPv6 (the probe
+  CHECK_EQ(m.sent[before + 2][5], 15); CHECK_EQ(m.sent[before + 2][9], 0x21); // took one transaction ID), IPv4,
+  CHECK_BYTES(m.sent[before + 4], kCtlReleaseWdaReq);                         // then the WDA client released
+  s.start(30200);
+  CHECK(s.state() == rmnet::SessionState::Syncing); CHECK_EQ(m.sent.size(), before + 6);
+  CHECK_EQ(m.last()[4], 0x00); CHECK_EQ(m.last()[8], 0x27);                    // the next request is a CTL Sync
+  size_t sent = m.sent.size();
+  feed_frame(s, settings4_response_with_txid(probe), 30300);                  // the late answer to the old probe
+  CHECK(s.state() == rmnet::SessionState::Syncing); CHECK_EQ(m.sent.size(), sent); CHECK_EQ(m.ups, 1);
+  bring_up_again(s, m, 30400, [&] {
+    size_t n = m.sent.size(); uint16_t bind = m.last_txid();
+    feed_frame(s, settings4_response_with_txid(probe), 30400);                // again, with client 15 granted anew
+    CHECK(s.state() == rmnet::SessionState::Connecting); CHECK_EQ(m.sent.size(), n); CHECK_EQ(m.last_txid(), bind);
+  });
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2); CHECK_EQ(m.downs, 1);   // link_down exactly once
+  CHECK(m.cfg.settings.has_v4); CHECK(m.cfg.settings.has_v6);
+}
+
+TEST(restart_from_backoff_starts_with_the_first_backoff_again) {
+  FakeModem m; rmnet::Session s({}, m); s.start(0);
+  uint64_t t = 0;
+  for (int i = 0; i < 3; ++i) {                                               // Sync gives up three times: 2 s, 4 s, 8 s
+    t = tick_until(s, t, rmnet::SessionState::Backoff);
+    t = tick_until(s, t, rmnet::SessionState::Syncing);
+  }
+  t = tick_until(s, t, rmnet::SessionState::Backoff);                         // now waiting 16 s
+  s.stop(); CHECK(s.state() == rmnet::SessionState::Idle);
+  s.start(t);
+  uint64_t failed = t;                                                        // the restarted Sync gives up 60 s later
+  while (s.state() == rmnet::SessionState::Syncing) s.tick(++failed);
+  CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(failed, t + 60000);
+  s.tick(failed + 1999); CHECK(s.state() == rmnet::SessionState::Backoff);
+  s.tick(failed + 2000); CHECK(s.state() == rmnet::SessionState::Syncing);   // the first wait, 2 s, as a fresh session
 }

@@ -77,13 +77,16 @@ enum : uint32_t {
 
 enum : uint32_t { kFamilyRetryFirstMs = 5000, kFamilyRetryMaxMs = 60000 };   // 5 s, 10 s, 20 s, 40 s, then 60 s
 
-// How long a modem that goes silent while Up can go unnoticed, counted from the last answered
-// probe: normally about 40 s (the interval, then the probe's kRequestTimeoutMs). With one family
-// missing, a retry outstanding as the modem goes silent delays the probe, since only one request
-// is outstanding at a time and a retry that times out keeps the link up: a retry sent just before
-// the probe falls due waits up to kStartNetworkTimeoutMs, then the probe goes on the next tick and
-// waits kRequestTimeoutMs, so about 100 s. No second retry can start first: the next one waits at
-// least kFamilyRetryFirstMs (silent_modem_during_a_retry_is_noticed_after_the_retry_times_out).
+// How long a modem that goes silent while Up can go unnoticed: normally about 40 s from the last
+// answered probe (the interval, then the probe's kRequestTimeoutMs). With one family missing, a
+// retry outstanding as the modem goes silent delays the probe, since only one request is
+// outstanding at a time and a retry that times out keeps the link up: a retry sent just before the
+// probe falls due waits up to kStartNetworkTimeoutMs, then the probe goes on the next tick and
+// waits kRequestTimeoutMs, so about 100 s from the moment the modem goes silent. Counted from the
+// last answered probe it can be about 130 s, when the retry has to re-run its earlier steps (Get
+// Client ID, Bind Mux, Set IP Family) with slow answers before its Start Network. No second retry
+// can start first: the next one waits at least kFamilyRetryFirstMs
+// (silent_modem_during_a_retry_is_noticed_after_the_retry_times_out).
 enum : uint32_t { kLivenessIntervalMs = 30000 };
 
 class Session {
@@ -92,7 +95,8 @@ class Session {
 
   void start(uint64_t now_ms);  // Idle -> Syncing; ignored in any other state
   // Stops started calls and releases clients without waiting for answers, then -> Idle.
-  // Calls link_down() if the link was up.
+  // Calls link_down() if the link was up. The backoff returns to its first wait, so a session
+  // started again begins as a fresh one.
   void stop();
   void on_qmi(const uint8_t* data, size_t len, uint64_t now_ms);
   void tick(uint64_t now_ms);  // the host calls this at least every 250 ms

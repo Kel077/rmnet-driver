@@ -111,7 +111,7 @@ final class ExtensionManager {
         }
         switch removalPlan(status, bundledVersion: bundledVersion) {
         case .nothingListed:
-            completion(.notSent("The system lists no driver; there is nothing to remove."))
+            completion(.notSent("The system lists no driver it is not already removing; there is nothing to remove."))
         case .cannot:
             completion(.notSent("This app carries version \(bundledVersion.isEmpty ? "unknown" : bundledVersion), "
                                 + "which is not listed, and the listing does not allow installing it first. "
@@ -125,7 +125,7 @@ final class ExtensionManager {
                     completion(.activationEnded(outcome))
                     return
                 }
-                step("Version \(bundledVersion) installed; reading the listing again.")
+                step("The system accepted version \(bundledVersion); reading the listing again.")
                 self.properties(timeout: 10) { answer in
                     guard case .listed(let found) = answer else {
                         completion(.listingAfterActivation("the system did not list the driver"))
