@@ -99,6 +99,7 @@ Small hardening left open:
 - The first-time log line "first qmap command reply kept" (`CoreHost::keep_reply`), like `first qmap command` and `first uplink transfer`, can fall inside a bulk-read handler that `RMNetRxHandlerMaxUs` times, so one of them could set the maximum once.
 - `docs/driverkit-notes.md` says build 316.19.9 "saw about 860" drains that did nothing during the burst. That figure is an estimate (999 refused offers minus 135 transfers), not a count.
 - Packets held at `Stop` are abandoned (watch the driver process's memory in the soak).
+  - **Soak run (2026-11-14, 317.9.11), memory not watched.** `scripts/soak.sh en33 30` passed (`docs/driverkit-notes.md`, "Runtime findings (30-minute soak)"), but it records no process memory, and no `Stop` happened during it. `RMNetPacketsHeld` was 0 in the first and the last sample.
 - `acquire_uplink` ignores `failed_`.
 - `logged_bad_qmap_` is dead.
 - `Worth` is duplicated.
@@ -167,3 +168,7 @@ Small hardening:
 - **A bus not ready at the wake call is fatal.** If posting the interrupt read or a bulk read at resume fails (for example with `kIOReturnNotReady`), the port goes down as `usb failed` and stays down until a re-enumeration or a manual reload; nothing retries. That meets "fresh addresses or down", but a retry after a short delay may be needed if it is ever seen. Not seen in the one test.
 - **Uplink transfers that complete while held** are counted neither as sent nor as dropped (`RMNetTxPackets`, `RMNetTxDropUsb`), and reads that complete while held are discarded unread.
 
+## Sent here by the recovery plan's Task 5, the soak (2026-11-14)
+
+- **The 30-minute soak has been run.** `scripts/soak.sh en33 30` on 317.9.11, 17:25 to 17:55: `soak: PASS`, the state `up` in all 181 samples, every listed error and drop counter 0 first and last, 0.0 % loss on 3,560 IPv4 and 3,559 IPv6 pings, about 15.2 MB moved (`docs/driverkit-notes.md`, "Runtime findings (30-minute soak)"). Under light traffic only (two 1,000-byte pings a second in each family); sustained heavy traffic has not been soaked.
+- **The liveness probe is noisy in the log.** Every 30 s, idle or not, it logs three lines: `qmi tx WDS client 15 msg 0x002d`, the `result ok` response, and `settings IPv4: ...` (61 probes, 183 lines, in the soak's 30 minutes, and nothing else). A candidate to quieten: log the probe's exchange and an unchanged settings line only when something differs or fails.

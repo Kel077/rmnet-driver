@@ -1114,3 +1114,21 @@ Build 317.9.11 (the sleep and wake commit). Installed with `scripts/install-driv
 
 **Not seen:** a sleep during which the stack cancels or fails transfers (`RMNetSleepCompletions` above 0); a re-enumeration on wake; a bus that answers not-ready (or refuses any re-post) at the wake call, which would leave the port down until a re-enumeration or a manual reload, since nothing retries; a sleep longer than half a minute; a `Stop` while asleep; a second power-off while asleep, or a power-on without one (the missing third sleep may be either, or neither); and the log lines of the power calls and of `resume`.
 
+## Runtime findings (30-minute soak, 2026-11-14 17:25 to 17:55)
+
+Build 317.9.11, the instance running since 17:12:10 (the one that went through the owner's sleep test). `scripts/soak.sh en33 30`, run once by the controller, started at 17:25:19 under `caffeinate` so the Mac would not idle-sleep; it did not sleep during the run (`RMNetSleeps` still 2 afterwards, from the sleep test). `scripts/driver-log.sh` ran alongside. Files: `build/logs/soak-run-20261114-172518.out` (the script's output), `build/logs/soak-20261114-172519.csv` (181 samples, one every 10 s), `build/logs/soak-20261114-172519-ping.log` and `soak-20261114-172519-ping6.log`, `build/logs/driver-20261114-172518.log`.
+
+Traffic: `ping -i 0.5 -s 1000 -b en33 223.5.5.5` and `ping6 -i 0.5 -s 1000 -B en33 2400:3200::1` for the whole run, about 8 KB a second in all, chosen to fit the data allowance.
+
+**Seen.**
+- Verdict `soak: PASS`. Duration 1807 s of 1800; 181 samples; status and `RMNetState` `up` in every sample.
+- First and last sample (`time,seconds,if_bytes_in,if_bytes_out,moved_in,moved_out,status,RMNetState`, then `RMNetUsbBulkInErrors`, `RMNetUsbBulkOutErrors`, `RMNetUsbBulkOutTimeouts`, `RMNetUsbRecoveries`, `RMNetRxDropNoPacket`, `RMNetRxDropBadQmap`, `RMNetTxDropBusy`, `RMNetTxDropUsb`, `RMNetTxDropRecovering`, `RMNetTimerArmFailures`, `RMNetPacketsHeld`):
+  - `2026-11-14T09:25:19Z,0,5851,170740,0,0,up,up,0,0,0,0,0,0,0,0,0,0,0`
+  - `2026-11-14T09:55:19Z,1800,7476097,7818850,7470246,7648110,up,up,0,0,0,0,0,0,0,0,0,0,0`
+  - So every listed error and drop counter was 0 at the start and at the end (times in UTC; local time is 8 hours ahead).
+- Pings: IPv4 3,560 sent, 3,560 answered, round trip 15.8 / 42.4 / 826.6 ms (min / avg / max); IPv6 3,559 sent, 3,559 answered, 14.2 / 37.1 / 770.1 ms. Loss 0.0 % in each.
+- Data: 7,494,452 bytes in and 7,673,108 out on `en33` (about 15.2 MB). One line appended to `build/installed/measure-usage.log`; the recorded total went from 279,079,160 to 294,246,720 bytes.
+- The driver's log over the run holds nothing but the Core liveness probe: 61 WDS Get Current Settings (`qmi tx WDS client 15 msg 0x002d`, txid 58 to 118, 17:25:34 to 17:55:38), one every 30 s, each answered `result ok` and followed by `settings IPv4: v4 1 (/30, 2 dns), v6 0 (/0, 0 dns), mtu 1500`. That is three log lines every 30 seconds while idle or busy. No link down, no USB error line, no restart.
+- Afterwards (read by the controller): no new crash report named after the driver; `en33` first in neither `scutil --nwi` list.
+
+**What this shows and what it does not.** Thirty minutes with no USB error, no recovery, no drop in the listed counters, no packet held at the end and no ping lost, under light traffic: two 1,000-byte pings a second in each family. It says nothing about behaviour under sustained heavy traffic (the longest heavy traffic on record is the 8 s download at 16:31 in "Runtime findings (measurements after the uplink hold and receive batching)"). It did not record the driver process's memory. Counters not in the soak's list (`RMNetTxDropLinkDown`, `RMNetTxDropFiltered`, `RMNetRxDropFiltered` and others) were not judged.
