@@ -114,6 +114,21 @@ struct ModemNetworkTests {
               "atFields: spaces inside quotes are kept",
               "\(String(describing: atFields("+QICSGP: 1,\" a b \",0", prefix: "+QICSGP")))")
         check(atFields("+QSPN: \"a,b", prefix: "+QSPN") == ["a,b"], "atFields: an unclosed quote runs to the end")
+        // Quotes are found by Unicode scalar: a quote that a combining mark, a ZWJ or a Prepend character
+        // joins into one Character is still a quote, and the fields split where the modem split them.
+        for (line, want, name) in [
+            ("+COPS: 0,0,\"\u{301}X\",7", ["0", "0", "\u{301}X", "7"], "a combining mark after the opening quote"),
+            ("+COPS: 0,0,\"\u{301}A,9\",7", ["0", "0", "\u{301}A,9", "7"], "a combining mark, then a quoted comma"),
+            ("+COPS: 0,0,\"X\"\u{200D},7", ["0", "0", "X\u{200D}", "7"], "a ZWJ after the closing quote"),
+            ("+COPS: 0,0,\"X\u{0600}\",7", ["0", "0", "X\u{0600}", "7"], "a Prepend character before the closing quote"),
+            ("+QICSGP: 1,\"\u{301}a,b\",\"\u{301}\",0", ["1", "\u{301}a,b", "\u{301}", "0"], "combining marks in an APN and a user"),
+        ] {
+            let got = atFields(line, prefix: String(line.prefix(while: { $0 != ":" })))
+            check(got == want, "atFields: \(name)", "\(String(describing: got?.map { $0.unicodeScalars.map { String($0.value, radix: 16) } }))")
+        }
+        let marked = parseOperator(["+COPS: 0,0,\"\u{301}A,9\",7"])
+        check(marked.name == "\u{301}A,9" && marked.accessTechnology == 7,
+              "parseOperator: a combining mark after the quote neither splits the name nor makes up an AcT", "\(marked)")
 
         // --- parseRadio ------------------------------------------------------------------------
         check(parseRadio(cfun) == .on, "parseRadio: 1 is on")
@@ -232,6 +247,16 @@ struct ModemNetworkTests {
             let leg = parseServingCell([line])?.cells.first
             check(leg != nil && leg?.sinr == nil, "parseServingCell: SINR \(odd) is not a number", "\(String(describing: leg))")
         }
+        // A raw LTE SINR that is finite but whose dB (× 2 − 20) is not: the SINR is nil, the JSON stays valid.
+        let hugeLine = "+QENG: \"servingcell\",\"CONNECT\",\"LTE\",\"FDD\",460,00,1C2D3E4,128,1300,3,5,3,2B3C,-98,-11,-68,"
+            + String(repeating: "9", count: 308) + ",8,230,52"
+        let hugeLeg = parseServingCell([hugeLine])?.cells.first
+        check(hugeLeg != nil && hugeLeg?.sinr == nil && hugeLeg?.rsrp == -98 && hugeLeg?.rsrq == -11,
+              "parseServingCell: an LTE SINR whose conversion is not finite is nil", "\(String(describing: hugeLeg))")
+        let hugeInfo = combined(qeng: [hugeLine])
+        check(JSONSerialization.isValidJSONObject(networkJSON(hugeInfo)), "networkJSON: valid with a huge raw LTE SINR")
+        check(value(hugeInfo, "Signal") == "RSRP -98 dBm, RSRQ -11 dB", "networkRows: no SINR inf dB",
+              "\(String(describing: value(hugeInfo, "Signal")))")
 
         let lte = parseServingCell(["+QENG: \"servingcell\",\"CONNECT\",\"LTE\",\"FDD\",460,00,1C2D3E4,128,1300,3,5,3,2B3C,-98,-11,-68,14,8,230,52"])
         check(lte == ServingCell(state: "CONNECT", cells: [lteLeg]), "parseServingCell: LTE on one line", "\(String(describing: lte))")
@@ -490,6 +515,12 @@ struct ModemNetworkTests {
         let searching = roundTrip(networkJSON(combined(qeng: ["+QENG: \"servingcell\",\"SEARCH\""])), "searching")
         check(searching["state"] as? String == "SEARCH" && (searching["cells"] as? [Any])?.isEmpty == true,
               "networkJSON: searching gives an empty cell list", "\(searching)")
+        let noStateLine = roundTrip(networkJSON(combined(qeng: Array(endc.dropFirst()))), "no servingcell line")
+        check(noStateLine["state"] is NSNull && (noStateLine["cells"] as? [Any])?.count == 2,
+              "networkJSON: no \"servingcell\" line gives state null, the legs kept", "\(noStateLine)")
+        let dashState = roundTrip(networkJSON(combined(qeng: ["+QENG: \"servingcell\",\"-\""])), "state -")
+        check(dashState["state"] is NSNull && (dashState["cells"] as? [Any])?.isEmpty == true,
+              "networkJSON: state - gives null", "\(dashState)")
         let lteJSON = roundTrip(networkJSON(combined(qeng: endc)), "EN-DC")
         let lteCell = (lteJSON["cells"] as? [[String: Any]])?.first ?? [:]
         check(lteCell["bandwidthMHz"] as? Double == 10 && lteCell["sinr"] as? Double == 8 && (lteJSON["cells"] as? [Any])?.count == 2,

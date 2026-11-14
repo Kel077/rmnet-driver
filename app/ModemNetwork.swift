@@ -42,25 +42,39 @@ struct NetworkInfo: Equatable {
 
 /// The fields after "<prefix>:", split on commas outside quotes, each trimmed, then its quotes removed
 /// (so spaces inside quotes are kept: `" a "` reads ` a `). Empty fields stay "". nil when the line does
-/// not start with "<prefix>:".
+/// not start with "<prefix>:". Works by Unicode scalar, not by Character: a quote or a comma that a
+/// combining mark, a ZWJ or a Prepend character joins into one Character is still found.
 func atFields(_ line: String, prefix: String) -> [String]? {
-    let text = line.trimmingCharacters(in: .whitespacesAndNewlines)
-    let head = prefix + ":"
-    guard text.hasPrefix(head) else { return nil }
+    let text = trimmedScalars(Array(line.unicodeScalars)[...], .whitespacesAndNewlines)
+    let head = Array((prefix + ":").unicodeScalars)
+    guard text.starts(with: head) else { return nil }
     var fields: [String] = []
-    var current = ""
+    var current: [Unicode.Scalar] = []
     var quoted = false
     for c in text.dropFirst(head.count) {
         if c == "\"" { quoted.toggle() }
         if c == "," && !quoted {
-            fields.append(current)
-            current = ""
+            fields.append(unquotedField(current))
+            current = []
         } else {
             current.append(c)
         }
     }
-    fields.append(current)
-    return fields.map { $0.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\"", with: "") }
+    fields.append(unquotedField(current))
+    return fields
+}
+
+private func trimmedScalars(_ s: ArraySlice<Unicode.Scalar>, _ set: CharacterSet) -> ArraySlice<Unicode.Scalar> {
+    var t = s.drop(while: { set.contains($0) })
+    while let last = t.last, set.contains(last) { t = t.dropLast() }
+    return t
+}
+
+/// A raw field (quotes still in it) trimmed of spaces, then its quote scalars removed.
+private func unquotedField(_ raw: [Unicode.Scalar]) -> String {
+    var out = String.UnicodeScalarView()
+    out.append(contentsOf: trimmedScalars(raw[...], .whitespaces).filter { $0 != "\"" })
+    return String(out)
 }
 
 /// The fields of the first line with the prefix; nil when no line has it.
@@ -86,6 +100,11 @@ private func decimalField(_ f: [String], _ i: Int) -> Double? {
     guard let s = field(f, i), !s.isEmpty, s.allSatisfy({ "+-.0123456789".contains($0) }),
           let d = Double(s), d.isFinite else { return nil }
     return d
+}
+
+/// The value when finite (a conversion can overflow a finite raw value to inf); else nil.
+private func finite(_ d: Double) -> Double? {
+    d.isFinite ? d : nil
 }
 
 /// A text field the modem formats itself (a state, a RAT, a hex cell ID): nil when missing, empty or
@@ -241,13 +260,13 @@ private func cellLeg(_ f: [String], rat r: Int) -> CellLeg? {
                        rsrp: intField(f, r + 10), rsrq: intField(f, r + 11), sinr: decimalField(f, r + 12))
     case "LTE":
         // <is_tdd>,<MCC>,<MNC>,<cellID>,<PCID>,<earfcn>,<freq_band_ind>,<UL_bandwidth>,<DL_bandwidth>,<TAC>,
-        // <RSRP>,<RSRQ>,<RSSI>,<SINR>,… ; the SINR is raw: dB = raw × 2 − 20.
+        // <RSRP>,<RSRQ>,<RSSI>,<SINR>,… ; the SINR is raw: dB = raw × 2 − 20 (nil unless finite).
         return CellLeg(rat: rat, duplex: textField(f, r + 1), mcc: textField(f, r + 2), mnc: textField(f, r + 3),
                        cellID: textField(f, r + 4), pci: intField(f, r + 5), tac: textField(f, r + 10),
                        channel: intField(f, r + 6), band: band("B", intField(f, r + 7)),
                        bandwidthMHz: bandwidth(lteBandwidthsMHz, intField(f, r + 9)),
                        rsrp: intField(f, r + 11), rsrq: intField(f, r + 12),
-                       sinr: decimalField(f, r + 14).map { $0 * 2 - 20 })
+                       sinr: decimalField(f, r + 14).flatMap { finite($0 * 2 - 20) })
     case "NR5G-NSA":
         // <MCC>,<MNC>,<PCID>,<RSRP>,<SINR>,<RSRQ>,<ARFCN>,<band>,<NR_DL_bandwidth>,… (SINR before RSRQ)
         return CellLeg(rat: rat, duplex: nil, mcc: textField(f, r + 1), mnc: textField(f, r + 2), cellID: nil,
@@ -551,8 +570,9 @@ private func legJSON(_ leg: CellLeg) -> [String: Any] {
      "rsrq": orNull(leg.rsrq), "sinr": orNull(leg.sinr)]
 }
 
-/// `RMNet network --json`: every key is always there; a value not read is null. `cells` is null when
-/// the serving cell was not read, [] when it has no leg (searching).
+/// `RMNet network --json`: every key is always there; a value not read is null (also `state` when the
+/// answer gave none: no "servingcell" line, or `-`). `cells` is null when the serving cell was not
+/// read, [] when it has no leg (searching).
 func networkJSON(_ info: NetworkInfo) -> [String: Any] {
     [
         "radio": orNull(info.radio.map(radioKey)),
@@ -562,7 +582,7 @@ func networkJSON(_ info: NetworkInfo) -> [String: Any] {
         "networkName": orNull(info.networkName),
         "plmn": orNull(shownPLMN(info)),
         "technology": technologyLabel(info),
-        "state": orNull(info.serving?.state),
+        "state": orNull(info.serving.flatMap { $0.state.isEmpty ? nil : $0.state }),
         "cells": orNull(info.serving.map { $0.cells.map(legJSON) }),
         "carriers": info.carriers,
         "mode": orNull(info.mode),
