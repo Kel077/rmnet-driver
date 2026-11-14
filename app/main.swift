@@ -1,8 +1,12 @@
-// RMNet host app: installs, removes and reports on the RMNet driver extension, and reads and sends
-// the modem's text messages.
+// RMNet host app: installs, removes and reports on the RMNet driver extension, reads and sends the
+// modem's text messages, and shows and changes the modem's network and settings.
 // Usage: RMNet activate | deactivate | status [--json]
 //        RMNet sms list [--json] | sms send <number> <text> | sms delete <index>...
 //        RMNet gps [seconds]
+//        RMNet network [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…]
+//        RMNet apn [show] [--json] | apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>]
+//                  [--password | --no-password] [--auth none|pap|chap|pap-or-chap] [--no-redial]
+//        RMNet sim [--json] | sim unlock [--last-attempt]
 //        RMNet (no argument, or opened from the Finder): the status window.
 // It must run from /Applications/RMNet.app for activate and deactivate (scripts/install-driver.sh).
 // With a verb it prints exactly the lines it always has (scripts read them), opens no window and
@@ -270,7 +274,7 @@ if verbs.isEmpty {
     exit(0)
 }
 
-let usage = "usage: RMNet activate | deactivate | status [--json] | sms list [--json] | sms send <number> <text> | sms delete <index>... | gps [seconds]"
+let usage = "usage: RMNet activate | deactivate | status [--json] | sms list [--json] | sms send <number> <text> | sms delete <index>... | gps [seconds] | \(modemUsage)"
 
 if verbs.first == "sms" {
     guard let smsCommand = parseSms(Array(verbs.dropFirst())) else {
@@ -291,6 +295,30 @@ if verbs.first == "gps" {
         exit(2)
     }
     exit(runGps(seconds: seconds))
+}
+
+// network, radio, mode, apn, sim: over the modem's spare AT port, off the main thread, as the sms verbs.
+if let verb = verbs.first, modemVerbs.contains(verb) {
+    guard let modemCommand = parseModem(verbs) else {
+        print(usage)
+        exit(2)
+    }
+    if modemCommand.changesModem {
+        // From before the port opens until the result is printed, Ctrl-C, Ctrl-Z, Ctrl-\, a hang-up or a
+        // plain kill do not stop a change in the middle (a redial with the radio off, a PIN sent). Ctrl-C at
+        // a password or PIN prompt still ends the prompt (readpassphrase), and nothing is changed.
+        for sig in [SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGQUIT] { signal(sig, SIG_IGN) }
+    }
+    // Each line is flushed at once, so that the attempts left and the APN warning are out before a prompt
+    // (which goes to /dev/tty) also when the output is piped.
+    DispatchQueue.global(qos: .userInitiated).async {
+        let code = runModem(modemCommand, service: ModemService(),
+                            driverProfile: readDriverProperties()?["RMNetProfile"].flatMap { Int($0) },
+                            readSecret: readSecret(prompt:), output: { print($0); fflush(stdout) })
+        fflush(stdout)
+        exit(code)
+    }
+    dispatchMain()
 }
 
 guard let command = Command(rawValue: verbs.first!),
