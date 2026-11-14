@@ -93,6 +93,7 @@ Small hardening left open:
 - `PrefixLength` is duplicated, and it and `FormatIPv6` are untested.
 - "usb failed" is published for about 4 s on re-enumeration.
   - **Settled in code (2026-11-14, 317.8.44).** `RMNetState` says `detached` instead when UsbIo had seen a not-attached or no-device status (`UsbIo::device_gone`). Not yet seen: the instance replaced at the 317.8.44 load was the older 316.19.56, which still said `usb failed`; the next reload is the first that can show it.
+  - **Reopened (2026-11-14, sleep and wake task).** The reload of 317.8.44 showed it never fires on a modem reboot: the re-post fails with `0xe00002d8`, which is `kIOReturnNotReady`, not `kIOReturnNotAttached` (`0xe00002d9`), and the interrupt read itself ends `kIOReturnAborted`. `Gone()` in `driver/usb_io.cpp` matches neither. Decide whether `kIOReturnNotReady` from a submission means gone (it may also come from a bus not yet awake after a sleep).
 - A failed `WakeAtTime` ends all ticks, and while stopping can stall `Stop`. Since the uplink-hold plan's fix wave it matters more: `TxPacketsAvailable_Impl` returns early while a hold is on, so after a failed bulk OUT completion, the end of a recovery or a link down, the 100 ms tick is the only thing that restarts a held drain. With no tick and no transfer in flight, the uplink would stay held for good. Not seen.
   - **Settled in code (2026-11-14, 317.8.44), not seen on hardware.** A failed arm is remembered and `RMNetDriver::EnsureTimer` retries it from every completion handler, `TxPacketsAvailable_Impl` and `RxPacketsAvailable_Impl`, also while stopping, never after the stop sequence has cancelled the timer; `RMNetTimerArmFailures` counts failures. A failed arm also counts as no timer in `AdvanceStop`'s two waits, and a failed re-arm in the stopping tick advances the stop at once, so `Stop` finishes without its timer (fix round 1, after 317.8.44).
 - The first-time log line "first qmap command reply kept" (`CoreHost::keep_reply`), like `first qmap command` and `first uplink transfer`, can fall inside a bulk-read handler that `RMNetRxHandlerMaxUs` times, so one of them could set the maximum once.
@@ -157,3 +158,10 @@ Small hardening:
 - Two tests index a list right after checking its size (`d.dns[0]`, `d.rdnss[0]`), so a regression would crash the run instead of failing one test.
 - `CHECK_EQ` needs the `u` suffix for unsigned comparisons; `hex()` does not accept `\r`.
 - Harness only: echo replies are not checked for destination; `sent` counts requests that never left; gateways print twice under `-v`.
+
+## Sent here by the recovery plan's Task 3, sleep and wake (2026-11-14)
+
+- **Sleep and wake have not been tried.** Build 317.9.11 holds `UsbIo` at power off and resumes it and restarts the session at power on (`docs/driverkit-notes.md` 3.8, "As built"); none of it has run. The owner's sleep test decides which of three things macOS does: the device stays and transfers stay pending, the stack fails or aborts them (`RMNetSleepCompletions`, `RMNetSleepLastStatus`), or the modem re-enumerates (a new instance with `RMNetSleeps` 0).
+- **A bus not ready at the wake call is fatal.** If posting the interrupt read or a bulk read at resume fails (for example with `kIOReturnNotReady`), the port goes down as `usb failed` and stays down until the modem re-enumerates. That meets "fresh addresses or down", but a retry after a short delay may be needed if the test shows it.
+- **Uplink transfers that complete while held** are counted neither as sent nor as dropped (`RMNetTxPackets`, `RMNetTxDropUsb`), and reads that complete while held are discarded unread.
+

@@ -57,7 +57,7 @@ enum : uint32_t {
   kLogFree = 1u << 1,
   kLogStart = 1u << 2,
   kLogStop = 1u << 3,
-  kLogSetPowerState = 1u << 4,
+  kLogSetPowerState = 1u << 4,  // unused: SetPowerState logs every call
   kLogSetInterfaceEnable = 1u << 5,
   kLogSetPromiscuous = 1u << 6,
   kLogSetAllMulticast = 1u << 7,
@@ -196,7 +196,7 @@ struct RxBridge final : RxSink {
 };
 
 // What PublishCounters last published, in its order.
-enum : uint32_t { kCounterCount = 45 };
+enum : uint32_t { kCounterCount = 51 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -259,6 +259,17 @@ struct RMNetDriver_IVars {
   uint64_t rxHandlerMaxNs;
   uint64_t rxHandlerTotalNs;
   bool rxReadSeen;
+  // Sleep (SetPowerState): asleep from a power-off call to the next power-on call. While asleep
+  // UsbIo is held and nothing calls Core: no tick, no drain. wakeUpPending: the wake restarted the
+  // session and its link up has not come yet; lastWakeUpMs is the time from that wake call to the
+  // link up (0 until then).
+  bool asleep;
+  bool wakeUpPending;
+  uint64_t sleeps;
+  uint64_t wakes;
+  uint64_t wakeStartMs;
+  uint64_t lastWakeUpMs;
+  uint32_t lastPowerFlags;
   bool countersPublished;
   uint64_t counters[kCounterCount];
 };
@@ -561,9 +572,74 @@ kern_return_t RMNetDriver::Stop_Impl(IOService* provider) {
   return kIOReturnSuccess;
 }
 
+// Sleep and wake (docs/driverkit-notes.md 3.8). Called by the system on the Default queue, as a
+// call of its own: never from inside a Core call or a UsbIo listener call, so RestartSession may be
+// called here. Every call is logged and always passed to the superclass.
+// - Power off (the system is going to sleep): nothing is sent and Core is not called (the bus is
+//   about to suspend, and transfers failing around the suspend must not count toward UsbIo's
+//   failure limits). The driver marks itself asleep and holds UsbIo.
+// - Power on after a sleep: UsbIo resumes (its failure memory cleared, its reads posted again)
+//   and the session restarts from sync, taking the link down first, so the port ends up with the
+//   new call's addresses or down, never up with the old ones. If USB failed or the device went
+//   during the sleep, nothing more: a new instance follows the re-enumeration.
+// - Anything else (power on while not asleep, a second power off, low power): nothing.
 kern_return_t RMNetDriver::SetPowerState_Impl(uint32_t powerFlags) {
-  LOG_FIRST(kLogSetPowerState, "SetPowerState 0x%x", powerFlags);
+  LOG("SetPowerState 0x%x%{public}s", powerFlags,
+      !ivars ? "" : (ivars->asleep ? " (asleep)" : (ivars->stopping ? " (stopping)" : "")));
+  if (ivars) {
+    ivars->lastPowerFlags = powerFlags;
+    if (powerFlags == kIOServicePowerCapabilityOff) {
+      PowerOff();
+    } else if (powerFlags & kIOServicePowerCapabilityOn) {
+      PowerOn(powerFlags);
+    }
+    if (!ivars->stopping && ivars->core && ivars->usb) PublishCounters();
+  }
   return SetPowerState(powerFlags, SUPERDISPATCH);  // must reach the superclass to acknowledge
+}
+
+void RMNetDriver::PowerOff() {
+  if (ivars->asleep) {
+    LOG("power off: already asleep, nothing new");
+    return;
+  }
+  ivars->asleep = true;
+  ivars->sleeps++;
+  LOG("power off: asleep (sleep %llu); the session is left as it is until the wake", ivars->sleeps);
+  if (ivars->usb && !ivars->stopping) ivars->usb->hold();
+}
+
+void RMNetDriver::PowerOn(uint32_t powerFlags) {
+  if (!ivars->asleep) {
+    LOG("power on 0x%x: not asleep, nothing to do", powerFlags);
+    return;
+  }
+  ivars->asleep = false;
+  ivars->wakes++;
+  ivars->wakeStartMs = NowMs();
+  ivars->lastWakeUpMs = 0;
+  ivars->wakeUpPending = false;
+  if (ivars->stopping || !ivars->usb || !ivars->core) {
+    LOG("wake %llu: stopping, nothing to do", ivars->wakes);
+    return;
+  }
+  if (ivars->usbFailed) {
+    LOG("wake %llu: usb had failed; nothing more (a new instance follows re-enumeration)", ivars->wakes);
+    return;
+  }
+  if (ivars->usb->device_gone()) {
+    // The link may still be reported up with the old call's addresses, and Stop may not have come
+    // yet: take it down now, with the state "detached".
+    LOG("wake %llu: the device went during the sleep; nothing more (a new instance follows re-enumeration)",
+        ivars->wakes);
+    OnUsbFatal("device gone during the sleep");
+    return;
+  }
+  LOG("wake %llu: resuming usb and restarting the session", ivars->wakes);
+  if (!ivars->usb->resume()) return;  // a read that could not be posted already reported usb failed
+  ivars->wakeUpPending = true;
+  RestartSession("wake");
+  EnsureTimer();  // everything periodic hangs on the tick: the liveness probe, the sync resends
 }
 
 // Reports the link status last decided (ivars->linkActive). A failure is logged and does not
@@ -650,6 +726,12 @@ void RMNetDriver::ApplyCore() {
     LOG("link up%{public}s: ipv4 %d ipv6 %d, carrier mtu %u; setMaxTransferUnit(%u) 0x%x%{public}s",
         again ? " (family added)" : "", s.has_v4, s.has_v6, s.mtu, mtu, mret,
         mret == kIOReturnSuccess ? "" : ", so the interface keeps the mtu it registered with");
+    if (!again && ivars->wakeUpPending) {
+      ivars->wakeUpPending = false;
+      uint64_t ms = NowMs() - ivars->wakeStartMs;
+      ivars->lastWakeUpMs = ms > 0 ? ms : 1;
+      LOG("link up %llu ms after the wake", ms);
+    }
     ivars->core->data_link_up(NowMs());
   }
   PublishStatus();
@@ -680,6 +762,8 @@ void RMNetDriver::PublishStatus() {
   char v6[80] = "none";
   const char* name = SessionStateName(ivars->core->state());
   if (ivars->usbFailed) name = ivars->usbDetached ? "detached" : "usb failed";
+  // While asleep a gone device is not fatal (UsbIo is held), but the state says so.
+  else if (ivars->asleep && ivars->usb && ivars->usb->device_gone()) name = "detached";
   snprintf(state, sizeof state, "%s", name);
   if (ivars->linkActive) {
     const rmnet::RuntimeSettings& s = ivars->core->link_config().settings;
@@ -825,6 +909,10 @@ void RMNetDriver::RxPacketsAvailable_Impl(OSAction*) {
 void RMNetDriver::DrainTx() {
   FlushTxDone();
   if (ivars->stopping || !ivars->core || !ivars->txSubmit) return;
+  if (ivars->asleep) {  // Core is not called while asleep; the first tick after the wake drains
+    ivars->txHeld = true;
+    return;
+  }
   if (ivars->core->uplink_paused()) {
     ivars->txHeld = true;
     return;
@@ -968,6 +1056,11 @@ void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
 // WakeAtTime calls; RMNetUsbBulkOutTimeouts uplink transfers that timed out or were aborted by no
 // one in the driver; RMNetUplinkStuckRestarts the session restarts asked for by a stuck uplink;
 // RMNetUplinkPauseTimeouts QMAP pauses that lasted kPauseMaxMs and asked for a session restart.
+// Sleep: RMNetSleeps and RMNetWakes count power-off calls and power-on calls after one;
+// RMNetLastWakeUpMs is the time from the last wake call to the next link up (0 until then);
+// RMNetSleepCompletions counts USB completions that arrived while UsbIo was held, and
+// RMNetSleepLastStatus is the last status among them other than success; RMNetLastPowerFlags is the
+// flags of the last SetPowerState call.
 void RMNetDriver::PublishCounters() {
   const DataCounters& c = ivars->core->counters();
   uint32_t txPending = ivars->txPendingCount - ivars->txPendingNext;
@@ -1025,6 +1118,12 @@ void RMNetDriver::PublishCounters() {
       {"RMNetUsbBulkOutTimeouts", u.bulk_out_timeouts},
       {"RMNetUplinkPauseTimeouts", c.uplink_pause_timeouts},
       {"RMNetUplinkStuckRestarts", u.uplink_stuck_restarts},
+      {"RMNetSleeps", ivars->sleeps},
+      {"RMNetWakes", ivars->wakes},
+      {"RMNetLastWakeUpMs", ivars->lastWakeUpMs},
+      {"RMNetSleepCompletions", u.sleep_completions},
+      {"RMNetSleepLastStatus", u.sleep_last_status},
+      {"RMNetLastPowerFlags", ivars->lastPowerFlags},
   };
   bool changed = !ivars->countersPublished;
   for (uint32_t i = 0; i < kCounterCount; i++) {
@@ -1129,6 +1228,14 @@ void RMNetDriver::TimerFired_Impl(OSAction*, uint64_t) {
     return;
   }
   if (!ivars->core) return;
+  if (ivars->asleep) {
+    // Neither Core nor USB is called while asleep (no probe, no sync resend, no recovery deadline);
+    // only the status and the counters are published.
+    PublishStatus();
+    if (++ivars->ticks % kCounterTicks == 0) PublishCounters();
+    ArmTimer();
+    return;
+  }
   uint64_t now = NowMs();
   if (ivars->usb) ivars->usb->tick();  // bounds a bulk pipe recovery; may report on_fatal
   if (!ivars->coreStopped) {

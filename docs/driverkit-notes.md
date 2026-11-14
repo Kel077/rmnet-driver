@@ -647,6 +647,12 @@ kern_return_t NetSpike::SetPowerState_Impl(uint32_t powerFlags) {
 
 `IOUserNetworkEthernet` exports its own `SetPowerState_Impl`, so `SUPERDISPATCH` reaches it. AppleEthernetIXL overrides `SetPowerState`; AppleUserECM does not. **[runtime]** What the USB interface looks like after wake. The design already says to treat wake as a full restart.
 
+**As built (recovery plan, Task 3, 317.9.11).** `SetPowerState` has no `QUEUENAME` in `IOService.iig`, so it runs on the Default queue as a call of its own, never inside a Core call or a `UsbIo` listener call; `RestartSession` may be called from it. Every call is logged with its flags and passed to the superclass.
+- Power off (`powerFlags == kIOServicePowerCapabilityOff`): Core is not called and nothing is sent. The driver marks itself asleep, counts `RMNetSleeps` and holds `UsbIo` (`UsbIo::hold`): nothing is posted, re-posted, submitted or sent, nothing is delivered to the listener, and completions that arrive are counted (`RMNetSleepCompletions`, `RMNetSleepLastStatus`) but never toward a failure limit, a recovery or `on_fatal`; a not-attached or no-device status still marks the device gone. While asleep the timer tick calls neither Core nor USB (it publishes status and counters only), and `DrainTx` keeps frames in the queue. A second power off while asleep does nothing new.
+- Power on (`powerFlags & kIOServicePowerCapabilityOn`) while asleep: counts `RMNetWakes`. If USB had failed, or the stop sequence runs, nothing more. If the device went during the sleep, `OnUsbFatal("device gone during the sleep")`: the session stops, the link goes down, the state says `detached`, nothing is sent (`UsbIo` stays held), and a new instance follows the re-enumeration. Otherwise `UsbIo::resume` clears the failure memory (uplink stall count and its restart memory, per-read and interrupt failure counts, recovery counts), finishes a pipe recovery whose requests have returned, posts the interrupt read and every bulk read not posted, sends what is queued and reads waiting responses; then `RestartSession("wake")` takes the link down and starts the session from sync, and `EnsureTimer` makes sure a tick is pending. `RMNetLastWakeUpMs` is the time from that call to the next link up (0 until then).
+- Power on while not asleep (one comes at every start: `RMNetLastPowerFlags` 2 on a fresh instance), and low power: nothing.
+- `Stop` while asleep: `finish_sending` ends the hold and drops the messages waiting behind it; the stop sequence then runs as before.
+
 ### 3.9 Order of work
 
 `Start_Impl` (spike order):
@@ -892,7 +898,7 @@ From installing 316.16.36, 316.16.40 and 316.16.41 and rebooting the modem with 
 
 **Session**
 - From a running modem: sync answered on the first try; link up about 0.5 s after the first sync (both calls connect; Start Network for IPv4 takes about 0.45 s). Data format: raw IP, QMAP both ways, 32 datagrams, UL 16384 and DL 31744 bytes.
-- After `AT+CFUN=1,1`: the old instance received a WDS Packet Service Status indication (disconnected) at once, went to `backoff` and sent its releases, then 4 s later its interrupt read failed with `0xe00002eb` (`kIOReturnAborted`), re-posting failed with `0xe00002d8` (`kIOReturnNotAttached`), so `usb failed` was reported, and `Stop` came 4 ms later. The new instance started about 11 s later and sent a sync every 2 s for about 18 s (10 in all) until the modem answered, then reached `link up` within 0.5 s.
+- After `AT+CFUN=1,1`: the old instance received a WDS Packet Service Status indication (disconnected) at once, went to `backoff` and sent its releases, then 4 s later its interrupt read failed with `0xe00002eb` (`kIOReturnAborted`), re-posting failed with `0xe00002d8` (`kIOReturnNotReady`; *corrected 2026-11-14: first misread as `kIOReturnNotAttached`, which is `0xe00002d9`*), so `usb failed` was reported, and `Stop` came 4 ms later. The new instance started about 11 s later and sent a sync every 2 s for about 18 s (10 in all) until the modem answered, then reached `link up` within 0.5 s.
 - `setMaxTransferUnit` still returns `kIOReturnUnsupported` (0xe00002c7) after link up; the carrier MTU was 1500 in every run, so the interface MTU stays 1500 from `getMaxTransferUnit`.
 
 **Stopping**
@@ -1072,7 +1078,7 @@ Build 317.8.44 (commit of this section). Installed with `scripts/install-driver.
 
 What the build adds: `RMNetDriver::EnsureTimer` re-arms the 100 ms timer from every other entry into the driver after a failed `WakeAtTime` (`RMNetTimerArmFailures`); `UsbIo` ends an uplink after `kUplinkTimeoutsFatal` (3) bulk OUT timeouts in a row with no success between them (`on_fatal("uplink is not accepting data")`, `RMNetUsbBulkOutTimeouts`); a QMAP pause not lifted within `kPauseMaxMs` (30 s) restarts the session (`CoreHost::restart`, `RMNetUplinkPauseTimeouts`); `RMNetState` says `detached` instead of `usb failed` when `UsbIo` had seen a not-attached or no-device status.
 
-**Seen on hardware.** Only that the build loads, links up (IPv4 and IPv6), carries the two 5-ping checks with no loss, publishes the three new counters at 0, leaves `en33` first in neither `scutil --nwi` list, and leaves no crash report. The old instance (316.19.56, the previous code) stopped as before: `interrupt read failed: 0xe00002eb`, `interrupt read not posted: 0xe00002d8`, `usb failed: interrupt read could not be posted`, `Stop` 4 ms later with 0 requests outstanding, `free`. That is the sequence the `detached` state is for, and `0xe00002d8` (`kIOReturnNotAttached`) from the re-post is the status that sets it in the new code.
+**Seen on hardware.** Only that the build loads, links up (IPv4 and IPv6), carries the two 5-ping checks with no loss, publishes the three new counters at 0, leaves `en33` first in neither `scutil --nwi` list, and leaves no crash report. The old instance (316.19.56, the previous code) stopped as before: `interrupt read failed: 0xe00002eb`, `interrupt read not posted: 0xe00002d8`, `usb failed: interrupt read could not be posted`, `Stop` 4 ms later with 0 requests outstanding, `free`. That is the sequence the `detached` state is for. *Corrected 2026-11-14 (sleep and wake task):* `0xe00002d8` is `kIOReturnNotReady`, not `kIOReturnNotAttached` (`0xe00002d9`), so this sequence does not set `detached`: see "Runtime findings (sleep and wake)".
 
 **Not seen, and not producible on this modem:** a failed timer arm (`WakeAtTime` has never failed), an uplink transfer that times out (none ever has), and a QMAP pause (the modem has never sent a command frame), so neither the fatal path for timeouts nor the session restart has ever run. `detached` itself was not seen either: the instance that stopped was the older build. The next reload of 317.8.44 or later is the first that can show it.
 
@@ -1083,3 +1089,15 @@ The commit after 317.8.44, built and tested but not installed (the next task ins
 - **What counts as a stall.** `kIOReturnTimeout` and the legacy `0xe0004051` (transaction timeout), neither of which a header names as the status of a timed-out `AsyncIO`; and `kIOReturnAborted` while running and not in a bulk OUT recovery (the driver's own `abort()` leaves the running phase first). The legacy timeout no longer starts a stall recovery. None of these statuses has been seen on hardware.
 - **Stop without its timer.** A failed arm counts as no timer in `AdvanceStop`'s two waits, and a failed re-arm in the stopping tick advances the stop at once.
 - **Pause timing** runs only while the data link is up.
+
+## Runtime findings (sleep and wake, 2026-11-14 17:11): SLEEP AND WAKE NOT YET TRIED
+
+Build 317.9.11 (the sleep and wake commit). Installed with `scripts/install-driver.sh`, loaded with one `AT+CFUN=1,1` at 17:11:55; the new instance reported link up at 17:12:28.742. Log: `build/logs/driver-20261114-171124.log`. The Mac has not been put to sleep: every path of 3.8 "As built" except the power-on call at start is unexercised.
+
+**Seen.**
+- A power-on call reaches each new instance at start: `RMNetLastPowerFlags` was 2 (`kIOServicePowerCapabilityOn`) with `RMNetSleeps` and `RMNetWakes` 0. The log line for it was lost with the instance's first lines, as usual.
+- The Core liveness probe (first time on hardware): over 150 idle seconds after link up, one WDS Get Current Settings (`qmi tx WDS client 15 msg 0x002d`) every 30.0 to 30.1 s (17:12:58.749, 17:13:28.840, 17:13:58.845, 17:14:28.853, 17:14:58.870), each answered `result ok` within 3 to 5 ms; the link stayed up. Only the IPv4 client (15) is probed.
+- Link up, both families, `en33` first in neither `scutil --nwi` list, both 5-ping checks 5 of 5, no new crash report.
+
+**`detached` is never set by a modem reboot.** The old instance (317.8.44) ended as every reboot has: `interrupt read failed: 0xe00002eb` (`kIOReturnAborted`), `interrupt read not posted: 0xe00002d8`, `usb failed: interrupt read could not be posted` with no "(device gone)", `Stop` 4 ms later. `0xe00002d8` is `kIOReturnNotReady`; `kIOReturnNotAttached` is `0xe00002d9`. Earlier sections named it wrongly (corrected above), and `UsbIo`'s `Gone()` (not-attached or no-device) matches neither status seen, so `RMNetState` said `syncing`, then the entry was gone; polling every half second never showed `detached`. Whether to treat `kIOReturnNotReady` as gone is open: around a sleep it might also mean a bus not yet awake.
+

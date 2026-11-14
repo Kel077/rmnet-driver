@@ -129,6 +129,7 @@ UsbIo::UsbIo(UsbIoListener& listener)
       intr_failures_(0),
       phase_(Phase::Running),
       failed_(false),
+      held_(false),
       gone_(false),
       send_failed_(false),
       sent_at_stop_(0),
@@ -267,7 +268,7 @@ bool UsbIo::send(const uint8_t* data, size_t len) {
 }
 
 bool UsbIo::queue(uint8_t request, uint16_t value, const uint8_t* data, size_t len) {
-  if (phase_ != Phase::Running || !opened_) return false;
+  if (phase_ != Phase::Running || !opened_ || held_) return false;
   if (len > kSlotSize) {
     LOG("control message of %zu bytes dropped: longer than %u", len, (unsigned)kSlotSize);
     return false;
@@ -288,7 +289,7 @@ bool UsbIo::queue(uint8_t request, uint16_t value, const uint8_t* data, size_t l
 // submitted is dropped (the session's timeout recovers), and the next one is tried; while
 // draining at stop, a failure ends the drain instead (abort drops the rest).
 void UsbIo::submit_next() {
-  while (!out_busy_ && count_ > 0 && (phase_ == Phase::Running || phase_ == Phase::Draining)) {
+  while (!out_busy_ && count_ > 0 && !held_ && (phase_ == Phase::Running || phase_ == Phase::Draining)) {
     uint32_t i = head_;
     const Slot& s = slots_[i];
     kern_return_t ret = kIOReturnSuccess;
@@ -316,6 +317,7 @@ void UsbIo::submit_next() {
 void UsbIo::control_out_complete(IOReturn status, uint32_t) {
   out_busy_ = false;
   note(status);
+  if (held_) note_held("control request", status);
   if (count_ > 0) {
     uint8_t request = slots_[head_].request;
     head_ = (head_ + 1) % kRingSlots;
@@ -334,7 +336,7 @@ void UsbIo::control_out_complete(IOReturn status, uint32_t) {
     }
   }
   if (phase_ == Phase::Draining && send_failed_) return;
-  submit_next();
+  submit_next();  // nothing while held: resume sends what is queued
 }
 
 kern_return_t UsbIo::post_interrupt() {
@@ -348,6 +350,10 @@ void UsbIo::interrupt_complete(IOReturn status, uint32_t bytes) {
   intr_busy_ = false;
   note(status);
   if (phase_ != Phase::Running) return;  // not re-posted while stopping
+  if (held_) {
+    note_held("interrupt read", status);  // resume posts it again
+    return;
+  }
   if (status != kIOReturnSuccess) {
     intr_failures_++;
     LOG("interrupt read failed: 0x%x (%u in a row)", status, intr_failures_);
@@ -381,7 +387,7 @@ void UsbIo::begin_drain() {
 }
 
 void UsbIo::post_response_read() {
-  if (phase_ != Phase::Running) return;
+  if (phase_ != Phase::Running || held_) return;
   kern_return_t ret = intf_->AsyncDeviceRequest(kInterfaceToHostClass, kGetEncapsulatedResponse, 0, iface_number_,
                                                 kResponseSize, in_buf_, in_action_, kControlTimeoutMs);
   if (ret != kIOReturnSuccess) {
@@ -400,6 +406,10 @@ void UsbIo::control_in_complete(IOReturn status, uint32_t bytes) {
   in_busy_ = false;
   note(status);
   if (phase_ != Phase::Running) return;  // Core is not called once stopping
+  if (held_) {
+    note_held("response read", status);  // not delivered; resume reads what is waiting
+    return;
+  }
   if (status == kIOReturnSuccess && bytes > 0) {
     deliver(bytes);
     if (phase_ != Phase::Running) return;
@@ -441,7 +451,7 @@ void UsbIo::start_bulk(uint32_t read_len) {
   uint32_t len = (read_len + mps - 1) / mps * mps;
   if (len == 0 || len > kMaxDownlink) len = kMaxDownlink;
   read_len_ = len;
-  if (in_recovering_) return;  // the recovery re-posts every read when it ends
+  if (in_recovering_ || held_) return;  // the recovery, or resume, posts every read
   for (uint32_t i = 0; i < kBulkReads && phase_ == Phase::Running && !failed_; i++) {
     if (!read_busy_[i]) post_read(i);
   }
@@ -472,8 +482,14 @@ void UsbIo::bulk_in_complete(uint32_t i, IOReturn status, uint32_t bytes) {
   read_busy_[i] = false;
   reads_busy_--;
   note(status);
-  // Not delivered or re-posted while stopping, nor after a fatal failure (the session is over).
-  if (phase_ != Phase::Running || failed_) return;
+  // Not delivered or re-posted while stopping, nor after a fatal failure (the session is over),
+  // nor while held (resume re-posts it; a recovery under way is finished by resume).
+  if (phase_ != Phase::Running) return;
+  if (held_) {
+    note_held("bulk read", status);
+    return;
+  }
+  if (failed_) return;
   if (status == kIOReturnSuccess) {
     read_failures_[i] = 0;
     in_recoveries_ = 0;
@@ -542,7 +558,7 @@ void UsbIo::end_in_recovery() {
 // --- Bulk OUT --------------------------------------------------------------------------------------
 
 int UsbIo::acquire_uplink() {
-  if (phase_ != Phase::Running || !opened_ || out_recovering_) return -1;
+  if (phase_ != Phase::Running || !opened_ || out_recovering_ || held_) return -1;
   for (uint32_t i = 0; i < kUplinkSlots; i++) {
     if (uplink_[i] == Uplink::Free) {
       uplink_[i] = Uplink::Reserved;
@@ -564,7 +580,7 @@ void UsbIo::release_uplink(int slot) {
 
 bool UsbIo::send_uplink(int slot, uint32_t len) {
   if (slot < 0 || slot >= static_cast<int>(kUplinkSlots) || uplink_[slot] != Uplink::Reserved) return false;
-  if (phase_ != Phase::Running || out_recovering_ || len == 0 || len > kMaxUplink) {
+  if (phase_ != Phase::Running || out_recovering_ || held_ || len == 0 || len > kMaxUplink) {
     uplink_[slot] = Uplink::Free;
     return false;
   }
@@ -606,6 +622,13 @@ void UsbIo::bulk_out_complete(uint32_t i, IOReturn status, uint32_t) {
   uplink_[i] = Uplink::Free;
   uplinks_busy_--;
   note(status);
+  // While held: not an error, a stall or a recovery, and not reported to the owner (its packets are
+  // counted neither as sent nor as dropped). Transfers submitted before resume never count as a
+  // new stall after it (resume moves out_stall_mark_).
+  if (held_) {
+    note_held("uplink transfer", status);
+    return;
+  }
   bool ok = status == kIOReturnSuccess;
   bool running = phase_ == Phase::Running && !failed_;
   bool timed_out = TimedOut(status);
@@ -676,7 +699,7 @@ void UsbIo::begin_out_recovery() {
 // within kRecoveryTicks is fatal, so a pipe cannot stay idle with the link reported up. Nothing
 // happens once stopping has begun or after a fatal failure.
 void UsbIo::tick() {
-  if (phase_ != Phase::Running || failed_) return;
+  if (phase_ != Phase::Running || failed_ || held_) return;
   if (in_recovering_ && ++in_recovery_ticks_ >= kRecoveryTicks) {
     LOG("bulk in recovery: %u reads still pending after %u ticks", reads_busy_, in_recovery_ticks_);
     fail("bulk in recovery did not finish within 1 s");
@@ -695,6 +718,84 @@ void UsbIo::end_out_recovery() {
   LOG("bulk out recovered: ClearStall 0x%x, uplink open again", ret);
 }
 
+// --- Sleep -----------------------------------------------------------------------------------------
+
+void UsbIo::hold() {
+  if (phase_ != Phase::Running || held_) return;
+  held_ = true;
+  LOG("usb held: %u requests outstanding (interrupt %d, response read %d, control send %d, %u bulk reads, "
+      "%u uplink transfers), %u control messages queued%{public}s%{public}s",
+      outstanding(), intr_busy_, in_busy_, out_busy_, reads_busy_, uplinks_busy_, count_,
+      in_recovering_ ? ", bulk in recovering" : "", out_recovering_ ? ", bulk out recovering" : "");
+}
+
+// A completion while held: counted, its status kept if not a success, and logged when the count is a
+// power of two. Nothing else: the caller has already freed the request and noted a gone device.
+void UsbIo::note_held(const char* what, IOReturn status) {
+  stats_.sleep_completions++;
+  if (status != kIOReturnSuccess) stats_.sleep_last_status = static_cast<uint32_t>(status);
+  if (Worth(stats_.sleep_completions)) {
+    LOG("while held: %{public}s completed 0x%x (%llu completions while held)", what, status,
+        stats_.sleep_completions);
+  }
+}
+
+bool UsbIo::resume() {
+  if (!held_) return phase_ == Phase::Running && !failed_ && !gone_;
+  if (phase_ != Phase::Running || failed_ || gone_) {
+    LOG("usb not resumed: %{public}s", gone_ ? "the device has gone" : "usb has failed");
+    return false;
+  }
+  held_ = false;
+  // What happened before the sleep, or to the requests around it, says nothing about the bus now.
+  intr_failures_ = 0;
+  memset(read_failures_, 0, sizeof read_failures_);
+  in_recoveries_ = 0;
+  out_recoveries_ = 0;
+  in_recovery_ticks_ = 0;
+  out_recovery_ticks_ = 0;
+  out_stalls_ = 0;
+  out_stuck_restarted_ = false;
+  out_stall_mark_ = out_seq_;
+  bool intr_posted = false;
+  if (!intr_busy_) {
+    kern_return_t ret = post_interrupt();
+    if (ret != kIOReturnSuccess) {
+      LOG("resume: interrupt read not posted: 0x%x", ret);
+      fail("interrupt read could not be posted after the wake");
+      return false;
+    }
+    intr_posted = true;
+  }
+  uint32_t pending = reads_busy_;
+  bool in_was_recovering = in_recovering_;
+  if (read_len_ != 0) {
+    if (in_recovering_) {
+      if (reads_busy_ == 0) end_in_recovery();  // posts every read
+    } else {
+      for (uint32_t i = 0; i < kBulkReads && !failed_; i++) {
+        if (!read_busy_[i]) post_read(i);
+      }
+    }
+    if (failed_) return false;
+  }
+  bool out_was_recovering = out_recovering_;
+  if (out_recovering_ && uplinks_busy_ == 0) end_out_recovery();
+  uint32_t queued = count_;
+  bool response_pending = in_busy_;
+  submit_next();
+  begin_drain();
+  LOG("usb resumed: interrupt read %{public}s; %u bulk reads posted, %u were still pending%{public}s; "
+      "%u uplink transfers in flight%{public}s; %u control messages queued; response read %{public}s",
+      intr_posted ? "posted" : "still pending", reads_busy_ - pending, pending,
+      read_len_ == 0 ? " (bulk not started)"
+                     : (in_was_recovering ? (in_recovering_ ? ", bulk in still recovering" : ", bulk in recovery finished") : ""),
+      uplinks_busy_,
+      out_was_recovering ? (out_recovering_ ? ", bulk out still recovering" : ", bulk out recovery finished") : "",
+      queued, response_pending ? "still pending" : (in_busy_ ? "posted" : "not posted"));
+  return !failed_;
+}
+
 // --- Stopping ----------------------------------------------------------------------------------------
 
 // Remembers that the device has gone, from any request's completion status or submission result.
@@ -708,7 +809,16 @@ void UsbIo::fail(const char* what) {
   listener_.on_fatal(what);
 }
 
+// On a held UsbIo the messages that waited behind the hold are dropped (the bus may be asleep or
+// gone); the one in flight, if any, is counted when its completion pops it.
 void UsbIo::finish_sending() {
+  if (held_) {
+    held_ = false;
+    uint32_t waiting = out_busy_ ? count_ - 1 : count_;
+    dropped_at_stop_ += waiting;
+    count_ -= waiting;
+    if (count_ == 0) head_ = 0;
+  }
   if (phase_ == Phase::Running) phase_ = Phase::Draining;
 }
 

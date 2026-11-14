@@ -82,6 +82,10 @@ struct UsbIoStats {
   // recovery (also in bulk_out_errors), whether or not they counted as a new stall.
   uint64_t bulk_out_timeouts;
   uint64_t uplink_stuck_restarts;  // times the uplink was stuck and a session restart was asked for
+  // Completions of any kind that arrived while held (hold), and the last status other than success
+  // among them. They are counted only here, never in the error counts above.
+  uint64_t sleep_completions;
+  uint32_t sleep_last_status;
 };
 
 class UsbIo {
@@ -128,8 +132,25 @@ class UsbIo {
   // gone (a re-enumeration or an unplug), as opposed to a failure of a device still present.
   bool device_gone() const { return gone_; }
   // Called by the owner every 100 ms while running: bounds a pipe recovery to about 1 s, after
-  // which it is fatal. Does nothing once finish_sending or abort has been called.
+  // which it is fatal. Does nothing once finish_sending or abort has been called, or while held.
   void tick();
+  // Sleep. hold (the system is going to sleep): nothing is posted, re-posted, submitted or sent
+  // and nothing is delivered to the listener: no interrupt or bulk read, no uplink transfer
+  // (acquire_uplink gives no buffer), no control message (send refuses it), no response read and
+  // no pipe recovery or ClearStall. Completions that arrive while held free their request and are
+  // counted in sleep_completions only: never toward a failure limit, never a recovery, never
+  // on_fatal; a not-attached or no-device status still sets device_gone. Only while running.
+  // resume (after the wake): ends the hold unless USB has failed or the device has gone (false,
+  // and the hold stays). It clears the failure memory (the uplink stall count and its restart
+  // memory, transfers submitted before it no longer counting as new stalls, the per-read and
+  // interrupt failure counts, the recovery counts in a row), finishes a pipe recovery whose
+  // requests have all returned, posts the interrupt read and every bulk read not posted, sends the
+  // queued control messages and reads any waiting response. False if a read could not be posted
+  // (fatal, reported through on_fatal). finish_sending on a held UsbIo ends the hold and drops the
+  // messages waiting behind it; stopping then goes on as it does when not held.
+  void hold();
+  bool resume();
+  bool held() const { return held_; }
   uint16_t bulk_out_packet_size() const { return bulk_out_mps_; }  // from the endpoint descriptor
   const UsbIoStats& stats() const { return stats_; }
   // Stopping, in three calls made by the owner (docs/driverkit-notes.md 3.9):
@@ -188,6 +209,7 @@ class UsbIo {
   void end_out_recovery();
   void fail(const char* what);
   void note(IOReturn status);
+  void note_held(const char* what, IOReturn status);
   void release();
 
   UsbIoListener& listener_;
@@ -254,6 +276,7 @@ class UsbIo {
   enum class Phase : uint8_t { Running, Draining, Aborted, Released };
   Phase phase_;
   bool failed_;
+  bool held_;  // hold: the system sleeps; only while phase_ is Running
   bool gone_;  // a status said the device is not attached (device_gone)
   bool send_failed_;         // a control request failed while draining
   uint32_t sent_at_stop_;    // messages sent after finish_sending
