@@ -15,6 +15,18 @@
 // Current Settings; first Bind Mux and Set IP Family if those failed at bring-up), or, if it has
 // none, starts from Get Client ID. A retry whose call drops before its settings arrive fails. A
 // retry due while Refreshing waits until the session is Up again.
+//
+// Up, the session also probes the modem: kLivenessIntervalMs after link_up() (a link_up() that
+// only adds a retried family does not restart the wait) and after each answered probe, it sends
+// WDS Get Current Settings on the first live family, IPv4 first. Any response to it is an answer,
+// whatever its result; its contents are ignored. No answer within kRequestTimeoutMs takes the
+// link down and goes to Backoff. A probe and a retry never run together: whichever falls due
+// while the other is outstanding waits, and when both are due the retry goes first. A
+// packet-service-status indication that takes the link down or starts a refresh abandons the
+// probe; a late answer to it is then ignored.
+//
+// Refreshing, a reconfigure indication for the other family is remembered, and that family is
+// refreshed after the current one, before the link comes back up.
 #pragma once
 
 #include <stddef.h>
@@ -65,6 +77,8 @@ enum : uint32_t {
 
 enum : uint32_t { kFamilyRetryFirstMs = 5000, kFamilyRetryMaxMs = 60000 };   // 5 s, 10 s, 20 s, 40 s, then 60 s
 
+enum : uint32_t { kLivenessIntervalMs = 30000 };
+
 class Session {
  public:
   Session(const SessionConfig& cfg, SessionDelegate& delegate);
@@ -79,7 +93,8 @@ class Session {
 
  private:
   // What the outstanding request is, so its response goes to the right handler.
-  enum class Step : uint8_t { Sync, GetWdaClient, SetDataFormat, GetWdsClient, Bind, IpFamily, Start, Settings };
+  enum class Step : uint8_t { Sync, GetWdaClient, SetDataFormat, GetWdsClient, Bind, IpFamily, Start, Settings,
+                              Probe };
 
   struct Pending {
     bool active;
@@ -114,12 +129,14 @@ class Session {
   void send_bind(uint64_t now_ms);
   void send_start(uint64_t now_ms);
   void send_settings(uint64_t now_ms);
+  void tick_up(uint64_t now_ms);
+  void send_probe(uint64_t now_ms);
   void family_done(uint64_t now_ms);
   void schedule_retry(uint64_t now_ms);
   void begin_retry(uint64_t now_ms);
   void retry_done(uint64_t now_ms);
   void cancel_retry();
-  void finish_bring_up();
+  void finish_bring_up(uint64_t now_ms);
   void enter_backoff(uint64_t now_ms);
   void teardown();
   void reset_clients();
@@ -151,6 +168,8 @@ class Session {
   uint64_t retry_from_ms_;
   uint32_t retry_wait_ms_;
   uint32_t next_retry_wait_ms_;  // the wait after the next failed retry
+  uint64_t probe_from_ms_;       // Up: the next probe is due kLivenessIntervalMs after this
+  bool refresh_other_;           // Refreshing: the other family asked for a refresh too
   uint8_t buf_[128];  // every request the session builds fits
 };
 

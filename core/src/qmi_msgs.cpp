@@ -261,11 +261,20 @@ bool parse_wds_current_settings(const QmiMessage& m, RuntimeSettings* out) {
   if (!response_ok(m)) return false;
   RuntimeSettings s = *out;  // committed only if every TLV present is well formed
 
+  // IPv4 counts only with its address, gateway and mask all present; otherwise none of the three
+  // is taken, so a partial reply cannot hand the host a zero router or mask.
   bool found;
-  if (!optional_v4(m, kTlvV4Addr, s.v4_addr, &found)) return false;
-  if (found) s.has_v4 = true;
-  if (!optional_v4(m, kTlvV4Gateway, s.v4_gateway, &found)) return false;
-  if (!optional_v4(m, kTlvV4Mask, s.v4_mask, &found)) return false;
+  uint8_t addr[4], gateway[4], mask[4];
+  bool has_addr, has_gateway, has_mask;
+  if (!optional_v4(m, kTlvV4Addr, addr, &has_addr)) return false;
+  if (!optional_v4(m, kTlvV4Gateway, gateway, &has_gateway)) return false;
+  if (!optional_v4(m, kTlvV4Mask, mask, &has_mask)) return false;
+  if (has_addr && has_gateway && has_mask) {
+    memcpy(s.v4_addr, addr, sizeof addr);
+    memcpy(s.v4_gateway, gateway, sizeof gateway);
+    memcpy(s.v4_mask, mask, sizeof mask);
+    s.has_v4 = true;
+  }
 
   uint8_t dns4[2][4];
   uint8_t n4 = 0;

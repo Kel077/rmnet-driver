@@ -82,7 +82,9 @@ struct RuntimeSettings {  // all addresses in network byte order
   uint8_t v6_dns_count;
   uint32_t mtu;
 };
-// Merges into *out, so IPv4 and IPv6 replies combine. On failure *out is left unchanged.
+// Merges into *out, so IPv4 and IPv6 replies combine. On failure *out is left unchanged. IPv4
+// counts (has_v4, and its address, gateway and mask are taken) only when the reply holds all
+// three; a reply missing any of them leaves those fields and has_v4 as they were.
 bool parse_wds_current_settings(const QmiMessage& m, RuntimeSettings* out);
 
 struct PacketStatus {  // status 1 disconnected, 2 connected; family 0 if absent

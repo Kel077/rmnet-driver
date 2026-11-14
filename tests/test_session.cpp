@@ -131,6 +131,41 @@ void bring_up_v6_only(rmnet::Session& s, FakeModem& m, uint64_t time) {
   feed_frame(s, settings6_response_with_txid(m.last_txid()), time);
 }
 
+// A captured service (non-CTL) frame with TLV `type` removed and both length fields adjusted.
+// Layout: 01, u16 QMUX length, flags, service, client, flags, u16 txid, u16 msg, u16 TLV length.
+std::vector<uint8_t> without_tlv(std::vector<uint8_t> f, uint8_t type) {
+  for (size_t i = 13; i + 3 <= f.size();) {
+    size_t n = 3 + (size_t)(f[i + 1] | f[i + 2] << 8);
+    if (f[i] == type) {
+      f.erase(f.begin() + (long)i, f.begin() + (long)(i + n));
+      size_t qmux = f.size() - 1, tlvs = f.size() - 13;
+      f[1] = (uint8_t)qmux; f[2] = (uint8_t)(qmux >> 8);
+      f[11] = (uint8_t)tlvs; f[12] = (uint8_t)(tlvs >> 8);
+      return f;
+    }
+    i += n;
+  }
+  ::minitest::fail(__FILE__, __LINE__, "without_tlv(): TLV not in frame");
+  return f;
+}
+
+// Ticks at `now`; if that sent a liveness probe, answers it at once with the capture's settings
+// reply for the probed client. For tests that span minutes with the link up.
+void tick_answering_probe(rmnet::Session& s, FakeModem& m, uint64_t now) {
+  size_t sent = m.sent.size();
+  s.tick(now);
+  if (m.sent.size() != sent + 1 || m.last()[9] != 0x2d) return;
+  const char* reply = m.last()[5] == 15 ? kWdsSettings4Resp : kWdsSettings6Resp;
+  feed_frame(s, with_txid(reply, m.last_txid()), now);
+}
+
+// The capture's packet-service-status indication with its reconfigure flag set.
+std::vector<uint8_t> reconfigure_indication(const char* connected_ind) {
+  std::vector<uint8_t> ind = hex(connected_ind);
+  ind[17] = 0x01;
+  return ind;
+}
+
 }  // namespace
 
 TEST(happy_path_brings_link_up_dual_stack) {
@@ -297,16 +332,19 @@ TEST(missing_family_is_retried_while_up) {
   feed_frame(s, settings6_response_with_txid(m.last_txid()), 5300);
   CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2); CHECK_EQ(m.downs, 0);
   CHECK(m.cfg.settings.has_v4); CHECK(m.cfg.settings.has_v6);
-  sent = m.sent.size(); s.tick(200000); CHECK_EQ(m.sent.size(), sent);        // nothing left to retry
+  sent = m.sent.size(); s.tick(200000); CHECK_EQ(m.sent.size(), sent + 1);    // nothing left to retry: only the
+  CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);                     // liveness probe, on the IPv4 client
 }
 
 TEST(failed_retry_keeps_link_up_and_backs_off) {
   FakeModem m; rmnet::Session s({}, m); bring_up_v4_only(s, m, 100);
   const uint64_t at[] = {5100, 15200, 35300, 75400, 135500, 195600};          // waits of 5, 10, 20, 40, 60, 60 s after each failure
   for (uint64_t t : at) {
+    tick_answering_probe(s, m, t - 500);                                      // keeps the liveness probe answered
     size_t sent = m.sent.size();
     s.tick(t - 1); CHECK_EQ(m.sent.size(), sent);
     s.tick(t);     CHECK_EQ(m.sent.size(), sent + 1);
+    CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0x20);                   // Start Network on the IPv6 client
     feed_frame(s, failed_start_frame(16, m.last_txid()), t + 100);
     CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0); CHECK_EQ(m.ups, 1);
   }
@@ -370,13 +408,15 @@ TEST(missing_v4_is_retried_while_up) {
   CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2); CHECK_EQ(m.downs, 0);
   CHECK(m.cfg.settings.has_v4); CHECK(m.cfg.settings.has_v6);
   CHECK_BYTES(m.cfg.settings.v4_addr, 4, "0a 66 f6 e6");
-  sent = m.sent.size(); s.tick(200000); CHECK_EQ(m.sent.size(), sent);        // nothing left to retry
+  sent = m.sent.size(); s.tick(200000); CHECK_EQ(m.sent.size(), sent + 1);    // nothing left to retry: only the
+  CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);                     // liveness probe, on the IPv4 client
 }
 
 TEST(failed_v4_retry_keeps_link_up_and_backs_off) {
   FakeModem m; rmnet::Session s({}, m); bring_up_v6_only(s, m, 100);
   const uint64_t at[] = {5100, 15200, 35300, 75400, 135500, 195600};          // waits of 5, 10, 20, 40, 60, 60 s after each failure
   for (uint64_t t : at) {
+    tick_answering_probe(s, m, t - 500);                                      // keeps the liveness probe answered
     size_t sent = m.sent.size();
     s.tick(t - 1); CHECK_EQ(m.sent.size(), sent);
     s.tick(t);     CHECK_EQ(m.sent.size(), sent + 1);
@@ -385,4 +425,146 @@ TEST(failed_v4_retry_keeps_link_up_and_backs_off) {
     CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0); CHECK_EQ(m.ups, 1);
     CHECK(m.cfg.settings.has_v6); CHECK(!m.cfg.settings.has_v4);
   }
+}
+
+// Liveness probe while Up. bring_up_fully() brings the link up at time 100.
+
+TEST(probe_is_sent_30_s_after_link_up) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m);
+  size_t sent = m.sent.size();
+  s.tick(30099); CHECK_EQ(m.sent.size(), sent);
+  s.tick(30100); CHECK_EQ(m.sent.size(), sent + 1);
+  CHECK_EQ(m.last()[4], 0x01); CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);   // Get Current Settings, IPv4 client
+  s.tick(30200); CHECK_EQ(m.sent.size(), sent + 1);                           // one probe at a time
+}
+
+TEST(answered_probe_schedules_the_next_one) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m);
+  s.tick(30100);
+  auto reply = settings4_response_with_txid(m.last_txid());
+  const uint8_t old_addr[7] = {0x1e, 0x04, 0x00, 0xe6, 0xf6, 0x66, 0x0a};    // TLV 0x1E: 10.102.246.230
+  auto at = std::search(reply.begin(), reply.end(), old_addr, old_addr + 7);
+  CHECK(at != reply.end()); at[3] = 0xea;                                     // contents are ignored
+  feed_frame(s, reply, 30200);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1); CHECK_EQ(m.downs, 0);
+  CHECK_BYTES(m.cfg.settings.v4_addr, 4, "0a 66 f6 e6");
+  size_t sent = m.sent.size();
+  s.tick(40200); CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0);
+  s.tick(60199); CHECK_EQ(m.sent.size(), sent);
+  s.tick(60200); CHECK_EQ(m.sent.size(), sent + 1); CHECK_EQ(m.last()[9], 0x2d);   // 30 s after the answer
+}
+
+TEST(probe_with_error_result_counts_as_alive) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m);
+  s.tick(30100);
+  feed_frame(s, wds_error_frame(rmnet::kWdsGetCurrentSettings, 15, m.last_txid(), rmnet::kQmiErrCallFailed), 30200);
+  size_t sent = m.sent.size();
+  s.tick(40100); s.tick(60199);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0); CHECK_EQ(m.sent.size(), sent);
+  s.tick(60200); CHECK_EQ(m.sent.size(), sent + 1); CHECK_EQ(m.last()[9], 0x2d);
+}
+
+TEST(unanswered_probe_takes_the_link_down_and_backs_off) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m);
+  s.tick(30100);
+  s.tick(40099); CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0);
+  s.tick(40100); CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(m.downs, 1);
+  s.tick(40200); CHECK_EQ(m.downs, 1);
+}
+
+TEST(probe_waits_for_an_outstanding_retry) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_v4_only(s, m, 100);          // link up at 100, IPv6 missing
+  s.tick(5100); CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0x20);       // retry: Start Network, 60 s timeout
+  size_t sent = m.sent.size();
+  s.tick(30100); s.tick(39999); CHECK_EQ(m.sent.size(), sent);                // no probe while the retry is outstanding
+  feed_frame(s, failed_start_frame(16, m.last_txid()), 40000);                // next retry due at 50000
+  s.tick(40000); CHECK_EQ(m.sent.size(), sent + 1);
+  CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);                     // the probe, on the live IPv4 client
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0);
+}
+
+TEST(retry_waits_for_an_outstanding_probe) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_v4_only(s, m, 100);
+  s.tick(5100);  feed_frame(s, failed_start_frame(16, m.last_txid()), 5200);   // next retry at 15200
+  s.tick(15200); feed_frame(s, failed_start_frame(16, m.last_txid()), 15300);  // next retry at 35300
+  s.tick(30100); CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);      // the probe
+  uint16_t probe = m.last_txid(); size_t sent = m.sent.size();
+  s.tick(35300); s.tick(35900); CHECK_EQ(m.sent.size(), sent);                // the due retry waits
+  feed_frame(s, settings4_response_with_txid(probe), 36000);
+  CHECK_EQ(m.ups, 1);                                                         // an answered probe changes nothing
+  s.tick(36000); CHECK_EQ(m.sent.size(), sent + 1);
+  CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0x20);                     // now the retry
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.downs, 0);
+}
+
+TEST(disconnect_indication_during_a_probe_abandons_it) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m);
+  size_t before = m.sent.size();
+  s.tick(30100); CHECK_EQ(m.sent.size(), before + 1); CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);
+  uint16_t probe = m.last_txid();
+  feed(s, kWdsDisconnected4Ind, 31000);
+  CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(m.downs, 1);
+  size_t sent = m.sent.size();
+  feed_frame(s, settings4_response_with_txid(probe), 31100);                  // the late answer
+  CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(m.sent.size(), sent); CHECK_EQ(m.ups, 1);
+  s.tick(40100); CHECK_EQ(m.downs, 1);
+}
+
+TEST(reconfigure_indication_during_a_probe_abandons_it) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m);
+  size_t before = m.sent.size();
+  s.tick(30100); CHECK_EQ(m.sent.size(), before + 1); CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);
+  uint16_t probe = m.last_txid();
+  feed_frame(s, reconfigure_indication(kWdsConnected4Ind), 31000);
+  CHECK(s.state() == rmnet::SessionState::Refreshing); CHECK_EQ(m.downs, 1);
+  CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);
+  uint16_t refresh = m.last_txid(); CHECK(refresh != probe);
+  feed_frame(s, settings4_response_with_txid(probe), 31100);                  // the late probe answer is not the refresh's
+  CHECK(s.state() == rmnet::SessionState::Refreshing); CHECK_EQ(m.ups, 1);
+  s.tick(40099); CHECK(s.state() == rmnet::SessionState::Refreshing);         // the probe's timeout no longer applies
+  feed_frame(s, settings4_response_with_txid(refresh), 40099);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2); CHECK_EQ(m.downs, 1);
+  size_t sent = m.sent.size();
+  s.tick(70098); CHECK_EQ(m.sent.size(), sent);                               // the interval restarts at the new link up
+  s.tick(70099); CHECK_EQ(m.sent.size(), sent + 1); CHECK_EQ(m.last()[9], 0x2d);
+}
+
+TEST(reconfigure_for_the_other_family_during_a_refresh_is_not_lost) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m);
+  feed_frame(s, reconfigure_indication(kWdsConnected4Ind), 5000);
+  CHECK(s.state() == rmnet::SessionState::Refreshing); CHECK_EQ(m.last()[5], 15);
+  size_t sent = m.sent.size(); uint16_t v4 = m.last_txid();
+  feed_frame(s, reconfigure_indication(kWdsConnected6Ind), 5005);
+  CHECK_EQ(m.sent.size(), sent);                                              // remembered, not sent yet
+  feed_frame(s, settings4_response_with_txid(v4), 5010);
+  CHECK(s.state() == rmnet::SessionState::Refreshing); CHECK_EQ(m.ups, 1);
+  CHECK_EQ(m.sent.size(), sent + 1); CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0x2d);   // IPv6 refreshed next
+  auto reply = settings6_response_with_txid(m.last_txid());
+  reply[51] = 0x09;                                                           // last byte of the IPv6 address: 08 -> 09
+  feed_frame(s, reply, 5020);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2); CHECK_EQ(m.downs, 1);
+  CHECK(m.cfg.settings.has_v4); CHECK(m.cfg.settings.has_v6);
+  CHECK_BYTES(m.cfg.settings.v6_addr, 16, "20 01 0d b8 8a f4 b2 60 61 fc 0d be 3a b2 6e 09");
+}
+
+TEST(ipv4_without_gateway_or_mask_is_not_up) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_to(s, m, kWdsStart4Resp);   // IPv4 Get Current Settings outstanding
+  feed_frame(s, without_tlv(settings4_response_with_txid(m.last_txid()), 0x20), 100);   // no gateway
+  CHECK_EQ(m.last()[8], 0x22);                                                // bring-up moves on to IPv6 (CTL Get Client ID)
+  feed(s, kCtlGetWds6Resp, 100);
+  feed_frame(s, with_txid(kWdsBind6Resp, m.last_txid()), 100);
+  feed_frame(s, with_txid(kWdsFamily6Resp, m.last_txid()), 100);
+  feed_frame(s, start6_response_with_txid(m.last_txid()), 100);
+  feed_frame(s, settings6_response_with_txid(m.last_txid()), 100);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1);
+  CHECK(!m.cfg.settings.has_v4); CHECK(m.cfg.settings.has_v6);
+  s.tick(5100); CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x20);       // IPv4 is retried
+  feed_frame(s, start4_response_with_txid(m.last_txid()), 5200);
+  feed_frame(s, without_tlv(settings4_response_with_txid(m.last_txid()), 0x21), 5300);  // no mask
+  CHECK_EQ(m.ups, 1); CHECK(!m.cfg.settings.has_v4);
+  s.tick(15300); CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x20);      // retried again
+  feed_frame(s, start4_response_with_txid(m.last_txid()), 15400);
+  feed_frame(s, settings4_response_with_txid(m.last_txid()), 15500);          // complete
+  CHECK_EQ(m.ups, 2); CHECK(m.cfg.settings.has_v4);
+  CHECK_BYTES(m.cfg.settings.v4_gateway, 4, "0a 66 f6 e5"); CHECK_BYTES(m.cfg.settings.v4_mask, 4, "ff ff ff fc");
 }

@@ -161,3 +161,10 @@ TEST(parsers_reject_short_values) {  // frames built in the test with a 2-byte T
   rmnet::PacketStatus p{};    CHECK(!rmnet::parse_wds_packet_status(short_status_frame(), &p));
   uint32_t h; rmnet::CallEnd e{}; CHECK(!rmnet::parse_wds_start_network(decode(kWdsBind4Resp), &h, &e));  // success but no handle TLV
 }
+TEST(parse_settings_ipv4_needs_address_mask_and_gateway) {   // the capture's IPv4 reply without one TLV
+  for (uint8_t missing : {0x1e, 0x20, 0x21}) {
+    rmnet::RuntimeSettings s{};
+    CHECK(rmnet::parse_wds_current_settings(decode_bytes(without_tlv(kWdsSettings4Resp, missing)), &s));
+    CHECK(!s.has_v4); CHECK_BYTES(s.v4_addr, 4, "00 00 00 00"); CHECK_EQ(s.mtu, 1500u);
+  }
+}

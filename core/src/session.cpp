@@ -48,6 +48,8 @@ Session::Session(const SessionConfig& cfg, SessionDelegate& delegate)
       retry_from_ms_(0),
       retry_wait_ms_(0),
       next_retry_wait_ms_(kFamilyRetryFirstMs),
+      probe_from_ms_(0),
+      refresh_other_(false),
       buf_() {}
 
 SessionState Session::state() const { return state_; }
@@ -61,6 +63,7 @@ void Session::stop() {
   if (state_ == SessionState::Idle) return;
   pending_.active = false;
   cancel_retry();
+  refresh_other_ = false;
   state_ = SessionState::Idle;
   if (link_is_up_) {
     link_is_up_ = false;
@@ -74,14 +77,7 @@ void Session::tick(uint64_t now_ms) {
     case SessionState::Idle:
       return;
     case SessionState::Up:
-      if (retrying_) {
-        if (pending_.active && elapsed(now_ms, pending_.sent_ms) >= pending_.timeout_ms) {
-          pending_.active = false;
-          retry_done(now_ms);
-        }
-      } else if (retry_due_ && elapsed(now_ms, retry_from_ms_) >= retry_wait_ms_) {
-        begin_retry(now_ms);
-      }
+      tick_up(now_ms);
       return;
     case SessionState::Backoff:
       if (elapsed(now_ms, backoff_started_ms_) >= backoff_wait_ms_) begin_sync(now_ms);
@@ -207,7 +203,13 @@ void Session::on_response(const QmiMessage& m, uint64_t now_ms) {
         if (!parse_wds_current_settings(m, &link_.settings) || !family_has_settings(current_)) {
           break;
         }
-        finish_bring_up();
+        if (refresh_other_) {
+          refresh_other_ = false;
+          current_ = current_ == 0 ? 1 : 0;
+          send_settings(now_ms);
+          return;
+        }
+        finish_bring_up(now_ms);
         return;
       }
       // A reply that fails to parse leaves the settings unchanged, so this family has none. A
@@ -216,6 +218,10 @@ void Session::on_response(const QmiMessage& m, uint64_t now_ms) {
       family_done(now_ms);
       return;
     }
+    case Step::Probe:
+      // The modem answered: alive, whatever the result. The settings it reports are not used.
+      probe_from_ms_ = now_ms;
+      return;
   }
   enter_backoff(now_ms);
 }
@@ -256,12 +262,19 @@ void Session::on_indication(const QmiMessage& m, uint64_t now_ms) {
     }
     return;
   }
+  // Either way an outstanding probe is abandoned: enter_backoff() drops it, and a refresh drops it
+  // below. Its late answer then matches nothing, since the refresh uses a new transaction ID.
   if (status.status == kStatusDisconnected) {
     fam.has_handle = false;  // the call is gone; nothing to stop
     fam.live = false;
     enter_backoff(now_ms);
-  } else if (status.status == kStatusConnected && status.reconfigure &&
-             state_ == SessionState::Up) {
+  } else if (status.status == kStatusConnected && status.reconfigure) {
+    if (state_ == SessionState::Refreshing) {
+      // The other family is refreshed once the current one is done, instead of being dropped.
+      if (index != current_) refresh_other_ = true;
+      return;
+    }
+    pending_.active = false;  // an outstanding probe (or retry, below) is abandoned
     if (retrying_) {
       // The refresh takes over the one outstanding request. The abandoned retry is due again as
       // soon as the session is back Up, with the same next wait.
@@ -354,6 +367,42 @@ void Session::send_settings(uint64_t now_ms) {
          kRequestTimeoutMs);
 }
 
+// Up: a retry of the missing family and the liveness probe share the one outstanding request.
+// This is the only place either starts or times out, so neither starts while the other is
+// outstanding; whichever falls due meanwhile waits. When both are due, the retry goes first: a
+// retry waits at least kFamilyRetryFirstMs after it ends, so the probe follows it at once.
+void Session::tick_up(uint64_t now_ms) {
+  if (pending_.active) {
+    if (elapsed(now_ms, pending_.sent_ms) < pending_.timeout_ms) return;
+    if (pending_.step == Step::Probe) {
+      enter_backoff(now_ms);  // the modem went silent: the link must not look up
+      return;
+    }
+    pending_.active = false;  // the retry's request timed out; the link stays up
+    retry_done(now_ms);
+    return;
+  }
+  if (retry_due_ && elapsed(now_ms, retry_from_ms_) >= retry_wait_ms_) {
+    begin_retry(now_ms);
+  } else if (!retrying_ && elapsed(now_ms, probe_from_ms_) >= kLivenessIntervalMs) {
+    send_probe(now_ms);
+  }
+}
+
+// Sends Get Current Settings on the first live family, IPv4 first. Up always has one; if none is
+// live, no probe is sent.
+void Session::send_probe(uint64_t now_ms) {
+  for (uint8_t i = 0; i < 2; ++i) {
+    const Family& fam = families_[i];
+    if (!fam.live || !fam.has_client) continue;
+    uint16_t tx = next_txid();
+    size_t n = build_wds_get_current_settings(buf_, sizeof buf_, fam.client, tx);
+    expect(Step::Probe, QmiService::WDS, fam.client, tx, kWdsGetCurrentSettings, n, now_ms,
+           kRequestTimeoutMs);
+    return;
+  }
+}
+
 // The current family is finished, with or without settings. A failed family keeps its client
 // (and any handle) until teardown releases them. During a retry, the retry is finished instead.
 void Session::family_done(uint64_t now_ms) {
@@ -371,7 +420,7 @@ void Session::family_done(uint64_t now_ms) {
   }
   next_retry_wait_ms_ = kFamilyRetryFirstMs;
   schedule_retry(now_ms);
-  finish_bring_up();
+  finish_bring_up(now_ms);
 }
 
 // Schedules a retry of the missing family, if one is missing, with the next wait.
@@ -423,9 +472,10 @@ void Session::cancel_retry() {
   retrying_ = false;
 }
 
-void Session::finish_bring_up() {
+void Session::finish_bring_up(uint64_t now_ms) {
   state_ = SessionState::Up;
   link_is_up_ = true;
+  probe_from_ms_ = now_ms;
   next_backoff_ms_ = kFirstBackoffMs;
   delegate_.link_up(link_);
 }
@@ -433,6 +483,7 @@ void Session::finish_bring_up() {
 void Session::enter_backoff(uint64_t now_ms) {
   pending_.active = false;
   cancel_retry();
+  refresh_other_ = false;
   state_ = SessionState::Backoff;
   backoff_started_ms_ = now_ms;
   backoff_wait_ms_ = next_backoff_ms_;
