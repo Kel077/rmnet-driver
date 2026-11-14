@@ -210,6 +210,104 @@ func readBack(_ pdus: [SubmitPdu], reference: Int, number: String) -> String? {
     return text
 }
 
+// --- the window's helpers (composeNote, canSend, numberNote, rowTitle, rowNote, deleteQuestion, unreadMarks)
+
+func message(_ indices: [Int], unread: Bool = false, sender: String = "+27838890001", time: Date? = nil,
+             text: String = "hi", missing: Int = 0, readable: Bool = true) -> SmsMessage {
+    SmsMessage(indices: indices, unread: unread, sender: sender, timestamp: time, text: text,
+               missingParts: missing, readable: readable)
+}
+
+func windowHelperChecks() {
+    // composeNote: parts and alphabet, from the same splitting the sender uses.
+    let notes: [(String, String)] = [
+        ("", ""),
+        ("hello", "1 part, GSM alphabet"),
+        (String(repeating: "a", count: 160), "1 part, GSM alphabet"),
+        (String(repeating: "a", count: 161), "2 parts, GSM alphabet"),
+        ("你好", "1 part, Unicode"),
+        (String(repeating: "好", count: 140), "3 parts, Unicode"),
+        (String(repeating: "a", count: 1530), "10 parts, GSM alphabet"),
+        (String(repeating: "a", count: 1531), "too long: 11 parts, at most 10"),
+        (String(repeating: "a", count: 153 * 11 + 1), "too long: 12 parts, at most 10"),
+    ]
+    for (text, want) in notes {
+        let got = composeNote(text)
+        check(got == want, "composeNote: \(text.count) characters", "want \"\(want)\", got \"\(got)\"")
+    }
+
+    // canSend: a valid number and a text of 1 to 10 parts that is not only blanks.
+    let good = "+27838890001"
+    check(canSend(number: good, text: "hi"), "canSend: valid number and text")
+    check(canSend(number: "10086", text: "你好"), "canSend: national number, Unicode text")
+    check(!canSend(number: "12", text: "hi"), "canSend: number too short")
+    check(!canSend(number: "+27 83", text: "hi"), "canSend: number with a space")
+    check(!canSend(number: "", text: "hi"), "canSend: no number")
+    check(!canSend(number: good, text: ""), "canSend: empty text")
+    check(!canSend(number: good, text: " \n\t "), "canSend: only blanks")
+    check(canSend(number: good, text: String(repeating: "a", count: 1530)), "canSend: 10 parts")
+    check(!canSend(number: good, text: String(repeating: "a", count: 1531)), "canSend: 11 parts")
+
+    // numberNote: says nothing until there is a number, and nothing for a valid one.
+    let rule = "The number is 3 to 20 digits, with an optional + in front."
+    check(numberNote("") == "", "numberNote: empty")
+    check(numberNote(good) == "", "numberNote: valid")
+    check(numberNote("12") == rule, "numberNote: too short", numberNote("12"))
+    check(numberNote("+27 83") == rule, "numberNote: with a space", numberNote("+27 83"))
+
+    // rowTitle: today's messages as HH:mm, older ones with the date, in the zone given.
+    let now = utc(1794657600) // 2026-11-14 12:00 UTC (20:00 in Shanghai)
+    let utcZone = TimeZone(identifier: "UTC")!
+    let shanghai = TimeZone(identifier: "Asia/Shanghai")!
+    let titles: [(SmsMessage, TimeZone, String)] = [
+        (message([1], time: utc(1794616200)), utcZone, "+27838890001, 00:30"),            // 14th 00:30 UTC
+        (message([1], time: utc(1794611400)), utcZone, "+27838890001, 2026-11-13 23:10"), // 13th 23:10 UTC
+        (message([1], time: utc(1794611400)), shanghai, "+27838890001, 07:10"),          // 14th 07:10 there
+        (message([1], time: utc(1794700200)), utcZone, "+27838890001, 23:50"),            // later today
+        (message([1], time: utc(1794700200)), shanghai, "+27838890001, 2026-11-15 07:50"), // tomorrow there
+        (message([1], time: utc(1735787040)), utcZone, "+27838890001, 2025-01-02 03:04"),
+        (message([1], sender: "Alerts", time: nil), utcZone, "Alerts, no time"),
+        (message([5], sender: "", time: nil, text: "", readable: false), utcZone, "unknown sender, no time"),
+    ]
+    for (m, zone, want) in titles {
+        let got = rowTitle(m, now: now, timeZone: zone)
+        check(got == want, "rowTitle: \(want) in \(zone.identifier)", "got \"\(got)\"")
+    }
+
+    // rowNote: what the row says besides the text.
+    check(rowNote(message([1])) == "", "rowNote: complete")
+    check(rowNote(message([1, 2], missing: 1)) == "1 part missing", "rowNote: one part missing")
+    check(rowNote(message([1], missing: 2)) == "2 parts missing", "rowNote: two parts missing")
+    check(rowNote(message([7], sender: "", text: "", readable: false)) == "not readable", "rowNote: not readable")
+
+    // deleteQuestion: names the sender and counts every stored part.
+    let two = deleteQuestion(message([3, 4], sender: "+111"))
+    check(two.title == "Delete the message from +111?", "deleteQuestion: title", two.title)
+    check(two.message == "2 stored parts will be deleted from the modem. This cannot be undone.",
+          "deleteQuestion: two parts", two.message)
+    let one = deleteQuestion(message([9], sender: ""))
+    check(one.title == "Delete the message from an unknown sender?", "deleteQuestion: no sender", one.title)
+    check(one.message == "1 stored part will be deleted from the modem. This cannot be undone.",
+          "deleteQuestion: one part", one.message)
+
+    // The key: indices, sender and time together.
+    let a = message([1], unread: true, time: utc(1794616200))
+    let b = message([2, 3], time: utc(1794611400))
+    let c = message([4], time: nil)
+    check(a.key == message([1], unread: false, time: utc(1794616200), text: "other").key,
+          "key: the unread flag and the text are not part of it")
+    check(a.key != message([1], sender: "+1", time: utc(1794616200)).key, "key: another sender")
+    check(a.key != message([1], time: utc(1794611400)).key, "key: another time")
+    check(b.key != message([2], time: utc(1794611400)).key, "key: other indices")
+
+    // unreadMarks: unread now, or still marked from before and still listed.
+    let gone = message([8], time: nil).key
+    let marks = unreadMarks(listed: [a, b, c], kept: [b.key, gone])
+    check(marks == [a.key, b.key], "unreadMarks: new unread plus kept, gone dropped", "\(marks)")
+    check(unreadMarks(listed: [], kept: [a.key]).isEmpty, "unreadMarks: nothing listed")
+    check(unreadMarks(listed: [b, c], kept: []).isEmpty, "unreadMarks: nothing unread")
+}
+
 @main
 struct SmsModelTests {
     static func main() {
@@ -632,6 +730,8 @@ struct SmsModelTests {
         check(parseStorage(["+CPMS: \"ME\",300,255"]) == nil, "parseStorage: more used than there is")
         check(parseStorage(["+CPMS: \"ME\""]) == nil, "parseStorage: no numbers")
         check(parseStorage(["OK"]) == nil && parseStorage([]) == nil, "parseStorage: no +CPMS line")
+
+        windowHelperChecks()
 
         print("sms-test: \(checks) checks passed")
     }

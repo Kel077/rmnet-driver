@@ -724,3 +724,72 @@ func encodeSubmit(to number: String, text: String, reference: UInt8) -> Result<[
     }
     return .success(out)
 }
+
+// MARK: - What the window shows (pure decisions for app/SmsView.swift)
+
+/// The line under the text being written: how many parts it needs and in which alphabet; "" for no text.
+func composeNote(_ text: String) -> String {
+    let parts = partCount(text)
+    if parts == 0 { return "" }
+    if parts > maximumParts { return "too long: \(parts) parts, at most \(maximumParts)" }
+    let alphabet = chooseEncoding(text) == .gsm7 ? "GSM alphabet" : "Unicode"
+    return "\(parts) \(parts == 1 ? "part" : "parts"), \(alphabet)"
+}
+
+/// A valid number and a text of 1 to 10 parts that is not only blanks.
+func canSend(number: String, text: String) -> Bool {
+    guard validNumber(number), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+    return (1...maximumParts).contains(partCount(text))
+}
+
+/// The line under the number: "" while it is empty or valid, else the rule.
+func numberNote(_ number: String) -> String {
+    number.isEmpty || validNumber(number) ? "" : "The number is 3 to 20 digits, with an optional + in front."
+}
+
+/// "<sender>, <time>": today's messages (in `timeZone`) as HH:mm, others as yyyy-MM-dd HH:mm.
+func rowTitle(_ m: SmsMessage, now: Date, timeZone: TimeZone = .current) -> String {
+    let sender = m.sender.isEmpty ? "unknown sender" : m.sender
+    guard let time = m.timestamp else { return "\(sender), no time" }
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = timeZone
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.calendar = calendar
+    formatter.timeZone = timeZone
+    formatter.dateFormat = calendar.isDate(time, inSameDayAs: now) ? "HH:mm" : "yyyy-MM-dd HH:mm"
+    return "\(sender), \(formatter.string(from: time))"
+}
+
+/// What a row says besides its title and text: "not readable", "<n> part(s) missing" or "".
+func rowNote(_ m: SmsMessage) -> String {
+    if !m.readable { return "not readable" }
+    if m.missingParts > 0 { return "\(m.missingParts) \(m.missingParts == 1 ? "part" : "parts") missing" }
+    return ""
+}
+
+/// The confirmation before a delete: the sender, and how many stored parts go.
+func deleteQuestion(_ m: SmsMessage) -> (title: String, message: String) {
+    let sender = m.sender.isEmpty ? "an unknown sender" : m.sender
+    let n = m.indices.count
+    return ("Delete the message from \(sender)?",
+            "\(n) stored \(n == 1 ? "part" : "parts") will be deleted from the modem. This cannot be undone.")
+}
+
+/// A message across listings: its stored indices, its sender and its time.
+struct SmsMessageKey: Hashable {
+    let indices: [Int]
+    let sender: String
+    let timestamp: Date?
+}
+
+extension SmsMessage {
+    var key: SmsMessageKey { SmsMessageKey(indices: indices, sender: sender, timestamp: timestamp) }
+}
+
+/// Listing marks messages as read on the modem, so the window keeps its own marks: a listed message is
+/// marked when the modem says unread or when it was marked before (`kept`); marks of messages no longer
+/// listed are dropped.
+func unreadMarks(listed: [SmsMessage], kept: Set<SmsMessageKey>) -> Set<SmsMessageKey> {
+    Set(listed.filter { $0.unread || kept.contains($0.key) }.map { $0.key })
+}

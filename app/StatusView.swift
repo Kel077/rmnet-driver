@@ -1,5 +1,6 @@
-// The RMNet app's one window: the driver's status, refreshed every 2 seconds, and the buttons that
-// install, update and remove it. Started by main.swift when the app gets no command-line verb.
+// The RMNet app's one window: on its Driver tab the driver's status, refreshed every 2 seconds, and the
+// buttons that install, update and remove it; on its Messages tab the modem's text messages (SmsView.swift).
+// Started by main.swift when the app gets no command-line verb.
 import AppKit
 import Combine
 import SwiftUI
@@ -9,9 +10,23 @@ struct RMNetApp: App {
 
     var body: some Scene {
         Window("RMNet", id: "status") {
-            StatusView()
+            RMNetWindow()
         }
-        .defaultSize(width: 480, height: 420)
+        .defaultSize(width: 520, height: 480)
+    }
+}
+
+// The window's two tabs: Driver (the status below) and Messages (SmsView.swift).
+struct RMNetWindow: View {
+    @StateObject private var messages = SmsController()
+
+    var body: some View {
+        TabView {
+            StatusView()
+                .tabItem { Text("Driver") }
+            SmsView(controller: messages)
+                .tabItem { Text("Messages") }
+        }
     }
 }
 
