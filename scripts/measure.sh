@@ -1,8 +1,9 @@
 #!/bin/sh
 # Measures throughput on one network port, from the port's own byte counters, under a data budget.
 #
-#   scripts/measure.sh <interface> down|up
-#   scripts/measure.sh --analyse down|up <samples file>    (re-prints the figures of a saved run)
+#   scripts/measure.sh <interface> down|up|down-long|up-long
+#   scripts/measure.sh --analyse down|up|down-long|up-long <samples file>
+#                                         (re-prints the figures of a saved run)
 #
 # down: 4 parallel downloads from mensura.cdn-apple.com/api/v1/gm/large, stopped when 50,000,000
 #       bytes have arrived on the port since the start, or after 8 s, whichever is first. Each
@@ -13,6 +14,13 @@
 #       can be recognised.
 # up:   4 parallel uploads to .../gm/slurp, stopped when 10,000,000 bytes have left the port,
 #       or after 6 s. Each upload sends one 4,000,000-byte body, so 16 MB is the most it can send.
+# down-long: the down transfer, stopped when 320,000,000 bytes have arrived on the port, or after
+#       8 s (at up to about 40 MB a second, the watchdog stops it within one sample, about
+#       10,000,000 bytes, of the threshold). Each download stops itself at 90,000,000 bytes, so a run
+#       cannot pass 360,000,000 bytes of payload even if the watchdog dies; streams that end at that
+#       limit are counted as in down.
+# up-long: the up transfer, stopped when 60,000,000 bytes have left the port, or after 8 s. Each
+#       upload sends one 20,000,000-byte body, so 80 MB is the most it can send.
 #
 # Nothing is resolved through the system resolver: every transfer is bound to the port with
 # --interface and pinned to one server address with --resolve. Proxies are bypassed (--noproxy),
@@ -21,7 +29,7 @@
 # A watchdog samples `netstat -I <interface> -b -n` every 0.25 s. The bytes moved are accumulated
 # from sample to sample: a counter that goes down (the interface was recreated and its counters
 # restarted) counts as a reset, and what it shows after the reset is added. The samples file,
-# build/logs/measure-<time>-<dir>.samples, holds "seconds since start, bytes in, bytes out" moved
+# build/logs/measure-<time>-<mode>.samples, holds "seconds since start, bytes in, bytes out" moved
 # since the start. The figures:
 #   gate figure  the mean rate from 1.0 s after traffic starts (the first sample with more than
 #                100,000 bytes moved in the measured direction) to the last sample before the stop;
@@ -29,13 +37,15 @@
 #
 # The cellular data is metered. Every run appends "time direction bytes-in bytes-out" to the usage
 # file (build/installed/measure-usage.log, which `make clean` keeps; MEASURE_USAGE_FILE overrides
-# it on lo0 only), also when it fails or is interrupted. If the counters cannot be read at the end, the run is
+# it on lo0 only), also when it fails or is interrupted; the direction is down or up (down-long is
+# recorded as down, up-long as up). If the counters cannot be read at the end, the run is
 # charged at least its reservation in the measured direction. A run refuses to start (exit 2) if a
 # line of the usage file is not "<time> <down|up> <bytes in> <bytes out>" with non-negative whole
 # numbers, or if the recorded total plus this run's reservation (its stop threshold plus 10,000,000
-# bytes for what arrives after the stop) would pass 310,000,000 bytes. It warns when a run moved more
-# than 60,000,000 bytes. The run fails if fewer than 1,000,000 bytes crossed the port in the
-# measured direction (curl did not go through it).
+# bytes for what arrives after the stop) would pass 1,300,000,000 bytes. It warns when a run moved
+# more than 60,000,000 bytes (down and up), 384,000,000 (down-long) or 72,000,000 (up-long; for the
+# long modes, the stop threshold plus 20 percent). The run fails if fewer than 1,000,000 bytes
+# crossed the port in the measured direction (curl did not go through it).
 #
 # For testing with no network: MEASURE_TEST_PORT=<port> sends every transfer to 127.0.0.1:<port>
 # over plain HTTP, MEASURE_NETSTAT=<program> replaces netstat, and MEASURE_USAGE_FILE=<file> replaces
@@ -45,9 +55,8 @@ set -u
 
 cd "$(dirname "$0")/.." || exit 1
 
-BUDGET=310000000
+BUDGET=1300000000
 MARGIN=10000000
-WARN_BYTES=60000000
 MIN_BYTES=1000000
 HOST=mensura.cdn-apple.com
 ADDR=111.132.43.41
@@ -59,7 +68,6 @@ if [ -n "${MEASURE_TEST_PORT:-}" ]; then
   SCHEME=http
 fi
 NETSTAT=${MEASURE_NETSTAT:-/usr/sbin/netstat}
-STREAM_BYTES=15000000
 USAGE=${MEASURE_USAGE_FILE:-build/installed/measure-usage.log}
 
 die() {
@@ -108,22 +116,38 @@ analyse() {
     }' "$2"
 }
 
+MODES="down|up|down-long|up-long"
+
 if [ "${1:-}" = "--analyse" ]; then
-  [ $# -eq 3 ] || die "usage: $0 --analyse down|up <samples file>"
-  case $2 in down | up) ;; *) die "direction must be down or up" ;; esac
+  [ $# -eq 3 ] || die "usage: $0 --analyse $MODES <samples file>"
+  case $2 in
+    down | down-long) adir=down ;;
+    up | up-long) adir=up ;;
+    *) die "mode must be one of $MODES" ;;
+  esac
   [ -r "$3" ] || die "cannot read $3"
-  analyse "$2" "$3"
+  analyse "$adir" "$3"
   exit 0
 fi
 
-[ $# -eq 2 ] || die "usage: $0 <interface> down|up"
+[ $# -eq 2 ] || die "usage: $0 <interface> $MODES"
 IFACE=$1
-DIR=$2
-case $DIR in
-  down) STOP_BYTES=50000000 STOP_SECS=8 URL="$SCHEME://$HOST:$PORT/api/v1/gm/large" ;;
-  up) STOP_BYTES=10000000 STOP_SECS=6 URL="$SCHEME://$HOST:$PORT/api/v1/gm/slurp" ;;
-  *) die "direction must be down or up" ;;
+MODE=$2
+# Per mode: the measured direction (DIR, also the usage line's direction word), the stop threshold
+# and time limit, the warning threshold, and the per-stream limit: each download's byte limit
+# (STREAM_BYTES) or each upload's body in millions of bytes (BODY_MB).
+case $MODE in
+  down) DIR=down STOP_BYTES=50000000 STOP_SECS=8 WARN_BYTES=60000000 STREAM_BYTES=15000000 ;;
+  up) DIR=up STOP_BYTES=10000000 STOP_SECS=6 WARN_BYTES=60000000 BODY_MB=4 ;;
+  down-long) DIR=down STOP_BYTES=320000000 STOP_SECS=8 WARN_BYTES=384000000 STREAM_BYTES=90000000 ;;
+  up-long) DIR=up STOP_BYTES=60000000 STOP_SECS=8 WARN_BYTES=72000000 BODY_MB=20 ;;
+  *) die "mode must be one of $MODES" ;;
 esac
+if [ "$DIR" = down ]; then
+  URL="$SCHEME://$HOST:$PORT/api/v1/gm/large"
+else
+  URL="$SCHEME://$HOST:$PORT/api/v1/gm/slurp"
+fi
 
 # The test settings change where the bytes are counted, sent or recorded, so they are refused on any
 # interface but lo0, before the usage file is touched or anything is sent.
@@ -189,7 +213,7 @@ base=$(counters) || die "no interface $IFACE ($NETSTAT -I $IFACE -b -n shows no 
 
 mkdir -p build/logs
 stamp=$(date +%Y%m%d-%H%M%S)
-SAMPLES="build/logs/measure-$stamp-$DIR.samples"
+SAMPLES="build/logs/measure-$stamp-$MODE.samples"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/measure.XXXXXX") || die "cannot create a temporary directory"
 
 pids=
@@ -279,7 +303,7 @@ on_signals() {
 on_signals
 
 if [ "$DIR" = up ]; then
-  dd if=/dev/zero of="$WORK/body" bs=1000000 count=4 2>/dev/null || die "cannot write the upload body"
+  dd if=/dev/zero of="$WORK/body" bs=1000000 count=$BODY_MB 2>/dev/null || die "cannot write the upload body"
 fi
 
 CURL="/usr/bin/curl --noproxy * --interface $IFACE --resolve $HOST:$PORT:$ADDR -s --max-time $STOP_SECS"
@@ -343,7 +367,7 @@ sleep 1 # let what was in flight at the stop arrive, so the usage record include
 record
 
 set -- $base
-echo "interface:        $IFACE ($DIR)"
+echo "interface:        $IFACE ($MODE)"
 echo "before:           in $1 bytes, out $2 bytes"
 if [ "$last_ok" -eq 1 ]; then
   echo "after:            in $prev_in bytes, out $prev_out bytes (1 s after the stop)"
