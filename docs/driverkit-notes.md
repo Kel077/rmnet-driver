@@ -1236,3 +1236,24 @@ Branch `sms`, commit `a17f979`; installed as 317.16.8 at 00:08 on 2026-11-15 (`s
 - After the install (00:09): `/Applications/RMNet.app/Contents/MacOS/RMNet sms list` printed "sms: 16 message(s), 32 of 255 stored parts used"; `status --json` gave `Connected` with one entry, 317.16.8; both address families; `en33` first in neither `scutil --nwi` list; no new crash report; pings 3 of 3.
 
 **Not seen.** The window's `Messages` tab (nobody but the owner can look at it); a send from the window; quitting during a send; a multi-part send; a full store; the app recovering a modem left at the `> ` prompt (only the collector's checks cover it).
+
+## Runtime findings (measurements with the new budget, 2026-11-15 00:29 to 00:45)
+
+Build 317.16.8 (main's driver code: flow control asked and granted, transmit queue of 64), cell PCI 893 on band n41, RSRP -88 to -92, SINR 14 to 15, idle pings 20 to 60 ms. The owner added 1 GB to the testing budget at about 00:19. `scripts/measure.sh` got two longer modes for this (`down-long`: four downloads, stop at 320 MB or 8 s; `up-long`: four uploads, stop at 60 MB or 8 s) and now waits for the port's counters to settle before it records a run. Each figure is from the port's own byte counters; the "gate figure" is the mean from 1.0 s after traffic starts to the last sample.
+
+| Time | Mode | Moved | Gate figure | Best second | Ping every 0.2 s alongside |
+|---|---|---|---|---|---|
+| 00:29:44 | `up` (stop at 10 MB) | 17.8 MB out | 25.0 Mbit/s over 2.8 s | 33.7 Mbit/s | 45 of 45, 12 to 148 ms |
+| 00:33:52 | `down-long` (8 s) | 145.6 MB in | **154.8 Mbit/s** over 6.7 s | 177.2 Mbit/s | not run |
+| 00:44:20 | `up-long` (8 s) | 34.3 MB out | 33.6 Mbit/s over 6.4 s | 56.6 Mbit/s | 70 of 70, 11 to 122 ms |
+
+**The 8-second download** is the design's own test. 154.8 Mbit/s is below its 200 Mbit/s line. Second by second: 77, 135, 139, 174, 173, 153, 135, 163 Mbit/s. The driver during the run: 5,311 transfers carrying 101,641 packets (about 19 per transfer, about 27 KB of the 31,744-byte read); handler time 421,529 µs in all, about 79 µs per transfer, which is 5.2 % of the 8.14 s; `RMNetRxHandlerMaxUs` 780; `RMNetRxLagMaxUs` 1,778; `RMNetRxFullTransfers` 0 (no read came back full, so the modem never had more waiting than one read takes); `RMNetRxDropNoPacket`, `RMNetRxDropBadQmap`, `RMNetRxDropTooBig`, `RMNetUsbBulkInErrors` and `RMNetUsbRecoveries` all 0. Nothing there shows the driver limiting the run. What another driver would have got from the same cell in the same half hour was not measured.
+
+**Uploads with flow control on.**
+- The rates are in the range seen before the change (37.9 Mbit/s and a best second of 43.2 on 316.19.56 at 16:27 on 2026-11-14, on a cell that was not recorded): 25.0 and 33.6 Mbit/s here, with a best second of 56.6. So neither the 64-entry queue nor the flow-control request shows as a loss of upload speed. The runs differ in cell and hour, so no finer comparison is made.
+- Small packets are no longer held up: during 4 s and 8 s of upload every ping was answered, the slowest in 148 and 122 ms. Without the request, on 2026-11-14, pings behind a 1.84 MB burst waited 2 to 3.5 s.
+- `RMNetTxHolds` rose by 121 in the short run and by 465 in the long one (it rose by 2 for a whole burst before the request), with `RMNetTxDropBusy`, `RMNetTxDropUsb`, `RMNetTxDropRecovering`, bulk OUT errors and timeouts all 0, `RMNetTxPending` and `RMNetPacketsHeld` 0 afterwards, and `RMNetQmapCommands` still 0. So with the request the modem takes an upload at about the rate it can send it: the driver's eight uplink buffers stay in flight, the frames wait in the transmit queue and in macOS's own interface queue, and small packets pass between them. This is the controller's reading of the hold count and the ping times; what the modem does inside is not visible.
+
+**Not measured.** A download while an upload runs; the same tests on PCI 32; a second 8-second download (one run on this cell does not measure the driver: 278 and 37 Mbit/s were seen four minutes apart on 2026-11-14).
+
+**Data.** The three runs moved 199,492,768 bytes (recorded; the usage file's total is 509,193,836). With traffic the usage file does not record, about 516 MB of the 1,400 MB is used.
