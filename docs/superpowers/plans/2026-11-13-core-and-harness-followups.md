@@ -216,3 +216,23 @@ Minor, one line each:
 - `soak.sh`: the crash-report listing hides a permission failure and does not list `Retired/`.
 - `soak.sh`: the usage reader is a copy of `measure.sh`'s.
 - The liveness probe writes three log lines every 30 s.
+
+## Left by the recovery plan's last re-reviews (2026-11-14)
+
+From the final fix wave's re-review (items (1), (2) and (4) of its eight Minor residuals were README statements, corrected in the "Done means" table and the app section):
+
+- App: `ExtensionManager`'s "cannot" text says the bundled version "is not listed" when it is listed as uninstalling.
+- Driver: the corrected comment in `RMNetDriver.cpp` says the transfers end in `kIOReturnNotReady`, but the interrupt read ends in `kIOReturnAborted` and the re-post is refused with not-ready.
+- App: one vacuous check and one dead branch in the status model.
+- App: the not-QMI advice lines are dropped while every entry is uninstalling.
+- App: `installTitle` compares versions as numbers and `canRemoveDirectly` as text.
+
+From the soak fix's re-review (`scripts/soak.sh`):
+
+- `pgrep -f io.rmnetdriver.RMNet.driver` also matches the `log stream` process of `scripts/driver-log.sh`, so starting or stopping the log during a soak gives a false "driver restarted" FAIL (anchor the pattern on the dext path).
+- The default-route check cannot see a VPN tunnel carried over the port.
+- A signal during the first sample leaves a hanging status command running.
+- The first sample's seconds are measured from a different start.
+- `netstat` has no timeout.
+
+The owner's five steps are still open, as listed in the README ("Owner steps still to do"). With the owner away, the controller established on 317.10.17 that the app's window opens (one window, 480 by 452 points, up for 75 s, no crash report) and what its model (`status --json`) says, without seeing the window (step 1); and, read only, that the port and an enabled service `RM520N-GL` exist and Internet Sharing is off, without looking at the Sharing pane (step 4). Steps 2, 3 and 5 were not done.
