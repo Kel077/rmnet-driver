@@ -177,8 +177,8 @@ enum GpsEnd: Equatable {
 
 // The lines the gps verb prints after asking for `seconds` of reading that ended as `end` says, and its
 // exit code: 0 with a fix, 1 without. A fix is printed however the reading ended. Without one, a port
-// that closed or failed is reported as such, never as the receiver's state: only a reading that ran its
-// full time says that GNSS may be off or has no fix. Only numbers parsed from the sentences are printed,
+// that closed or failed is reported as such, never as the receiver's state: only a reading that ended by
+// its time (or one second after a fix that was then lost) says that GNSS may be off or has no fix. Only numbers parsed from the sentences are printed,
 // never a field as it came.
 func gpsOutcome(_ report: GpsReport, seconds: Int, end: GpsEnd) -> (lines: [String], code: Int32) {
     if !report.hasFix {

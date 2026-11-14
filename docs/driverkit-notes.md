@@ -829,7 +829,7 @@ Two personalities in `driver/Info.plist`, `RMNetSerialDIAG` and `RMNetSerialNMEA
 | `RMNetSerialSubClass`, `RMNetSerialProtocol` | 255 and 48 (DIAG, `ff`/`ff`/`30`), 0 and 64 (NMEA, `ff`/`00`/`40`) |
 | `quirks` | 1 (6.7) |
 
-Matching by interface number alone could take an AT or QMI interface if the modem's USB configuration changed (switching DIAG off, for example, renumbers the rest), which is why `Start` checks the class, subclass and protocol first (6.2). `scripts/check-personalities.sh`, run by `make check-driverkit`, also refuses any personality on interface 2 or 3, an `RMNetSerial` one on any interface but 0 or 1 or without `IOClass` `IOUserSerial`, `CFBundleIdentifierKernel` `com.apple.driver.driverkit.serial` and a valid `RMNetSerialName`, and `RMNetDriver` on any interface but 4.
+Matching by interface number alone could take an AT or QMI interface if the modem's USB configuration changed (switching DIAG off, for example, renumbers the rest), which is why `Start` checks the class, subclass and protocol first (6.2). `scripts/check-personalities.sh`, run by `make check-driverkit`, also refuses any personality on interface 2 or 3, an `RMNetSerial` one on any interface but 0 or 1 or without `IOClass` `IOUserSerial`, `CFBundleIdentifierKernel` `com.apple.driver.driverkit.serial` and a valid `RMNetSerialName`, `RMNetDriver` on any interface but 4, and a personality whose `IOUserClass` is neither `RMNetSerial` nor `RMNetDriver`.
 
 DIAG is included because it costs one personality on the same class and lets Qualcomm DIAG tools that take a serial device (QCSuper, Quectel's QLog) run on the Mac.
 
@@ -850,6 +850,8 @@ Linux's `option`/`usb_wwan` driver sends the CDC request SET_CONTROL_LINE_STATE 
 Quectel's Linux driver sets `URB_ZERO_PACKET` on every bulk OUT for vendor 0x2C7C, so both personalities set `quirks` = 1, which makes `IOUserUSBSerial` send a zero-length packet after a write that fills its last packet.
 
 ### 6.8 Open questions for the first load **[runtime]**
+
+*Answered 2026-11-15 on 317.20.51; see "Runtime findings (serial ports)": 1 yes; 2 as listed there; 3 yes, one process per instance; 4 yes (both ports started); 5 yes, the modem accepts the request before `HwActivate`; whether NMEA needs DTR was not tested.*
 
 1. Whether our `SetProperties` names win: `ls /dev/cu.*` shows `cu.RM520N-GL-DIAG` and `cu.RM520N-GL-NMEA`, or Apple's `usbserial-...` names (and the log has `naming the port failed`).
 2. Which `Hw*` calls the kernel makes, and in what order, when a port is opened and closed: `open` and `close`, the MCR line on every call, and the first-call lines of the others.
@@ -1441,3 +1443,31 @@ Build 317.20.43, from `cleanup` at `bee6b41` (plan `docs/superpowers/plans/2026-
 - The radio cycle took the link down and up once (`RMNetTxDropLinkDown` 11, frames sent while it was down); the port came back with new addresses in both families within 8 s.
 
 **Data.** 72,994,373 bytes recorded for the two runs (usage file total 3,453,768,567; the scripts' ceiling 6,300,000,000). With pings and the radio cycle, about 75 MB of the owner's allowance, about 3.57 GB left of 6.4 GB.
+
+## Runtime findings (serial ports, 2026-11-15 04:50 to 04:56)
+
+Build 317.20.51 (`serial-ports` at `72d91a6`, which contains `main` at `61e2941`), installed with `scripts/install-driver.sh` over 317.20.43 and loaded with `AT+CFUN=1,1`; the coordinating session's modem lock was held from 04:50 to 04:55:50. Log: `build/logs/driver-20261115-045059.log` (in the `serial-ports` worktree).
+
+**Loading.** After `activate` the new serial personalities did not attach to the free interfaces 0 and 1: the old entry stayed `terminating for upgrade via delegate` until the modem re-enumerated, and then all three instances of the new build started together. Link up 38 s after `AT+CFUN=1,1`.
+
+**Attachment and names** (6.8 questions 1, 3 and 4):
+- `RMNetSerial` (`IOUserSerial`) on `IOUSBHostInterface@0` and `@1`, `RMNetDriver` on `RmNet@4`, nothing on interfaces 2 and 3 (the console's libusb client came back on 2 a little later).
+- `IOTTYBaseName` `RM520N-GL-DIAG` and `RM520N-GL-NMEA`, `IOTTYSuffix` empty: our names won over `IOUserUSBSerial`'s `usbserial-...`. Devices `/dev/cu.` and `/dev/tty.RM520N-GL-DIAG` and `-NMEA`, mode `crw-rw-rw-`, root:wheel.
+- Three processes of the dext, one per instance (`ps`), so the serial instances do not share `RMNetDriver`'s process.
+- The serial instances' `serial start` and `started on interface` lines of the first load were lost, as `RMNetDriver`'s own `init` and `Start` lines were (the stream loses lines around a load); at the second load (04:54:48) both came: `serial RM520N-GL-DIAG: started on interface 0`, `serial RM520N-GL-NMEA: started on interface 1`. So `CopyProperties` and the descriptor read answer before the superclass's `Start`.
+
+**Calls on open and close** (6.8 questions 2 and 5), the same on every open:
+- Open: `HwProgramMCR(1, 1)` (SET_CONTROL_LINE_STATE status `0x0`), then `HwActivate` (`0x0`), then the first `HwResetFIFO` (tx 1, rx 0), `HwGetModemStatus`, `HwProgramFlowControl` (arg 0, XON 0x11, XOFF 0x13), `HwProgramBaudRate` 9600 and `HwProgramUART` (9600, 8 data bits, 2 half stop bits, parity 1), within 2 ms.
+- Close: the first `HwSendBreak(0)`, `HwProgramMCR(0, 0)` (`0x0`), `HwDeactivate` (`0x0`).
+- So the modem accepts the control request before `HwActivate`: the interface is open by then. Whether NMEA needs DTR at all was not tested.
+- A fresh port's settings had `ECHO` and `ICANON` off and `CLOCAL` off; `RMNet gps` sets `CLOCAL`, and the setting stays on the port for the next opener.
+
+**NMEA.** `AT+QGPSCFG="outport"` answers `usbnmea`. With `AT+QGPS=1` (04:53:07), a 15-second raw read got 1,962 bytes: `GPGGA`, `GPGSA`, `GPRMC` and `GPVTG` once a second each, every checksum valid, `RMC` status `V` and `GGA` quality 0 throughout, no `GSV` (no satellites in view). `RMNet gps 20` printed `gps: no fix after 20 s (104 sentences, 0 satellites in view)` and `RMNet gps 3` the same for 32 sentences, exit 1; at four sentences a second both counts are above what that time delivers, so the first read after an open returns a few seconds of sentences sent before it. Two readers on the port at once split the bytes and each saw broken sentences. Whether an antenna is attached is not known; no fix was seen.
+
+**DIAG.** Writing `00 78 F0 7E` (command 0x00, version) to `/dev/cu.RM520N-GL-DIAG` gave a 58-byte answer starting `00` and ending `7E`, with the firmware's compile and release dates in it; the same after the second load.
+
+**Re-enumeration with the NMEA port open** (04:54:33, `AT+CFUN=1,1` with a raw reader and `RMNet gps 60` both reading): both readers ended with `ENXIO` (`Device not configured`); `RMNet gps` printed `gps: reading the NMEA port failed after 9 s: Device not configured`, exit 1. In the log, the DIAG instance stopped, then the NMEA port's close sent `HwProgramMCR(0, 0)`, which failed with `0xe00002d7` (`kIOReturnOffline`, logged and ignored), `HwDeactivate`, its stop, and `RMNetDriver`'s usual stop sequence. New instances of all three started 10 s later; the ports, `en33` (IPv4 and IPv6, pings 3 of 3 each), `sms list` and the console came back. No crash report. GNSS was off after the reboot (`AT+QGPS?` answered 0), as the owner wanted, so no `AT+QGPSEND` was sent.
+
+**Not seen:** a fix; DTR's effect on NMEA output; a DIAG tool beyond the version request; sleep and wake with the serial instances; a serial instance failing while `en33` carries traffic.
+
+**Data.** Pings and SMS listings only; no measurement was run.
