@@ -40,8 +40,16 @@ struct SubmitPdu: Equatable { let hex: String; let tpduLength: Int }
 /// A sentence for the owner.
 struct SmsFailure: Error, Equatable { let message: String }
 
+/// A listing: the messages, and how many of the store's entries are used (nil when the modem's answer to
+/// AT+CPMS? could not be read).
+struct SmsListing: Equatable {
+    let messages: [SmsMessage]
+    let used: Int?
+    let total: Int?
+}
+
 protocol SmsServing {
-    func list() -> Result<[SmsMessage], SmsFailure>
+    func list() -> Result<SmsListing, SmsFailure>
     func delete(indices: [Int]) -> Result<Int, SmsFailure>               // stored entries deleted
     func send(to number: String, text: String) -> Result<Int, SmsFailure> // parts sent
 }
@@ -725,10 +733,12 @@ func encodeSubmit(to number: String, text: String, reference: UInt8) -> Result<[
     return .success(out)
 }
 
-// MARK: - What the window shows (pure decisions for app/SmsView.swift)
+// MARK: - What the window shows (pure decisions for app/SmsView.swift and app/SmsController.swift)
 
 /// The line under the text being written: how many parts it needs and in which alphabet; "" for no text.
-func composeNote(_ text: String) -> String {
+/// While an input method is composing, that the input must be finished first (Send is disabled).
+func composeNote(_ text: String, composing: Bool = false) -> String {
+    if composing { return "Finish the input being composed (the underlined text) before sending." }
     let parts = partCount(text)
     if parts == 0 { return "" }
     if parts > maximumParts { return "too long: \(parts) parts, at most \(maximumParts)" }
@@ -784,16 +794,50 @@ func rowTitle(_ m: SmsMessage, now: Date, timeZone: TimeZone = .current) -> Stri
     return "\(sender), \(text)"
 }
 
-/// The line about the list itself: when it was last listed, or why the last listing failed. A send's
-/// or a delete's result never goes here.
-func listLine(updated: Date?, failure: String?, timeZone: TimeZone = .current) -> String {
+/// The line about the list itself: when it was last listed and how full the store was then (with the
+/// warning from 90 %), or why the last listing failed. A send's or a delete's result never goes here.
+func listLine(updated: Date?, failure: String?, used: Int? = nil, total: Int? = nil,
+              timeZone: TimeZone = .current) -> String {
     let at = updated.map { TimeFormats.formats(timeZone).seconds.string(from: $0) }
+    let line: String
     switch (failure, at) {
     case (nil, nil): return ""
-    case (nil, let t?): return "Updated \(t)."
+    case (nil, let t?): line = "Updated \(t)."
     case (let f?, nil): return f
-    case (let f?, let t?): return "\(f) The list below may be out of date; it was updated \(t)."
+    case (let f?, let t?): line = "\(f) The list below may be out of date; it was updated \(t)."
     }
+    let use = storeUse(used: used, total: total)
+    let warning = storeWarning(used: used, total: total)
+    return [line, use.isEmpty ? "" : "\(use).", warning].filter { !$0.isEmpty }.joined(separator: " ")
+}
+
+// MARK: - The modem's message store (AT+CPMS?)
+
+/// "N of M stored parts"; "" when not known.
+func storeUse(used: Int?, total: Int?) -> String {
+    guard let used, let total else { return "" }
+    return "\(used) of \(total) stored parts"
+}
+
+/// From 90 % of the store used. When the store is full the network holds new messages, and they can
+/// expire without the owner knowing.
+func storeNearlyFull(used: Int?, total: Int?) -> Bool {
+    guard let used, let total, total > 0 else { return false }
+    return used * 10 >= total * 9
+}
+
+/// The warning shown (window and verb) when the store is nearly full; "" otherwise.
+func storeWarning(used: Int?, total: Int?) -> String {
+    guard storeNearlyFull(used: used, total: total), let used, let total else { return "" }
+    return "The modem's message store is nearly full (\(used) of \(total)). "
+        + "Delete old messages, or new ones will not arrive."
+}
+
+/// The first line of `sms list`.
+func listHeadline(count: Int, used: Int?, total: Int?) -> String {
+    let head = count == 0 ? "sms: no messages" : "sms: \(count) message(s)"
+    let use = storeUse(used: used, total: total)
+    return use.isEmpty ? head : "\(head), \(use) used"
 }
 
 /// What the list area says while there are no rows.

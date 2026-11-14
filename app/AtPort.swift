@@ -148,12 +148,13 @@ struct AtEchoProbe {
 // Timeouts. `timeout` is the time allowed for the answer after the line has been written. Before each
 // command the port reads away what the modem sent unasked, for at most 0.5 s in all; each write may
 // take up to 2 s. Worst cases:
-// - `open()`: registry lookups, then the echo probes (drains, "AT" writes, answers) within 3 s, plus
-//   one 2 s write begun just before those 3 s ran out: 5 s.
+// - `open()`: while another program holds the interface, retries every 0.1 s for up to 2 s (then
+//   `.busy`); registry lookups; then the ESC and the echo probes (drains, "AT" writes, answers) within
+//   3 s, plus one 2 s write begun just before those 3 s ran out: 7 s.
 // - `command`: 0.5 s + 2 s + `timeout`.
 // - `send`: 0.5 s drain + 2 s line write + min(10 s, `timeout`) for the prompt + 2 s payload write,
 //   then either `timeout` for the result or a 2 s ESC write: 4.5 s + min(10 s, `timeout`) +
-//   max(`timeout`, 2 s). (A failed line write goes straight to the ESC write: 6.5 s.)
+//   max(`timeout`, 2 s). (A failed line write goes straight to the ESC write: 0.5 s + 2 s + 2 s = 4.5 s.)
 // After `.timeout` the port has closed itself: a later call returns `.io(kIOReturnNotOpen)` and the
 // caller opens a new port. So does any failure that may leave the modem at the "> " prompt.
 final class AtPort {
@@ -166,6 +167,8 @@ final class AtPort {
     private static let writeTimeout: TimeInterval = 2
     private static let openTimeout: TimeInterval = 3
     private static let promptLimit: TimeInterval = 10
+    private static let busyLimit: TimeInterval = 2
+    private static let busyRetryInterval: TimeInterval = 0.1
     private static let ctrlZ: UInt8 = 0x1A
     private static let escape: UInt8 = 0x1B
 
@@ -189,7 +192,19 @@ final class AtPort {
 
     // MARK: Opening and closing
 
+    // Another program (an `sms` verb in a terminal while the window lists, or the other way round) may
+    // hold the interface for a moment: a busy open is tried again every 0.1 s for up to 2 s. Nothing has
+    // been written to the modem before an open succeeds, so trying again is safe.
     static func open() -> Result<AtPort, AtError> {
+        let deadline = Date().addingTimeInterval(busyLimit)
+        while true {
+            let result = openOnce()
+            guard case .failure(.busy) = result, deadline.timeIntervalSinceNow > busyRetryInterval else { return result }
+            Thread.sleep(forTimeInterval: busyRetryInterval)
+        }
+    }
+
+    private static func openOnce() -> Result<AtPort, AtError> {
         let device = matchingService("IOUSBHostDevice", ["idVendor": vendor, "idProduct": product])
         guard device != IO_OBJECT_NULL else { return .failure(.modemNotAttached) }
         defer { IOObjectRelease(device) }
@@ -243,11 +258,16 @@ final class AtPort {
     }
 
     // Probes with "AT" until two answers in a row agree on whether the port echoes (AtEchoProbe),
-    // within `openTimeout` in all; otherwise `.timeout`.
+    // within `openTimeout` in all; otherwise `.timeout`. First one ESC: a process that died between
+    // AT+CMGS and its payload leaves the modem at the "> " prompt, where "AT" would become message text;
+    // ESC cancels that half-entered message (and is ignored otherwise). An echoed ESC is a control
+    // character, which the collector removes from its line, and whatever the modem answers to it is read
+    // away by the first drain or makes the probe try again.
     private func learnEcho() -> AtError? {
         lock.lock()
         defer { lock.unlock() }
         let deadline = Date().addingTimeInterval(AtPort.openTimeout)
+        if let failure = write([AtPort.escape]) { return failure }
         var probe = AtEchoProbe()
         while deadline.timeIntervalSinceNow > 0 {
             discardUnsolicited(until: deadline)

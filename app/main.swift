@@ -181,8 +181,11 @@ let localTimeFormatter: DateFormatter = {
 
 func localTime(_ date: Date) -> String { localTimeFormatter.string(from: date) }
 
-func printMessages(_ messages: [SmsMessage]) {
-    print(messages.isEmpty ? "sms: no messages" : "sms: \(messages.count) message(s)")
+func printMessages(_ listing: SmsListing) {
+    let messages = listing.messages
+    print(listHeadline(count: messages.count, used: listing.used, total: listing.total))
+    let warning = storeWarning(used: listing.used, total: listing.total)
+    if !warning.isEmpty { print("sms: \(warning)") }
     for m in messages {
         let indices = "[" + m.indices.map(String.init).joined(separator: ",") + "]"
         guard m.readable else {
@@ -221,17 +224,18 @@ func runSms(_ command: SmsCommand, service: SmsServing) -> Int32 {
     switch command {
     case .list(let json):
         switch service.list() {
-        case .success(let messages):
-            if json { printMessagesJSON(messages) } else { printMessages(messages) }
+        case .success(let listing):
+            if json { printMessagesJSON(listing.messages) } else { printMessages(listing) }
             return 0
         case .failure(let failure):
             print("sms: \(failure.message)")
             return 1
         }
     case .send(let number, let text):
-        // From before the port opens until the result is printed, Ctrl-C, a hang-up or a plain kill do
-        // not stop the verb in the middle of a part (at the modem's "> " prompt) or of a multi-part send.
-        for sig in [SIGINT, SIGTERM, SIGHUP] { signal(sig, SIG_IGN) }
+        // From before the port opens until the result is printed, Ctrl-C, Ctrl-Z, Ctrl-\, a hang-up or a
+        // plain kill do not stop the verb in the middle of a part (at the modem's "> " prompt) or of a
+        // multi-part send.
+        for sig in [SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGQUIT] { signal(sig, SIG_IGN) }
         switch service.send(to: number, text: text) {
         case .success(let parts):
             print("sms: sent to \(number) in \(parts) part(s)")

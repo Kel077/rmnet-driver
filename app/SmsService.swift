@@ -12,7 +12,9 @@ final class SmsService: SmsServing {
 
     init() {}
 
-    func list() -> Result<[SmsMessage], SmsFailure> {
+    // The listing, then the store's use (AT+CPMS?) in the same session; if that answer cannot be read the
+    // listing still succeeds, without it.
+    func list() -> Result<SmsListing, SmsFailure> {
         let port: AtPort
         switch AtPort.open() {
         case .success(let p): port = p
@@ -22,7 +24,10 @@ final class SmsService: SmsServing {
         if let failure = usePduMode(port) { return .failure(failure) }
         switch port.command("AT+CMGL=4", timeout: SmsService.listTimeout) {
         case .success(let lines):
-            return .success(assemble(parseListing(lines).map(decodePart)))
+            let messages = assemble(parseListing(lines).map(decodePart))
+            var store: (used: Int, total: Int)? = nil
+            if case .success(let answer) = port.command("AT+CPMS?") { store = parseStorage(answer) }
+            return .success(SmsListing(messages: messages, used: store?.used, total: store?.total))
         case .failure(let error):
             return .failure(SmsFailure(message: "The messages could not be listed. \(describe(error))"))
         }
@@ -122,7 +127,9 @@ final class SmsService: SmsServing {
     }
 }
 
-// `part` counts from 0. Parts before it were confirmed by the modem.
+// `part` counts from 0. Parts before it were confirmed by the modem. When it is not known whether the
+// part went, the sentence warns that sending again may deliver it twice: the text is kept and Send works
+// again, and each send costs the owner a fee.
 private func sendFailure(part: Int, of total: Int, reason: String, known: Bool) -> String {
     let which = total == 1 ? "The message" : "Part \(part + 1) of \(total)"
     let state: String
@@ -137,7 +144,8 @@ private func sendFailure(part: Int, of total: Int, reason: String, known: Bool) 
         state = "It is not known whether that part was sent; \(part) of \(total) parts were sent before it, "
             + "so the message is incomplete at the receiver."
     }
-    return known ? "\(which) was refused. \(reason) \(state)" : "\(which) failed. \(reason) \(state)"
+    if known { return "\(which) was refused. \(reason) \(state)" }
+    return "\(which) failed. \(reason) \(state) It may have been delivered; sending it again may deliver it twice."
 }
 
 // One sentence for each way the AT port can fail.

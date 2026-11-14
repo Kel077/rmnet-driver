@@ -211,7 +211,7 @@ func readBack(_ pdus: [SubmitPdu], reference: Int, number: String) -> String? {
 }
 
 // --- the window's helpers (composeNote, canSend, numberNote, rowTitle, rowNote, deleteQuestion, unreadMarks,
-// listLine, listPlaceholder)
+// listLine, the store's use and warning, listHeadline, listPlaceholder)
 
 func message(_ indices: [Int], unread: Bool = false, sender: String = "+27838890001", time: Date? = nil,
              text: String = "hi", missing: Int = 0, readable: Bool = true) -> SmsMessage {
@@ -326,6 +326,53 @@ func windowHelperChecks() {
         let got = listLine(updated: at, failure: failure, timeZone: zone)
         check(got == want, "listLine: \(want.isEmpty ? "nothing" : want)", "got \"\(got)\"")
     }
+
+    // listLine with the store's use: after the update time; the warning from 90 %.
+    let full = "The modem's message store is nearly full (230 of 255). Delete old messages, or new ones will not arrive."
+    let storeLines: [(String?, Int?, Int?, String)] = [
+        (nil, 22, 255, "Updated 12:00:09. 22 of 255 stored parts."),
+        (nil, 229, 255, "Updated 12:00:09. 229 of 255 stored parts."),
+        (nil, 230, 255, "Updated 12:00:09. 230 of 255 stored parts. " + full),
+        (nil, nil, nil, "Updated 12:00:09."),
+        (busy, 230, 255, "The modem's AT port is busy. The list below may be out of date; it was updated 12:00:09. "
+                         + "230 of 255 stored parts. " + full),
+    ]
+    for (failure, used, total, want) in storeLines {
+        let got = listLine(updated: updated, failure: failure, used: used, total: total, timeZone: utcZone)
+        check(got == want, "listLine with the store: \(want)", "got \"\(got)\"")
+    }
+    check(listLine(updated: nil, failure: busy, used: 230, total: 255, timeZone: utcZone) == busy,
+          "listLine: never listed, the store's use is not shown")
+
+    // The store: its use, when it is nearly full (90 %), the warning, and the verb's first line.
+    let stores: [(Int?, Int?, String, Bool, String)] = [
+        (0, 255, "0 of 255 stored parts", false, "sms: 3 message(s), 0 of 255 stored parts used"),
+        (229, 255, "229 of 255 stored parts", false, "sms: 3 message(s), 229 of 255 stored parts used"),
+        (230, 255, "230 of 255 stored parts", true, "sms: 3 message(s), 230 of 255 stored parts used"),
+        (255, 255, "255 of 255 stored parts", true, "sms: 3 message(s), 255 of 255 stored parts used"),
+        (nil, nil, "", false, "sms: 3 message(s)"),
+        (0, 0, "0 of 0 stored parts", false, "sms: 3 message(s), 0 of 0 stored parts used"),
+    ]
+    for (used, total, use, nearlyFull, headline) in stores {
+        let name = "store \(used.map(String.init) ?? "unknown") of \(total.map(String.init) ?? "unknown")"
+        check(storeUse(used: used, total: total) == use, "storeUse: \(name)", storeUse(used: used, total: total))
+        check(storeNearlyFull(used: used, total: total) == nearlyFull, "storeNearlyFull: \(name)")
+        let warning = storeWarning(used: used, total: total)
+        let wantWarning = nearlyFull
+            ? "The modem's message store is nearly full (\(used!) of \(total!)). Delete old messages, or new ones will not arrive."
+            : ""
+        check(warning == wantWarning, "storeWarning: \(name)", warning)
+        check(listHeadline(count: 3, used: used, total: total) == headline, "listHeadline: \(name)",
+              listHeadline(count: 3, used: used, total: total))
+    }
+    check(listHeadline(count: 0, used: 0, total: 255) == "sms: no messages, 0 of 255 stored parts used",
+          "listHeadline: no messages, store known")
+    check(listHeadline(count: 0, used: nil, total: nil) == "sms: no messages", "listHeadline: no messages, store unknown")
+
+    // composeNote while an input method composes: Send waits for the input to be finished.
+    check(composeNote("hello", composing: true) == "Finish the input being composed (the underlined text) before sending.",
+          "composeNote: composing")
+    check(composeNote("hello", composing: false) == "1 part, GSM alphabet", "composeNote: not composing")
 
     // listPlaceholder: what an empty list area says, from the list's state only.
     check(listPlaceholder(listed: false, failed: false) == "Reading the messages…", "listPlaceholder: first listing")

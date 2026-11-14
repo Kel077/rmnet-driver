@@ -162,6 +162,21 @@ struct AtPortTests {
         expectProbe(["AT\r\r\n+X: 1\r\n\r\nOK\r\n", echoAnswer], [.probeAgain, .probeAgain],
                     "an echo with more lines does not count")
 
+        // --- the ESC open() writes first (a modem left at the "> " prompt) -------------------------
+        expect("\u{1B}AT\r\r\nOK\r\n", echo: "AT", .answer([]),
+               "an echoed ESC on the line of the AT echo: the echo is still found")
+        expect("\u{1B}\r\nAT\r\r\nOK\r\n", echo: "AT", .answer([]),
+               "an echoed ESC on a line of its own is dropped before the echo")
+        expect("> \u{1B}\r\n\r\nOK\r\nAT\r\r\nOK\r\n", echo: "AT", .answer([]),
+               "the prompt, the ESC and the modem's OK to it come before the echo and are discarded")
+        expectProbe(["\u{1B}AT\r\r\nOK\r\n", echoAnswer], [.probeAgain, .settled(echoes: true)],
+                    "an echoed ESC before the first AT echo still counts as an echo")
+        expectProbe(["\u{1B}\r\nAT\r\r\nOK\r\n", echoAnswer], [.probeAgain, .settled(echoes: true)],
+                    "an echoed ESC on a line of its own is dropped; the AT echo counts")
+        expectProbe(["\u{1B}\r\n\r\nOK\r\n", "AT\r\r\nOK\r\n", echoAnswer],
+                    [.probeAgain, .probeAgain, .settled(echoes: true)],
+                    "the modem's OK to the ESC, read as a silent answer, does not settle on no echo")
+
         print("at-test: \(checks) checks passed")
     }
 }

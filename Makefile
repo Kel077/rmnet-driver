@@ -40,12 +40,13 @@ build/obj/harness/%.o: harness/%.mm
 check-driverkit:
 	./scripts/check-driverkit-compile.sh
 
-# The app's status model, SMS model and AT answer logic, tested without Xcode or hardware
-# (the AT port itself is not opened).
-app-test: build/app-tests build/sms-tests build/at-tests
+# The app's status model, SMS model, AT answer logic and the Messages tab's controller, tested without
+# Xcode or hardware (the AT port itself is not opened, and no window is made).
+app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests
 	./build/app-tests
 	./build/sms-tests
 	./build/at-tests
+	./build/smsui-tests
 
 build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
 	@mkdir -p build
@@ -56,6 +57,10 @@ build/sms-tests: app/SmsModel.swift tests/app/SmsModelTests.swift
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 build/at-tests: app/AtPort.swift tests/app/AtPortTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+build/smsui-tests: app/SmsModel.swift app/SmsController.swift tests/app/SmsControllerTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 

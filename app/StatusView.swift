@@ -10,7 +10,7 @@ struct RMNetApp: App {
 
     var body: some Scene {
         Window("RMNet", id: "status") {
-            RMNetWindow(messages: appDelegate.messages)
+            RMNetWindow(messages: appDelegate.messages, quitNotice: appDelegate.messages.quitNotice)
         }
         .defaultSize(width: 520, height: 480)
     }
@@ -23,19 +23,29 @@ enum WindowTab: Hashable {
 
 // The window's two tabs: Driver (the status below) and Messages (SmsView.swift). The tab shown is tracked
 // by the selection; the Messages tab asks the modem only while it is the one shown and the window can be
-// seen. The controller is not observed here, so typing a message does not redraw the Driver tab.
+// seen. The controller is not observed here, so typing a message does not redraw the Driver tab; only its
+// small quit notice is: while a quit waits for a call to the modem, one line above the tabs says so.
 struct RMNetWindow: View {
     let messages: SmsController
+    @ObservedObject var quitNotice: SmsQuitNotice
     @State private var tab = WindowTab.driver
 
     var body: some View {
-        TabView(selection: $tab) {
-            StatusView()
-                .tabItem { Text("Driver") }
-                .tag(WindowTab.driver)
-            SmsView(controller: messages)
-                .tabItem { Text("Messages") }
-                .tag(WindowTab.messages)
+        VStack(spacing: 0) {
+            if !quitNotice.line.isEmpty {
+                Text(verbatim: quitNotice.line)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding([.horizontal, .top])
+            }
+            TabView(selection: $tab) {
+                StatusView()
+                    .tabItem { Text("Driver") }
+                    .tag(WindowTab.driver)
+                SmsView(controller: messages)
+                    .tabItem { Text("Messages") }
+                    .tag(WindowTab.messages)
+            }
         }
         .onAppear { messages.setTabShown(tab == .messages) }
         .onChange(of: tab) { _, shown in messages.setTabShown(shown == .messages) }
@@ -48,16 +58,20 @@ struct RMNetWindow: View {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     // The process's one SmsController (and so its one serial queue to the modem): the window shows it, and
-    // quitting waits for its running call.
-    let messages = SmsController()
+    // quitting waits for its running call. It lives as long as the app, so a window reopened from the Dock
+    // shows the same messages and result line.
+    let messages = SmsController(
+        service: SmsService(),
+        replyToQuit: { NSApp.reply(toApplicationShouldTerminate: $0) },
+        requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     // Every way of quitting (Cmd-Q, the Dock's Quit, closing the last window, logout) comes here. With a
-    // call to the modem running, the app ends only when it has finished; a send is never cut short.
+    // call to the modem running, the app ends only when it has finished; a send is never cut short. A send
+    // or delete that does not succeed cancels the quit, so that its result can be read.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let waits = messages.quitWhenFinished { NSApp.reply(toApplicationShouldTerminate: true) }
-        return waits ? .terminateLater : .terminateNow
+        messages.quitWhenFinished() ? .terminateLater : .terminateNow
     }
 }
 
