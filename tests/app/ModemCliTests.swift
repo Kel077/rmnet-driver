@@ -209,6 +209,22 @@ func apnSet(apn: String? = nil, type: PdpType? = nil, user: String? = nil, askPa
 }
 
 let warning = "apn: A wrong APN breaks the connection."
+let noAuthentication = "apn: With no authentication the user name and password must be empty; "
+    + "choose PAP, CHAP or PAP or CHAP to use them."
+
+/// What `apn --json` prints: profilesJSON with `driverAttached` (ruling R17).
+func apnJSON(_ profiles: [DataProfile], driverProfile: Int?) -> [String: Any] {
+    var object = profilesJSON(profiles, driverProfile: driverProfile ?? 1)
+    object["driverAttached"] = driverProfile != nil
+    return object
+}
+
+/// The `driverAttached` value of one printed JSON object.
+func driverAttached(_ got: Run) -> Bool? {
+    guard got.lines.count == 1, let data = got.lines[0].data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    return object["driverAttached"] as? Bool
+}
 let restoreProfile1 = "apn: to put it back: RMNet apn set --apn '' --type ipv4v6 --user '' --auth none --no-password"
 
 @main
@@ -471,15 +487,22 @@ struct ModemCliTests {
 
         for words in [["apn", "--json"], ["apn", "show", "--json"]] {
             fake = FakeModem()
-            expectLines(run(words, fake, "\(words)"), [prettyJSON(profilesJSON(fixtureProfiles, driverProfile: 1))], code: 0,
-                        "\(words): profilesJSON, pretty, sorted keys")
+            let got = run(words, fake, "\(words)")
+            expectLines(got, [prettyJSON(apnJSON(fixtureProfiles, driverProfile: 1))], code: 0,
+                        "\(words): profilesJSON and driverAttached, pretty, sorted keys")
+            check(driverAttached(got) == true, "\(words): driverAttached true", linesText(got.lines))
         }
         fake = FakeModem()
         expectLines(run(["apn", "--json"], fake, driverProfile: 3, "apn --json, driver on 3"),
-                    [prettyJSON(profilesJSON(fixtureProfiles, driverProfile: 3))], code: 0, "apn --json: the driver's profile 3")
+                    [prettyJSON(apnJSON(fixtureProfiles, driverProfile: 3))], code: 0, "apn --json: the driver's profile 3")
         fake = FakeModem()
-        expectLines(run(["apn", "--json"], fake, driverProfile: nil, "apn --json, driver not attached"),
-                    [prettyJSON(profilesJSON(fixtureProfiles, driverProfile: 1))], code: 0, "apn --json: not attached, profile 1")
+        let jsonNotAttached = run(["apn", "--json"], fake, driverProfile: nil, "apn --json, driver not attached")
+        expectLines(jsonNotAttached, [prettyJSON(apnJSON(fixtureProfiles, driverProfile: nil))], code: 0,
+                    "apn --json: not attached, profile 1")
+        check(driverAttached(jsonNotAttached) == false, "apn --json: driverAttached false without the driver",
+              linesText(jsonNotAttached.lines))
+        check(jsonNotAttached.lines.first?.contains("\"driverProfile\" : 1") == true,
+              "apn --json: driverProfile 1 without the driver", linesText(jsonNotAttached.lines))
         fake = FakeModem()
         fake.profilesResult = .failure(ModemFailure(message: "Fake: the profiles could not be read."))
         expectLines(run(["apn"], fake, "apn failed"), ["apn: Fake: the profiles could not be read."], code: 1, "apn: a failure")
@@ -538,32 +561,66 @@ struct ModemCliTests {
 
         // --password: read by readSecret after the warning, sent, never printed.
         fake = FakeModem()
-        let typed = run(["apn", "set", "--password"], fake, secretAnswer: secret, "apn set --password")
-        check(typed.prompts == ["New password for profile 1 (empty for none): "], "apn set --password: the prompt",
-              "\(typed.prompts)")
-        check(fake.profilesSet.count == 1 && fake.profilesSet[0].settings.password == secret,
+        let typed = run(["apn", "set", "--password", "--auth", "pap"], fake, secretAnswer: secret, "apn set --password")
+        check(typed.prompts == ["New password for profile 1: "], "apn set --password: the prompt (R16)", "\(typed.prompts)")
+        check(fake.profilesSet.count == 1 && fake.profilesSet[0].settings.password == secret
+              && fake.profilesSet[0].settings.auth == .pap,
               "apn set --password: the password read reaches setProfile")
         check(fake.events == ["profiles", "output", "readSecret", "setProfile", "output", "output"],
               "apn set --password: read, warn, ask, change, say", "\(fake.events)")
         check(typed.code == 0 && typed.lines.first == warning, "apn set --password: the warning first", linesText(typed.lines))
         expectNoSecret(typed, secret, "apn set --password")
+        // An empty answer (a hang-up gives one too) is refused: --no-password clears a password (R16).
         fake = FakeModem()
+        fake.profilesResult = .success([DataProfile(id: 1, pdpType: "IPV4V6", apn: "old", settings: keptPassword)])
         let typedEmpty = run(["apn", "set", "--password"], fake, secretAnswer: "", "apn set --password, empty")
-        check(typedEmpty.code == 0 && fake.profilesSet.count == 1 && fake.profilesSet[0].settings.password == "",
-              "apn set --password: an empty answer sets no password")
+        expectLines(typedEmpty, [warning, "apn: No password was entered. Nothing was changed; use --no-password to clear the password."],
+                    code: 1, "apn set --password: an empty answer is refused")
+        check(fake.profilesSet.isEmpty && fake.events.filter { $0 != "output" } == ["profiles", "readSecret"],
+              "apn set --password: an empty answer changes nothing", "\(fake.events)")
         fake = FakeModem()
         fake.profilesResult = .success([DataProfile(id: 1, pdpType: "IPV4V6", apn: "", settings: profile1)])
         let quoteSecret = "pa\"ss-\(secret)"
-        let badPassword = run(["apn", "set", "--password"], fake, secretAnswer: quoteSecret, "apn set --password with a quote")
+        let badPassword = run(["apn", "set", "--password", "--auth", "chap"], fake, secretAnswer: quoteSecret,
+                              "apn set --password with a quote")
         check(badPassword.code == 1 && fake.profilesSet.isEmpty && badPassword.lines.count == 2
               && badPassword.lines[1].hasPrefix("apn: "),
               "apn set --password: a password the rules refuse is one failure line, nothing set", linesText(badPassword.lines))
         expectNoSecret(badPassword, secret, "apn set --password refused")
+        // Not read (Ctrl-C at the prompt, or no terminal): nothing is changed (R16).
         fake = FakeModem()
-        let noTerminal = run(["apn", "set", "--password"], fake, secretAnswer: nil, "apn set --password, no terminal")
-        expectLines(noTerminal, [warning, "apn: --password needs a terminal to read the password."], code: 1,
-                    "apn set --password without a terminal")
-        check(fake.profilesSet.isEmpty, "apn set --password without a terminal: nothing set")
+        let noTerminal = run(["apn", "set", "--password", "--auth", "pap"], fake, secretAnswer: nil,
+                             "apn set --password, not read")
+        expectLines(noTerminal, [warning, "apn: The password was not read (cancelled, or no terminal). Nothing was changed."],
+                    code: 1, "apn set --password: a password not read")
+        check(fake.profilesSet.isEmpty && fake.events.filter { $0 != "output" } == ["profiles", "readSecret"],
+              "apn set --password: a password not read changes nothing", "\(fake.events)")
+        // With no authentication a password is refused before the prompt (R15).
+        fake = FakeModem()
+        let noAuthPassword = run(["apn", "set", "--password"], fake, secretAnswer: secret, "apn set --password, no auth")
+        expectLines(noAuthPassword, [noAuthentication], code: 1, "apn set --password on a profile with no authentication")
+        check(noAuthPassword.prompts.isEmpty && fake.profilesSet.isEmpty,
+              "apn set --password with no authentication: nothing asked, nothing set")
+        for words in [["apn", "set", "--user", "u"], ["apn", "set", "--password", "--auth", "none"],
+                      ["apn", "set", "--auth", "none"]] {
+            fake = FakeModem()
+            fake.profilesResult = .success([DataProfile(id: 1, pdpType: "IPV4V6", apn: "x", settings: keptPassword)])
+            if words.contains("--user") { fake.profilesResult = .success(fixtureProfiles) }
+            let got = run(words, fake, secretAnswer: secret, "\(words)")
+            expectLines(got, [noAuthentication], code: 1, "\(words): credentials with no authentication are refused")
+            check(got.prompts.isEmpty && fake.profilesSet.isEmpty, "\(words): nothing asked, nothing set")
+            expectNoSecret(got, oldSecret, "\(words)")
+        }
+        fake = FakeModem()
+        run(["apn", "set", "--user", "u", "--auth", "pap-or-chap"], fake, "apn set --user with PAP or CHAP")
+        check(fake.profilesSet.count == 1 && fake.profilesSet[0].settings.user == "u"
+              && fake.profilesSet[0].settings.auth == .papOrChap, "apn set: a user name with an authentication method is sent")
+        fake = FakeModem()
+        fake.profilesResult = .success([DataProfile(id: 1, pdpType: "IPV4V6", apn: "x", settings: keptPassword)])
+        run(["apn", "set", "--no-password", "--user", "", "--auth", "none"], fake, "apn set back to no authentication")
+        check(fake.profilesSet.count == 1 && fake.profilesSet[0].settings
+                == ProfileSettings(type: .ipv4v6, apn: "old", user: "", password: "", auth: .none),
+              "apn set: back to no authentication with the credentials cleared")
         // An old password the rules refuse does not stop a new one being typed.
         fake = FakeModem()
         let badOld = ProfileSettings(type: .ipv4v6, apn: "x", user: "", password: "a\"b", auth: .pap)
@@ -614,7 +671,7 @@ struct ModemCliTests {
 
         // --- sim ---------------------------------------------------------------------------------
         fake = FakeModem()
-        expectLines(run(["sim"], fake, "sim"), ["sim: sim: ready", "sim: pin lock: off", "sim: attempts left: PIN 3, PUK 10"],
+        expectLines(run(["sim"], fake, "sim"), ["sim: ready", "sim: pin lock: off", "sim: attempts left: PIN 3, PUK 10"],
                     code: 0, "sim: the READY fixture")
         fake = FakeModem()
         expectLines(run(["sim", "--json"], fake, "sim --json"), [prettyJSON(simJSON(readySim))], code: 0,
@@ -708,9 +765,16 @@ struct ModemCliTests {
         expectNoSecret(wrongPin, "12ab", "sim unlock, a PIN refused")
         fake = FakeModem()
         fake.simResult = .success(askingSim)
-        let noTty = run(["sim", "unlock"], fake, secretAnswer: nil, "sim unlock, no terminal")
-        check(noTty.code == 1 && noTty.lines.count == 2 && noTty.lines[1].hasPrefix("sim: ") && fake.pinsEntered.isEmpty,
-              "sim unlock: without a terminal, nothing sent", linesText(noTty.lines))
+        let noTty = run(["sim", "unlock"], fake, secretAnswer: nil, "sim unlock, not read")
+        expectLines(noTty, ["sim: The SIM asks for its PIN. 3 attempt(s) left; a wrong PIN uses one.",
+                            "sim: The PIN was not read (cancelled, or no terminal). Nothing was sent."],
+                    code: 1, "sim unlock: a PIN not read (R16)")
+        check(fake.pinsEntered.isEmpty, "sim unlock: a PIN not read, nothing sent")
+        fake = FakeModem()
+        fake.simResult = .success(askingSim)
+        let emptyPin = run(["sim", "unlock"], fake, secretAnswer: "", "sim unlock, empty")
+        check(emptyPin.code == 1 && emptyPin.lines.count == 2 && emptyPin.lines[1].hasPrefix("sim: ") && fake.pinsEntered.isEmpty,
+              "sim unlock: an empty answer (a hang-up) sends nothing", linesText(emptyPin.lines))
         fake = FakeModem()
         fake.simResult = .failure(ModemFailure(message: "Fake: no modem."))
         expectLines(run(["sim", "unlock"], fake, secretAnswer: pinSecret, "sim unlock, read failed"), ["sim: Fake: no modem."],

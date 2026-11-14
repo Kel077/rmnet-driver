@@ -244,6 +244,30 @@ struct ModemSettingsTests {
               "profileProblem: the APN is checked before the user name")
         check(profileProblem(1, ProfileSettings(type: .ipv4v6, apn: "a", user: "\"", password: "\"", auth: .pap)) == userRule,
               "profileProblem: the user name is checked before the password")
+        // Ruling R15: the modem turns a profile with a password and authentication 0 into CHAP by itself, so
+        // with no authentication the user name and the password must be empty.
+        let noAuthRule = "With no authentication the user name and password must be empty; choose PAP, CHAP or PAP or CHAP to use them."
+        for (user, password, name) in [("u", "", "a user name only"), ("", secret, "a password only"),
+                                       ("u", secret, "both"), (" ", "", "a user name of one space")] {
+            let s = ProfileSettings(type: .ipv4v6, apn: "cmnet", user: user, password: password, auth: .none)
+            let problem = profileProblem(1, s)
+            check(problem == noAuthRule, "profileProblem: no authentication with \(name) is refused",
+                  "\(String(describing: problem))".replacingOccurrences(of: secret, with: "<the password>"))
+            expectNoSecret(problem ?? "", "profileProblem: the no-authentication rule never quotes the password")
+        }
+        check(profileProblem(1, ProfileSettings(type: .ipv4v6, apn: "cmnet", user: "", password: "", auth: .none)) == nil,
+              "profileProblem: no authentication with neither is allowed")
+        for auth in [AuthMethod.pap, .chap, .papOrChap] {
+            for (user, password, name) in [("u", "", "a user name"), ("", secret, "a password"), ("u", secret, "both")] {
+                let s = ProfileSettings(type: .ipv4v6, apn: "cmnet", user: user, password: password, auth: auth)
+                check(profileProblem(1, s) == nil, "profileProblem: \(auth) with \(name) is allowed",
+                      "\(String(describing: profileProblem(1, s)))".replacingOccurrences(of: secret, with: "<the password>"))
+            }
+        }
+        check(profileProblem(1, ProfileSettings(type: .ipv4v6, apn: "a", user: "u", password: "\"", auth: .none)) == passwordRule,
+              "profileProblem: the password's characters are checked before the no-authentication rule")
+        check(profileProblem(0, ProfileSettings(type: .ipv4v6, apn: "a", user: "u", password: "", auth: .none)) == idRule(0),
+              "profileProblem: the profile number is checked before the no-authentication rule")
 
         // --- pinProblem ------------------------------------------------------------------------
         for pin in ["1234", "0000", "12345678", "98765"] {

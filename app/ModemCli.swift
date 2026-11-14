@@ -12,8 +12,9 @@ import Foundation
 enum ModemCommand: Equatable {
     case network(json: Bool)
     case radio(on: Bool?)                       // nil: show
-    case mode(String?)                          // nil: show; else a mode canonicalMode accepts, upper-cased, in
-                                                // the order typed (ruling R8)
+    case mode(String?)                          // nil: show; else the mode as typed, upper-cased, the RATs in
+                                                // the order typed: one canonicalMode accepts, not its reordered
+                                                // value, so a put-back restores the modem's own string (R8, R17)
     case apnShow(json: Bool)
     case apnSet(apn: String?, type: PdpType?, user: String?, askPassword: Bool, clearPassword: Bool, auth: AuthMethod?,
                 redial: Bool)
@@ -163,7 +164,10 @@ func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int
         case .failure(let failure): return fail("sim", failure.message, output)
         case .success(let sim):
             if json { return outputJSON("sim", simJSON(sim), output) }
-            for row in simRows(sim) { output("sim: \(row.label.lowercased()): \(row.value)") }
+            for row in simRows(sim) {
+                // The SIM row is the state itself: `sim: ready`; the others `sim: pin lock: off`.
+                output(row.label == "SIM" ? "sim: \(row.value)" : "sim: \(row.label.lowercased()): \(row.value)")
+            }
             return 0
         }
     case .simUnlock(let lastAttempt):
@@ -248,7 +252,11 @@ private func showProfiles(_ service: ModemServing, driverProfile: Int?, json: Bo
     case .failure(let failure): return fail("apn", failure.message, output)
     case .success(let profiles):
         let driver = driverProfile ?? 1
-        if json { return outputJSON("apn", profilesJSON(profiles, driverProfile: driver), output) }
+        if json {
+            var object = profilesJSON(profiles, driverProfile: driver)
+            object["driverAttached"] = driverProfile != nil
+            return outputJSON("apn", object, output)
+        }
         if let driverProfile {
             output("apn: the driver dials profile \(driverProfile)")
         } else {
@@ -274,8 +282,8 @@ private struct ProfileOptions {
 }
 
 /// Reads the profile's settings, puts the options over them, checks them, warns, reads a new password if
-/// asked, and changes the profile. Nothing is changed before the checks pass. A password kept from the
-/// current settings is sent as it is; none is ever printed.
+/// asked, and changes the profile. Nothing is changed before the checks pass, nor when the password was not
+/// read or is empty. A password kept from the current settings is sent as it is; none is ever printed.
 private func setProfile(_ service: ModemServing, _ id: Int, _ options: ProfileOptions,
                         readSecret: (String) -> String?, _ output: (String) -> Void) -> Int32 {
     var settings: ProfileSettings
@@ -291,12 +299,21 @@ private func setProfile(_ service: ModemServing, _ id: Int, _ options: ProfileOp
     if let type = options.type { settings.type = type }
     if let user = options.user { settings.user = user }
     if let auth = options.auth { settings.auth = auth }
-    if options.clearPassword || options.askPassword { settings.password = "" }   // a new one is read below
-    if let problem = profileProblem(id, settings) { return fail("apn", problem, output) }
+    if options.clearPassword { settings.password = "" }
+    // With --password the new password is read after the warning, and an empty one is refused: the checks
+    // before the prompt take it as set (any allowed text stands for it), so a rule it breaks, such as no
+    // authentication (ruling R15), is told before anything is typed. The old password is not checked.
+    var beforePrompt = settings
+    if options.askPassword { beforePrompt.password = "?" }
+    if let problem = profileProblem(id, beforePrompt) { return fail("apn", problem, output) }
     output("apn: A wrong APN breaks the connection.")
     if options.askPassword {
-        guard let password = readSecret("New password for profile \(id) (empty for none): ") else {
-            return fail("apn", "--password needs a terminal to read the password.", output)
+        guard let password = readSecret("New password for profile \(id): ") else {
+            return fail("apn", "The password was not read (cancelled, or no terminal). Nothing was changed.", output)
+        }
+        guard !password.isEmpty else {
+            return fail("apn", "No password was entered. Nothing was changed; use --no-password to clear the password.",
+                        output)
         }
         settings.password = password
         if let problem = profileProblem(id, settings) { return fail("apn", problem, output) }
@@ -342,7 +359,7 @@ private func unlockSim(_ service: ModemServing, lastAttempt: Bool, readSecret: (
                     + "Run again with --last-attempt to send it.", output)
     }
     guard let pin = readSecret("PIN: ") else {
-        return fail("sim", "unlock needs a terminal to read the PIN.", output)
+        return fail("sim", "The PIN was not read (cancelled, or no terminal). Nothing was sent.", output)
     }
     if let problem = pinProblem(pin) { return fail("sim", problem, output) }
     switch service.enterPin(pin, shownAttempts: attempts) {

@@ -305,20 +305,26 @@ if let verb = verbs.first, modemVerbs.contains(verb) {
     }
     if modemCommand.changesModem {
         // From before the port opens until the result is printed, Ctrl-C, Ctrl-Z, Ctrl-\, a hang-up or a
-        // plain kill do not stop a change in the middle (a redial with the radio off, a PIN sent). Ctrl-C at
-        // a password or PIN prompt still ends the prompt (readpassphrase), and nothing is changed.
+        // plain kill do not stop a change in the middle (a redial with the radio off, a PIN sent).
         for sig in [SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGQUIT] { signal(sig, SIG_IGN) }
     }
-    // Each line is flushed at once, so that the attempts left and the APN warning are out before a prompt
-    // (which goes to /dev/tty) also when the output is piped.
+    // The verb runs on a worker thread; the password and PIN prompts run on the main thread (ruling R16).
+    // Worker threads block signals, so there Ctrl-C would not end readpassphrase: the terminal would drop
+    // what was typed and the next Return would give an empty answer. On the main thread readpassphrase
+    // catches Ctrl-C itself and gives nil, and the verb stops with nothing changed or sent. A hang-up can
+    // still give an empty answer, which the verbs refuse. Each line is flushed at once, so that the attempts
+    // left and the APN warning are out before a prompt (which goes to /dev/tty) also when output is piped.
     DispatchQueue.global(qos: .userInitiated).async {
         let code = runModem(modemCommand, service: ModemService(),
                             driverProfile: readDriverProperties()?["RMNetProfile"].flatMap { Int($0) },
-                            readSecret: readSecret(prompt:), output: { print($0); fflush(stdout) })
+                            readSecret: { prompt in DispatchQueue.main.sync { readSecret(prompt: prompt) } },
+                            output: { print($0); fflush(stdout) })
         fflush(stdout)
         exit(code)
     }
-    dispatchMain()
+    // Not dispatchMain(): it ends the main thread, and the main queue then runs on a worker thread, which
+    // blocks signals. The main run loop keeps the main thread and runs the main queue's blocks on it.
+    while true { RunLoop.main.run(mode: .default, before: .distantFuture) }
 }
 
 guard let command = Command(rawValue: verbs.first!),
