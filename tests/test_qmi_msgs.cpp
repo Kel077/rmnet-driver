@@ -3,6 +3,7 @@
 #include <list>
 
 #include "captures.h"
+#include "frames.h"
 #include "rmnet/qmi.h"
 #include "rmnet/qmi_msgs.h"
 
@@ -37,25 +38,6 @@ rmnet::QmiMessage wds_frame(rmnet::QmiKind kind, uint16_t msg_id, const std::vec
   for (const RawTlv& t : tlvs) b.tlv(t.type, t.value.data(), t.value.size());
   buf.resize(b.finish());
   return decode_bytes(std::move(buf));
-}
-
-// A captured service (non-CTL) frame with TLV `type` removed and both length fields adjusted.
-// Layout: 01, u16 QMUX length, flags, service, client, flags, u16 txid, u16 msg, u16 TLV length.
-std::vector<uint8_t> without_tlv(const char* hex_text, uint8_t type) {
-  std::vector<uint8_t> f = hex(hex_text);
-  for (size_t i = 13; i + 3 <= f.size();) {
-    size_t n = 3 + (size_t)(f[i + 1] | f[i + 2] << 8);
-    if (f[i] == type) {
-      f.erase(f.begin() + (long)i, f.begin() + (long)(i + n));
-      size_t qmux = f.size() - 1, tlvs = f.size() - 13;
-      f[1] = (uint8_t)qmux; f[2] = (uint8_t)(qmux >> 8);
-      f[11] = (uint8_t)tlvs; f[12] = (uint8_t)(tlvs >> 8);
-      return f;
-    }
-    i += n;
-  }
-  ::minitest::fail(__FILE__, __LINE__, "without_tlv(): TLV not in frame");
-  return f;
 }
 
 // Start Network response that failed: result 01 00 0e 00, TLV 0x10 = 02 00, TLV 0x11 = 03 00 d0 07.
@@ -105,9 +87,9 @@ TEST(parse_data_format) {
 }
 TEST(data_format_without_uplink_size_unusable) {   // the capture's response without TLV 0x18 (uplink max size)
   rmnet::DataFormat f{};
-  CHECK(rmnet::parse_wda_data_format(decode_bytes(without_tlv(kWdaSetFormatResp, 0x18)), &f));
+  CHECK(rmnet::parse_wda_data_format(decode_bytes(without_tlv(hex(kWdaSetFormatResp), 0x18)), &f));
   CHECK_EQ(f.ul_max_size, 0u); CHECK(!rmnet::data_format_usable(f));
-  CHECK(rmnet::parse_wda_data_format(decode_bytes(without_tlv(kWdaSetFormatResp, 0x17)), &f));
+  CHECK(rmnet::parse_wda_data_format(decode_bytes(without_tlv(hex(kWdaSetFormatResp), 0x17)), &f));
   CHECK_EQ(f.ul_max_datagrams, 0u); CHECK(!rmnet::data_format_usable(f));
 }
 TEST(data_format_limits) {                          // from the capture's values: 32/31744 down, 32/16384 up
@@ -164,7 +146,7 @@ TEST(parsers_reject_short_values) {  // frames built in the test with a 2-byte T
 TEST(parse_settings_ipv4_needs_address_mask_and_gateway) {   // the capture's IPv4 reply without one TLV
   for (uint8_t missing : {0x1e, 0x20, 0x21}) {
     rmnet::RuntimeSettings s{};
-    CHECK(rmnet::parse_wds_current_settings(decode_bytes(without_tlv(kWdsSettings4Resp, missing)), &s));
+    CHECK(rmnet::parse_wds_current_settings(decode_bytes(without_tlv(hex(kWdsSettings4Resp), missing)), &s));
     CHECK(!s.has_v4); CHECK_BYTES(s.v4_addr, 4, "00 00 00 00"); CHECK_EQ(s.mtu, 1500u);
   }
 }

@@ -36,6 +36,21 @@ TEST(frame_length_splits_a_read) {
   CHECK_EQ(rmnet::qmi_frame_length({a.data(), 2}), 0u);
   auto bad = a; bad[0] = 0x02; CHECK_EQ(rmnet::qmi_frame_length({bad.data(), bad.size()}), 0u);
 }
+TEST(frame_length_at_its_minimum_lengths) {
+  // The QMUX length counts itself, flags, service and client (5 bytes) and everything after them.
+  auto smallest = hex("01 05 00 80 01 0f");                                     // a header and nothing else
+  CHECK_EQ(rmnet::qmi_frame_length({smallest.data(), smallest.size()}), 6u);
+  for (size_t n = 0; n < smallest.size(); ++n) {                               // shorter than the QMUX header
+    CHECK_EQ(rmnet::qmi_frame_length({smallest.data(), n}), 0u);
+  }
+  auto declared_4 = hex("01 04 00 80 01 0f");                                   // declared shorter than the header
+  CHECK_EQ(rmnet::qmi_frame_length({declared_4.data(), declared_4.size()}), 0u);
+  auto a = hex(kCtlSyncResp);
+  auto one_more = a; one_more[1]++;                                             // declares one byte more than it holds
+  CHECK_EQ(rmnet::qmi_frame_length({one_more.data(), one_more.size()}), 0u);
+  one_more.push_back(0x00);                                                     // and with that byte, it is whole
+  CHECK_EQ(rmnet::qmi_frame_length({one_more.data(), one_more.size()}), a.size() + 1);
+}
 TEST(build_matches_capture_ctl) {
   uint8_t buf[64]; uint8_t svc = 0x1a;
   rmnet::QmiBuilder b(buf, sizeof buf, {rmnet::QmiService::CTL, 0, rmnet::QmiKind::Request, 2, 0x0022});

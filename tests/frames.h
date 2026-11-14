@@ -84,6 +84,25 @@ inline std::vector<uint8_t> ipv4_udp(const char* src, const char* dst, uint16_t 
   return eth(kRouterMac, kHostMac, 0x0800, pkt);
 }
 
+// A service (non-CTL) QMI frame with TLV `type` removed and both length fields adjusted. Fails the
+// running test if the frame has no such TLV.
+// Layout: 01, u16 QMUX length, flags, service, client, flags, u16 txid, u16 msg, u16 TLV length.
+inline std::vector<uint8_t> without_tlv(std::vector<uint8_t> f, uint8_t type) {
+  for (size_t i = 13; i + 3 <= f.size();) {
+    size_t n = 3 + (size_t)(f[i + 1] | f[i + 2] << 8);
+    if (f[i] == type) {
+      f.erase(f.begin() + (long)i, f.begin() + (long)(i + n));
+      size_t qmux = f.size() - 1, tlvs = f.size() - 13;
+      f[1] = (uint8_t)qmux; f[2] = (uint8_t)(qmux >> 8);
+      f[11] = (uint8_t)tlvs; f[12] = (uint8_t)(tlvs >> 8);
+      return f;
+    }
+    i += n;
+  }
+  ::minitest::fail(__FILE__, __LINE__, "without_tlv(): TLV not in frame");
+  return f;
+}
+
 // The link settings the modem reported in the recorded Get Current Settings replies (IPv4 and IPv6).
 inline rmnet::RuntimeSettings link_settings() {
   rmnet::RuntimeSettings s{};

@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "captures.h"
+#include "frames.h"
 #include "rmnet/qmi.h"
 #include "rmnet/qmi_msgs.h"
 #include "rmnet/session.h"
@@ -129,24 +130,6 @@ void bring_up_v6_only(rmnet::Session& s, FakeModem& m, uint64_t time) {
   feed_frame(s, with_txid(kWdsFamily6Resp, m.last_txid()), time);
   feed_frame(s, start6_response_with_txid(m.last_txid()), time);
   feed_frame(s, settings6_response_with_txid(m.last_txid()), time);
-}
-
-// A captured service (non-CTL) frame with TLV `type` removed and both length fields adjusted.
-// Layout: 01, u16 QMUX length, flags, service, client, flags, u16 txid, u16 msg, u16 TLV length.
-std::vector<uint8_t> without_tlv(std::vector<uint8_t> f, uint8_t type) {
-  for (size_t i = 13; i + 3 <= f.size();) {
-    size_t n = 3 + (size_t)(f[i + 1] | f[i + 2] << 8);
-    if (f[i] == type) {
-      f.erase(f.begin() + (long)i, f.begin() + (long)(i + n));
-      size_t qmux = f.size() - 1, tlvs = f.size() - 13;
-      f[1] = (uint8_t)qmux; f[2] = (uint8_t)(qmux >> 8);
-      f[11] = (uint8_t)tlvs; f[12] = (uint8_t)(tlvs >> 8);
-      return f;
-    }
-    i += n;
-  }
-  ::minitest::fail(__FILE__, __LINE__, "without_tlv(): TLV not in frame");
-  return f;
 }
 
 // Ticks at `now`; if that sent a liveness probe, answers it at once with the capture's settings
@@ -708,4 +691,134 @@ TEST(restart_from_backoff_starts_with_the_first_backoff_again) {
   CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(failed, t + 60000);
   s.tick(failed + 1999); CHECK(s.state() == rmnet::SessionState::Backoff);
   s.tick(failed + 2000); CHECK(s.state() == rmnet::SessionState::Syncing);   // the first wait, 2 s, as a fresh session
+}
+
+// Follow-up gaps: the Get Client ID retry, reconfigure orders, the probe's ignored reply.
+
+namespace {
+
+// The capture's IPv6 CTL Get Client ID response with CTL transaction `txid`, failed with
+// ClientIdsExhausted (0x05) when `ok` is false.
+std::vector<uint8_t> get_wds6_client_response(uint8_t txid, bool ok) {
+  std::vector<uint8_t> f = hex(kCtlGetWds6Resp);
+  f[7] = txid;
+  if (!ok) { f[15] = 0x01; f[17] = 0x05; }                                   // result: failure, error 0x05
+  return f;
+}
+
+// The capture's IPv4 settings reply with transaction `txid` and the address 10.102.246.234.
+std::vector<uint8_t> settings4_moved_with_txid(uint16_t txid) {
+  auto reply = settings4_response_with_txid(txid);
+  const uint8_t old_addr[7] = {0x1e, 0x04, 0x00, 0xe6, 0xf6, 0x66, 0x0a};    // TLV 0x1E: 10.102.246.230, u32le
+  auto at = std::search(reply.begin(), reply.end(), old_addr, old_addr + 7);
+  if (at == reply.end()) ::minitest::fail(__FILE__, __LINE__, "settings4_moved_with_txid(): address not found");
+  else at[3] = 0xea;
+  return reply;
+}
+
+}  // namespace
+
+TEST(retry_of_a_family_that_never_got_a_client_starts_from_get_client_id) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_to(s, m, kWdsSettings4Resp);  // IPv6 Get Client ID outstanding
+  feed_frame(s, get_wds6_client_response(static_cast<uint8_t>(m.last_txid()), false), 100);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1);
+  CHECK(m.cfg.settings.has_v4); CHECK(!m.cfg.settings.has_v6);
+  size_t sent = m.sent.size();
+  s.tick(5099); CHECK_EQ(m.sent.size(), sent);
+  s.tick(5100); CHECK_EQ(m.sent.size(), sent + 1);
+  CHECK_EQ(m.last()[4], 0x00); CHECK_EQ(m.last()[8], 0x22); CHECK_EQ(m.last().back(), 0x01);  // CTL Get Client ID for WDS
+  feed_frame(s, get_wds6_client_response(static_cast<uint8_t>(m.last_txid()), false), 5200);   // refused again
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1); CHECK_EQ(m.downs, 0);
+  sent = m.sent.size();
+  s.tick(15199); CHECK_EQ(m.sent.size(), sent);
+  s.tick(15200); CHECK_EQ(m.sent.size(), sent + 1);                           // next retry 10 s after the failure
+  CHECK_EQ(m.last()[4], 0x00); CHECK_EQ(m.last()[8], 0x22); CHECK_EQ(m.last().back(), 0x01);  // from Get Client ID again
+  feed_frame(s, get_wds6_client_response(static_cast<uint8_t>(m.last_txid()), true), 15300);   // client 16
+  CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0xa2); CHECK_EQ(m.last()[10], 0x00);        // Bind Mux on client 16
+  feed_frame(s, with_txid(kWdsBind6Resp, m.last_txid()), 15400);
+  CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0x4d);                     // Set IP Family
+  feed_frame(s, with_txid(kWdsFamily6Resp, m.last_txid()), 15500);
+  CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0x20);                     // Start Network
+  feed_frame(s, start6_response_with_txid(m.last_txid()), 15600);
+  CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0x2d);                     // Get Current Settings
+  feed_frame(s, settings6_response_with_txid(m.last_txid()), 15700);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2); CHECK_EQ(m.downs, 0);
+  CHECK(m.cfg.settings.has_v4); CHECK(m.cfg.settings.has_v6);
+}
+
+TEST(reconfigure_for_ipv4_during_an_ipv6_refresh_is_not_lost) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m);
+  feed_frame(s, reconfigure_indication(kWdsConnected6Ind), 5000);
+  CHECK(s.state() == rmnet::SessionState::Refreshing); CHECK_EQ(m.downs, 1);
+  CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0x2d);                     // IPv6 refreshed first
+  size_t sent = m.sent.size(); uint16_t v6 = m.last_txid();
+  feed_frame(s, reconfigure_indication(kWdsConnected4Ind), 5005);
+  CHECK_EQ(m.sent.size(), sent);                                              // remembered, not sent yet
+  feed_frame(s, settings6_response_with_txid(v6), 5010);
+  CHECK(s.state() == rmnet::SessionState::Refreshing); CHECK_EQ(m.ups, 1);
+  CHECK_EQ(m.sent.size(), sent + 1); CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);   // then IPv4
+  feed_frame(s, settings4_moved_with_txid(m.last_txid()), 5020);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2); CHECK_EQ(m.downs, 1);
+  CHECK(m.cfg.settings.has_v4); CHECK(m.cfg.settings.has_v6);
+  CHECK_BYTES(m.cfg.settings.v4_addr, 4, "0a 66 f6 ea");
+  CHECK_BYTES(m.cfg.settings.v6_addr, 16, "20 01 0d b8 8a f4 b2 60 61 fc 0d be 3a b2 6e 08");
+}
+
+TEST(another_reconfigure_for_the_family_being_refreshed_is_ignored) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m);
+  // Alone: the refresh of IPv4 is not repeated, and IPv6 is not refreshed.
+  feed_frame(s, reconfigure_indication(kWdsConnected4Ind), 5000);
+  size_t sent = m.sent.size(); uint16_t v4 = m.last_txid();
+  feed_frame(s, reconfigure_indication(kWdsConnected4Ind), 5005);
+  CHECK_EQ(m.sent.size(), sent); CHECK(s.state() == rmnet::SessionState::Refreshing);
+  feed_frame(s, settings4_response_with_txid(v4), 5010);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2); CHECK_EQ(m.downs, 1);
+  CHECK_EQ(m.sent.size(), sent);                                              // no IPv6 refresh
+  // A third indication, after the other family's: IPv4, then IPv6, then IPv4 again.
+  feed_frame(s, reconfigure_indication(kWdsConnected4Ind), 6000);
+  CHECK(s.state() == rmnet::SessionState::Refreshing); CHECK_EQ(m.downs, 2);
+  sent = m.sent.size(); v4 = m.last_txid(); CHECK_EQ(m.last()[5], 15);
+  feed_frame(s, reconfigure_indication(kWdsConnected6Ind), 6005);
+  feed_frame(s, reconfigure_indication(kWdsConnected4Ind), 6006);
+  CHECK_EQ(m.sent.size(), sent);
+  feed_frame(s, settings4_response_with_txid(v4), 6010);
+  CHECK_EQ(m.sent.size(), sent + 1); CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0x2d);   // IPv6, once
+  feed_frame(s, settings6_response_with_txid(m.last_txid()), 6020);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 3); CHECK_EQ(m.downs, 2);
+  CHECK_EQ(m.sent.size(), sent + 1);                                          // and IPv4 not again
+}
+
+TEST(disconnect_while_a_refresh_is_remembered_forgets_it) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m);
+  feed_frame(s, reconfigure_indication(kWdsConnected4Ind), 5000);
+  uint16_t v4 = m.last_txid();
+  feed_frame(s, reconfigure_indication(kWdsConnected6Ind), 5005);             // IPv6 remembered
+  feed(s, kWdsDisconnected6Ind, 5010);
+  CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(m.downs, 1);     // the link was already down
+  size_t sent = m.sent.size();
+  feed_frame(s, settings4_response_with_txid(v4), 5020);                      // the late refresh answer
+  CHECK(s.state() == rmnet::SessionState::Backoff); CHECK_EQ(m.sent.size(), sent); CHECK_EQ(m.ups, 1);
+  uint64_t t = tick_until(s, 5010, rmnet::SessionState::Syncing);
+  bring_up_again(s, m, t, [] {});
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2); CHECK_EQ(m.downs, 1);
+  // The remembered IPv6 refresh did not survive the redial: a new IPv4 refresh is followed by nothing.
+  feed_frame(s, reconfigure_indication(kWdsConnected4Ind), t + 1000);
+  CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);
+  sent = m.sent.size();
+  feed_frame(s, settings4_response_with_txid(m.last_txid()), t + 1010);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 3); CHECK_EQ(m.downs, 2);
+  CHECK_EQ(m.sent.size(), sent);
+}
+
+TEST(probe_reply_settings_never_reach_a_later_link_up) {
+  FakeModem m; rmnet::Session s({}, m); bring_up_fully(s, m);
+  s.tick(30100); CHECK_EQ(m.last()[5], 15); CHECK_EQ(m.last()[9], 0x2d);      // the probe, on the IPv4 client
+  feed_frame(s, settings4_moved_with_txid(m.last_txid()), 30200);            // reports 10.102.246.234
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 1);
+  // An IPv6 refresh reports link up again with the IPv4 settings the session holds.
+  feed_frame(s, reconfigure_indication(kWdsConnected6Ind), 31000);
+  CHECK_EQ(m.last()[5], 16); CHECK_EQ(m.last()[9], 0x2d);
+  feed_frame(s, settings6_response_with_txid(m.last_txid()), 31100);
+  CHECK(s.state() == rmnet::SessionState::Up); CHECK_EQ(m.ups, 2);
+  CHECK(m.cfg.settings.has_v4); CHECK_BYTES(m.cfg.settings.v4_addr, 4, "0a 66 f6 e6");   // from bring-up, not the probe
 }
