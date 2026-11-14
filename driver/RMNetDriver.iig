@@ -69,6 +69,7 @@ public:
     void RestartSession(const char * why) LOCALONLY;
     void PowerOff() LOCALONLY;
     void PowerOn(uint32_t powerFlags) LOCALONLY;
+    void ResumeUsb() LOCALONLY;
     void TearDown(IOService * provider) LOCALONLY;
     void AdvanceStop() LOCALONLY;
     void FinishStop() LOCALONLY;

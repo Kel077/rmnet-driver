@@ -41,6 +41,17 @@ uint8_t PrefixLength(const uint8_t mask[4]) {
   return n;
 }
 
+// Field by field (no memcmp of the struct: its padding is not set).
+bool SameSettings(const rmnet::RuntimeSettings& a, const rmnet::RuntimeSettings& b) {
+  return a.has_v4 == b.has_v4 && memcmp(a.v4_addr, b.v4_addr, sizeof a.v4_addr) == 0 &&
+         memcmp(a.v4_gateway, b.v4_gateway, sizeof a.v4_gateway) == 0 &&
+         memcmp(a.v4_mask, b.v4_mask, sizeof a.v4_mask) == 0 && memcmp(a.v4_dns, b.v4_dns, sizeof a.v4_dns) == 0 &&
+         a.v4_dns_count == b.v4_dns_count && a.has_v6 == b.has_v6 &&
+         memcmp(a.v6_addr, b.v6_addr, sizeof a.v6_addr) == 0 && a.v6_prefix_len == b.v6_prefix_len &&
+         memcmp(a.v6_gateway, b.v6_gateway, sizeof a.v6_gateway) == 0 &&
+         memcmp(a.v6_dns, b.v6_dns, sizeof a.v6_dns) == 0 && a.v6_dns_count == b.v6_dns_count && a.mtu == b.mtu;
+}
+
 rmnet::SessionConfig ConfigWithProfile(uint8_t profile) {
   rmnet::SessionConfig cfg{};
   cfg.profile = profile;
@@ -91,7 +102,6 @@ CoreHost::CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t p
       last_advert_ms_(0),
       counters_(),
       logged_first_command_(false),
-      logged_bad_qmap_(false),
       logged_reply_kept_(false),
       kept_reply_(),
       kept_reply_len_(),
@@ -103,9 +113,12 @@ CoreHost::CoreHost(UsbIo& usb, RxSink& rx, const rmnet::MacPair& macs, uint8_t p
       change_{false, false},
       syncs_sent_(0),
       start_client_(),
-      start_client_known_() {}
+      start_client_known_(),
+      logged_settings_(),
+      logged_settings_known_() {}
 
 void CoreHost::start(uint64_t now_ms) {
+  forget_logged_settings();
   session_.start(now_ms);
   note_state();
 }
@@ -123,8 +136,14 @@ void CoreHost::restart(uint64_t now_ms) {
   drop_open_uplink();
   data_link_down();
   restart_wanted_ = false;
+  forget_logged_settings();
   session_.start(now_ms);
   note_state();
+}
+
+void CoreHost::forget_logged_settings() {
+  logged_settings_known_[0] = false;
+  logged_settings_known_[1] = false;
 }
 
 void CoreHost::tick(uint64_t now_ms) {
@@ -244,7 +263,15 @@ void CoreHost::log_received(const uint8_t* data, size_t len) {
   } else if (m.hdr.service == rmnet::QmiService::WDS && m.hdr.msg_id == rmnet::kWdsGetCurrentSettings) {
     rmnet::RuntimeSettings s{};
     if (rmnet::parse_wds_current_settings(m, &s)) {
-      LOG("settings IPv%u: v4 %d (/%u, %u dns), v6 %d (/%u, %u dns), mtu %u", family_of(m.hdr.client), s.has_v4,
+      uint8_t family = family_of(m.hdr.client);
+      // Only for a known family: a reply from an unknown client is always logged.
+      int f = family == kFamilyV4 ? 0 : (family == kFamilyV6 ? 1 : -1);
+      if (f >= 0 && logged_settings_known_[f] && SameSettings(logged_settings_[f], s)) return;
+      if (f >= 0) {
+        logged_settings_[f] = s;
+        logged_settings_known_[f] = true;
+      }
+      LOG("settings IPv%u: v4 %d (/%u, %u dns), v6 %d (/%u, %u dns), mtu %u", family, s.has_v4,
           s.has_v4 ? PrefixLength(s.v4_mask) : 0, s.v4_dns_count, s.has_v6, s.v6_prefix_len, s.v6_dns_count, s.mtu);
     }
   }

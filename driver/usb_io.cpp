@@ -1,6 +1,7 @@
 #include "usb_io.h"
 
 #include <os/log.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <DriverKit/IOLib.h>
@@ -114,11 +115,8 @@ UsbIo::UsbIo(UsbIoListener& listener)
       out_recoveries_(0),
       in_recovery_ticks_(0),
       out_recovery_ticks_(0),
-      out_stalls_(0),
-      out_seq_(0),
-      out_stall_mark_(0),
+      out_stalls_(),
       out_submit_seq_(),
-      out_stuck_restarted_(false),
       head_(0),
       count_(0),
       out_busy_(false),
@@ -130,6 +128,7 @@ UsbIo::UsbIo(UsbIoListener& listener)
       phase_(Phase::Running),
       failed_(false),
       held_(false),
+      resume_(),
       gone_(false),
       send_failed_(false),
       sent_at_stop_(0),
@@ -458,15 +457,22 @@ void UsbIo::start_bulk(uint32_t read_len) {
 }
 
 void UsbIo::post_read(uint32_t i) {
+  kern_return_t ret = submit_read(i);
+  if (ret == kIOReturnSuccess) return;
+  LOG("bulk read %u not posted: 0x%x", i, ret);
+  fail("bulk read could not be posted");
+}
+
+// Posts read i; a refusal is noted (device_gone) and returned, and nothing else is done.
+kern_return_t UsbIo::submit_read(uint32_t i) {
   kern_return_t ret = bulk_in_->AsyncIO(read_buf_[i], read_len_, read_action_[i], 0);  // 0: no timeout
   if (ret == kIOReturnSuccess) {
     read_busy_[i] = true;
     reads_busy_++;
-    return;
+    return ret;
   }
   note(ret);
-  LOG("bulk read %u not posted: 0x%x", i, ret);
-  fail("bulk read could not be posted");
+  return ret;
 }
 
 // A failure that halts the endpoint starts a recovery of the pipe (begin_in_recovery): nothing
@@ -545,10 +551,15 @@ void UsbIo::begin_in_recovery() {
   }
 }
 
-void UsbIo::end_in_recovery() {
+// Ends a bulk IN recovery whose reads have all returned: one ClearStall per recovery.
+kern_return_t UsbIo::clear_in_stall() {
   in_recovering_ = false;
   stats_.stall_clears++;
-  kern_return_t ret = bulk_in_->ClearStall(true);
+  return bulk_in_->ClearStall(true);
+}
+
+void UsbIo::end_in_recovery() {
+  kern_return_t ret = clear_in_stall();
   LOG("bulk in recovered: ClearStall 0x%x, reads posted again", ret);
   for (uint32_t i = 0; i < kBulkReads && phase_ == Phase::Running && !failed_; i++) {
     if (!read_busy_[i]) post_read(i);
@@ -558,7 +569,7 @@ void UsbIo::end_in_recovery() {
 // --- Bulk OUT --------------------------------------------------------------------------------------
 
 int UsbIo::acquire_uplink() {
-  if (phase_ != Phase::Running || !opened_ || out_recovering_ || held_) return -1;
+  if (phase_ != Phase::Running || !opened_ || failed_ || out_recovering_ || held_) return -1;
   for (uint32_t i = 0; i < kUplinkSlots; i++) {
     if (uplink_[i] == Uplink::Free) {
       uplink_[i] = Uplink::Reserved;
@@ -600,7 +611,7 @@ bool UsbIo::send_uplink(int slot, uint32_t len) {
   }
   uplink_[slot] = Uplink::InFlight;
   uplinks_busy_++;
-  out_submit_seq_[slot] = ++out_seq_;
+  out_submit_seq_[slot] = out_stalls_.submitted();
   return true;
 }
 
@@ -611,12 +622,13 @@ bool UsbIo::send_uplink(int slot, uint32_t len) {
 //
 // A stalled uplink: a transfer that timed out (TimedOut), or was aborted while running and not by
 // a recovery (abort() leaves Running first, so the driver's own aborts never count), means the
-// modem did not take the data. The transfers queued together on the NAKing endpoint all time out
+// modem did not take the data. Which failures are of that kind is decided here; counting them is
+// rmnet::UplinkStallCounter's: the transfers queued together on the NAKing endpoint all time out
 // together, so a failure counts as a new stall only if its transfer was submitted after the
-// previous counted stall completed (out_submit_seq_ above out_stall_mark_). kUplinkTimeoutsFatal
-// stalls in a row with no successful transfer between make the uplink stuck: the first time the
-// owner is asked to restart the session (on_uplink_stuck) and the count starts again; stuck again
-// with no successful transfer since that is fatal. A success resets both.
+// previous counted stall completed. rmnet::kUplinkStallsStuck stalls in a row with no successful
+// transfer between make the uplink stuck (Stuck): the owner is asked to restart the session
+// (on_uplink_stuck) and the count starts again; stuck again with no successful transfer since that
+// (StuckAgain) is fatal. A success resets both.
 void UsbIo::bulk_out_complete(uint32_t i, IOReturn status, uint32_t) {
   if (i >= kUplinkSlots || uplink_[i] != Uplink::InFlight) return;
   uplink_[i] = Uplink::Free;
@@ -624,7 +636,7 @@ void UsbIo::bulk_out_complete(uint32_t i, IOReturn status, uint32_t) {
   note(status);
   // While held: not an error, a stall or a recovery, and not reported to the owner (its packets are
   // counted neither as sent nor as dropped). Transfers submitted before resume never count as a
-  // new stall after it (resume moves out_stall_mark_).
+  // new stall after it (resume clears the stall counter).
   if (held_) {
     note_held("uplink transfer", status);
     return;
@@ -642,15 +654,12 @@ void UsbIo::bulk_out_complete(uint32_t i, IOReturn status, uint32_t) {
     }
   }
   if (!running) return;  // the owner is not called while stopping
-  bool new_stall = false;
+  rmnet::StallOutcome stall = rmnet::StallOutcome::None;
   if (ok) {
     out_recoveries_ = 0;
-    out_stalls_ = 0;
-    out_stuck_restarted_ = false;
-  } else if ((timed_out || stray_abort) && out_submit_seq_[i] > out_stall_mark_) {
-    new_stall = true;
-    out_stalls_++;
-    out_stall_mark_ = out_seq_;
+    out_stalls_.succeeded();
+  } else if (timed_out || stray_abort) {
+    stall = out_stalls_.failed(out_submit_seq_[i]);
   }
   listener_.on_bulk_out_done(static_cast<int>(i), ok);
   if (phase_ != Phase::Running || failed_) return;
@@ -658,15 +667,16 @@ void UsbIo::bulk_out_complete(uint32_t i, IOReturn status, uint32_t) {
     fail("bulk out: device not attached");
     return;
   }
-  if (new_stall && out_stalls_ >= kUplinkTimeoutsFatal) {
-    LOG("uplink: %u stalls in a row (last 0x%x), %llu failed transfers; %{public}s", out_stalls_, status,
-        stats_.bulk_out_timeouts, out_stuck_restarted_ ? "stuck again since the restart" : "asking for a session restart");
-    out_stalls_ = 0;
-    if (out_stuck_restarted_) {
+  if (stall == rmnet::StallOutcome::Stuck || stall == rmnet::StallOutcome::StuckAgain) {
+    bool again = stall == rmnet::StallOutcome::StuckAgain;
+    // The counter has already started its count again: the stalls in a row were kUplinkStallsStuck.
+    LOG("uplink: %u stalls in a row (last 0x%x), %llu failed transfers; %{public}s",
+        (unsigned)rmnet::kUplinkStallsStuck, status, stats_.bulk_out_timeouts,
+        again ? "stuck again since the restart" : "asking for a session restart");
+    if (again) {
       fail("uplink is not accepting data");
       return;
     }
-    out_stuck_restarted_ = true;
     stats_.uplink_stuck_restarts++;
     listener_.on_uplink_stuck();
     if (phase_ != Phase::Running || failed_) return;
@@ -721,7 +731,12 @@ void UsbIo::end_out_recovery() {
 // --- Sleep -----------------------------------------------------------------------------------------
 
 void UsbIo::hold() {
-  if (phase_ != Phase::Running || held_) return;
+  if (phase_ != Phase::Running) return;
+  if (held_ && resume_.attempts > 0) {
+    LOG("usb held again: the last wake's resume had not finished after %u attempts", resume_.attempts);
+  }
+  resume_ = ResumeState{};  // the next resume is the first attempt of a new wake
+  if (held_) return;
   held_ = true;
   LOG("usb held: %u requests outstanding (interrupt %d, response read %d, control send %d, %u bulk reads, "
       "%u uplink transfers), %u control messages queued%{public}s%{public}s",
@@ -740,60 +755,84 @@ void UsbIo::note_held(const char* what, IOReturn status) {
   }
 }
 
-bool UsbIo::resume() {
-  if (!held_) return phase_ == Phase::Running && !failed_ && !gone_;
+UsbIo::Resume UsbIo::resume(bool last_try) {
+  if (!held_) return phase_ == Phase::Running && !failed_ && !gone_ ? Resume::Done : Resume::Failed;
   if (phase_ != Phase::Running || failed_ || gone_) {
     LOG("usb not resumed: %{public}s", gone_ ? "the device has gone" : "usb has failed");
-    return false;
+    return Resume::Failed;
   }
-  held_ = false;
-  // What happened before the sleep, or to the requests around it, says nothing about the bus now.
-  intr_failures_ = 0;
-  memset(read_failures_, 0, sizeof read_failures_);
-  in_recoveries_ = 0;
-  out_recoveries_ = 0;
-  in_recovery_ticks_ = 0;
-  out_recovery_ticks_ = 0;
-  out_stalls_ = 0;
-  out_stuck_restarted_ = false;
-  out_stall_mark_ = out_seq_;
-  bool intr_posted = false;
+  if (resume_.attempts++ == 0) {
+    // What happened before the sleep, or to the requests around it, says nothing about the bus now.
+    // Once per wake: the completions of later attempts' requests arrive held and change none of it.
+    intr_failures_ = 0;
+    memset(read_failures_, 0, sizeof read_failures_);
+    in_recoveries_ = 0;
+    out_recoveries_ = 0;
+    in_recovery_ticks_ = 0;
+    out_recovery_ticks_ = 0;
+    out_stalls_.clear();
+    resume_.reads_pending = reads_busy_;
+    resume_.in_was_recovering = in_recovering_;
+  }
+  // Posted while still held: neither post checks held_, and their completions are handled as held
+  // ones until the hold ends. A request already posted (busy) is not posted again.
   if (!intr_busy_) {
     kern_return_t ret = post_interrupt();
     if (ret != kIOReturnSuccess) {
-      LOG("resume: interrupt read not posted: 0x%x", ret);
-      fail("interrupt read could not be posted after the wake");
-      return false;
+      return resume_refused("interrupt read", "interrupt read could not be posted after the wake", ret, last_try);
     }
-    intr_posted = true;
+    resume_.intr_posted = true;
   }
-  uint32_t pending = reads_busy_;
-  bool in_was_recovering = in_recovering_;
-  if (read_len_ != 0) {
+  // A bulk IN recovery with reads still pending goes on after the hold, as it would have.
+  if (read_len_ != 0 && !(in_recovering_ && reads_busy_ > 0)) {
     if (in_recovering_) {
-      if (reads_busy_ == 0) end_in_recovery();  // posts every read
-    } else {
-      for (uint32_t i = 0; i < kBulkReads && !failed_; i++) {
-        if (!read_busy_[i]) post_read(i);
-      }
+      kern_return_t ret = clear_in_stall();  // once: in_recovering_ is false from here
+      LOG("resume: bulk in recovered: ClearStall 0x%x, reads posted again", ret);
     }
-    if (failed_) return false;
+    for (uint32_t i = 0; i < kBulkReads; i++) {
+      if (read_busy_[i]) continue;
+      kern_return_t ret = submit_read(i);
+      if (ret != kIOReturnSuccess) return resume_refused("bulk read", "bulk read could not be posted", ret, last_try);
+      resume_.reads_posted++;
+    }
   }
+  held_ = false;
   bool out_was_recovering = out_recovering_;
   if (out_recovering_ && uplinks_busy_ == 0) end_out_recovery();
   uint32_t queued = count_;
   bool response_pending = in_busy_;
   submit_next();
   begin_drain();
-  LOG("usb resumed: interrupt read %{public}s; %u bulk reads posted, %u were still pending%{public}s; "
+  char attempts[32] = "";
+  if (resume_.attempts > 1) snprintf(attempts, sizeof attempts, " after %u attempts", resume_.attempts);
+  LOG("usb resumed%{public}s: interrupt read %{public}s; %u bulk reads posted, %u were still pending%{public}s; "
       "%u uplink transfers in flight%{public}s; %u control messages queued; response read %{public}s",
-      intr_posted ? "posted" : "still pending", reads_busy_ - pending, pending,
+      attempts, resume_.intr_posted ? "posted" : "still pending", resume_.reads_posted, resume_.reads_pending,
       read_len_ == 0 ? " (bulk not started)"
-                     : (in_was_recovering ? (in_recovering_ ? ", bulk in still recovering" : ", bulk in recovery finished") : ""),
+                     : (resume_.in_was_recovering ? (in_recovering_ ? ", bulk in still recovering" : ", bulk in recovery finished") : ""),
       uplinks_busy_,
       out_was_recovering ? (out_recovering_ ? ", bulk out still recovering" : ", bulk out recovery finished") : "",
       queued, response_pending ? "still pending" : (in_busy_ ? "posted" : "not posted"));
-  return !failed_;
+  return failed_ ? Resume::Failed : Resume::Done;
+}
+
+// A post refused during resume. Not yet, with the hold kept, unless the device has gone or this is
+// the last try: then fatal, as a refused post at the wake always was, and with the hold ended first,
+// as it was then (the session's releases are queued and sent as after any fatal error).
+UsbIo::Resume UsbIo::resume_refused(const char* what, const char* fatal, IOReturn status, bool last_try) {
+  if (Gone(status) || last_try) {
+    LOG("resume: %{public}s not posted: 0x%x (attempt %u%{public}s)", what, status, resume_.attempts,
+        Gone(status) ? ", device gone" : ", the last");
+    held_ = false;
+    fail(fatal);
+    return Resume::Failed;
+  }
+  resume_.refusals++;
+  if (Worth(resume_.refusals)) {
+    LOG("resume: %{public}s not posted: 0x%x (attempt %u, %u refusals this wake); usb stays held, tried again",
+        what, status, resume_.attempts, resume_.refusals);
+  }
+  return Resume::NotYet;
 }
 
 // --- Stopping ----------------------------------------------------------------------------------------

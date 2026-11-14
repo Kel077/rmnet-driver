@@ -19,6 +19,8 @@
 
 #include <DriverKit/IOReturn.h>
 
+#include "rmnet/stall.h"
+
 class IOService;
 class IOUSBHostInterface;
 class IOUSBHostPipe;
@@ -36,7 +38,7 @@ class UsbIoListener {
   virtual void on_bulk_in(const uint8_t* data, size_t len) = 0;
   // The uplink transfer from `slot` completed; the slot is free again.
   virtual void on_bulk_out_done(int slot, bool ok) = 0;
-  // The uplink is stuck (kUplinkTimeoutsFatal stalls, no successful transfer between them) for
+  // The uplink is stuck (rmnet::kUplinkStallsStuck stalls, no successful transfer between them) for
   // the first time since a successful transfer: the owner should restart the session, after the
   // current call returns. A second time with no success between is on_fatal instead.
   virtual void on_uplink_stuck() = 0;
@@ -51,12 +53,12 @@ enum : uint32_t {
   kMaxUplink = 16384,    // the largest uplink transfer Core accepts
 };
 
-// Bulk OUT stalls in a row, with no successful transfer between them, after which the uplink is
-// stuck: the first time the owner restarts the session (on_uplink_stuck), the second time with no
-// success since then the uplink is given up (on_fatal). A stall is a transfer that timed out
+// Bulk OUT stalls are counted by rmnet::UplinkStallCounter (core/include/rmnet/stall.h):
+// rmnet::kUplinkStallsStuck stalls in a row, with no successful transfer between them, make the
+// uplink stuck: the first time the owner restarts the session (on_uplink_stuck), the second time
+// with no success since then the uplink is given up (on_fatal). A stall is a transfer that timed out
 // (kUplinkTimeoutMs, 5 s) or was aborted by no one in this driver; the transfers queued together
-// during one stall count once (UsbIo::bulk_out_complete).
-enum { kUplinkTimeoutsFatal = 3 };
+// during one stall count once (UsbIo::bulk_out_complete decides which failures it reports).
 
 // Completion actions made by the driver (its CreateAction* methods). UsbIo takes a reference
 // to each and releases it with the other USB objects. Each bulk action carries its slot index
@@ -111,7 +113,7 @@ class UsbIo {
   // it is aborted asynchronously, and ClearStall runs only once nothing is pending on it. While
   // bulk OUT recovers, acquire_uplink gives no buffer (uplink_recovering() says why). A failed
   // abort, or a recovery not finished within about 1 s (tick), is fatal. A timed-out uplink
-  // transfer does not halt the pipe; kUplinkTimeoutsFatal stalls in a row, with no successful
+  // transfer does not halt the pipe; rmnet::kUplinkStallsStuck stalls in a row, with no successful
   // transfer between, ask for a session restart, and again after it are fatal ("uplink is not
   // accepting data").
   //
@@ -140,16 +142,29 @@ class UsbIo {
   // no pipe recovery or ClearStall. Completions that arrive while held free their request and are
   // counted in sleep_completions only: never toward a failure limit, never a recovery, never
   // on_fatal; a not-attached or no-device status still sets device_gone. Only while running.
-  // resume (after the wake): ends the hold unless USB has failed or the device has gone (false,
-  // and the hold stays). It clears the failure memory (the uplink stall count and its restart
-  // memory, transfers submitted before it no longer counting as new stalls, the per-read and
-  // interrupt failure counts, the recovery counts in a row), finishes a pipe recovery whose
-  // requests have all returned, posts the interrupt read and every bulk read not posted, sends the
-  // queued control messages and reads any waiting response. False if a read could not be posted
-  // (fatal, reported through on_fatal). finish_sending on a held UsbIo ends the hold and drops the
-  // messages waiting behind it; stopping then goes on as it does when not held.
+  // resume (after the wake), one attempt; the owner may make several for one wake. Failed, and
+  // the hold stays, if USB has failed or the device has gone. The first attempt after a hold clears
+  // the failure memory (the uplink stall count and its restart memory, transfers submitted before
+  // it no longer counting as new stalls, the per-read and interrupt failure counts, the recovery
+  // counts in a row). Each attempt finishes a bulk IN recovery whose reads have all returned (one
+  // ClearStall per recovery, whatever the attempts) and posts the interrupt read and every bulk read
+  // not posted; requests an earlier attempt posted stay posted and are not posted again.
+  // - A post refused with a status other than not-attached or no-device, when last_try is false:
+  //   NotYet. The hold stays (held_), nothing is reported to the listener, and what this attempt
+  //   posted stays posted (its completions are handled as every completion while held is). Logged
+  //   at the first refusal of a wake and at power-of-two counts after it.
+  // - A post refused with not-attached or no-device, or any refusal when last_try is true: Failed.
+  //   As a refused post at the wake always was: the hold ends and the failure is reported through
+  //   on_fatal.
+  // - Every post made, in this attempt or earlier ones: Done. Only then does the hold end; the
+  //   bulk OUT recovery whose transfers have returned is finished, the queued control messages are
+  //   sent and any waiting response is read.
+  // hold resets the attempts: the next resume is the first of a new wake. finish_sending on a held
+  // UsbIo ends the hold and drops the messages waiting behind it; stopping then goes on as it does
+  // when not held.
+  enum class Resume : uint8_t { Done, NotYet, Failed };
   void hold();
-  bool resume();
+  Resume resume(bool last_try);
   bool held() const { return held_; }
   uint16_t bulk_out_packet_size() const { return bulk_out_mps_; }  // from the endpoint descriptor
   const UsbIoStats& stats() const { return stats_; }
@@ -203,6 +218,9 @@ class UsbIo {
   void end_drain();
   void deliver(uint32_t bytes);
   void post_read(uint32_t slot);
+  kern_return_t submit_read(uint32_t slot);
+  kern_return_t clear_in_stall();
+  Resume resume_refused(const char* what, const char* fatal, IOReturn status, bool last_try);
   void begin_in_recovery();
   void end_in_recovery();
   void begin_out_recovery();
@@ -256,15 +274,10 @@ class UsbIo {
   uint32_t out_recoveries_;  // recoveries in a row with no successful transfer between
   uint32_t in_recovery_ticks_;   // ticks since the current bulk IN recovery began
   uint32_t out_recovery_ticks_;  // ticks since the current bulk OUT recovery began
-  // Bulk OUT stalls. Each submitted transfer gets the next number (out_seq_) in out_submit_seq_.
-  // A failed transfer counts as a new stall only if its number is above out_stall_mark_, which is
-  // out_seq_ when the previous counted stall completed; a success resets out_stalls_ and
-  // out_stuck_restarted_.
-  uint32_t out_stalls_;
-  uint64_t out_seq_;
-  uint64_t out_stall_mark_;
+  // Bulk OUT stalls. Each submitted transfer's sequence number (UplinkStallCounter::submitted) is
+  // kept in out_submit_seq_ for its slot and given back to the counter if the transfer stalls.
+  rmnet::UplinkStallCounter out_stalls_;
   uint64_t out_submit_seq_[kUplinkSlots];
-  bool out_stuck_restarted_;  // stuck once already with no successful transfer since
   uint32_t head_;   // oldest queued slot
   uint32_t count_;  // queued slots, the head one in flight when out_busy_
   bool out_busy_;
@@ -277,6 +290,16 @@ class UsbIo {
   Phase phase_;
   bool failed_;
   bool held_;  // hold: the system sleeps; only while phase_ is Running
+  // The resume attempts of the current wake, reset by hold.
+  struct ResumeState {
+    uint32_t attempts;       // resume calls made while held
+    uint32_t refusals;       // posts refused (NotYet)
+    uint32_t reads_pending;  // bulk reads still pending at the first attempt
+    uint32_t reads_posted;   // bulk reads posted by the attempts
+    bool intr_posted;        // the interrupt read was posted by an attempt
+    bool in_was_recovering;  // bulk IN was recovering at the first attempt
+  };
+  ResumeState resume_;
   bool gone_;  // a status said the device is not attached (device_gone)
   bool send_failed_;         // a control request failed while draining
   uint32_t sent_at_stop_;    // messages sent after finish_sending

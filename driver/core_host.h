@@ -20,7 +20,8 @@
 // discarded, and counted as reply drops, on a link down, at stop and on drop_kept_replies.
 // A pause that no flow enable lifts within kPauseMaxMs of link-up time (timed by data_tick) makes CoreHost ask the
 // driver for a session restart (take_restart_wanted); it never restarts the session itself.
-// No per-packet logging: counters carry it.
+// No per-packet logging: counters carry it. A WDS Get Current Settings reply (the liveness probe's,
+// every 30 s) is logged only when its settings differ from the ones last logged for that family.
 #pragma once
 
 #include <stddef.h>
@@ -158,6 +159,7 @@ class CoreHost final : public rmnet::SessionDelegate {
   void note_state();
   void log_sent(const uint8_t* data, size_t len);
   void log_received(const uint8_t* data, size_t len);
+  void forget_logged_settings();
   uint8_t family_of(uint8_t wds_client) const;
   void deliver_ip(const uint8_t* ip, size_t len);
   void deliver_frame(const uint8_t* frame, size_t len);
@@ -194,7 +196,6 @@ class CoreHost final : public rmnet::SessionDelegate {
   uint64_t last_advert_ms_;
   DataCounters counters_;
   bool logged_first_command_;
-  bool logged_bad_qmap_;
   bool logged_reply_kept_;
   // Kept command replies: a ring of kKeptReplies, oldest at kept_head_. Never the read buffer the
   // request sits in, so qmap_build_command_reply's no-overlap rule holds.
@@ -210,6 +211,11 @@ class CoreHost final : public rmnet::SessionDelegate {
   // The IP family (4 or 6) each WDS client asked for in Start Network, for the log.
   uint8_t start_client_[2];
   bool start_client_known_[2];
+  // The settings last logged for each family (IPv4, IPv6) in this session: a Get Current Settings
+  // reply is logged only when its settings differ (the liveness probe repeats it every 30 s).
+  // Forgotten at start and restart, so a session's first reply is always logged.
+  rmnet::RuntimeSettings logged_settings_[2];
+  bool logged_settings_known_[2];
 };
 
 const char* SessionStateName(rmnet::SessionState s);

@@ -78,15 +78,15 @@ Before the same-day comparison with the userspace tool:
 None of these has run on hardware.
 
 - **Empty packets held across an interface disable and enable.** The driver now holds up to 32 empty receive packets (`RMNetRxStock`) and up to 32 kept transmit frames while idle or held, where before it held 0 or 1; whether the framework reclaims driver-held packets on `SetInterfaceEnable(false)` is unknown, and if it does they would be used twice. Needs the port switched off and on with `RMNetRxStock` above 0 (the owner's step).
-- **Pool margin.** The driver alone can hold `rxOut` 256 + `rxStock` 32 + `txDone` and kept frames 256 = 544 packets against `kPacketCount` 512, with the four queues of 256 on top; no array can overflow, but during an upload the hold keeps the transmit queue full, so a download at the same time could find no empty packets (`RMNetRxDropNoPacket`), and the standing queue of about 288 frames adds latency in front of acknowledgements. If hardware shows it: raise `kPacketCount` to 1024, or give the transmit queue a smaller capacity.
+- **Pool margin.** The driver alone can hold `rxOut` 256 + `rxStock` 32 + `txDone` and kept frames 256 = 544 packets against `kPacketCount` 512, with the four queues of 256 on top; no array can overflow, but during an upload the hold keeps the transmit queue full, so a download at the same time could find no empty packets (`RMNetRxDropNoPacket`), and the standing queue of about 288 frames adds latency in front of acknowledgements. If hardware shows it: raise `kPacketCount` to 1024, or give the transmit queue a smaller capacity. **Changed 2026-11-14 (hardening), changed in code, not yet seen on hardware:** the TX submission queue now has `kTxQueueCapacity` 64 (the other three queues keep `kQueueCapacity` 256), so the queues hold 64 + 3 × 256 = 832 packets at most against 1,088 before, and the standing queue in front of the driver during an upload is about 64 + 32 kept frames = 96 instead of about 288; the rest waits in macOS's interface queue, which schedules flows fairly. The driver's own holding (`rxOut` 256 + `rxStock` 32 + `txDone` and kept frames 256 = 544) is unchanged, and so is `kPacketCount` (512). Whether the capacity really bounds what waits inside the driver's queue is measured after the install.
 - **An "uplink usable" callback.** A failed bulk OUT completion, the end of a bulk OUT recovery (`UsbIo::end_out_recovery`) and a link down without a pause restart a held drain only on the next 100 ms tick; a `UsbIoListener` callback raised after `UsbIo::bulk_out_complete` has decided on recovery, and at the end of `UsbIo::end_out_recovery`, would remove that wait.
 - **A host harness for `CoreHost`'s hold.** No automated test covers `CoreHost::transmit` returning false, the re-offer of the kept frame, or frame order; nor the kept QMAP command replies.
 - **The burst tool's remaining signal cases.** A second signal inside the interrupt handler of `scripts/uplink-burst.py` ends with a traceback, though the usage line is written; SIGQUIT and SIGKILL leave no line.
 
 Small hardening left open:
-- The frame-length minimum tests.
+- The frame-length minimum tests. **Changed 2026-11-14 (hardening), Task 1 (`90755d8`): closed:** `frame_length_at_its_minimum_lengths` (`qmi_frame_length` at its minimum lengths).
 - A refresh during a retry abandons an allocated client until the next sync.
-- The Get Client ID retry path has no test.
+- The Get Client ID retry path has no test. **Changed 2026-11-14 (hardening), Task 1 (`90755d8`): closed:** `retry_of_a_family_that_never_got_a_client_starts_from_get_client_id`.
 - `tick` could check `!pending_.active ||`.
 - An empty CDHash is reported as "older build running" by the install script.
 - The install script's stop check sees only the `activated enabled` entry.
@@ -101,8 +101,8 @@ Small hardening left open:
 - `docs/driverkit-notes.md` says build 316.19.9 "saw about 860" drains that did nothing during the burst. That figure is an estimate (999 refused offers minus 135 transfers), not a count.
 - Packets held at `Stop` are abandoned (watch the driver process's memory in the soak).
   - **Soak run (2026-11-14, 317.9.11), memory not watched.** `scripts/soak.sh en33 30` passed (`docs/driverkit-notes.md`, "Runtime findings (30-minute soak)"), but it records no process memory, and no `Stop` happened during it. `RMNetPacketsHeld` was 0 in the first and the last sample.
-- `acquire_uplink` ignores `failed_`.
-- `logged_bad_qmap_` is dead.
+- `acquire_uplink` ignores `failed_`. **Changed 2026-11-14 (hardening): done:** it refuses after a failure, as while recovering.
+- `logged_bad_qmap_` is dead. **Changed 2026-11-14 (hardening): done:** removed.
 - `Worth` is duplicated.
 - A failed `setDataOffAndLen` is ignored.
 - `RMNetPoolPacketCount` publishes a fixed total.
@@ -166,35 +166,35 @@ Small hardening:
 - **Sleep and wake.** Build 317.9.11 holds `UsbIo` at power off and resumes it and restarts the session at power on (`docs/driverkit-notes.md` 3.8, "As built").
   - **Seen on hardware (2026-11-14, 17:22 to 17:23), for one case:** the device stayed attached and its requests stayed pending. Two power-offs and two wakes (for three sleep entries in `pmset -g log`; which one did not reach the driver is unknown), the same driver instance throughout, `RMNetSleepCompletions` 0, link up 0.58 s after the last wake with new addresses in both families, both pings 5 of 5, every USB error counter 0 (`docs/driverkit-notes.md`, "Runtime findings (sleep and wake)").
   - **Open (not seen):** a sleep during which the stack cancels or fails transfers; a re-enumeration on wake; a bus that answers not-ready at the wake call; a sleep longer than half a minute; a `Stop` while asleep.
-- **A bus not ready at the wake call is fatal.** If posting the interrupt read or a bulk read at resume fails (for example with `kIOReturnNotReady`), the port goes down as `usb failed` and stays down until a re-enumeration or a manual reload; nothing retries. That meets "fresh addresses or down", but a retry after a short delay may be needed if it is ever seen. Not seen in the one test. **Raised from minor by the recovery plan's final review; open** (below).
+- **A bus not ready at the wake call is fatal.** If posting the interrupt read or a bulk read at resume fails (for example with `kIOReturnNotReady`), the port goes down as `usb failed` and stays down until a re-enumeration or a manual reload; nothing retries. That meets "fresh addresses or down", but a retry after a short delay may be needed if it is ever seen. Not seen in the one test. **Raised from minor by the recovery plan's final review; open** (below). **Changed 2026-11-14 (hardening): built, not seen on hardware;** see "No retry at the wake" below.
 - **Uplink transfers that complete while held** are counted neither as sent nor as dropped (`RMNetTxPackets`, `RMNetTxDropUsb`), and reads that complete while held are discarded unread.
 
 ## Sent here by the recovery plan's Task 5, the soak (2026-11-14)
 
 - **The 30-minute soak has been run.** `scripts/soak.sh en33 30` on 317.9.11, 17:25 to 17:55: `soak: PASS`, the state `up` in all 181 samples, every listed error and drop counter 0 first and last, 0.0 % loss on 3,560 IPv4 and 3,559 IPv6 pings, about 15.2 MB moved (`docs/driverkit-notes.md`, "Runtime findings (30-minute soak)"). Under light traffic only (two 1,000-byte pings a second in each family); sustained heavy traffic has not been soaked.
-- **The liveness probe is noisy in the log.** Every 30 s, idle or not, it logs three lines: `qmi tx WDS client 15 msg 0x002d`, the `result ok` response, and `settings IPv4: ...` (61 probes, 183 lines, in the soak's 30 minutes, and nothing else). A candidate to quieten: log the probe's exchange and an unchanged settings line only when something differs or fails.
+- **The liveness probe is noisy in the log.** Every 30 s, idle or not, it logs three lines: `qmi tx WDS client 15 msg 0x002d`, the `result ok` response, and `settings IPv4: ...` (61 probes, 183 lines, in the soak's 30 minutes, and nothing else). A candidate to quieten: log the probe's exchange and an unchanged settings line only when something differs or fails. **Changed 2026-11-14 (hardening): done in code, not yet seen on hardware:** the `settings IPv…` line is logged only when the reply's settings differ from the ones last logged for that family (the first of a session and the first after a restart always), so the probe should cost two lines every 30 s.
 
 ## Sent here by the recovery plan's final review (2026-11-14)
 
 Decisions (the controller's rulings for the one fix wave):
 
 - **`detached` and not-ready (decided).** `kIOReturnNotReady` does not count as "device gone": held completions, and a submission right at the wake, can plausibly return not-ready from a device still attached, and counting it as gone would turn a recoverable wake into a permanently detached port; so on a modem reboot the old instance shows `usb failed` for a few milliseconds before `Stop`, and the window may show "Link down" once. `Gone()` in `driver/usb_io.cpp` is unchanged.
-- **No retry at the wake (decided: recorded, not built; the gap stays open, raised from minor).** If a re-post is refused when the driver resumes, the port goes down as `usb failed` and nothing retries until a re-enumeration or a manual reload; a retry of `resume` and the restart from the tick for about 5 s would close it. Not built because the bus was ready at the wake on 2026-11-14 and the new resume state could not be exercised here.
+- **No retry at the wake (decided: recorded, not built; the gap stays open, raised from minor).** If a re-post is refused when the driver resumes, the port goes down as `usb failed` and nothing retries until a re-enumeration or a manual reload; a retry of `resume` and the restart from the tick for about 5 s would close it. Not built because the bus was ready at the wake on 2026-11-14 and the new resume state could not be exercised here. **Changed 2026-11-14 (hardening): built, not seen on hardware:** a refused post at the wake (not "device gone") keeps `UsbIo` held and the driver tries the whole resume again from every tick until it succeeds or `kResumeRetryMs` (5000 ms) after the wake call, then fails as before; `RMNetWakeRetries` counts the attempts after the first (`docs/driverkit-notes.md`, "Changed in code, not yet on hardware (hardening)").
 - **The window's 2-second refresh stays (decided).** The plan asked for it; it asks the system for the listing every 2 s.
 
 Open:
 
 - **A pause that keeps coming back.** A modem that keeps its flow-control pause makes the session restart about every 30 s with no "second time is fatal" rule; between restarts the link looks up and passes no uplink traffic. Never seen.
 - **A gap in the design.** Goal 5 names "the network dropping the connection", but no "Done means" line covers it; a network-side drop with the modem still attached has never been seen on hardware (Core's tests and the disconnect indication at modem reboots cover the logic).
-- **Testing the driver.** Nothing under `driver/` has a test; the cheapest worthwhile step is to move the uplink stall counter (`out_seq_`, `out_stall_mark_`, `out_stalls_`, `out_stuck_restarted_`) into a small plain C++ struct under `core/` and unit-test it (`CoreHost` would need a `UsbIo` interface to be testable on the host).
+- **Testing the driver.** Nothing under `driver/` has a test; the cheapest worthwhile step is to move the uplink stall counter (`out_seq_`, `out_stall_mark_`, `out_stalls_`, `out_stuck_restarted_`) into a small plain C++ struct under `core/` and unit-test it (`CoreHost` would need a `UsbIo` interface to be testable on the host). **Changed 2026-11-14 (hardening): started:** the stall counter is `rmnet::UplinkStallCounter` in Core (`core/include/rmnet/stall.h`) with unit tests (`tests/test_stall.cpp`, Task 1, `90755d8`), and `UsbIo` uses it in place of the four fields (this task). `CoreHost`, `UsbIo` and the rest of `driver/` still have no test.
 
 Minor, one line each:
 
-- Core: the probe's "contents ignored" check is weak.
+- Core: the probe's "contents ignored" check is weak. **Changed 2026-11-14 (hardening), Task 1 (`90755d8`): closed:** `probe_reply_settings_never_reach_a_later_link_up` checks it for real.
 - Core: the teardown after the probe's redial is unchecked.
-- Core: only one reconfigure order is tested.
-- Core tests: `without_tlv` is duplicated.
-- Driver: "timer armed again" can flood the log.
+- Core: only one reconfigure order is tested. **Changed 2026-11-14 (hardening), Task 1 (`90755d8`): closed:** the other family in the reverse order (`reconfigure_for_ipv4_during_an_ipv6_refresh_is_not_lost`), a repeated indication for the family being refreshed (`another_reconfigure_for_the_family_being_refreshed_is_ignored`), a disconnect while one is remembered (`disconnect_while_a_refresh_is_remembered_forgets_it`).
+- Core tests: `without_tlv` is duplicated. **Changed 2026-11-14 (hardening), Task 1 (`90755d8`): closed:** moved into `tests/frames.h`.
+- Driver: "timer armed again" can flood the log. **Changed 2026-11-14 (hardening): done:** logged only at the power-of-two steps of the arm failures.
 - Driver: `usbDetached` is fixed at the moment of the fatal report.
 - Driver: with a failed timer arm, a held drain or an abort that never returns waits for unrelated traffic.
 - Driver: the host stack's own aborts count as an uplink stall.
@@ -215,14 +215,14 @@ Minor, one line each:
 - `soak.sh`: a sample whose status has an `error` key is classed unreadable even when the registry part says `up`.
 - `soak.sh`: the crash-report listing hides a permission failure and does not list `Retired/`.
 - `soak.sh`: the usage reader is a copy of `measure.sh`'s.
-- The liveness probe writes three log lines every 30 s.
+- The liveness probe writes three log lines every 30 s. **Changed 2026-11-14 (hardening): done in code, not yet seen on hardware:** an unchanged `settings IPv…` line is no longer logged.
 
 ## Left by the recovery plan's last re-reviews (2026-11-14)
 
 From the final fix wave's re-review (items (1), (2) and (4) of its eight Minor residuals were README statements, corrected in the "Done means" table and the app section):
 
 - App: `ExtensionManager`'s "cannot" text says the bundled version "is not listed" when it is listed as uninstalling.
-- Driver: the corrected comment in `RMNetDriver.cpp` says the transfers end in `kIOReturnNotReady`, but the interrupt read ends in `kIOReturnAborted` and the re-post is refused with not-ready.
+- Driver: the corrected comment in `RMNetDriver.cpp` says the transfers end in `kIOReturnNotReady`, but the interrupt read ends in `kIOReturnAborted` and the re-post is refused with not-ready. **Changed 2026-11-14 (hardening): done:** the comment at `RMNetDriver::OnUsbFatal` says so.
 - App: one vacuous check and one dead branch in the status model.
 - App: the not-QMI advice lines are dropped while every entry is uninstalling.
 - App: `installTitle` compares versions as numbers and `canRemoveDirectly` as text.

@@ -33,7 +33,10 @@ constexpr uint8_t kQmiInterfaceNumber = 4;
 constexpr uint8_t kVendorSpecific = 0xff;
 constexpr uint32_t kPacketCount = 512;
 constexpr uint32_t kPacketBufSize = 2048;  // one Ethernet frame per packet
-constexpr uint32_t kQueueCapacity = 256;
+constexpr uint32_t kQueueCapacity = 256;  // the TX completion and both RX queues
+// The TX submission queue only. During an upload the uplink hold keeps it full; what does not fit
+// waits in macOS's own interface queue, which schedules flows fairly, rather than in order here.
+constexpr uint32_t kTxQueueCapacity = 64;
 constexpr uint32_t kMtu = 1500;
 constexpr uint32_t kMinMtu = 576;
 constexpr uint8_t kDefaultProfile = 1;
@@ -50,6 +53,9 @@ constexpr uint64_t kTickNs = 100 * 1000000ull;
 constexpr uint64_t kTickLeewayNs = 10 * 1000000ull;
 constexpr uint64_t kStopDrainMs = 1000;  // the control ring may take this long to send at Stop
 constexpr uint64_t kStopAbortMs = 1000;  // and the aborted requests this long to come back
+// A wake whose USB posts are refused (the bus not ready yet) is tried again from every tick until
+// this long after the wake call; the attempt made then is the last.
+enum : uint32_t { kResumeRetryMs = 5000 };
 
 // One bit per override and handler, set the first time it runs.
 enum : uint32_t {
@@ -195,7 +201,7 @@ struct RxBridge final : RxSink {
 };
 
 // What PublishCounters last published, in its order.
-enum : uint32_t { kCounterCount = 51 };
+enum : uint32_t { kCounterCount = 52 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -259,15 +265,20 @@ struct RMNetDriver_IVars {
   uint64_t rxHandlerTotalNs;
   bool rxReadSeen;
   // Sleep (SetPowerState): asleep from a power-off call to the next power-on call. While asleep
-  // UsbIo is held and nothing calls Core: no tick, no drain. wakeUpPending: the wake restarted the
-  // session and its link up has not come yet; lastWakeUpMs is the time from that wake call to the
-  // link up (0 until then).
+  // UsbIo is held and nothing calls Core: no tick, no drain. resumePending: the wake's first
+  // resume found the bus not ready; until a later attempt (one per tick) resumes UsbIo, or the
+  // deadline, a fatal error, a power-off or Stop ends it, the driver behaves as while asleep (every
+  // check of asleep also checks it). wakeUpPending: the wake restarted the session and its link up
+  // has not come yet; lastWakeUpMs is the time from that wake call to the link up (0 until then).
+  // wakeRetries: resume attempts after the first of their wake, since start.
   bool asleep;
+  bool resumePending;
   bool wakeUpPending;
   uint64_t sleeps;
   uint64_t wakes;
   uint64_t wakeStartMs;
   uint64_t lastWakeUpMs;
+  uint64_t wakeRetries;
   uint32_t lastPowerFlags;
   bool countersPublished;
   uint64_t counters[kCounterCount];
@@ -413,7 +424,7 @@ kern_return_t RMNetDriver::CreateInterface(const uint8_t* hostMac) {
   kern_return_t ret = IOUserNetworkPacketBufferPool::CreateWithOptions(this, "RMNetPool", &opts, &ivars->pool);
   if (ret != kIOReturnSuccess) return ret;
 
-  ret = IOUserNetworkTxSubmissionQueue::Create(ivars->pool, this, kQueueCapacity, 0, ivars->queue, &ivars->txSubmit);
+  ret = IOUserNetworkTxSubmissionQueue::Create(ivars->pool, this, kTxQueueCapacity, 0, ivars->queue, &ivars->txSubmit);
   if (ret != kIOReturnSuccess) return ret;
   ret = IOUserNetworkTxCompletionQueue::Create(ivars->pool, this, kQueueCapacity, 0, ivars->queue, &ivars->txComplete);
   if (ret != kIOReturnSuccess) return ret;
@@ -462,16 +473,19 @@ kern_return_t RMNetDriver::StartTimer() {
 
 // The timer is one-shot: re-armed after every tick. A failure is remembered (timerArmFailed) and
 // EnsureTimer tries again from every other entry into the driver; until one succeeds no tick is due.
+// Both lines are logged only when the failure count is a power of two, so a timer that keeps failing
+// and recovering cannot flood the log.
 void RMNetDriver::ArmTimer() {
   kern_return_t ret = ivars->timer->WakeAtTime(kIOTimerClockUptimeRaw, NowNs() + kTickNs, kTickLeewayNs);
+  uint64_t n = ivars->timerArmFailures;
+  bool worth = (n & (n - 1)) == 0;
   if (ret == kIOReturnSuccess) {
-    if (ivars->timerArmFailed) LOG("timer armed again after %llu failures", ivars->timerArmFailures);
+    if (ivars->timerArmFailed && worth) LOG("timer armed again after %llu failures", n);
     ivars->timerArmFailed = false;
     return;
   }
   ivars->timerArmFailed = true;
-  ivars->timerArmFailures++;
-  uint64_t n = ivars->timerArmFailures;
+  n = ++ivars->timerArmFailures;
   if ((n & (n - 1)) == 0) LOG("timer not armed: 0x%x (%llu failures)", ret, n);
 }
 
@@ -504,6 +518,7 @@ void RMNetDriver::TearDown(IOService* provider) {
   provider->retain();
   ivars->stopStartMs = NowMs();
   ivars->wakeUpPending = false;  // no link up can follow now: none is measured from an old wake
+  ivars->resumePending = false;  // nothing is retried once stopping: finish_sending ends the hold
   // Not again if OnUsbFatal already stopped the session: Core is not called after stop().
   if (ivars->core && !ivars->coreStopped) {
     ivars->coreStopped = true;
@@ -581,11 +596,18 @@ kern_return_t RMNetDriver::Stop_Impl(IOService* provider) {
 // - Power on after a sleep: UsbIo resumes (its failure memory cleared, its reads posted again)
 //   and the session restarts from sync, taking the link down first, so the port ends up with the
 //   new call's addresses or down, never up with the old ones. If USB failed or the device went
-//   during the sleep, nothing more: a new instance follows the re-enumeration.
-// - Anything else (power on while not asleep, a second power off, low power): nothing.
+//   during the sleep, nothing more: a new instance follows the re-enumeration. If the bus refuses a
+//   post and has not gone, the resume is pending: tried again from every tick (ResumeUsb), the
+//   driver behaving as while asleep meanwhile, until it succeeds or kResumeRetryMs after the wake
+//   call, when a refusal is fatal as before.
+// - A power off while the resume is pending ends it; the next power on is a fresh wake.
+// - Anything else (power on while not asleep, pending or not, a second power off, low power):
+//   nothing.
 kern_return_t RMNetDriver::SetPowerState_Impl(uint32_t powerFlags) {
   LOG("SetPowerState 0x%x%{public}s", powerFlags,
-      !ivars ? "" : (ivars->asleep ? " (asleep)" : (ivars->stopping ? " (stopping)" : "")));
+      !ivars ? ""
+             : (ivars->asleep ? " (asleep)"
+                              : (ivars->resumePending ? " (resume pending)" : (ivars->stopping ? " (stopping)" : ""))));
   if (ivars) {
     ivars->lastPowerFlags = powerFlags;
     if (powerFlags == kIOServicePowerCapabilityOff) {
@@ -606,10 +628,13 @@ void RMNetDriver::PowerOff() {
     LOG("power off: already asleep, nothing new");
     return;
   }
+  bool wasPending = ivars->resumePending;
+  ivars->resumePending = false;  // the next power on starts a fresh wake, with a fresh deadline
   ivars->asleep = true;
   ivars->sleeps++;
-  LOG("power off: asleep (sleep %llu); the session is left as it is until the wake", ivars->sleeps);
-  if (ivars->usb && !ivars->stopping) ivars->usb->hold();
+  LOG("power off: asleep (sleep %llu); the session is left as it is until the wake%{public}s", ivars->sleeps,
+      wasPending ? " (the last wake's resume was still pending)" : "");
+  if (ivars->usb && !ivars->stopping) ivars->usb->hold();  // still held if pending: only resets its attempts
 }
 
 void RMNetDriver::PowerOn(uint32_t powerFlags) {
@@ -639,9 +664,41 @@ void RMNetDriver::PowerOn(uint32_t powerFlags) {
     return;
   }
   LOG("wake %llu: resuming usb and restarting the session", ivars->wakes);
-  if (!ivars->usb->resume()) return;  // a read that could not be posted already reported usb failed
+  ResumeUsb();  // SetPowerState_Impl then retries a failed timer arm (EnsureTimer)
+}
+
+// One attempt to resume UsbIo for the current wake: PowerOn makes the first; while it leaves the
+// resume pending, every timer tick makes one more (TimerFired_Impl), the last once kResumeRetryMs
+// have passed since the wake call. Resumed: the session restarts from sync, as after any wake. Not
+// yet: pending, the driver behaving as while asleep. Failed: UsbIo reported it (on_fatal), or USB
+// had failed already; nothing more. Never once stopping, after a fatal error or after a new power
+// off: each of those clears resumePending, and only TimerFired_Impl calls this while it is set.
+void RMNetDriver::ResumeUsb() {
+  bool first = !ivars->resumePending;
+  ivars->resumePending = false;
+  if (!first) {
+    ivars->wakeRetries++;
+    if (ivars->usb->device_gone()) {
+      // As at the wake call: take the link down, with the state "detached".
+      LOG("wake %llu: the device went while its resume was pending; nothing more", ivars->wakes);
+      OnUsbFatal("device gone before usb resumed");
+      return;
+    }
+  }
+  bool lastTry = NowMs() - ivars->wakeStartMs >= kResumeRetryMs;
+  UsbIo::Resume r = ivars->usb->resume(lastTry);
+  if (r == UsbIo::Resume::NotYet) {
+    ivars->resumePending = true;
+    if (first) {
+      LOG("wake %llu: usb not ready; tried again every tick for up to %u ms", ivars->wakes,
+          (unsigned)kResumeRetryMs);
+    }
+    return;
+  }
+  if (r == UsbIo::Resume::Failed) return;  // already reported as usb failed
+  if (!first) LOG("wake %llu: usb resumed on retry %llu", ivars->wakes, ivars->wakeRetries);
   ivars->wakeUpPending = true;
-  RestartSession("wake");  // SetPowerState_Impl then retries a failed timer arm (EnsureTimer)
+  RestartSession("wake");
 }
 
 // Reports the link status last decided (ivars->linkActive). A failure is logged and does not
@@ -666,8 +723,9 @@ void RMNetDriver::OnControl(const uint8_t* data, size_t len) {
 // uplink keeps timing out, the device has gone). The session cannot continue: stop it and report
 // the link down. It is not restarted; a re-enumeration starts afresh. RMNetState says "detached"
 // rather than "usb failed" when UsbIo had seen a not-attached or no-device status by then: the
-// device went away. A modem reboot does not show that: its transfers end in kIOReturnNotReady
-// (0xe00002d8), which does not count as gone (a device still attached can return it around a wake),
+// device went away. A modem reboot does not show that: its interrupt read ends aborted
+// (kIOReturnAborted, 0xe00002eb) and the re-post is refused with not-ready (kIOReturnNotReady,
+// 0xe00002d8); neither counts as gone (a device still attached can return not-ready around a wake),
 // so the old instance shows "usb failed" for a few milliseconds before Stop.
 void RMNetDriver::OnUsbFatal(const char* what) {
   bool gone = ivars->usb && ivars->usb->device_gone();
@@ -675,6 +733,7 @@ void RMNetDriver::OnUsbFatal(const char* what) {
   ivars->usbFailed = true;
   ivars->usbDetached = gone;
   ivars->wakeUpPending = false;  // the session is not restarted, so the wake's link up never comes
+  ivars->resumePending = false;  // nor is a pending resume tried again
   if (ivars->stopping || !ivars->core) return;
   ivars->core->drop_kept_replies();  // they will never find an uplink buffer (not the Session)
   if (ivars->coreStopped) return;
@@ -767,8 +826,9 @@ void RMNetDriver::PublishStatus() {
   char v6[80] = "none";
   const char* name = SessionStateName(ivars->core->state());
   if (ivars->usbFailed) name = ivars->usbDetached ? "detached" : "usb failed";
-  // While asleep a gone device is not fatal (UsbIo is held), but the state says so.
-  else if (ivars->asleep && ivars->usb && ivars->usb->device_gone()) name = "detached";
+  // While asleep (or its resume pending) a gone device is not fatal (UsbIo is held), but the state
+  // says so.
+  else if ((ivars->asleep || ivars->resumePending) && ivars->usb && ivars->usb->device_gone()) name = "detached";
   snprintf(state, sizeof state, "%s", name);
   if (ivars->linkActive) {
     const rmnet::RuntimeSettings& s = ivars->core->link_config().settings;
@@ -914,7 +974,9 @@ void RMNetDriver::RxPacketsAvailable_Impl(OSAction*) {
 void RMNetDriver::DrainTx() {
   FlushTxDone();
   if (ivars->stopping || !ivars->core || !ivars->txSubmit) return;
-  if (ivars->asleep) {  // Core is not called while asleep; the first tick after the wake drains
+  // Core is not called while asleep or while the wake's resume is pending; the first tick after the
+  // resume drains.
+  if (ivars->asleep || ivars->resumePending) {
     ivars->txHeld = true;
     return;
   }
@@ -1063,6 +1125,7 @@ void RMNetDriver::OnBulkOutDone(int slot, bool ok) {
 // RMNetUplinkPauseTimeouts QMAP pauses that lasted kPauseMaxMs and asked for a session restart.
 // Sleep: RMNetSleeps and RMNetWakes count power-off calls and power-on calls after one;
 // RMNetLastWakeUpMs is the time from the last wake call to the next link up (0 until then);
+// RMNetWakeRetries counts resume attempts after the first of their wake (the bus not ready);
 // RMNetSleepCompletions counts USB completions that arrived while UsbIo was held, and
 // RMNetSleepLastStatus is the last status among them other than success; RMNetLastPowerFlags is the
 // flags of the last SetPowerState call.
@@ -1126,6 +1189,7 @@ void RMNetDriver::PublishCounters() {
       {"RMNetSleeps", ivars->sleeps},
       {"RMNetWakes", ivars->wakes},
       {"RMNetLastWakeUpMs", ivars->lastWakeUpMs},
+      {"RMNetWakeRetries", ivars->wakeRetries},
       {"RMNetSleepCompletions", u.sleep_completions},
       {"RMNetSleepLastStatus", u.sleep_last_status},
       {"RMNetLastPowerFlags", ivars->lastPowerFlags},
@@ -1233,9 +1297,11 @@ void RMNetDriver::TimerFired_Impl(OSAction*, uint64_t) {
     return;
   }
   if (!ivars->core) return;
-  if (ivars->asleep) {
+  if (ivars->asleep || ivars->resumePending) {
     // Neither Core nor USB is called while asleep (no probe, no sync resend, no recovery deadline);
-    // only the status and the counters are published.
+    // only the status and the counters are published. While the wake's resume is pending, the same,
+    // and one more attempt (which may resume and restart the session; the next tick is a full one).
+    if (ivars->resumePending) ResumeUsb();
     PublishStatus();
     if (++ivars->ticks % kCounterTicks == 0) PublishCounters();
     ArmTimer();
