@@ -288,7 +288,9 @@ if verbs.first == "sms" {
 
 // gps: switches GNSS over the spare AT port, so it runs off the main thread, as the AT verbs. Ctrl-C, SIGTERM
 // and a hang-up are watched by runGps itself: they switch GNSS off again if this run switched it on, and then
-// end the verb by that signal. The main run loop keeps the main thread, as for the modem verbs below.
+// end the verb by that signal. runGps also ignores SIGPIPE before it asks GNSS anything, so that output to a
+// pipe that closed (`RMNet gps | head -1`) fails with EPIPE and GNSS is still switched off. The main run loop
+// keeps the main thread, as for the modem verbs below.
 if verbs.first == "gps" {
     guard let gps = parseGps(Array(verbs.dropFirst())) else {
         print(usage)

@@ -164,9 +164,10 @@ let removalUnderWayLine = "The system is removing the driver; the removal finish
 // while every listed entry is uninstalling, when it is `removalUnderWayLine` (after the QMI-mode lines
 // if the modem is not in QMI mode). When it is not: for the RM520N-GL, the one model the app's AT port
 // opens, `RMNet usbmode set qmi` first, with the two AT commands sent with `RMNet at` as the fallback; for
-// any other model (or none known), the two AT commands, for a terminal program of the owner's (RMNet's AT
-// verbs, which the advice says work only with the RM520N-GL, cannot reach it), and a replug in place of the
-// second.
+// any other model (or none known), the two AT commands, to be sent from software that talks to the modem over
+// USB or from another computer where the AT port is a serial device (macOS gives the AT ports no serial device,
+// and RMNet's AT verbs, which the advice says work only with the RM520N-GL, cannot reach it), and a replug in
+// place of the second.
 func advice(_ s: DriverStatus, bundledVersion: String) -> [String] {
     var lines: [String] = []
     if case .notQMI = s.modem {
@@ -176,7 +177,7 @@ func advice(_ s: DriverStatus, bundledVersion: String) -> [String] {
             lines.append("Or send the two AT commands with RMNet at, then wait for the modem to come back; unplugging it and plugging it in again does the same as the second:")
             lines.append(contentsOf: atFallbackCommands)
         } else {
-            lines.append("The modem is attached but not in QMI mode. Send it these two AT commands from a terminal program of your own, then wait for it to come back (RMNet at and RMNet usbmode work only with the RM520N-GL):")
+            lines.append("The modem is attached but not in QMI mode. Send it these two AT commands from software that talks to the modem over USB, or from another computer (Linux or Windows) where its AT port is a serial device, then wait for it to come back (macOS gives the AT ports no serial device, and RMNet at and RMNet usbmode work only with the RM520N-GL):")
             lines.append("AT+QCFG=\"usbnet\",0")
             lines.append("AT+CFUN=1,1")
             lines.append("(or unplug and replug the modem instead of AT+CFUN=1,1)")

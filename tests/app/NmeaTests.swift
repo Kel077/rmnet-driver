@@ -54,13 +54,16 @@ func report(_ lines: [String], into start: GpsReport = GpsReport()) -> GpsReport
     return r
 }
 
-// The outcome after asking for 10 s, the reading having ended as `end` says. Unless `onlyKnownOn`, the
-// same lines whether or not GNSS was known to be on.
-func expectOutcome(_ r: GpsReport, _ lines: [String], _ code: Int32, _ name: String, end: GpsEnd,
-                   gnssKnownOn: Bool = true, onlyKnownOn: Bool = false) {
-    for known in onlyKnownOn ? [gnssKnownOn] : [true, false] {
-        let got = gpsOutcome(r, seconds: 10, end: end, gnssKnownOn: known)
-        check(got.lines == lines && got.code == code, "outcome: \(name) (GNSS known on: \(known))",
+// Every way the gps verb can know GNSS while it reads.
+let everyGnss: [GnssKnown] = [.notKnownOn, .alreadyOn, .switchedOn]
+
+// The outcome after asking for `seconds` (10 without), the reading having ended as `end` says: the same lines
+// for each of `gnss` (by default every way GNSS can be known).
+func expectOutcome(_ r: GpsReport, _ lines: [String], _ code: Int32, _ name: String, end: GpsEnd, seconds: Int = 10,
+                   gnss: [GnssKnown] = everyGnss) {
+    for known in gnss {
+        let got = gpsOutcome(r, seconds: seconds, end: end, gnss: known)
+        check(got.lines == lines && got.code == code, "outcome: \(name) (GNSS \(known), \(seconds) s)",
               "want \(lines) \(code), got \(got.lines) \(got.code)")
     }
 }
@@ -158,7 +161,18 @@ struct NmeaTests {
         check(noFix.sentences == 4, "report: no fix, four sentences", "got \(noFix.sentences)")
         check(!noFix.hasFix && noFix.latitude == nil && noFix.longitude == nil, "report: no fix")
         check(noFix.satellitesInView == 0, "report: none in view", "got \(noFix.satellitesInView)")
-        expectOutcome(noFix, ["gps: no fix after 10 s (4 sentences, 0 satellites in view)"], 1, "no fix", end: .deadline)
+        expectOutcome(noFix, ["gps: no fix after 10 s (4 sentences, 0 satellites in view)"], 1, "no fix", end: .deadline,
+                      gnss: [.notKnownOn, .alreadyOn])
+        // GNSS switched on by this run and read for less than a minute: a first fix can take minutes.
+        let firstFix = "; a first fix can take minutes: try RMNet gps 120, or --keep-on"
+        expectOutcome(noFix, ["gps: no fix after 10 s (4 sentences, 0 satellites in view)" + firstFix], 1,
+                      "no fix, GNSS just switched on", end: .deadline, gnss: [.switchedOn])
+        expectOutcome(noFix, ["gps: no fix after 59 s (4 sentences, 0 satellites in view)" + firstFix], 1,
+                      "no fix, GNSS just switched on, 59 s", end: .deadline, seconds: 59, gnss: [.switchedOn])
+        for seconds in [60, 120] {
+            expectOutcome(noFix, ["gps: no fix after \(seconds) s (4 sentences, 0 satellites in view)"], 1,
+                          "no fix after a minute or more: no advice to wait", end: .deadline, seconds: seconds)
+        }
 
         // --- report: satellites in view, the latest per talker -------------------------------------
         let inView = report([line8, line9])
@@ -187,12 +201,12 @@ struct NmeaTests {
 
         // --- outcome: nothing read: the hint only when GNSS is not known to be on -------------------
         expectOutcome(GpsReport(), ["gps: no NMEA sentences in 10 s"], 1, "no sentences, GNSS known on", end: .deadline,
-                      gnssKnownOn: true, onlyKnownOn: true)
+                      gnss: [.alreadyOn, .switchedOn])
         expectOutcome(GpsReport(), ["gps: no NMEA sentences in 10 s; GNSS may be off (RMNet at AT+QGPS? shows it, "
-                                    + "RMNet at AT+QGPS=1 switches it on)"], 1, "no sentences, GNSS's state unknown",
-                      end: .deadline, gnssKnownOn: false, onlyKnownOn: true)
-        for known in [true, false] {
-            let line = gpsOutcome(GpsReport(), seconds: 10, end: .deadline, gnssKnownOn: known).lines.joined()
+                                    + "RMNet at AT+QGPS=1 switches it on, RMNet at AT+QGPSEND switches it off)"], 1,
+                      "no sentences, GNSS's state unknown", end: .deadline, gnss: [.notKnownOn])
+        for known in everyGnss {
+            let line = gpsOutcome(GpsReport(), seconds: 10, end: .deadline, gnss: known).lines.joined()
             check(!line.contains("console"), "outcome: no sentences never mentions a console", line)
         }
 
@@ -256,6 +270,7 @@ struct NmeaTests {
         let reason = "the modem did not answer in time"
         check(GnssLine.checkFailed(reason) == "gps: could not check GNSS (the modem did not answer in time); reading anyway",
               "GnssLine: check failed", GnssLine.checkFailed(reason))
+        check(GnssLine.alreadyOn == "gps: GNSS was already on; left on", "GnssLine: already on", GnssLine.alreadyOn)
         check(GnssLine.switchedOn == "gps: GNSS switched on; a first fix outdoors can take a minute or more",
               "GnssLine: switched on", GnssLine.switchedOn)
         check(GnssLine.switchOnFailed(reason)
@@ -267,6 +282,8 @@ struct NmeaTests {
               "GnssLine: switch off failed", GnssLine.switchOffFailed(reason))
         check(GnssLine.leftOn == "gps: GNSS left on (RMNet at AT+QGPSEND switches it off)", "GnssLine: left on",
               GnssLine.leftOn)
+        check(GnssLine.mayBeOn == "gps: GNSS may be on (RMNet at AT+QGPS? shows it, RMNet at AT+QGPSEND switches it off)",
+              "GnssLine: may be on", GnssLine.mayBeOn)
 
         print("nmea-test: \(checks) checks passed")
     }

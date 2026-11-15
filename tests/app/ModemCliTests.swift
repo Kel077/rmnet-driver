@@ -532,7 +532,7 @@ struct ModemCliTests {
         fake.modeResult = .success(ModeChange(before: "GSM:LTE", after: "LTE"))
         expectLines(run(["mode", "lte"], fake, "mode lte from GSM:LTE"),
                     ["mode: " + modeSentence(ModeChange(before: "GSM:LTE", after: "LTE")),
-                     "mode: the earlier value GSM:LTE cannot be set by RMNet; "
+                     "mode: the earlier value GSM:LTE cannot be set with RMNet mode; "
                         + "to put it back: RMNet at 'AT+QNWPREFCFG=\"mode_pref\",GSM:LTE'"],
                     code: 0, "mode: an earlier value RMNet cannot set (R8): its AT command, the value filled in")
         // A value that is not printable ASCII without quotes: the command with `<value>` as written.
@@ -541,7 +541,7 @@ struct ModemCliTests {
             fake.modeResult = .success(ModeChange(before: before, after: "LTE"))
             expectLines(run(["mode", "lte"], fake, "mode lte from \(before)"),
                         ["mode: " + modeSentence(ModeChange(before: before, after: "LTE")),
-                         "mode: the earlier value \(shown) cannot be set by RMNet; "
+                         "mode: the earlier value \(shown) cannot be set with RMNet mode; "
                             + "set it again with RMNet at 'AT+QNWPREFCFG=\"mode_pref\",<value>'"],
                         code: 0, "mode: an earlier value \(before.debugDescription) is not filled in")
         }
@@ -1113,7 +1113,8 @@ struct ModemCliTests {
         let question = "The modem will restart (about 30 s) and the network port will go away until it is back. Continue? [y/N] "
         func otherModeWarning(_ name: String) -> String {
             "In \(name) mode this driver does not work; to come back: RMNet usbmode set qmi (if RMNet cannot find the modem "
-                + "afterwards, switch back with any AT terminal: AT+QCFG=\"usbnet\",0 then AT+CFUN=1,1)"
+                + "afterwards, send AT+QCFG=\"usbnet\",0 then AT+CFUN=1,1 from other software that talks to the modem "
+                + "over USB, or from another computer)"
         }
         let noTerminal = "usb mode: no terminal to ask on, so nothing changed; run again with --yes to restart the modem "
             + "without asking"

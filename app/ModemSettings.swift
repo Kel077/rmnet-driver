@@ -546,13 +546,13 @@ func modeAtRestoreCommand(_ before: String) -> String? {
 }
 
 /// The way back from a mode change for an earlier value RMNet's `mode` cannot set (modeRestoreCommand is nil,
-/// ruling R8), to follow a phrase naming that value: `cannot be set by RMNet; to put it back: <its RMNet at
-/// line>`, or, without such a line, `cannot be set by RMNet; set it again with RMNet at
+/// ruling R8), to follow a phrase naming that value: `cannot be set with RMNet mode; to put it back: <its
+/// RMNet at line>`, or, without such a line, `cannot be set with RMNet mode; set it again with RMNet at
 /// 'AT+QNWPREFCFG="mode_pref",<value>'`, `<value>` as written. No period after it: one would join the
 /// pasted command's last word.
 func modeAtWayBack(_ before: String) -> String {
-    if let line = modeAtRestoreCommand(before) { return "cannot be set by RMNet; to put it back: \(line)" }
-    return "cannot be set by RMNet; set it again with RMNet at '\(modeCommand("<value>"))'"
+    if let line = modeAtRestoreCommand(before) { return "cannot be set with RMNet mode; to put it back: \(line)" }
+    return "cannot be set with RMNet mode; set it again with RMNet at '\(modeCommand("<value>"))'"
 }
 
 private func orNull<T>(_ value: T?) -> Any {

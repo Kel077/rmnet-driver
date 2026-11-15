@@ -737,7 +737,7 @@ struct ModemControllerTests {
         check(o.undo == nil && !o.resultIsFailure && o.undoCommand == nil,
               "mode: no undo and no command when the mode before cannot be set by RMNet")
         check(o.result == modeSentence(ModeChange(before: "GSM:LTE", after: "LTE"))
-                + " The earlier value GSM:LTE cannot be set by RMNet; "
+                + " The earlier value GSM:LTE cannot be set with RMNet mode; "
                 + "to put it back: RMNet at 'AT+QNWPREFCFG=\"mode_pref\",GSM:LTE'",
               "mode: the result line says the mode before cannot be put back by RMNet, and its AT command (R8)", o.result)
         o.setTabShown(nil)
@@ -755,7 +755,7 @@ struct ModemControllerTests {
         check(q.undo == nil && !q.resultIsFailure && q.undoCommand == nil,
               "mode: no undo and no command when the mode before has a quote")
         check(q.result == modeSentence(ModeChange(before: "GSM\"LTE", after: "LTE"))
-                + " The earlier value GSM\"LTE cannot be set by RMNet; "
+                + " The earlier value GSM\"LTE cannot be set with RMNet mode; "
                 + "set it again with RMNet at 'AT+QNWPREFCFG=\"mode_pref\",<value>'",
               "mode: a value that cannot go into the command is written <value> (R8)", q.result)
         q.setTabShown(nil)

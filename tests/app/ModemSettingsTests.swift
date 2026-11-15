@@ -529,12 +529,12 @@ struct ModemSettingsTests {
         check(fromReordered.message.contains("`RMNet mode nr5g:lte`") && fromReordered.message.contains("Put Back"),
               "modeQuestion: the modem's own order (NR5G:LTE) is offered as the way back (R8)", fromReordered.message)
         let fromOdd = modeQuestion(from: "GSM:LTE", to: "LTE")
-        check(!fromOdd.message.contains("RMNet mode") && !fromOdd.message.contains("Put Back")
-                && fromOdd.message.hasSuffix(" The current mode GSM:LTE cannot be set by RMNet; "
+        check(!fromOdd.message.contains("`RMNet mode") && !fromOdd.message.contains("Put Back")
+                && fromOdd.message.hasSuffix(" The current mode GSM:LTE cannot be set with RMNet mode; "
                                              + "to put it back: RMNet at 'AT+QNWPREFCFG=\"mode_pref\",GSM:LTE'"),
               "modeQuestion: a mode RMNet cannot set is not offered as the way back; its AT command is", fromOdd.message)
         let fromQuoted = modeQuestion(from: "GSM'LTE", to: "LTE")
-        check(fromQuoted.message.hasSuffix(" The current mode GSM'LTE cannot be set by RMNet; "
+        check(fromQuoted.message.hasSuffix(" The current mode GSM'LTE cannot be set with RMNet mode; "
                                            + "set it again with RMNet at 'AT+QNWPREFCFG=\"mode_pref\",<value>'"),
               "modeQuestion: a mode with a quote: the AT command with <value> as written", fromQuoted.message)
         check(![toLTE, fromBoth, fromReordered, fromOdd, fromQuoted].contains { $0.message.contains("console") },
@@ -593,7 +593,7 @@ struct ModemSettingsTests {
             let want = "RMNet at '\(modeCommand(before))'"
             check(modeAtRestoreCommand(before) == want, "modeAtRestoreCommand: \(before.debugDescription)",
                   "\(String(describing: modeAtRestoreCommand(before)))")
-            check(modeAtWayBack(before) == "cannot be set by RMNet; to put it back: \(want)",
+            check(modeAtWayBack(before) == "cannot be set with RMNet mode; to put it back: \(want)",
                   "modeAtWayBack: \(before.debugDescription) filled in", modeAtWayBack(before))
         }
         check(modeAtRestoreCommand("GSM:LTE") == "RMNet at 'AT+QNWPREFCFG=\"mode_pref\",GSM:LTE'",
@@ -603,7 +603,7 @@ struct ModemSettingsTests {
             check(modeAtRestoreCommand(before) == nil, "modeAtRestoreCommand: \(before.debugDescription) is not filled in",
                   "\(String(describing: modeAtRestoreCommand(before)))")
             check(modeAtWayBack(before)
-                    == "cannot be set by RMNet; set it again with RMNet at 'AT+QNWPREFCFG=\"mode_pref\",<value>'",
+                    == "cannot be set with RMNet mode; set it again with RMNet at 'AT+QNWPREFCFG=\"mode_pref\",<value>'",
                   "modeAtWayBack: \(before.debugDescription) is written <value>", modeAtWayBack(before))
         }
         check(profileNumberProblem(1) == nil && profileNumberProblem(16) == nil, "profileNumberProblem: 1 and 16")
