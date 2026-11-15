@@ -138,6 +138,10 @@ final class FakeModem: ModemServing {
     func enterPin(_ pin: String, shownAttempts: Int) -> Result<PinOutcome, ModemFailure> {
         .failure(ModemFailure(message: "not used"))
     }
+    func usbMode() -> Result<UsbModeInfo, ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func setUsbMode(_ mode: UsbNetMode, reboot: Bool) -> Result<UsbModeChange, ModemFailure> {
+        .failure(ModemFailure(message: "not used"))
+    }
 
     func releaseInfo(_ outcome: Result<NetworkInfo, ModemFailure>) {
         calls.locked { infoOutcome = outcome }

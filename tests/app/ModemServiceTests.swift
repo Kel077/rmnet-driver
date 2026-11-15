@@ -1,8 +1,9 @@
 // Tests for app/ModemService.swift: the AT sequences of the modem service (the network read, the radio, the
-// network mode, the data profiles with the redial, the SIM and PIN entry), run against a scripted port that
-// answers from a queue and records every line sent, an opener that counts the ports it hands out, and a
-// fake clock that `sleep` moves on. The fixtures are the modem's real answers (2026-11-15, firmware
-// RM520NGLAAR03A04M4G_01.204.01.204). Built with swiftc by `make app-test` together with app/AtPort.swift,
+// network mode, the USB network mode, the data profiles with the redial, the SIM and PIN entry), run against
+// a scripted port that answers from a queue and records every line sent, an opener that counts the ports it
+// hands out, and a fake clock that `sleep` moves on. The fixtures are the modem's real answers (2026-11-15,
+// firmware RM520NGLAAR03A04M4G_01.204.01.204); the AT+QCFG="usbnet" answers are in the form Quectel's AT
+// manual gives, not read from the modem. Built with swiftc by `make app-test` together with app/AtPort.swift,
 // app/SmsModel.swift, app/SmsService.swift (for `describe`), app/ModemNetwork.swift and
 // app/ModemSettings.swift; opens no port and needs no hardware.
 // Stops at the first failure, prints which check failed and exits 1.
@@ -282,6 +283,7 @@ struct ModemServiceTests {
         networkInfo()
         radio()
         mode()
+        usbMode()
         profiles()
         profileChange()
         profileRedialFailures()
@@ -571,6 +573,160 @@ struct ModemServiceTests {
             check(message.hasSuffix("Nothing was changed."), "setMode: the mode before \(name): nothing written", message)
             expectLines(rig.port(1).lines, [read], "setMode: the mode before \(name): only the read")
             rig.finish("mode before \(name)", opens: 1)
+        }
+    }
+
+    // MARK: usbMode, setUsbMode
+
+    static func usbMode() {
+        let read = "AT+QCFG=\"usbnet\""
+        func usbnet(_ n: Int) -> Answer { .success(["+QCFG: \"usbnet\",\(n)"]) }
+        func set(_ n: Int) -> String { "AT+QCFG=\"usbnet\",\(n)" }
+        let notRestarted = "The modem was not restarted."
+
+        // Reading.
+        for (n, mode) in [(0, UsbNetMode.qmi), (1, .ecm), (2, .mbim), (3, .rndis)] {
+            let rig = Rig([(read, usbnet(n))])
+            let info = success(rig.service.usbMode(), "usbMode \(n)")
+            check(info == UsbModeInfo(value: n) && info?.mode == mode, "usbMode: +QCFG: \"usbnet\",\(n) is \(mode)",
+                  "\(String(describing: info))")
+            expectLines(rig.port(1).lines, [read], "usbMode \(n): one read")
+            check(rig.port(1).timeout(of: read) == 3, "usbMode: the read has 3 s")
+            rig.finish("usbMode \(n)", opens: 1)
+        }
+        do {
+            // A number RMNet does not know is kept as the modem gave it, without a mode.
+            let rig = Rig([(read, usbnet(5))])
+            let info = success(rig.service.usbMode(), "usbMode 5")
+            check(info == UsbModeInfo(value: 5) && info?.mode == nil, "usbMode: an unknown number is kept, its mode nil",
+                  "\(String(describing: info))")
+            rig.finish("usbMode 5", opens: 1)
+        }
+        for (answer, name) in [(ok, "a bare OK"), (Answer.success(["+QCFG: \"usbnet\""]), "no number"),
+                               (Answer.success(["+QCFG: \"usbnet\",-"]), "a dash"),
+                               (Answer.success(["+QCFG: \"usbcfg\",0x2C7C,0x0801"]), "another setting")] {
+            let rig = Rig([(read, answer)])
+            let message = failureMessage(rig.service.usbMode(), "usbMode, \(name)")
+            expectEqual(message, "The modem did not say which USB mode it uses.", "usbMode: \(name) is a failure")
+            rig.finish("usbMode, \(name)", opens: 1)
+        }
+        for (answer, words) in [(cme(3), "The modem refused the command (+CME ERROR: 3)."),
+                                (timedOut, "The modem did not answer in time.")] {
+            let rig = Rig([(read, answer)])
+            let message = failureMessage(rig.service.usbMode(), "usbMode, \(words)")
+            expectEqual(message, "The USB mode could not be read. \(words)", "usbMode: a read that fails: \(words)")
+            rig.finish("usbMode, \(words)", opens: 1)
+        }
+        do {
+            let rig = Rig([.failure(.modemNotAttached)])
+            let message = failureMessage(rig.service.usbMode(), "usbMode, no modem")
+            expectEqual(message, describe(.modemNotAttached), "usbMode: a failed open fails with describe(error)")
+            rig.finish("usbMode, no modem", opens: 1)
+        }
+
+        // Setting: already that mode, nothing more is sent.
+        for reboot in [true, false] {
+            let rig = Rig([(read, usbnet(0))])
+            let change = success(rig.service.setUsbMode(.qmi, reboot: reboot), "setUsbMode qmi, already, reboot \(reboot)")
+            check(change == .unchanged, "setUsbMode(.qmi): already qmi is unchanged", "\(String(describing: change))")
+            expectLines(rig.port(1).lines, [read], "setUsbMode(.qmi, reboot: \(reboot)): already qmi sends only the read")
+            rig.finish("setUsbMode qmi, already, reboot \(reboot)", opens: 1)
+        }
+        do {
+            let rig = Rig([(read, usbnet(0)), (set(1), ok), (read, usbnet(1)), ("AT+CFUN=1,1", ok)])
+            let change = success(rig.service.setUsbMode(.ecm, reboot: true), "setUsbMode ecm")
+            check(change == .rebooting, "setUsbMode(.ecm, reboot: true): rebooting", "\(String(describing: change))")
+            expectLines(rig.port(1).lines, [read, set(1), read, "AT+CFUN=1,1"],
+                        "setUsbMode(.ecm, reboot: true): read, set, read back, restart")
+            check(rig.port(1).sent.map { $0.timeout } == [3, 5, 3, 20],
+                  "setUsbMode: the reads have 3 s, the write 5 s, the restart 20 s", "\(rig.port(1).sent.map { $0.timeout })")
+            check(rig.sleeps.isEmpty, "setUsbMode: no wait for the modem to come back", "\(rig.sleeps)")
+            rig.finish("setUsbMode ecm", opens: 1)
+        }
+        do {
+            let rig = Rig([(read, usbnet(0)), (set(1), ok), (read, usbnet(1))])
+            let change = success(rig.service.setUsbMode(.ecm, reboot: false), "setUsbMode ecm, no reboot")
+            check(change == .setTakesEffectAfterRestart, "setUsbMode(.ecm, reboot: false): takes effect after a restart",
+                  "\(String(describing: change))")
+            expectLines(rig.port(1).lines, [read, set(1), read], "setUsbMode(reboot: false): stops before AT+CFUN")
+            rig.finish("setUsbMode ecm, no reboot", opens: 1)
+        }
+        for (from, to) in [(2, UsbNetMode.qmi), (5, .qmi), (0, .mbim), (0, .rndis), (3, .ecm)] {
+            let rig = Rig([(read, usbnet(from)), (set(to.rawValue), ok), (read, usbnet(to.rawValue)), ("AT+CFUN=1,1", ok)])
+            let change = success(rig.service.setUsbMode(to, reboot: true), "setUsbMode \(from) to \(to)")
+            check(change == .rebooting, "setUsbMode: \(from) to \(to) restarts", "\(String(describing: change))")
+            expectLines(rig.port(1).lines, [read, set(to.rawValue), read, "AT+CFUN=1,1"], "setUsbMode: \(from) to \(to)")
+            rig.finish("setUsbMode \(from) to \(to)", opens: 1)
+        }
+
+        // A read-back that disagrees, or none: a failure, and no AT+CFUN.
+        for (answer, reports) in [(usbnet(0), "qmi"), (usbnet(9), "unknown (9)"), (ok, "no USB mode")] {
+            let rig = Rig([(read, usbnet(0)), (set(1), ok), (read, answer)])
+            let message = failureMessage(rig.service.setUsbMode(.ecm, reboot: true), "setUsbMode, read-back \(reports)")
+            expectEqual(message, "The modem answered OK but now reports \(reports). It was qmi. \(notRestarted)",
+                        "setUsbMode: a read-back of \(reports) fails")
+            expectLines(rig.port(1).lines, [read, set(1), read], "setUsbMode: a read-back of \(reports): no AT+CFUN")
+            rig.finish("setUsbMode, read-back \(reports)", opens: 1)
+        }
+        do {
+            let rig = Rig([(read, usbnet(2)), (set(0), ok), (read, timedOut)])
+            let message = failureMessage(rig.service.setUsbMode(.qmi, reboot: true), "setUsbMode, read-back times out")
+            expectEqual(message, "The modem answered OK, but the USB mode could not be read back. The modem did not answer "
+                        + "in time. It was mbim. \(notRestarted)", "setUsbMode: a read-back that times out")
+            expectLines(rig.port(1).lines, [read, set(0), read], "setUsbMode: a read-back that times out: no AT+CFUN")
+            rig.finish("setUsbMode, read-back times out", opens: 1)
+        }
+
+        // The write.
+        do {
+            let rig = Rig([(read, usbnet(0)), (set(2), cme(3))])
+            let message = failureMessage(rig.service.setUsbMode(.mbim, reboot: true), "setUsbMode, refused")
+            expectEqual(message, "The USB mode was not changed. The modem refused the command (+CME ERROR: 3).",
+                        "setUsbMode: a refused write")
+            expectLines(rig.port(1).lines, [read, set(2)], "setUsbMode: a refused write: nothing more")
+            rig.finish("setUsbMode, refused", opens: 1)
+        }
+        do {
+            let rig = Rig([(read, usbnet(0)), (set(2), timedOut)])
+            let message = failureMessage(rig.service.setUsbMode(.mbim, reboot: true), "setUsbMode, write times out")
+            expectEqual(message, "It is not known whether the USB mode changed. The modem did not answer in time. "
+                        + "It was qmi. \(notRestarted)", "setUsbMode: a write that times out")
+            expectLines(rig.port(1).lines, [read, set(2)], "setUsbMode: a write that times out: nothing more")
+            rig.finish("setUsbMode, write times out", opens: 1)
+        }
+
+        // The mode before not read: nothing is written.
+        for (answer, name) in [(cme(3), "refused"), (ok, "without a mode"), (timedOut, "timed out")] {
+            let rig = Rig([(read, answer)])
+            let message = failureMessage(rig.service.setUsbMode(.qmi, reboot: true), "setUsbMode, before \(name)")
+            check(message.hasSuffix("Nothing was changed."), "setUsbMode: the mode before \(name): nothing changed", message)
+            expectLines(rig.port(1).lines, [read], "setUsbMode: the mode before \(name): only the read")
+            rig.finish("setUsbMode, before \(name)", opens: 1)
+        }
+        do {
+            let rig = Rig([.failure(.busy)])
+            let message = failureMessage(rig.service.setUsbMode(.qmi, reboot: true), "setUsbMode, busy")
+            expectEqual(message, "\(describe(.busy)) Nothing was changed.", "setUsbMode: a failed open changes nothing")
+            rig.finish("setUsbMode, busy", opens: 1)
+        }
+
+        // The restart itself.
+        do {
+            let rig = Rig([(read, usbnet(0)), (set(1), ok), (read, usbnet(1)), ("AT+CFUN=1,1", cme(3))])
+            let message = failureMessage(rig.service.setUsbMode(.ecm, reboot: true), "setUsbMode, restart refused")
+            expectEqual(message, "The USB mode is now ecm, but the modem was not restarted. The modem refused the command "
+                        + "(+CME ERROR: 3). It takes effect at the next restart (AT+CFUN=1,1 or a replug).",
+                        "setUsbMode: a refused restart")
+            rig.finish("setUsbMode, restart refused", opens: 1)
+        }
+        for (answer, words) in [(timedOut, "The modem did not answer in time."),
+                                (ioError, describe(.io(Int32(bitPattern: 0xE000_02ED))))] {
+            let rig = Rig([(read, usbnet(2)), (set(0), ok), (read, usbnet(0)), ("AT+CFUN=1,1", answer)])
+            let message = failureMessage(rig.service.setUsbMode(.qmi, reboot: true), "setUsbMode, restart: \(words)")
+            expectEqual(message, "The USB mode is now qmi. It is not known whether the modem is restarting. \(words) "
+                        + "If it does not restart, the new mode takes effect at the next restart (AT+CFUN=1,1 or a replug).",
+                        "setUsbMode: a restart without an answer: \(words)")
+            rig.finish("setUsbMode, restart: \(words)", opens: 1)
         }
     }
 
