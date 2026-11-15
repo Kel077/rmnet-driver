@@ -1,6 +1,7 @@
-// The gps verb's logic, apart from the port so that `make app-test` covers it without hardware: NMEA 0183
+// The gps verb's logic, apart from the ports so that `make app-test` covers it without hardware: NMEA 0183
 // sentences, coordinates, the report built from the sentences, how the reading ended, the verb's outcome
-// text and its arguments. Foundation only. Nothing here prints, logs or stores a position.
+// text, its arguments, the answer to AT+QGPS? and the lines about switching GNSS. Foundation only. Nothing
+// here prints, logs or stores a position.
 import Foundation
 
 // One sentence. "$GPRMC,123519,A,...*6A" is talker "GP", type "RMC" and the fields after the address,
@@ -178,9 +179,11 @@ enum GpsEnd: Equatable {
 // The lines the gps verb prints after asking for `seconds` of reading that ended as `end` says, and its
 // exit code: 0 with a fix, 1 without. A fix is printed however the reading ended. Without one, a port
 // that closed or failed is reported as such, never as the receiver's state: only a reading that ended by
-// its time (or one second after a fix that was then lost) says that GNSS may be off or has no fix. Only numbers parsed from the sentences are printed,
-// never a field as it came.
-func gpsOutcome(_ report: GpsReport, seconds: Int, end: GpsEnd) -> (lines: [String], code: Int32) {
+// its time (or one second after a fix that was then lost) says that there were no sentences or no fix.
+// With no sentences, unless GNSS is known to be on (`gnssKnownOn`: it was on, or this run switched it
+// on), it adds that GNSS may be off and the commands that show and switch it. Only numbers parsed from
+// the sentences are printed, never a field as it came.
+func gpsOutcome(_ report: GpsReport, seconds: Int, end: GpsEnd, gnssKnownOn: Bool) -> (lines: [String], code: Int32) {
     if !report.hasFix {
         switch end {
         case .deadline:
@@ -192,8 +195,8 @@ func gpsOutcome(_ report: GpsReport, seconds: Int, end: GpsEnd) -> (lines: [Stri
         }
     }
     guard report.sentences > 0 else {
-        return (["gps: no NMEA sentences in \(seconds) s; GNSS may be off (AT+QGPS? on the console shows it, "
-                 + "AT+QGPS=1 switches it on)"], 1)
+        let hint = gnssKnownOn ? "" : "; GNSS may be off (RMNet at AT+QGPS? shows it, RMNet at AT+QGPS=1 switches it on)"
+        return (["gps: no NMEA sentences in \(seconds) s" + hint], 1)
     }
     guard let latitude = report.latitude, let longitude = report.longitude else {
         return (["gps: no fix after \(seconds) s (\(report.sentences) sentences, "
@@ -216,10 +219,48 @@ private func clockTime(_ time: String) -> String? {
     return "\(pair(0)):\(pair(2)):\(pair(4))"
 }
 
-// The words after "gps": none is 10 seconds; one whole number from 1 to 600 is that many seconds;
-// anything else is wrong usage (nil).
-func parseGps(_ words: [String]) -> Int? {
-    if words.isEmpty { return 10 }
-    guard words.count == 1, let seconds = Int(words[0]), (1...600).contains(seconds) else { return nil }
-    return seconds
+// What `RMNet gps` was asked: how long to read, and whether to leave GNSS on if this run switches it on.
+struct GpsOptions: Equatable {
+    let seconds: Int
+    let keepOn: Bool
+}
+
+// The words after "gps", in either order: at most one whole number from 1 to 600 (the seconds; 10 without
+// one) and at most one "--keep-on"; anything else is wrong usage (nil).
+func parseGps(_ words: [String]) -> GpsOptions? {
+    var seconds: Int?
+    var keepOn = false
+    for word in words {
+        if word == "--keep-on" {
+            guard !keepOn else { return nil }
+            keepOn = true
+        } else {
+            guard seconds == nil, let value = Int(word), (1...600).contains(value) else { return nil }
+            seconds = value
+        }
+    }
+    return GpsOptions(seconds: seconds ?? 10, keepOn: keepOn)
+}
+
+// Whether GNSS is on, from the answer to AT+QGPS?: its "+QGPS: <state>" line, 1 on and 0 off. nil when
+// there is no such line or its state is anything else.
+func parseGnssState(_ lines: [String]) -> Bool? {
+    guard let line = lines.first(where: { $0.hasPrefix("+QGPS:") }) else { return nil }
+    switch line.dropFirst("+QGPS:".count).trimmingCharacters(in: .whitespaces) {
+    case "0": return false
+    case "1": return true
+    default: return nil
+    }
+}
+
+// The lines the gps verb writes to standard error about switching GNSS; `reason` is a failure in words.
+enum GnssLine {
+    static func checkFailed(_ reason: String) -> String { "gps: could not check GNSS (\(reason)); reading anyway" }
+    static let switchedOn = "gps: GNSS switched on; a first fix outdoors can take a minute or more"
+    static func switchOnFailed(_ reason: String) -> String { "gps: could not switch GNSS on (\(reason)); reading anyway" }
+    static let switchedOff = "gps: GNSS switched off again"
+    static func switchOffFailed(_ reason: String) -> String {
+        "gps: could not switch GNSS off (\(reason)); RMNet at AT+QGPSEND does it"
+    }
+    static let leftOn = "gps: GNSS left on (RMNet at AT+QGPSEND switches it off)"
 }

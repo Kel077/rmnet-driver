@@ -2,7 +2,7 @@
 // modem's text messages, and shows and changes the modem's network and settings.
 // Usage: RMNet activate | deactivate | status [--json]
 //        RMNet sms list [--json] | sms send <number> <text> | sms delete <index>...
-//        RMNet gps [seconds]
+//        RMNet gps [seconds] [--keep-on]
 //        RMNet network [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…]
 //        RMNet apn [show] [--json] | apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>]
 //                  [--password | --no-password] [--auth none|pap|chap|pap-or-chap] [--no-redial]
@@ -271,7 +271,7 @@ if verbs.isEmpty {
     exit(0)
 }
 
-let usage = "usage: RMNet activate | deactivate | status [--json] | sms list [--json] | sms send <number> <text> | sms delete <index>... | gps [seconds] | \(modemUsage)"
+let usage = "usage: RMNet activate | deactivate | status [--json] | sms list [--json] | sms send <number> <text> | sms delete <index>... | gps [seconds] [--keep-on] | \(modemUsage)"
 
 if verbs.first == "sms" {
     guard let smsCommand = parseSms(Array(verbs.dropFirst())) else {
@@ -286,12 +286,20 @@ if verbs.first == "sms" {
     dispatchMain()
 }
 
+// gps: switches GNSS over the spare AT port, so it runs off the main thread, as the AT verbs. Ctrl-C, SIGTERM
+// and a hang-up are watched by runGps itself: they switch GNSS off again if this run switched it on, and then
+// end the verb by that signal. The main run loop keeps the main thread, as for the modem verbs below.
 if verbs.first == "gps" {
-    guard let seconds = parseGps(Array(verbs.dropFirst())) else {
+    guard let gps = parseGps(Array(verbs.dropFirst())) else {
         print(usage)
         exit(2)
     }
-    exit(runGps(seconds: seconds))
+    DispatchQueue.global(qos: .userInitiated).async {
+        let code = runGps(seconds: gps.seconds, keepOn: gps.keepOn)
+        fflush(stdout)
+        exit(code)
+    }
+    while true { RunLoop.main.run(mode: .default, before: .distantFuture) }
 }
 
 // network, radio, mode, apn, sim, usbmode, bands, at: over the modem's spare AT port, off the main thread, as the
