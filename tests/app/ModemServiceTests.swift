@@ -1246,11 +1246,20 @@ struct ModemServiceTests {
         for line in ["", "hello", "ATI\rAT+CFUN=0", "ATI\n", "AT+CMGS=\"123\"\u{1A}", "AT\tI", "AT\u{E9}", "AT\u{7F}",
                      long, "AT+CMGS=\"123\"", "at+cmgs=\"123\"", "AT+CMGW", "At+CmGw=\"123\"",
                      "AT+CSQ;+CMGS=\"1\"", "AT +CMGS=1", "AT+CMGC=1", "AT+QCMGS", "ATD*99#", "ATO", "ATV0", "ATQ1",
-                     "ATS3=10", "ATE1S4=10", "AT&W", "AT S3 = 13"] {
+                     "ATS3=10", "ATE1S4=10", "AT&W", "AT S3 = 13", "AT+CGDATA", "AT+CGDATA=\"PPP\",1", "AT+CSQ;+cgdata",
+                     "AT+QCFG=\"usbnet\",1", "AT+QCFG=\"usbnet\",3", "at+qcfg=\"usbnet\",2", "AT+QCFG=\"usbnet\",0;+QCFG=\"usbnet\",1",
+                     "AT+QCFG=\"usbcfg\",0x2C7C,0x0801,1,1,1,1,1,0,0", "AT+QCFG = \"usbcfg\" , 0"] {
             let rig = Rig([])
             let message = failureMessage(rig.service.at(line, timeout: 10), "at, refused \(line.debugDescription)")
             check(message.hasSuffix("; nothing was sent"), "at: \(line.debugDescription) is refused, nothing sent", message)
             rig.finish("at, refused \(line.debugDescription)", opens: 0)
+        }
+        // The USB mode back to QMI (the README's fallback), and the reads of both USB settings, are sent.
+        for line in ["AT+QCFG=\"usbnet\",0", "AT+QCFG=\"usbcfg\"", "AT+QCFG=\"usbnet\""] {
+            let rig = Rig([(line, ok)])
+            _ = success(rig.service.at(line, timeout: 10), "at \(line)")
+            expectLines(rig.port(1).lines, [line], "at(\(line)): sent as it is")
+            rig.finish("at \(line)", opens: 1)
         }
         do {
             let longest = "AT+" + String(repeating: "A", count: 509)

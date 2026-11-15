@@ -947,6 +947,8 @@ struct ModemCliTests {
         let cmgw = "at: AT+CMGW needs a message body; use RMNet sms send"
         let cmgc = "at: AT+CMGC needs a second stage after a > prompt; RMNet at sends one line only"
         let qcmgs = "at: AT+QCMGS needs a second stage after a > prompt; RMNet at sends one line only"
+        let usbnet = "at: use RMNet usbmode set to change the USB mode; it warns and checks first"
+        let usbcfg = "at: RMNet at does not change the USB configuration (usbcfg): the modem could disappear from RMNet"
         func lockout(_ what: String) -> String {
             "at: RMNet at does not send \(what) (it would switch the AT port to data mode or change how the modem answers, "
                 + "and RMNet's own AT features would stop working)"
@@ -973,6 +975,11 @@ struct ModemCliTests {
                      "AT&V", "ATZ", "ATE0", "ATE1", "ATI", "AT+QCFG=\"usbnet\"", "AT+CGDCONT?"] {
             expectParse(["at", line], .at(line, timeout: 10))
         }
+        // The USB mode back to QMI (the README's fallback) and the reads of both USB settings are sent.
+        for line in ["at+qcfg=\"usbnet\",0", "AT+QCFG=\"usbnet\",0;+CSQ", "AT+QCFG=\"usbcfg\"", "AT+QCFG=?", "AT+QCFG=\"usbnet\";+QCFG=\"usbcfg\""] {
+            expectParse(["at", line], .at(line, timeout: 10))
+        }
+        expectParse(["at", "AT+QCFG=\"usbnet\"", ",", "0"], .at("AT+QCFG=\"usbnet\" , 0", timeout: 10))
         expectParse(["at", longest], .at(longest, timeout: 10))
         // Spaces at the ends are dropped (the port's echo check would never match them); inside, kept.
         expectParse(["at", "ATI "], .at("ATI", timeout: 10))
@@ -1015,6 +1022,21 @@ struct ModemCliTests {
             (["at", "ATS4=10"], lockout("ATS4=")), (["at", "AT+CSQ;S4=10"], lockout("ATS4=")),
             (["at", "AT&W"], lockout("AT&W")), (["at", "AT&W0"], lockout("AT&W")), (["at", "ATE0&W"], lockout("AT&W")),
             (["at", "AT&F&W"], lockout("AT&W")), (["at", "at&w"], lockout("AT&W")), (["at", "AT+CSQ;& W"], lockout("AT&W")),
+            // +CGDATA (enter data state) anywhere.
+            (["at", "AT+CGDATA"], lockout("AT+CGDATA")), (["at", "AT+CGDATA=\"PPP\",1"], lockout("AT+CGDATA")),
+            (["at", "at+cgdata=1"], lockout("AT+CGDATA")), (["at", "AT+CSQ;+CGDATA"], lockout("AT+CGDATA")),
+            (["at", "AT", "+CG", "DATA"], lockout("AT+CGDATA")),
+            // A USB mode other than QMI (0): `RMNet usbmode set` warns and checks first.
+            (["at", "AT+QCFG=\"usbnet\",1"], usbnet), (["at", "AT+QCFG=\"usbnet\",2"], usbnet),
+            (["at", "AT+QCFG=\"usbnet\",3"], usbnet), (["at", "at+qcfg=\"USBNet\",1"], usbnet),
+            (["at", "AT+QCFG=usbnet,1"], usbnet), (["at", "AT+QCFG", "=", "\"usbnet\"", ",", "1"], usbnet),
+            (["at", "AT+QCFG=\"usbnet\",0;+QCFG=\"usbnet\",2"], usbnet), (["at", "AT+CSQ;+QCFG=\"usbnet\",1"], usbnet),
+            (["at", "AT+QCFG=\"usbnet\",01"], usbnet), (["at", "AT+QCFG=\"usbnet\",0,1"], usbnet),
+            (["at", "AT+QCFG=\"usbnet\","], usbnet), (["at", "AT+QCFG=\"usbnet\",\"0\""], usbnet),
+            // Any write of the USB configuration (the read is sent).
+            (["at", "AT+QCFG=\"usbcfg\",0x2C7C,0x0801,1,1,1,1,1,0,0"], usbcfg), (["at", "at+qcfg=\"usbcfg\",0"], usbcfg),
+            (["at", "AT+QCFG=usbcfg,0"], usbcfg), (["at", "AT+CSQ;+QCFG=\"usbcfg\",0x2C7C"], usbcfg),
+            (["at", "AT+QCFG=\"usbnet\",0;+QCFG=\"usbcfg\",0"], usbcfg),
         ]
         for (words, line) in refusals {
             let fake = FakeModem()
