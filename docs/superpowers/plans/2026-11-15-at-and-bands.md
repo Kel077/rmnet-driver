@@ -8,6 +8,7 @@
 
 **What the modem answers (read on the owner's RM520N-GL, 2026-11-15, console, read-only):**
 - `AT+QNWPREFCFG="ue_capability_band"` → lines `+QNWPREFCFG: "gw_band",1:2:4:5:8:19`, `+QNWPREFCFG: "lte_band",1:2:3:…:71`, `+QNWPREFCFG: "nsa_nr5g_band",1:2:3:…:79`, `+QNWPREFCFG: "nr5g_band",1:2:3:…:79`, `+QNWPREFCFG: "nrdc_nr5g_band",0`, then `OK`.
+  - *Changed in fix round 2 (2026-11-15): supported bands come from rf_band; ue_capability_band follows a lock (seen on the modem).*
 - `AT+QNWPREFCFG="lte_band"` → `+QNWPREFCFG: "lte_band",1:2:3:4:5:7:8:12:13:14:17:18:19:20:25:26:28:29:30:32:34:38:39:40:41:42:43:46:48:66:71`; `"nsa_nr5g_band"` and `"nr5g_band"` → `1:2:3:5:7:8:12:13:14:18:20:25:26:28:29:30:38:40:41:48:66:70:71:75:76:77:78:79` (today every supported band is allowed).
 - Writing is `AT+QNWPREFCFG="<key>",<b1>:<b2>:…` (Quectel's manual); the modem re-selects a cell after a change, so the connection can drop for a few seconds.
 
@@ -31,6 +32,7 @@
 - `RMNet at` refuses the commands that need a second stage (`AT+CMGS`, `AT+CMGW`: an SMS body after a `>` prompt) and points to `RMNet sms send`.
 - `RMNet bands set` never writes a band the modem does not list as supported, never writes an empty list, and reads the list back before saying it worked.
 - `RMNet bands reset` restores exactly the supported list from `ue_capability_band`, for one RAT or all three.
+  - *Changed in fix round 2 (2026-11-15): supported bands come from rf_band; ue_capability_band follows a lock (seen on the modem).*
 - Answers that do not parse (a missing line, a key the modem did not echo) are failures that say nothing was changed, never a silent success.
 
 ---
@@ -63,6 +65,7 @@
 **Interfaces:**
 - Produces: `enum BandRat: String, CaseIterable { case lte, nsa, sa }` with modem keys `lte_band`, `nsa_nr5g_band`, `nr5g_band` and display names `LTE`, `5G NSA`, `5G SA`; `struct BandSet { let rat: BandRat; let allowed: [Int]; let supported: [Int] }` (sorted, unique).
 - Produces on `ModemServing`: `func bands() -> Result<[BandSet], ModemFailure>` (one `AT+QNWPREFCFG="ue_capability_band"` read plus one `AT+QNWPREFCFG="<key>"` read per RAT; the three in `BandRat.allCases` order); `func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure>` where `BandChange` holds `before` and `after` lists: reads the supported and allowed lists first; refuses (failure, nothing written) an empty list or any band not supported (the failure names them); if the allowed list already equals the request, returns without writing; otherwise writes `AT+QNWPREFCFG="<key>",<b1>:<b2>:…` (sorted, unique), reads back, and fails if the read-back differs as a set (saying what the modem now reports and what it was). `reset` is `setBands(rat, to: supported)`.
+  - *Changed in fix round 2 (2026-11-15): supported bands come from rf_band; ue_capability_band follows a lock (seen on the modem).*
 - Parsing: a line `+QNWPREFCFG: "<key>",<list>` where `<list>` is numbers joined by `:`; `0` alone (as for `nrdc_nr5g_band`) means none. A missing key or an unparsable list is a failure saying the modem did not report it.
 - Produces the verbs:
   - `RMNet bands [--json]` prints one line per RAT: `LTE: all 31 supported bands allowed` or `LTE: 2 of 31 supported bands allowed: 3, 41`, then, indented, `supported: 1, 2, 3, …`. `--json`: `[{"rat":"lte","allowed":[…],"supported":[…]}, …]`.

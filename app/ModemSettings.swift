@@ -279,6 +279,12 @@ func bandsProblem(_ rat: BandRat, _ bands: [Int], supported: [Int]) -> String? {
         + "\(bandListWords(unsupported)) (supported: \(bandListWords(supported)))."
 }
 
+/// The end of a sentence for a failure before `rat`'s write: `The 5G NSA bands were not changed.` (In `bands
+/// reset` of all three an earlier RAT may have been set, so not "Nothing was changed.")
+func bandsNotChanged(_ rat: BandRat) -> String {
+    "The \(rat.name) bands were not changed."
+}
+
 /// `RMNet bands --json`, one RAT: `{"rat":"lte","allowed":[3,41],"supported":[1,2,…]}`.
 func bandsJSON(_ set: BandSet) -> [String: Any] {
     ["rat": set.rat.rawValue, "allowed": set.allowed, "supported": set.supported]
@@ -304,13 +310,30 @@ private let atPromptCommands: [(name: String, reason: String)] = [
 /// change whether and how the modem answers (V: words or numbers; Q: result codes on or off).
 private let atLockoutFirstCommands: [Character] = ["D", "O", "V", "Q"]
 
-/// Anywhere in the line: the line-end characters the modem expects and answers with (S3, S4), and &W, which
-/// would keep such settings across a restart.
-private let atLockoutAnywhere = ["S3=", "S4=", "&W"]
+/// Anywhere in the line: the line-end characters the modem expects and answers with (S3, S4), &W, which
+/// would keep such settings across a restart, and +CGDATA, which enters data state.
+private let atLockoutAnywhere = ["S3=", "S4=", "&W", "+CGDATA"]
 
 private func atLockout(_ what: String) -> String {
     "RMNet at does not send \(what) (it would switch the AT port to data mode or change how the modem answers, "
         + "and RMNet's own AT features would stop working)"
+}
+
+/// The values written to the modem's USB setting `key` (`USBNET`, `USBCFG`) anywhere in `compact` (the line
+/// upper-cased, spaces removed): for each `+QCFG=<key>,` (the key in quotes or not), the text after the comma up
+/// to the next `;` or the line's end. A read (`+QCFG="usbnet"`, no comma) has none.
+private func usbSettingWrites(_ compact: String, key: String) -> [Substring] {
+    var values: [Substring] = []
+    for quoted in ["\"\(key)\",", "\(key),"] {
+        let pattern = "+QCFG=" + quoted
+        var rest = compact[...]
+        while let found = rest.range(of: pattern) {
+            let after = rest[found.upperBound...]
+            values.append(after.prefix { $0 != ";" })
+            rest = after
+        }
+    }
+    return values
 }
 
 /// nil when `line` may be sent as one AT command; else why not, as `RMNet at` says it after `at: ` (never
@@ -318,8 +341,11 @@ private func atLockout(_ what: String) -> String {
 /// (which would end the line early and send a second command) and no Ctrl-Z (which ends a message body); more
 /// than 512 characters; a line that does not start with AT (any case). Then, on the line upper-cased with its
 /// spaces removed: a prompt command anywhere (`atPromptCommands`); ATD, ATO, ATV or ATQ as the first basic
-/// command; S3=, S4= or &W anywhere. Those would leave the port waiting for a second stage, or unusable for
-/// RMNet's own AT features (AtPort expects verbose answers ending in OK, in command mode).
+/// command; S3=, S4=, &W or +CGDATA anywhere; a write of the USB network mode (AT+QCFG="usbnet",<n>) other than
+/// 0, QMI (`RMNet usbmode set` warns and checks first), and any write of the USB configuration
+/// (AT+QCFG="usbcfg",…), after which the modem may no longer be found on USB 2c7c:0801; the reads of both are
+/// sent. Those would leave the port waiting for a second stage, or unusable for RMNet's own AT features (AtPort
+/// expects verbose answers ending in OK, in command mode), or take the modem away from RMNet.
 func atCommandProblem(_ line: String) -> String? {
     let scalars = line.unicodeScalars
     if scalars.isEmpty { return "no command given; usage: RMNet at [--timeout <seconds>] <command>" }
@@ -333,6 +359,12 @@ func atCommandProblem(_ line: String) -> String? {
     for command in atPromptCommands where compact.contains(command.name) { return command.reason }
     if let first = compact.dropFirst(2).first, atLockoutFirstCommands.contains(first) { return atLockout("AT\(first)") }
     for part in atLockoutAnywhere where compact.contains(part) { return atLockout("AT\(part)") }
+    if usbSettingWrites(compact, key: "USBNET").contains(where: { $0 != "0" }) {
+        return "use RMNet usbmode set to change the USB mode; it warns and checks first"
+    }
+    if !usbSettingWrites(compact, key: "USBCFG").isEmpty {
+        return "RMNet at does not change the USB configuration (usbcfg): the modem could disappear from RMNet"
+    }
     return nil
 }
 
