@@ -352,6 +352,17 @@ struct ModemNetworkTests {
         check(modeWords("WCDMA") == "WCDMA only", "modeWords: WCDMA")
         check(modeWords("WCDMA:LTE") == "WCDMA and LTE", "modeWords: another mode, its RATs joined")
         check(modeWords("WCDMA:LTE:NR5G") == "WCDMA and LTE and NR5G", "modeWords: three RATs joined")
+        // Any order of the same RATs reads the same (compared by canonicalMode), so the window's menu never
+        // shows one mode twice.
+        for (mode, words) in [("NR5G:LTE", "5G and LTE"), ("LTE:WCDMA", "WCDMA and LTE"), ("NR5G:LTE:WCDMA", "WCDMA and LTE and NR5G"),
+                              ("NR5G:WCDMA", "WCDMA and NR5G"), ("GSM:LTE", "GSM and LTE"), ("LTE:LTE", "LTE and LTE")] {
+            check(modeWords(mode) == words, "modeWords: \(mode) reads \(words)", modeWords(mode))
+        }
+        for (a, b, same) in [("NR5G:LTE", "LTE:NR5G", true), ("LTE:NR5G", "LTE:NR5G", true), ("WCDMA:LTE", "LTE:WCDMA", true),
+                             ("AUTO", "AUTO", true), ("LTE", "NR5G", false), ("LTE:NR5G", "NR5G", false),
+                             ("GSM:LTE", "GSM:LTE", true), ("GSM:LTE", "LTE:GSM", false), ("AUTO", "WCDMA:LTE:NR5G", false)] {
+            check(sameMode(a, b) == same && sameMode(b, a) == same, "sameMode: \(a) and \(b): \(same)")
+        }
 
         // --- networkRows -----------------------------------------------------------------------
         expectRows(saInfo, [

@@ -384,15 +384,40 @@ func registrationWords(_ r: Registration?) -> String {
     }
 }
 
-/// A mode_pref value in words; a mode not named here reads as its RATs joined with " and ".
+private let modeRATs = ["WCDMA", "LTE", "NR5G"]
+
+/// The mode_pref value for what the owner typed, ignoring case: `auto` alone, or RATs from `wcdma`,
+/// `lte` and `nr5g` joined by `:`, each at most once, returned in the order WCDMA, LTE, NR5G
+/// (`nr5g:lte` → `LTE:NR5G`). nil for anything else: empty, an unknown name, a repeat, `auto` with
+/// others, an empty piece.
+func canonicalMode(_ argument: String) -> String? {
+    if argument.lowercased() == "auto" { return "AUTO" }
+    var picked = Set<String>()
+    for piece in argument.lowercased().split(separator: ":", omittingEmptySubsequences: false) {
+        guard let rat = modeRATs.first(where: { $0.lowercased() == piece }), !picked.contains(rat) else { return nil }
+        picked.insert(rat)
+    }
+    return picked.isEmpty ? nil : modeRATs.filter { picked.contains($0) }.joined(separator: ":")
+}
+
+/// The same mode: the same value, or the same RATs in another order (`NR5G:LTE` and `LTE:NR5G`), compared
+/// by canonicalMode; a value it does not accept is only the same as itself.
+func sameMode(_ a: String, _ b: String) -> Bool {
+    a == b || (canonicalMode(a).map { $0 == canonicalMode(b) } ?? false)
+}
+
+/// A mode_pref value in words, the same for any order of the same RATs (`NR5G:LTE` reads as `LTE:NR5G`
+/// does); a mode not named here reads as its RATs joined with " and ", in canonicalMode's order when it
+/// accepts the value.
 func modeWords(_ mode: String) -> String {
-    switch mode {
+    let named = canonicalMode(mode) ?? mode
+    switch named {
     case "AUTO": return "automatic (5G, LTE and WCDMA)"
     case "NR5G": return "5G only"
     case "LTE": return "LTE only"
     case "LTE:NR5G": return "5G and LTE"
     case "WCDMA": return "WCDMA only"
-    default: return mode.split(separator: ":").joined(separator: " and ")
+    default: return named.split(separator: ":").joined(separator: " and ")
     }
 }
 

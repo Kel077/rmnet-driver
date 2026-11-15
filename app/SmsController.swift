@@ -147,6 +147,15 @@ final class SmsController: ObservableObject {
         return true
     }
 
+    /// The quit was cancelled elsewhere (the modem tabs' call failed): working again, the tab listed at once
+    /// if it is shown. A quit of this controller that still waited is cancelled too and never answered.
+    func resumeAfterCancelledQuit() {
+        stopping = false
+        quitWaits = false
+        quitNotice.line = ""
+        updateTimer()
+    }
+
     // Called by each finish after `running` is cleared; true when a quit was waiting (it is answered).
     private func answeredQuit(succeeded: Bool) -> Bool {
         guard quitWaits else { return false }

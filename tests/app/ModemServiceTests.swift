@@ -171,12 +171,16 @@ func success<T>(_ result: Result<T, ModemFailure>, _ name: String) -> T? {
 }
 
 func failureMessage<T>(_ result: Result<T, ModemFailure>, _ name: String) -> String {
+    failureOf(result, name).message
+}
+
+func failureOf<T>(_ result: Result<T, ModemFailure>, _ name: String) -> ModemFailure {
     switch result {
     case .success(let value):
         check(false, "\(name): fails", "succeeded with \(value)")
-        return ""
+        return ModemFailure(message: "")
     case .failure(let failure):
-        return failure.message
+        return failure
     }
 }
 
@@ -281,6 +285,7 @@ struct ModemServiceTests {
         profiles()
         profileChange()
         profileRedialFailures()
+        profileWayBack()
         sim()
         pinEntry()
         print("modem service: \(checks) checks passed")
@@ -794,12 +799,79 @@ struct ModemServiceTests {
         do {
             // The change refused and AT+CFUN=1 failing on both ports (the second will not open).
             let rig = Rig([.success(ScriptedPort("port 1", redialStart + [(setCmnet, cme(3)), ("AT+CFUN=1", ioError)])),
-                           .failure(.busy)])
+                           .failure(.modemNotAttached)])
             let message = failureMessage(rig.service.setProfile(1, to: cmnet, redial: true), "refused, radio still off")
             expectEqual(message, "The new settings for profile 1 were refused. The modem refused the command (+CME ERROR: 3). "
-                        + "Nothing was changed, but the radio is still off. \(describe(.busy)) \(stillOff)",
+                        + "Nothing was changed, but the radio is still off. \(describe(.modemNotAttached)) \(stillOff)",
                         "redial: the change refused and the radio still off")
             rig.finish("refused, radio still off", opens: 2)
+        }
+        do {
+            // The change and its read-back are fine; AT+CFUN=1 times out on the first port and works on a new
+            // one: the redial is done.
+            let rig = Rig(redialStart + [(setCmnet, ok), ("AT+QICSGP=1", qicsgpCmnet), ("AT+CFUN=1", timedOut)],
+                          [("AT+CFUN=1", ok)] + registered)
+            let change = success(rig.service.setProfile(1, to: cmnet, redial: true), "CFUN=1 times out, reopen works")
+            check(change == ProfileChange(id: 1, before: profile1, after: cmnet,
+                                          redial: .done(RadioChange(on: true, registration: homeSA, secondsToRegister: 0))),
+                  "redial: AT+CFUN=1 timing out on port 1 and working on port 2 is .done", "\(String(describing: change))")
+            expectLines(rig.port(2).lines, ["AT+CFUN=1"] + registrationLines, "redial: AT+CFUN=1 again on the second port")
+            rig.finish("CFUN=1 times out, reopen works", opens: 2)
+        }
+        do {
+            // The change refused and AT+CFUN=1 refused on a working port: no second port; nothing changed, but
+            // the radio is still off.
+            let rig = Rig(redialStart + [(setCmnet, cme(3)), ("AT+CFUN=1", cme(4))])
+            let message = failureMessage(rig.service.setProfile(1, to: cmnet, redial: true), "refused, CFUN=1 refused")
+            expectEqual(message, "The new settings for profile 1 were refused. The modem refused the command (+CME ERROR: 3). "
+                        + "Nothing was changed, but the radio is still off. The modem refused the command (+CME ERROR: 4). "
+                        + stillOff, "redial: the change and AT+CFUN=1 both refused")
+            rig.finish("refused, CFUN=1 refused", opens: 1)
+        }
+        do {
+            // The reopen finds interface 3 busy (the window's read or another verb took it in the gap): it is
+            // tried again every 0.5 s (ruling R22); busy twice, then it opens and the radio is back on.
+            let rig = Rig([.success(ScriptedPort("port 1", redialStart + [(setCmnet, ok), ("AT+QICSGP=1", qicsgpCmnet),
+                                                                          ("AT+CFUN=1", timedOut)])),
+                           .failure(.busy), .failure(.busy),
+                           .success(ScriptedPort("port 2", [("AT+CFUN=1", ok)] + registered))])
+            let change = success(rig.service.setProfile(1, to: cmnet, redial: true), "reopen busy twice")
+            check(change == ProfileChange(id: 1, before: profile1, after: cmnet,
+                                          redial: .done(RadioChange(on: true, registration: homeSA, secondsToRegister: 0))),
+                  "redial: a reopen busy twice, then open: the radio is back on", "\(String(describing: change))")
+            check(rig.sleeps == [1, 0.5, 0.5], "redial: 0.5 s between the busy reopens", "\(rig.sleeps)")
+            rig.finish("reopen busy twice", opens: 4)
+        }
+        do {
+            // Busy for 15 s: the opens at 0, 0.5, …, 15 s of fake time (31), then the radio is left off, busy.
+            let busy = [Result<ScriptedPort, AtError>](repeating: .failure(.busy), count: 31)
+            let rig = Rig([.success(ScriptedPort("port 1", redialStart + [(setCmnet, ok), ("AT+QICSGP=1", qicsgpCmnet),
+                                                                          ("AT+CFUN=1", timedOut)]))] + busy)
+            let change = success(rig.service.setProfile(1, to: cmnet, redial: true), "reopen busy for 15 s")
+            check(change?.redial == .radioLeftOff(describe(.busy)), "redial: busy for 15 s leaves the radio off, and says why",
+                  "\(String(describing: change))")
+            check(rig.sleeps == [1] + Array(repeating: 0.5, count: 30), "redial: thirty waits of 0.5 s", "\(rig.sleeps)")
+            rig.finish("reopen busy for 15 s", opens: 32)
+        }
+        do {
+            // A clock that stands still cannot keep the retries going: at most 30 more opens.
+            let busy = [Result<ScriptedPort, AtError>](repeating: .failure(.busy), count: 31)
+            let rig = Rig([.success(ScriptedPort("port 1", redialStart + [(setCmnet, ok), ("AT+QICSGP=1", qicsgpCmnet),
+                                                                          ("AT+CFUN=1", timedOut)]))] + busy)
+            rig.sleepMovesClock = false
+            let change = success(rig.service.setProfile(1, to: cmnet, redial: true), "reopen busy, clock still")
+            check(change?.redial == .radioLeftOff(describe(.busy)), "redial: busy with a still clock ends", "\(String(describing: change))")
+            rig.finish("reopen busy, clock still", opens: 32)
+        }
+        do {
+            // A reopen that fails otherwise is not tried again.
+            let rig = Rig([.success(ScriptedPort("port 1", redialStart + [(setCmnet, ok), ("AT+QICSGP=1", qicsgpCmnet),
+                                                                          ("AT+CFUN=1", timedOut)])),
+                           .failure(.modemNotAttached)])
+            let change = success(rig.service.setProfile(1, to: cmnet, redial: true), "reopen fails")
+            check(change?.redial == .radioLeftOff(describe(.modemNotAttached)) && rig.sleeps == [1],
+                  "redial: a reopen that fails but not busy is not retried", "\(String(describing: change)) \(rig.sleeps)")
+            rig.finish("reopen fails", opens: 2)
         }
         do {
             // The change times out and AT+CFUN=1 fails on the second port too.
@@ -847,6 +919,74 @@ struct ModemServiceTests {
             check(rig.allLines.filter { $0.contains(secret) } == [setWithSecret], "redial: the password only in the change line")
             rig.finish("redial, password not kept", opens: 1)
         }
+    }
+
+    // A profile change that fails after its line may have reached the modem carries the settings before, so
+    // that the CLI and the window can say how to put them back (ruling R19): the write times out, the
+    // read-back differs, or the read-back times out, fails or gives no settings; with or without a redial.
+    // Not when nothing was sent (or the modem refused the change itself: nothing was changed).
+    static func profileWayBack() {
+        let differs: Answer = .success(["+QICSGP: 3,\"x\",\"\",\"\",0"])
+        for (name, script, opens) in [
+            ("no redial: the write times out", [("AT+QICSGP=1", qicsgp1), (setCmnet, timedOut)], [[(String, Answer)]]()),
+            ("no redial: the read-back differs", [("AT+QICSGP=1", qicsgp1), (setCmnet, ok), ("AT+QICSGP=1", differs)], []),
+            ("no redial: the read-back times out", [("AT+QICSGP=1", qicsgp1), (setCmnet, ok), ("AT+QICSGP=1", timedOut)], []),
+            ("no redial: the read-back's I/O error", [("AT+QICSGP=1", qicsgp1), (setCmnet, ok), ("AT+QICSGP=1", ioError)], []),
+            ("no redial: the read-back gives no settings", [("AT+QICSGP=1", qicsgp1), (setCmnet, ok), ("AT+QICSGP=1", ok)], []),
+            ("redial: the write times out", redialStart + [(setCmnet, timedOut)], [[("AT+CFUN=1", ok)] + registered]),
+            ("redial: the read-back differs", redialStart + [(setCmnet, ok), ("AT+QICSGP=1", differs), ("AT+CFUN=1", ok)] + registered, []),
+            ("redial: the read-back times out", redialStart + [(setCmnet, ok), ("AT+QICSGP=1", timedOut)],
+             [[("AT+CFUN=1", ok)] + registered]),
+            ("redial: the write times out and the radio stays off", redialStart + [(setCmnet, timedOut)], [[("AT+CFUN=1", timedOut)]]),
+        ] {
+            let redial = name.hasPrefix("redial")
+            let rig = Rig(([script] + opens).enumerated().map { .success(ScriptedPort("port \($0.offset + 1)", $0.element)) })
+            let failure = failureOf(rig.service.setProfile(1, to: cmnet, redial: redial), name)
+            check(failure.profileBefore == profile1, "way back: \(name): the failure holds the settings before",
+                  "\(String(describing: failure.profileBefore)) | \(failure.message)")
+            rig.finish("way back: \(name)", opens: 1 + opens.count)
+        }
+
+        // Nothing sent, or the change refused by the modem: no way back is needed.
+        let refusedChange: [(String, Answer)] = [("AT+QICSGP=1", qicsgp1), (setCmnet, cme(3))]
+        for (name, opens, settings, redial, count) in [
+            ("a refused AT+CFUN=4", [Result<ScriptedPort, AtError>.success(ScriptedPort("port 1", [("AT+QICSGP=1", qicsgp1),
+                ("AT+CFUN?", cfunOn), ("AT+CFUN=4", cme(3))]))], cmnet, true, 1),
+            ("AT+CFUN=4 timing out", [.success(ScriptedPort("port 1", [("AT+QICSGP=1", qicsgp1), ("AT+CFUN?", cfunOn),
+                ("AT+CFUN=4", timedOut)])), .success(ScriptedPort("port 2", [("AT+CFUN=1", ok)] + registered))], cmnet, true, 2),
+            ("a profileProblem refusal", [], ProfileSettings(type: .ipv4v6, apn: "a b", user: "", password: "", auth: .none), true, 0),
+            ("a failed before-read", [.success(ScriptedPort("port 1", [("AT+QICSGP=1", timedOut)]))], cmnet, true, 1),
+            ("a failed open", [.failure(.busy)], cmnet, true, 1),
+            ("the radio's state not read", [.success(ScriptedPort("port 1", [("AT+QICSGP=1", qicsgp1), ("AT+CFUN?", ok)]))],
+             cmnet, true, 1),
+            ("the change refused, no redial", [.success(ScriptedPort("port 1", refusedChange))], cmnet, false, 1),
+            ("the change refused in a redial", [.success(ScriptedPort("port 1", redialStart + [(setCmnet, cme(3)), ("AT+CFUN=1", ok)]
+                + registered))], cmnet, true, 1),
+        ] {
+            let rig = Rig(opens)
+            let failure = failureOf(rig.service.setProfile(1, to: settings, redial: redial), name)
+            check(failure.profileBefore == nil, "way back: \(name): no settings before in the failure",
+                  "\(String(describing: failure.profileBefore)) | \(failure.message)")
+            rig.finish("way back: \(name)", opens: count)
+        }
+
+        // A password before is kept in memory for the put-back, and shown by no string conversion.
+        let rig = Rig([("AT+QICSGP=1", qicsgpWithSecret), ("AT+CFUN?", cfunOn), ("AT+CFUN=4", ok), (setCmnet, timedOut)],
+                      [("AT+CFUN=1", ok)] + registered)
+        let failure = failureOf(rig.service.setProfile(1, to: cmnet, redial: true), "way back with a password")
+        check(failure.profileBefore == withSecret, "way back: the settings before, password included",
+              "\(String(describing: failure.profileBefore))")
+        var dumped = ""
+        dump(failure, to: &dumped)
+        let error: Error = failure
+        for (text, how) in [(String(describing: failure), "String(describing:)"), (String(reflecting: failure), "String(reflecting:)"),
+                            ("\(failure)", "interpolation"), (dumped, "dump"), (error.localizedDescription, "localizedDescription"),
+                            (String(reflecting: failure.profileBefore), "String(reflecting:) of profileBefore")] {
+            check(!text.contains(secret), "way back: \(how) of the failure does not show the password",
+                  text.replacingOccurrences(of: secret, with: "<the password>"))
+        }
+        check(dumped.contains("passwordSet"), "way back: a dump shows only whether a password is set", dumped)
+        rig.finish("way back with a password", opens: 2)
     }
 
     // MARK: sim
@@ -977,9 +1117,24 @@ struct ModemServiceTests {
             let rig = Rig([("AT+CPIN?", cpinPin), ("AT+QPINC?", qpinc(3)), (pinLine, cme(16)),
                            ("AT+CPIN?", cpinPin), ("AT+QPINC?", qpinc(2)), ("AT+CLCK=\"SC\",2", clckOn)])
             let outcome = success(rig.service.enterPin(pin, shownAttempts: 3), "pin refused")
-            check(outcome == PinOutcome(accepted: false, sim: SimInfo(state: .pin, pinLock: true, pinAttempts: 2, pukAttempts: 10)),
-                  "enterPin: +CME ERROR: 16 is not accepted, with the new attempts", "\(String(describing: outcome))")
+            check(outcome == PinOutcome(accepted: false, sim: SimInfo(state: .pin, pinLock: true, pinAttempts: 2, pukAttempts: 10),
+                                        refusal: "+CME ERROR: 16"),
+                  "enterPin: +CME ERROR: 16 is not accepted, with the new attempts and the modem's line", "\(String(describing: outcome))")
             done(rig, "pin refused", opens: 1)
+        }
+        do {
+            // Another error line (14: SIM busy) is kept as it is, for pinSentence (F10).
+            let rig = Rig([("AT+CPIN?", cpinPin), ("AT+QPINC?", qpinc(3)), (pinLine, cme(14)),
+                           ("AT+CPIN?", cpinPin), ("AT+QPINC?", qpinc(3)), ("AT+CLCK=\"SC\",2", clckOn)])
+            let outcome = success(rig.service.enterPin(pin, shownAttempts: 3), "pin, SIM busy")
+            check(outcome == PinOutcome(accepted: false, sim: SimInfo(state: .pin, pinLock: true, pinAttempts: 3, pukAttempts: 10),
+                                        refusal: "+CME ERROR: 14"),
+                  "enterPin: +CME ERROR: 14 is not accepted, with the modem's line", "\(String(describing: outcome))")
+            if let outcome {
+                expectEqual(pinSentence(outcome), "The modem did not take the PIN (+CME ERROR: 14). 3 attempts left; check them "
+                            + "before entering it again.", "enterPin: SIM busy is not said as a wrong PIN")
+            }
+            done(rig, "pin, SIM busy", opens: 1)
         }
         do {
             // The SIM read after the PIN fails: accepted, without the SIM.

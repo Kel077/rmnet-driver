@@ -86,41 +86,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // The process's one SmsController (its queue to the modem is the shared one): the window shows it, and
     // quitting waits for its running call. It lives as long as the app, so a window reopened from the Dock
-    // shows the same messages and result line. A quit it cancels is cancelled for the modem tabs too.
+    // shows the same messages and result line. Its answer to a quit goes through `quitGate`.
     private(set) lazy var messages: SmsController = SmsController(
         service: SmsService(),
         queue: modemQueue,
-        replyToQuit: { [unowned self] succeeded in
-            if !succeeded { self.modem.resumeAfterCancelledQuit() }
-            NSApp.reply(toApplicationShouldTerminate: succeeded)
-        },
+        replyToQuit: { [unowned self] succeeded in self.quitGate.replied(AppDelegate.messagesMember, succeeded) },
         requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
 
-    // The process's one ModemController, for the Network and SIM & APN tabs, kept the same way. Quitting
-    // waits for it first: when its call fails the quit is cancelled; when it succeeds, the messages are
-    // asked next, and they answer the quit if they still have a call running.
+    // The process's one ModemController, for the Network and SIM & APN tabs, kept the same way.
     private(set) lazy var modem: ModemController = ModemController(
         service: ModemService(),
         queue: modemQueue,
         driverProfile: driverProfileNumber,
-        replyToQuit: { [unowned self] succeeded in
-            if !succeeded {
-                NSApp.reply(toApplicationShouldTerminate: false)
-            } else if !self.messages.quitWhenFinished() {
-                NSApp.reply(toApplicationShouldTerminate: true)
-            }
-        },
+        replyToQuit: { [unowned self] succeeded in self.quitGate.replied(AppDelegate.modemMember, succeeded) },
         requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
+
+    // Both controllers are asked at once when the app is to quit, since a call of one can wait behind a call
+    // of the other on the shared queue: the app ends when every call the quit waited for has succeeded, and
+    // the first that did not cancels the quit and resumes the other controller (QuitGate.swift).
+    private static let modemMember = 0, messagesMember = 1
+    private lazy var quitGate: QuitGate = QuitGate(
+        [QuitGate.Member(quitWhenFinished: { [unowned self] in self.modem.quitWhenFinished() },
+                         resume: { [unowned self] in self.modem.resumeAfterCancelledQuit() }),
+         QuitGate.Member(quitWhenFinished: { [unowned self] in self.messages.quitWhenFinished() },
+                         resume: { [unowned self] in self.messages.resumeAfterCancelledQuit() })],
+        reply: { NSApp.reply(toApplicationShouldTerminate: $0) })
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     // Every way of quitting (Cmd-Q, the Dock's Quit, closing the last window, logout) comes here. With a
-    // call to the modem running, the app ends only when it has finished; a send is never cut short. A send
-    // or delete that does not succeed cancels the quit, so that its result can be read. The modem tabs'
-    // controller is asked first; the messages only once it has nothing running (see `modem`).
+    // call to the modem running, the app ends only when it has finished; a send is never cut short. A send,
+    // delete or change that does not succeed cancels the quit, so that its result can be read.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if modem.quitWhenFinished() { return .terminateLater }
-        return messages.quitWhenFinished() ? .terminateLater : .terminateNow
+        quitGate.ask() ? .terminateLater : .terminateNow
     }
 }
 

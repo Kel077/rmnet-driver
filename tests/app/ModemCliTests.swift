@@ -400,7 +400,7 @@ struct ModemCliTests {
         var nr5gLte = saInfo
         nr5gLte.mode = "NR5G:LTE"
         fake.networkResult = .success(nr5gLte)
-        expectLines(run(["mode"], fake, "mode NR5G:LTE"), ["mode: NR5G:LTE (NR5G and LTE)"], code: 0,
+        expectLines(run(["mode"], fake, "mode NR5G:LTE"), ["mode: NR5G:LTE (5G and LTE)"], code: 0,
                     "mode: the modem's own order")
         fake = FakeModem()
         var noMode = saInfo
@@ -635,6 +635,13 @@ struct ModemCliTests {
         check(badApn.code == 1 && badApn.lines.count == 1 && badApn.lines[0].hasPrefix("apn: ") && badApn.lines[0] != warning,
               "apn set: an APN the rules refuse is one line, exit 1", linesText(badApn.lines))
         check(fake.profilesSet.isEmpty && badApn.prompts.isEmpty, "apn set: a refused APN asks nothing and sets nothing")
+        // `--apn` takes the next word as it is; an option typed there is refused as an APN (ruling R21).
+        fake = FakeModem()
+        let optionAsApn = run(["apn", "set", "--apn", "--no-redial"], fake, "apn set --apn --no-redial")
+        expectLines(optionAsApn, ["apn: An APN is at most 100 characters of ASCII letters, digits, dots, hyphens and underscores; "
+                                  + "it does not start or end with a dot or a hyphen, has no two dots in a row, and has no hyphen "
+                                  + "next to a dot."], code: 1, "apn set --apn --no-redial: refused before anything is changed")
+        check(fake.profilesSet.isEmpty, "apn set --apn --no-redial: nothing set")
         fake = FakeModem()
         let unreadProfile = run(["apn", "set", "--apn", "x"], fake, driverProfile: 2, "apn set, profile 2 unread")
         expectLines(unreadProfile, ["apn: Profile 2 could not be read. Nothing was changed."], code: 1,
@@ -643,6 +650,15 @@ struct ModemCliTests {
         fake = FakeModem()
         let unlisted = run(["apn", "set", "--apn", "x"], fake, driverProfile: 7, "apn set, profile 7 unlisted")
         expectLines(unlisted, ["apn: Profile 7 could not be read. Nothing was changed."], code: 1, "apn set: profile not listed")
+        // A driver's profile above 16: AT+QICSGP cannot change it; said before anything is read.
+        for id in [17, 255] {
+            fake = FakeModem()
+            expectLines(run(["apn", "set", "--apn", "x"], fake, driverProfile: id, "apn set, profile \(id)"),
+                        ["apn: Profile \(id) cannot be changed by RMNet: AT+QICSGP takes profiles 1 to 16."], code: 1,
+                        "apn set: profile \(id) is refused with the 1-16 rule")
+            check(fake.events.filter { $0 != "output" }.isEmpty, "apn set: profile \(id): nothing read, asked or set",
+                  "\(fake.events)")
+        }
         fake = FakeModem()
         run(["apn", "set", "--apn", "x"], fake, driverProfile: nil, "apn set, driver not attached")
         check(fake.profilesSet.count == 1 && fake.profilesSet[0].id == 1, "apn set: without the driver, profile 1")
@@ -655,6 +671,27 @@ struct ModemCliTests {
         fake.setProfileResult = .failure(ModemFailure(message: "Fake: refused. The radio was switched back on."))
         expectLines(run(["apn", "set", "--apn", "x"], fake, "apn set, change failed"),
                     [warning, "apn: Fake: refused. The radio was switched back on."], code: 1, "apn set: the change failed")
+        // A change that failed after its line may have reached the modem: the failure, then the way back
+        // (ruling R19), one for each of the service's paths.
+        for sentence in [
+            "It is not known whether profile 1 was changed. The modem did not answer in time. The radio was switched back on.",
+            "Profile 1 does not read back as sent: the modem now reports IPV4V6, APN \"y\", no authentication. "
+                + "The radio was switched back on.",
+            "Profile 1 could not be read back after the change. The modem did not answer in time. The radio was switched back on.",
+        ] {
+            fake = FakeModem()
+            fake.setProfileResult = .failure(ModemFailure(message: sentence, profileBefore: profile1))
+            expectLines(run(["apn", "set", "--apn", "x"], fake, "apn set, \(sentence)"), [warning, "apn: \(sentence)", restoreProfile1],
+                        code: 1, "apn set: a failure that may have changed the profile says how to put it back: \(sentence)")
+        }
+        fake = FakeModem()
+        let hadPassword = ProfileSettings(type: .ipv4v6, apn: "old", user: "u", password: oldSecret, auth: .pap)
+        fake.setProfileResult = .failure(ModemFailure(message: "Fake: not known.", profileBefore: hadPassword))
+        let unknownWithPassword = run(["apn", "set", "--apn", "x"], fake, "apn set, not known, a password before")
+        expectLines(unknownWithPassword, [warning, "apn: Fake: not known.",
+                                          "apn: to put it back: RMNet apn set --apn 'old' --type ipv4v6 --user 'u' --auth pap --password"],
+                    code: 1, "apn set: the way back after a failure asks for the password again (--password)")
+        expectNoSecret(unknownWithPassword, oldSecret, "apn set, a failure's way back")
 
         // The redial's outcomes.
         fake = FakeModem()
@@ -741,13 +778,25 @@ struct ModemCliTests {
         fake = FakeModem()
         fake.simResult = .success(askingSim)
         let refusedOutcome = PinOutcome(accepted: false,
-                                        sim: SimInfo(state: .pin, pinLock: true, pinAttempts: 2, pukAttempts: 10))
+                                        sim: SimInfo(state: .pin, pinLock: true, pinAttempts: 2, pukAttempts: 10),
+                                        refusal: "+CME ERROR: 16")
         fake.pinResult = .success(refusedOutcome)
         let refused = run(["sim", "unlock"], fake, secretAnswer: pinSecret, "sim unlock, refused")
         expectLines(refused, ["sim: The SIM asks for its PIN. 3 attempt(s) left; a wrong PIN uses one.",
                               "sim: " + pinSentence(refusedOutcome)], code: 1, "sim unlock: refused is exit 1")
         check(fake.pinsEntered.count == 1 && fake.pinsEntered[0].shownAttempts == 3, "sim unlock: shownAttempts 3")
         expectNoSecret(refused, pinSecret, "sim unlock refused")
+
+        check(refused.lines.last == "sim: The SIM refused the PIN. 2 attempts left.", "sim unlock: +CME ERROR: 16 is a wrong PIN",
+              linesText(refused.lines))
+        fake = FakeModem()
+        fake.simResult = .success(askingSim)
+        fake.pinResult = .success(PinOutcome(accepted: false, sim: askingSim, refusal: "+CME ERROR: 14"))
+        let simBusy = run(["sim", "unlock"], fake, secretAnswer: pinSecret, "sim unlock, SIM busy")
+        expectLines(simBusy, ["sim: The SIM asks for its PIN. 3 attempt(s) left; a wrong PIN uses one.",
+                              "sim: The modem did not take the PIN (+CME ERROR: 14). 3 attempts left; check them before "
+                                + "entering it again."], code: 1, "sim unlock: SIM busy is not said as a wrong PIN (F10)")
+        expectNoSecret(simBusy, pinSecret, "sim unlock, SIM busy")
 
         fake = FakeModem()
         fake.simResult = .success(askingSim)

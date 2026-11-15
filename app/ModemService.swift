@@ -7,7 +7,9 @@
 // (a redial usually up to about 40 s, longer when the port fails) and must not be made on the main thread.
 //
 // Nothing here logs, prints or stores what goes over the port. A profile's password appears only in the one
-// AT+QICSGP=<id>,… line sent and a PIN only in the one AT+CPIN="…" line; neither is ever put in a failure.
+// AT+QICSGP=<id>,… line sent and a PIN only in the one AT+CPIN="…" line; neither is ever put in a failure's
+// sentence. A profile change that failed after its line may have reached the modem keeps the settings before,
+// password included, in its failure's `profileBefore` (in memory only, for the way back; ruling R19).
 import Foundation
 
 /// What the service needs of a port: one command at a time, and closing (closing twice is harmless). AtPort
@@ -67,6 +69,11 @@ final class ModemService: ModemServing {
     // Reads at 0, 1, …, 30 s; also the bound should the clock go back.
     private static let registrationReads = Int(registrationWait / registrationInterval) + 1
     private static let redialPause: TimeInterval = 1          // between AT+CFUN=4 and the change
+    // The reopen that switches the radio back on, while interface 3 is busy (ruling R22): every 0.5 s for up
+    // to 15 s; the count bounds it should the clock stand still or go back.
+    private static let reopenWait: TimeInterval = 15
+    private static let reopenInterval: TimeInterval = 0.5
+    private static let reopenRetries = Int(reopenWait / reopenInterval)
 
     private static let modeRead = "AT+QNWPREFCFG=\"mode_pref\""
     private static let simStateRead = "AT+CPIN?"
@@ -262,12 +269,18 @@ final class ModemService: ModemServing {
                 }
             }
 
+            // A change that failed after its line may have reached the modem says what the profile was, so that
+            // it can be put back (ruling R19); one the modem refused changed nothing.
+            func changeFailed(_ problem: ChangeProblem, _ message: String) -> Result<ProfileChange, ModemFailure> {
+                .failure(ModemFailure(message: message, profileBefore: problem.changedNothing ? nil : before))
+            }
+
             guard radioOn else {
                 switch change(link, id, settings) {
                 case .success(let after):
                     return .success(ProfileChange(id: id, before: before, after: after, redial: redial ? .radioWasOff : .notAsked))
                 case .failure(let problem):
-                    return failure(problem.sentence + (problem.changedNothing ? " Nothing was changed." : ""))
+                    return changeFailed(problem, problem.sentence + (problem.changedNothing ? " Nothing was changed." : ""))
                 }
             }
 
@@ -295,10 +308,10 @@ final class ModemService: ModemServing {
                 return .success(ProfileChange(id: id, before: before, after: after, redial: .radioLeftOff(describe(why))))
             case (.failure(let problem), .success):
                 let nothing = problem.changedNothing ? " Nothing was changed." : ""
-                return failure("\(problem.sentence)\(nothing) The radio was switched back on.")
+                return changeFailed(problem, "\(problem.sentence)\(nothing) The radio was switched back on.")
             case (.failure(let problem), .failure(let why)):
                 let stillOff = problem.changedNothing ? "Nothing was changed, but the radio is still off." : "The radio is still off."
-                return failure("\(problem.sentence) \(stillOff) \(describe(why)) \(stillOffAdvice)")
+                return changeFailed(problem, "\(problem.sentence) \(stillOff) \(describe(why)) \(stillOffAdvice)")
             }
         }
     }
@@ -341,7 +354,7 @@ final class ModemService: ModemServing {
 
     /// AT+CFUN=1 after the redial's AT+CFUN=4, then the wait for registration. On `link` while it works; when
     /// it closed itself (a timeout or an I/O error, before or on this line), it is closed and a new port is
-    /// opened, once. The failure is why the radio is still off.
+    /// opened (tried again while busy, see `reopen`). The failure is why the radio is still off.
     private func switchBackOn(_ link: Link) -> Result<RadioChange, AtError> {
         if link.broken == nil {
             switch link.command("AT+CFUN=1", timeout: ModemService.radioTimeout) {
@@ -352,7 +365,7 @@ final class ModemService: ModemServing {
         }
         // AtPort keeps the interface after an I/O error: close it, or the new open finds it busy.
         link.close()
-        switch open() {
+        switch reopen() {
         case .failure(let error):
             return .failure(error)
         case .success(let port):
@@ -363,6 +376,23 @@ final class ModemService: ModemServing {
             case .failure(let error): return .failure(error)
             }
         }
+    }
+
+    /// The open for switching the radio back on. Once the broken port is closed, the window's read or another
+    /// RMNet verb can take interface 3 before it, and the radio would be left off: while the open fails busy
+    /// (each open itself waits up to 2 s, AtPort's own wait), it is tried again every 0.5 s, for up to 15 s
+    /// from the first try (ruling R22).
+    private func reopen() -> Result<AtCommanding, AtError> {
+        let start = now()
+        var opened = open()
+        var retries = 0
+        while case .failure(.busy) = opened, retries < ModemService.reopenRetries,
+              now().timeIntervalSince(start) < ModemService.reopenWait {
+            sleep(ModemService.reopenInterval)
+            retries += 1
+            opened = open()
+        }
+        return opened
     }
 
     // MARK: The SIM
@@ -424,9 +454,12 @@ final class ModemService: ModemServing {
                                + "check and enter the PIN again.")
             }
             let accepted: Bool
+            var refusal: String? = nil
             switch link.command(pinCommand(pin), timeout: ModemService.pinTimeout) {
             case .success: accepted = true
-            case .failure(let error) where isRefusal(error): accepted = false
+            case .failure(.modem(let line)):   // the modem's error line: 16 is a wrong PIN, another is not (F10)
+                accepted = false
+                refusal = line
             case .failure(let error):
                 return failure("\(describe(error)) It is not known whether the SIM took the PIN. "
                                + "Check the attempts left (RMNet sim) before entering it again.")
@@ -436,7 +469,7 @@ final class ModemService: ModemServing {
             case .success(let s): after = readSimDetails(link, s)
             case .failure: after = nil
             }
-            return .success(PinOutcome(accepted: accepted, sim: after))
+            return .success(PinOutcome(accepted: accepted, sim: after, refusal: refusal))
         }
     }
 }

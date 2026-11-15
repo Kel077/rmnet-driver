@@ -194,7 +194,8 @@ struct ModemSettingsTests {
 
         // --- profileProblem --------------------------------------------------------------------
         let idRule = { (id: Int) in "Profile \(id) cannot be changed by RMNet: AT+QICSGP takes profiles 1 to 16." }
-        let apnRule = "An APN is at most 100 characters of ASCII letters, digits, dots, hyphens and underscores, and does not start or end with a dot."
+        let apnRule = "An APN is at most 100 characters of ASCII letters, digits, dots, hyphens and underscores; it does not "
+            + "start or end with a dot or a hyphen, has no two dots in a row, and has no hyphen next to a dot."
         let userRule = "A user name is at most 127 characters of printable ASCII, without a double quote (\") or a backslash (\\)."
         let passwordRule = "A password is at most 127 characters of printable ASCII, without a double quote (\") or a backslash (\\)."
         check(profileProblem(1, cmnetPap) == nil, "profileProblem: a good profile 1")
@@ -207,7 +208,8 @@ struct ModemSettingsTests {
         check(profileProblem(0, ProfileSettings(type: .ipv4, apn: "a b", user: "\"", password: "\"", auth: .pap)) == idRule(0),
               "profileProblem: the profile number is checked first")
         func withAPN(_ apn: String) -> ProfileSettings { ProfileSettings(type: .ipv4v6, apn: apn, user: "", password: "", auth: .none) }
-        for apn in ["a.b-c_D9", String(repeating: "a", count: 100), "cmnet", "3gnet", "-a", "_"] {
+        for apn in ["a.b-c_D9", String(repeating: "a", count: 100), "cmnet", "3gnet", "_", "a-b", "a--b", "my-apn.mnc001.mcc001.gprs",
+                    "_a", "a_", "a._b"] {
             check(profileProblem(3, withAPN(apn)) == nil, "profileProblem: APN \"\(apn)\" is allowed",
                   "\(String(describing: profileProblem(3, withAPN(apn))))")
         }
@@ -216,6 +218,10 @@ struct ModemSettingsTests {
             ("caf\u{E9}", "a precomposed accent"), ("cafe\u{301}", "a combining accent"), ("a/b", "a slash"),
             ("a,b", "a comma"), (".a", "a leading dot"), ("a.", "a trailing dot"), (".", "a dot alone"),
             ("a\nb", "a line feed"), ("a\u{0}", "a NUL"), ("ａ", "a full-width letter"),
+            // Ruling R21 (3GPP TS 23.003, DNS labels): a label starts and ends with a letter or digit, and none is empty.
+            ("-a", "a leading hyphen"), ("a-", "a trailing hyphen"), ("-", "a hyphen alone"),
+            ("--no-redial", "an option typed after --apn"), ("a.-b", "a label starting with a hyphen"),
+            ("a-.b", "a label ending with a hyphen"), ("a..b", "an empty label"), ("a.b.", "a trailing dot after labels"),
         ] {
             check(profileProblem(1, withAPN(apn)) == apnRule, "profileProblem: APN with \(name) is refused",
                   "\(String(describing: profileProblem(1, withAPN(apn))))")
@@ -553,6 +559,40 @@ struct ModemSettingsTests {
               "pinQuestion: the last attempt", last.message)
         check(!three.title.isEmpty && three.title == last.title, "pinQuestion: title", three.title)
 
+        // --- the commands that put a change back (the CLI's lines and the window's, F9) ------------
+        expectEqual(profileRestoreCommand(profile1), "RMNet apn set --apn '' --type ipv4v6 --user '' --auth none --no-password",
+                    "profileRestoreCommand: no password")
+        let withOld = ProfileSettings(type: .ipv4, apn: "it's", user: "u", password: secret, auth: .chap)
+        expectEqual(profileRestoreCommand(withOld), "RMNet apn set --apn 'it'\\''s' --type ipv4 --user 'u' --auth chap --password",
+                    "profileRestoreCommand: a password is asked for, never shown")
+        expectNoSecret(profileRestoreCommand(withOld), "profileRestoreCommand never holds the password")
+        for (before, want) in [("NR5G:LTE", "RMNet mode nr5g:lte"), ("AUTO", "RMNet mode auto"), ("LTE", "RMNet mode lte"),
+                               ("WCDMA:LTE:NR5G", "RMNet mode wcdma:lte:nr5g")] {
+            check(modeRestoreCommand(before) == want, "modeRestoreCommand: \(before)", "\(String(describing: modeRestoreCommand(before)))")
+        }
+        for before in ["GSM:LTE", "", "LTE:LTE"] {
+            check(modeRestoreCommand(before) == nil, "modeRestoreCommand: \"\(before)\" cannot be set by RMNet (R8)")
+        }
+        check(profileNumberProblem(1) == nil && profileNumberProblem(16) == nil, "profileNumberProblem: 1 and 16")
+        check(profileNumberProblem(17) == "Profile 17 cannot be changed by RMNet: AT+QICSGP takes profiles 1 to 16."
+              && profileNumberProblem(0) != nil, "profileNumberProblem: 0 and 17")
+
+        // --- the window's last PIN attempt (ruling R20) --------------------------------------------
+        expectEqual(lastAttemptChoice, "Use the last attempt (a wrong PIN blocks the SIM until its PUK is entered)",
+                    "lastAttemptChoice: the checkbox's words")
+        for (pin, attempts, ticked, want, name) in [
+            ("1234", 3, false, true, "3 attempts: no checkbox needed"),
+            ("1234", 2, false, true, "2 attempts: no checkbox needed"),
+            ("1234", 1, false, false, "the last attempt, unticked"),
+            ("1234", 1, true, true, "the last attempt, ticked"),
+            ("12a4", 1, true, false, "the last attempt, ticked, a PIN the rules refuse"),
+            ("12a4", 3, false, false, "a PIN the rules refuse"),
+            ("1234", 0, true, false, "no attempts left"),
+            ("1234", -1, true, false, "attempts below 0"),
+        ] {
+            check(unlockAllowed(pin: pin, attempts: attempts, lastAttemptTicked: ticked) == want, "unlockAllowed: \(name)")
+        }
+
         // --- the sentences ----------------------------------------------------------------------
         expectEqual(radioSentence(RadioChange(on: false, registration: nil, secondsToRegister: nil)),
                     "The radio is off. The driver's connection is down until the radio is switched on again.",
@@ -614,21 +654,58 @@ struct ModemSettingsTests {
                         "profileSentence: a reason ending \"\(why.last.map { String($0) } ?? "")\" gets no second stop")
         }
 
-        expectEqual(pinSentence(PinOutcome(accepted: false, sim: SimInfo(state: .pin, pinLock: true, pinAttempts: 2, pukAttempts: 10))),
-                    "The SIM refused the PIN. 2 attempts left.", "pinSentence: refused, 2 left")
-        expectEqual(pinSentence(PinOutcome(accepted: false, sim: SimInfo(state: .pin, pinLock: true, pinAttempts: 1, pukAttempts: 10))),
+        // Only +CME ERROR: 16 (incorrect password) is the SIM refusing the PIN (F10).
+        let wrong = "+CME ERROR: 16"
+        func refusedWith(_ line: String?, _ sim: SimInfo?) -> String { pinSentence(PinOutcome(accepted: false, sim: sim, refusal: line)) }
+        let asks2 = SimInfo(state: .pin, pinLock: true, pinAttempts: 2, pukAttempts: 10)
+        let asks1 = SimInfo(state: .pin, pinLock: true, pinAttempts: 1, pukAttempts: 10)
+        let asksUnread = SimInfo(state: .pin, pinLock: true, pinAttempts: nil, pukAttempts: nil)
+        let pukNow = SimInfo(state: .puk, pinLock: true, pinAttempts: 0, pukAttempts: 10)
+        let noSim = SimInfo(state: .notInserted, pinLock: nil, pinAttempts: nil, pukAttempts: nil)
+        expectEqual(refusedWith(wrong, asks2), "The SIM refused the PIN. 2 attempts left.", "pinSentence: refused, 2 left")
+        expectEqual(refusedWith(wrong, asks1),
                     "The SIM refused the PIN. 1 attempt left: the next wrong PIN blocks the SIM until its PUK is entered.",
                     "pinSentence: refused, 1 left")
-        expectEqual(pinSentence(PinOutcome(accepted: false, sim: SimInfo(state: .pin, pinLock: true, pinAttempts: nil, pukAttempts: nil))),
-                    "The SIM refused the PIN. The attempts left could not be read.", "pinSentence: refused, attempts unread")
-        let blocked = pinSentence(PinOutcome(accepted: false, sim: SimInfo(state: .puk, pinLock: true, pinAttempts: 0, pukAttempts: 10)))
-        expectEqual(blocked, "The SIM refused the PIN and is now blocked: it needs its PUK from the carrier. RMNet does not enter PUKs.",
+        expectEqual(refusedWith(wrong, asksUnread), "The SIM refused the PIN. The attempts left could not be read.",
+                    "pinSentence: refused, attempts unread")
+        expectEqual(refusedWith(wrong, pukNow),
+                    "The SIM refused the PIN and is now blocked: it needs its PUK from the carrier. RMNet does not enter PUKs.",
                     "pinSentence: blocked")
-        expectEqual(pinSentence(PinOutcome(accepted: false, sim: nil)),
+        expectEqual(refusedWith(wrong, nil),
                     "The SIM refused the PIN. Its state could not be read; check the attempts left (RMNet sim) before entering it again.",
                     "pinSentence: refused, state unread")
-        expectEqual(pinSentence(PinOutcome(accepted: false, sim: SimInfo(state: .notInserted, pinLock: nil, pinAttempts: nil, pukAttempts: nil))),
-                    "The SIM refused the PIN (SIM: not inserted).", "pinSentence: refused, another state")
+        expectEqual(refusedWith(wrong, noSim), "The SIM refused the PIN (SIM: not inserted).", "pinSentence: refused, another state")
+        expectEqual(refusedWith("+CME ERROR:16", asks2), "The SIM refused the PIN. 2 attempts left.",
+                    "pinSentence: +CME ERROR:16 without a space is the wrong PIN too")
+        // Any other line, such as 14 (SIM busy), is the modem not taking the PIN: an attempt may or may not
+        // have been used, so the owner checks before entering it again.
+        let busy = "+CME ERROR: 14"
+        expectEqual(refusedWith(busy, asks2),
+                    "The modem did not take the PIN (+CME ERROR: 14). 2 attempts left; check them before entering it again.",
+                    "pinSentence: SIM busy, 2 left")
+        expectEqual(refusedWith(busy, asks1),
+                    "The modem did not take the PIN (+CME ERROR: 14). 1 attempt left; check them before entering it again.",
+                    "pinSentence: SIM busy, 1 left")
+        expectEqual(refusedWith("ERROR", asks2),
+                    "The modem did not take the PIN (ERROR). 2 attempts left; check them before entering it again.",
+                    "pinSentence: a bare ERROR")
+        expectEqual(refusedWith(busy, asksUnread),
+                    "The modem did not take the PIN (+CME ERROR: 14). The attempts left could not be read; check them (RMNet sim) "
+                        + "before entering it again.", "pinSentence: SIM busy, attempts unread")
+        expectEqual(refusedWith(busy, nil),
+                    "The modem did not take the PIN (+CME ERROR: 14). The SIM's state could not be read; check the attempts left "
+                        + "(RMNet sim) before entering it again.", "pinSentence: SIM busy, state unread")
+        expectEqual(refusedWith(busy, pukNow),
+                    "The modem did not take the PIN (+CME ERROR: 14). The SIM is now blocked: it needs its PUK from the carrier. "
+                        + "RMNet does not enter PUKs.", "pinSentence: SIM busy, now blocked")
+        expectEqual(refusedWith(busy, noSim), "The modem did not take the PIN (+CME ERROR: 14). SIM: not inserted.",
+                    "pinSentence: SIM busy, another state")
+        expectEqual(refusedWith(nil, asks2),
+                    "The modem did not take the PIN. 2 attempts left; check them before entering it again.",
+                    "pinSentence: no refusal line")
+        expectEqual(refusedWith("+CME ERROR: 14\u{202E}", asks2),
+                    "The modem did not take the PIN (+CME ERROR: 14\u{FFFD}). 2 attempts left; check them before entering it again.",
+                    "pinSentence: the modem's line is display-safe")
         expectEqual(pinSentence(PinOutcome(accepted: true, sim: readySim)), "The SIM accepted the PIN and is ready.",
                     "pinSentence: accepted")
         expectEqual(pinSentence(PinOutcome(accepted: true, sim: nil)), "The SIM accepted the PIN.", "pinSentence: accepted, unread")

@@ -99,6 +99,23 @@ private struct RowsGrid: View {
     }
 }
 
+/// What Put Back does, as a command for a terminal (the controller's `undoCommand`), since Put Back is
+/// lost when the app quits; selectable, and never the password.
+private struct PutBackCommand: View {
+    let command: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Put Back is lost when RMNet quits. The same in a terminal:")
+                .foregroundStyle(.secondary)
+            Text(verbatim: command)
+                .font(.body.monospaced())
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
 /// A confirmation's words, taken when it opens (so a read that lands while it is open does not change
 /// what the owner is asked), and the change it confirms.
 private struct Question<Action> {
@@ -107,12 +124,13 @@ private struct Question<Action> {
     let message: String
     let confirm: String   // the confirm button's title
     var destructive = false
+    var cancelIsDefault = false   // Return cancels: the confirm button is never the default (the PIN, ruling R20)
 }
 
 /// Shows `question` as a confirmation. The tab calls `setConfirming(true)` when it opens one. Confirming
 /// calls `perform` first and then `setConfirming(false)`, so the change starts at once rather than after
 /// the read that may be due (ruling R12); the confirm button is never turned off. Confirmed, cancelled or
-/// dismissed, `closed` runs (the SIM & APN tab clears the PIN there).
+/// dismissed, `closed` runs (the SIM & APN tab clears the PIN and the last-attempt checkbox there).
 private struct Confirmation<Action>: ViewModifier {
     @Binding var question: Question<Action>?
     let controller: ModemController
@@ -134,10 +152,12 @@ private struct Confirmation<Action>: ViewModifier {
                     closed()
                     controller.setConfirming(false)
                 }
+                .keyboardShortcut(q.cancelIsDefault ? KeyboardShortcut.defaultAction : nil)
             } message: { q in
                 Text(verbatim: q.message)
             }
-            // However it closed (also without a button): the PIN cleared, and the controller reads again.
+            // However it closed (also without a button): the PIN cleared and the last-attempt checkbox
+            // unticked, and the controller reads again.
             .onChange(of: question == nil) { _, isClosed in
                 if isClosed {
                     closed()
@@ -166,13 +186,22 @@ struct NetworkTab: View {
     @ObservedObject var controller: ModemController
     @State private var question: Question<NetworkAction>? = nil
 
-    /// The picker's modes: the window's choices, then the modem's mode (or the pick) if it is another.
+    /// The picker's modes: the window's choices, then the modem's mode (or the pick) if it is another mode;
+    /// the same RATs in another order (the modem's `NR5G:LTE`) are the choice already there (sameMode).
     private var modeChoices: [String] {
         var choices = networkModeChoices
-        for mode in [controller.info?.mode, controller.pickedMode].compactMap({ $0 }) where !choices.contains(mode) {
+        for mode in [controller.info?.mode, controller.pickedMode].compactMap({ $0 })
+        where !choices.contains(where: { sameMode($0, mode) }) {
             choices.append(mode)
         }
         return choices
+    }
+
+    /// The picker's selection: the choice of the same mode as the pick (`LTE:NR5G` for the modem's
+    /// `NR5G:LTE`). Picking sets the controller's pick; Put Back still sends the modem's own string (R8).
+    private var pickedChoice: Binding<String?> {
+        Binding(get: { controller.pickedMode.map { p in modeChoices.first(where: { sameMode($0, p) }) ?? p } },
+                set: { controller.pickedMode = $0 })
     }
 
     var body: some View {
@@ -230,7 +259,7 @@ struct NetworkTab: View {
             Text("Network mode")
                 .font(.headline)
             if controller.pickedMode != nil {
-                Picker("Network mode", selection: $controller.pickedMode) {
+                Picker("Network mode", selection: pickedChoice) {
                     ForEach(modeChoices, id: \.self) { mode in
                         Text(verbatim: modeWords(mode)).tag(Optional(mode))
                     }
@@ -264,6 +293,7 @@ struct NetworkTab: View {
                 }
                 .disabled(!controller.refreshEnabled)
             }
+            if let command = controller.undoCommand { PutBackCommand(command: command) }
         }
     }
 
@@ -350,6 +380,9 @@ struct SimApnTab: View {
     @ObservedObject var controller: ModemController
     @State private var question: Question<SettingsAction>? = nil
     @State private var pin = ""   // only here; cleared when the confirmation closes or the tab goes
+    // The last-attempt checkbox (ruling R20): unticked each time it appears, and when the confirmation closes
+    // (after every Unlock… or cancel) or the tab goes.
+    @State private var lastAttempt = false
 
     private static let blockedSentence = "The SIM is blocked: it needs its PUK from the carrier, and RMNet does not enter PUKs."
     private static let applyWarning = "A wrong APN breaks the connection. Apply switches the radio off and on again "
@@ -384,11 +417,20 @@ struct SimApnTab: View {
         }
         .padding()
         .frame(minWidth: 480, minHeight: 420)
-        .modifier(Confirmation(question: $question, controller: controller, perform: perform, closed: { pin = "" }))
+        .modifier(Confirmation(question: $question, controller: controller, perform: perform, closed: {
+            pin = ""
+            lastAttempt = false
+        }))
         .onChange(of: controller.sim?.state == .pin) { _, asks in
-            if !asks { pin = "" }
+            if !asks {
+                pin = ""
+                lastAttempt = false
+            }
         }
-        .onDisappear { pin = "" }
+        .onDisappear {
+            pin = ""
+            lastAttempt = false
+        }
     }
 
     // MARK: SIM
@@ -417,8 +459,16 @@ struct SimApnTab: View {
                     .frame(width: 140)
                     .disabled(!controller.pinEnabled)
                 Button("Unlock…") { askPin() }
-                    .disabled(!controller.pinEnabled || pinProblem(pin) != nil)
+                    .disabled(!controller.pinEnabled
+                              || !unlockAllowed(pin: pin, attempts: attempts, lastAttemptTicked: lastAttempt))
                 Spacer()
+            }
+            if attempts == 1 {
+                // The last attempt needs this extra step, as `RMNet sim unlock` needs --last-attempt (ruling R20).
+                Toggle(lastAttemptChoice, isOn: $lastAttempt)
+                    .toggleStyle(.checkbox)
+                    .disabled(!controller.pinEnabled)
+                    .onAppear { lastAttempt = false }
             }
             if !pin.isEmpty, let problem = pinProblem(pin) {
                 Text(verbatim: problem)
@@ -433,10 +483,11 @@ struct SimApnTab: View {
     }
 
     private func askPin() {
-        guard controller.pinEnabled, let attempts = controller.sim?.pinAttempts, pinProblem(pin) == nil else { return }
+        guard controller.pinEnabled, let attempts = controller.sim?.pinAttempts,
+              unlockAllowed(pin: pin, attempts: attempts, lastAttemptTicked: lastAttempt) else { return }
         let q = pinQuestion(attempts: attempts)
         ask(Question(action: .pin(attempts: attempts), title: q.title, message: q.message, confirm: "Send PIN",
-                     destructive: attempts == 1))
+                     destructive: attempts == 1, cancelIsDefault: true))
     }
 
     // MARK: Data profiles
@@ -470,8 +521,7 @@ struct SimApnTab: View {
         if !settingsRead { return "Reading the settings of profile \(id)…" }
         if controller.profiles.isEmpty { return "The settings of profile \(id) have not been read." }
         guard controller.profiles.contains(where: { $0.id == id }) else { return "The modem does not list profile \(id)." }
-        let empty = ProfileSettings(type: .ipv4v6, apn: "", user: "", password: "", auth: .none)
-        return profileProblem(id, empty) ?? "The settings of profile \(id) could not be read."
+        return profileNumberProblem(id) ?? "The settings of profile \(id) could not be read."
     }
 
     @ViewBuilder private var editorSection: some View {
@@ -540,6 +590,7 @@ struct SimApnTab: View {
                 Button("Put Back…") { askPutBack() }
                     .disabled(!controller.refreshEnabled)
             }
+            if let command = controller.undoCommand { PutBackCommand(command: command) }
         }
     }
 

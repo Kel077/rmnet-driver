@@ -292,8 +292,10 @@ struct ModemControllerTests {
         formAndPick()
         enabledStates()
         modeChanges()
+        modeOrder()
         radio()
         profileChanges()
+        profileWayBack()
         queuedChanges()
         refreshing()
         nothingDone()
@@ -681,11 +683,13 @@ struct ModemControllerTests {
         rig2.fake.releaseMode(.success(ModeChange(before: "NR5G:LTE", after: "AUTO")))
         rig2.answerInfo(3, .success(network("AUTO")), "the read after the change")
         check(m.undo == .mode("NR5G:LTE"), "put back: the undo keeps the modem's own string")
+        check(m.undoCommand == "RMNet mode nr5g:lte", "put back: the window's command for a terminal (F9)",
+              "\(String(describing: m.undoCommand))")
         m.putBack()
         rig2.waitForCall(4, "the put back reaches the service")
         check(rig2.fake.calls.last == .setMode("NR5G:LTE") && m.running == .mode,
               "put back: setMode gets the modem's own string, unchanged (R8)", "\(rig2.fake.calls)")
-        check(m.result == "Putting the network mode back to NR5G and LTE…", "put back: the running sentence", m.result)
+        check(m.result == "Putting the network mode back to 5G and LTE…", "put back: the running sentence", m.result)
         rig2.fake.releaseMode(.failure(notAnswered))
         rig2.answerInfo(5, .success(network("AUTO")), "the read after the failed put back")
         check(m.result == notAnswered.message && m.resultIsFailure && m.undo == .mode("NR5G:LTE"),
@@ -697,6 +701,7 @@ struct ModemControllerTests {
         rig2.waitForCall(7, "the tab is read again after the put back")
         check(m.undo == nil && m.result == modeSentence(back) && !m.resultIsFailure && m.pickedMode == "NR5G:LTE",
               "put back: success clears the undo; its sentence; the pick is the mode put back", m.result)
+        check(m.undoCommand == nil, "put back: no command without an undo")
         rig2.fake.releaseInfo(.success(network("NR5G:LTE")))
         pump(until: { m.running == nil }, "the read comes back")
         m.putBack()
@@ -714,12 +719,40 @@ struct ModemControllerTests {
         rig3.waitForCall(2, "the change reaches the service")
         rig3.fake.releaseMode(.success(ModeChange(before: "GSM:LTE", after: "LTE")))
         rig3.answerInfo(3, .success(network("LTE")), "the read after the change")
-        check(o.undo == nil && !o.resultIsFailure, "mode: no undo when the mode before cannot be set by RMNet")
+        check(o.undo == nil && !o.resultIsFailure && o.undoCommand == nil,
+              "mode: no undo and no command when the mode before cannot be set by RMNet")
+        check(o.result == modeSentence(ModeChange(before: "GSM:LTE", after: "LTE"))
+                + " The earlier value GSM:LTE cannot be set by RMNet; set it again on the modem's console.",
+              "mode: the result line says the mode before cannot be put back by RMNet (R8)", o.result)
         o.setTabShown(nil)
     }
 
     // setRadio: its sentence, no undo of its own (an earlier one stays), the tab read again; not while
     // the window is hidden, until it shows.
+    // The same RATs in another order are the same mode (compared by canonicalMode): no change to make, and
+    // the pick follows the modem. (Put Back still sends the modem's own string: modeChanges, R8.)
+    static func modeOrder() {
+        let rig = Rig()
+        let c = rig.controller
+        c.setTabShown(.network)
+        rig.answerInfo(1, .success(network("NR5G:LTE")), "the first read")
+        check(c.pickedMode == "NR5G:LTE" && !c.modeChangeEnabled, "mode order: the modem's own value, no change")
+        c.pickedMode = "LTE:NR5G"
+        check(!c.modeChangeEnabled, "mode order: LTE:NR5G for NR5G:LTE is not a change")
+        c.changeMode()
+        settle()
+        check(rig.fake.calls.count == 1, "mode order: changeMode sends nothing for the same mode", "\(rig.fake.calls)")
+        check(c.result == "The network mode is already 5G and LTE. Nothing was changed." && c.resultIsFailure,
+              "mode order: changeMode says it is the mode already", c.result)
+        timer(of: c)?.fire()
+        rig.answerInfo(2, .success(network("AUTO")), "a read after the modem changed")
+        check(c.pickedMode == "AUTO", "mode order: the pick of the same mode in another order follows the modem",
+              "\(String(describing: c.pickedMode))")
+        c.pickedMode = "LTE"
+        check(c.modeChangeEnabled, "mode order: another mode is a change")
+        c.setTabShown(nil)
+    }
+
     static func radio() {
         let rig = Rig()
         let c = rig.controller
@@ -790,6 +823,8 @@ struct ModemControllerTests {
         check(rig.fake.calls.last == .profiles, "profile: the SIM & APN tab is read again")
         check(c.result == profileSentence(change) && !c.resultIsFailure, "profile: the success sentence", c.result)
         check(c.undo == .profile(id: 3, old), "profile: the undo holds the settings before, password included")
+        check(c.undoCommand == "RMNet apn set --apn 'CMNET' --type ipv4v6 --user 'carrier' --auth pap --password",
+              "profile: the window's command for a terminal, without the password (F9)", "\(String(describing: c.undoCommand))")
         check(c.form == applied && !c.formEdited, "profile: the form is filled with the new settings")
         rig.fake.releaseProfiles(.success(listing(three: applied)))
         rig.waitForCall(5, "sim()")
@@ -877,6 +912,82 @@ struct ModemControllerTests {
         rig.fake.releaseSim(.success(ready))
         pump(until: { c.running == nil }, "the read comes back")
         check(c.form == old && !c.formEdited, "put back: the read after it fills the form from what was read")
+        c.setTabShown(nil)
+    }
+
+    // A profile change that failed after its line may have reached the modem (ruling R19), one for each of
+    // the service's paths: its sentence, the undo set to the settings before it, and the owner's edit kept
+    // (R11) with the form's source reset, so that the earlier settings typed again count as a change.
+    static func profileWayBack() {
+        let old = ProfileSettings(type: .ipv4v6, apn: "CMNET", user: "carrier", password: "oldSecret1", auth: .pap)
+        for sentence in [
+            "It is not known whether profile 3 was changed. The modem did not answer in time. The radio was switched back on.",
+            "Profile 3 does not read back as sent: the modem now reports IPV4V6, APN \"x\", no authentication. "
+                + "The radio was switched back on.",
+            "Profile 3 could not be read back after the change. The modem did not answer in time. The radio was switched back on.",
+        ] {
+            let name = "way back after \"\(sentence.prefix(40))…\""
+            let rig = Rig()
+            rig.driver = 3
+            let c = rig.controller
+            c.setTabShown(.simAndApn)
+            rig.answerSettings(1, .success(listing(three: old)), .success(ready), "\(name): the first read")
+            c.form?.apn = "cmnet.example"
+            c.form?.password = "newSecret2"
+            let typed = c.form!
+            c.applyProfile()
+            rig.waitForCall(3, "\(name): the change")
+            rig.fake.releaseProfile(.failure(ModemFailure(message: sentence, profileBefore: old)))
+            rig.waitForCall(4, "\(name): the tab is read again")
+            check(c.result == sentence && c.resultIsFailure, "\(name): the failure's sentence", c.result)
+            check(c.undo == .profile(id: 3, old), "\(name): the undo holds the settings before, password included",
+                  "\(String(describing: c.undo))")
+            check(c.form == typed && c.formEdited, "\(name): the edit is kept (R11)")
+            rig.fake.releaseProfiles(.success(listing(three: typed)))
+            rig.waitForCall(5, "\(name): sim()")
+            rig.fake.releaseSim(.success(ready))
+            pump(until: { c.running == nil }, "\(name): the read comes back")
+            check(c.form == typed && c.formEdited && c.applyEnabled, "\(name): the read after it keeps the edit; Apply is on")
+            c.form = old
+            check(c.formEdited && c.applyEnabled, "\(name): the settings before typed again are a change Apply can make")
+            var dumped = ""
+            dump(c, to: &dumped)
+            check(!dumped.contains("oldSecret1") && !dumped.contains("newSecret2"), "\(name): a dump shows neither password")
+            c.putBack()
+            rig.waitForCall(6, "\(name): Put Back")
+            check(rig.fake.calls.last == .setProfile(3, old, redial: true), "\(name): Put Back writes the settings before")
+            rig.fake.releaseProfile(.success(ProfileChange(id: 3, before: typed, after: old, redial: .done(radioOn))))
+            rig.answerSettings(7, .success(listing(three: old)), .success(ready), "\(name): the read after Put Back")
+            check(c.undo == nil && c.form == old && !c.formEdited, "\(name): Put Back clears the undo and fills the form")
+            c.setTabShown(nil)
+        }
+
+        // Without the settings before (nothing was sent), the undo stays as it was; a Put Back that fails keeps
+        // the undo it was to apply, also when it may have changed the profile.
+        let rig = Rig()
+        rig.driver = 3
+        let c = rig.controller
+        c.setTabShown(.simAndApn)
+        rig.answerSettings(1, .success(listing(three: old)), .success(ready), "the first read")
+        c.form?.apn = "a"
+        c.applyProfile()
+        rig.waitForCall(3, "a change that sends nothing")
+        rig.fake.releaseProfile(.failure(ModemFailure(message: "Profile 3 could not be read. Nothing was changed.")))
+        rig.answerSettings(4, .success(listing(three: old)), .success(ready), "the read after it")
+        check(c.undo == nil && c.resultIsFailure, "way back: nothing sent: no undo", "\(String(describing: c.undo))")
+        let applied = c.form!
+        c.applyProfile()
+        rig.waitForCall(6, "a change made")
+        rig.fake.releaseProfile(.success(ProfileChange(id: 3, before: old, after: applied, redial: .done(radioOn))))
+        rig.answerSettings(7, .success(listing(three: applied)), .success(ready), "the read after it")
+        check(c.undo == .profile(id: 3, old), "way back: a change made sets the undo")
+        c.putBack()
+        rig.waitForCall(9, "a put back that will fail")
+        rig.fake.releaseProfile(.failure(ModemFailure(message: "It is not known whether profile 3 was changed.", profileBefore: applied)))
+        rig.answerSettings(10, .success(listing(three: applied)), .success(ready), "the read after it")
+        check(c.undo == .profile(id: 3, old) && c.resultIsFailure, "way back: a failed Put Back keeps the undo it was to apply",
+              "\(String(describing: c.undo))")
+        check(c.form == applied && !c.formEdited, "way back: an unedited form follows the read after a failed Put Back")
         c.setTabShown(nil)
     }
 
@@ -971,7 +1082,7 @@ struct ModemControllerTests {
         check(rig2.fake.calls.last == .enterPin(pin, shownAttempts: 3) && p.running == .pin,
               "queue: the attempts shown are passed unchanged, not the ones read meanwhile (R13)")
         check(p.sim == asksPin(2), "queue: the read before the PIN was applied")
-        rig2.fake.releasePin(.success(PinOutcome(accepted: false, sim: asksPin(2))))
+        rig2.fake.releasePin(.success(PinOutcome(accepted: false, sim: asksPin(2), refusal: "+CME ERROR: 16")))
         rig2.answerSettings(6, .success(listing()), .success(asksPin(2)), "the read after the PIN")
         check(keepsNoCopy(p, of: pin), "queue: no stored property holds the PIN afterwards")
         check(rig2.fake.calls.count == 7, "queue: the refused second PIN was never sent", "\(rig2.fake.calls.count)")
@@ -1100,7 +1211,7 @@ struct ModemControllerTests {
         p.enterPin(other, shownAttempts: 2)
         rig2.waitForCall(3, "the PIN reaches the service")
         check(rig2.fake.calls.last == .enterPin(other, shownAttempts: 2), "pin: 2 attempts shown, 2 passed")
-        let wrong = PinOutcome(accepted: false, sim: asksPin(1))
+        let wrong = PinOutcome(accepted: false, sim: asksPin(1), refusal: "+CME ERROR: 16")
         rig2.fake.releasePin(.success(wrong))
         rig2.waitForCall(4, "the read after the refused PIN starts")
         check(p.sim == asksPin(1) && p.pinEnabled, "pin: the SIM read with the outcome is shown at once (1 attempt left)")
@@ -1180,7 +1291,7 @@ struct ModemControllerTests {
         let edited = ProfileSettings(type: .ipv4v6, apn: "cmnet", user: "", password: "", auth: .none)
         let applied = ProfileChange(id: 1, before: profile1, after: edited, redial: .done(radioOn))
         let leftOff = ProfileChange(id: 1, before: profile1, after: edited, redial: .radioLeftOff("The modem did not answer in time."))
-        let refusedPin = PinOutcome(accepted: false, sim: asksPin(2))
+        let refusedPin = PinOutcome(accepted: false, sim: asksPin(2), refusal: "+CME ERROR: 16")
         let tick: (ModemController) -> Void = { $0.tick() }
         let apply: (ModemController) -> Void = { $0.form?.apn = "cmnet"; $0.applyProfile() }
         let changeMode: (ModemController) -> Void = { $0.pickedMode = "LTE"; $0.changeMode() }

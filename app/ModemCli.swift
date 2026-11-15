@@ -231,8 +231,8 @@ private func setMode(_ service: ModemServing, _ mode: String, _ output: (String)
     case .failure(let failure): return fail("mode", failure.message, output)
     case .success(let change):
         output("mode: \(modeSentence(change))")
-        if canonicalMode(change.before) != nil {
-            output("mode: to put it back: RMNet mode \(change.before.lowercased())")
+        if let back = modeRestoreCommand(change.before) {
+            output("mode: to put it back: \(back)")
         } else {
             output("mode: the earlier value \(modemTextSafe(change.before)) cannot be set by RMNet; "
                    + "set it again on the modem's console.")
@@ -286,6 +286,8 @@ private struct ProfileOptions {
 /// read or is empty. A password kept from the current settings is sent as it is; none is ever printed.
 private func setProfile(_ service: ModemServing, _ id: Int, _ options: ProfileOptions,
                         readSecret: (String) -> String?, _ output: (String) -> Void) -> Int32 {
+    // A driver's profile above 16 is not one AT+QICSGP can change: said before anything is read.
+    if let problem = profileNumberProblem(id) { return fail("apn", problem, output) }
     var settings: ProfileSettings
     switch service.profiles() {
     case .failure(let failure): return fail("apn", failure.message, output)
@@ -319,10 +321,14 @@ private func setProfile(_ service: ModemServing, _ id: Int, _ options: ProfileOp
         if let problem = profileProblem(id, settings) { return fail("apn", problem, output) }
     }
     switch service.setProfile(id, to: settings, redial: options.redial) {
-    case .failure(let failure): return fail("apn", failure.message, output)
+    case .failure(let failure):
+        output("apn: \(failure.message)")
+        // The change may have reached the modem: the way back all the same (ruling R19).
+        if let before = failure.profileBefore { output("apn: to put it back: \(profileRestoreCommand(before))") }
+        return 1
     case .success(let change):
         output("apn: \(profileSentence(change))")
-        output("apn: to put it back: RMNet apn set \(profileRestoreArguments(change.before))")
+        output("apn: to put it back: \(profileRestoreCommand(change.before))")
         // Changed, but the redial left the radio off: the connection is down until `RMNet radio on`.
         if case .radioLeftOff = change.redial { return 1 }
         return 0

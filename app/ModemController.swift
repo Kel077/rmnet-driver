@@ -138,15 +138,26 @@ final class ModemController: ObservableObject {
         guard changeFree, formEdited, let form else { return false }
         return profileProblem(profileID, form) == nil
     }
+    // The same RATs in another order are not a change (sameMode).
     var modeChangeEnabled: Bool {
         guard changeFree, let picked = pickedMode, canonicalMode(picked) != nil else { return false }
-        return picked != info?.mode
+        return !(info?.mode.map { sameMode(picked, $0) } ?? false)
     }
     var pinEnabled: Bool {
         guard changeFree, let sim, sim.state == .pin, let attempts = sim.pinAttempts else { return false }
         return attempts >= 1
     }
     var refreshEnabled: Bool { changeFree && !confirming }
+    /// What Put Back does, as a command for a terminal, since Put Back is lost when the app quits:
+    /// `RMNet mode <m>`, or `RMNet apn set …` (never the password: `--password` asks for it). nil without an
+    /// undo, and for a profile other than the driver's one now (`apn set` changes the driver's profile).
+    var undoCommand: String? {
+        switch undo {
+        case .mode(let before)?: return modeRestoreCommand(before)
+        case .profile(let id, let before)? where id == profileID: return profileRestoreCommand(before)
+        default: return nil
+        }
+    }
 
     private var changeFree: Bool { change == nil && !stopping }
 
@@ -250,8 +261,12 @@ final class ModemController: ObservableObject {
             info = read
             infoAt = Date()
             infoFailure = nil
-            // The pick follows the modem unless the owner picked another mode.
-            if pickedMode == nil || pickedMode == pickedFrom { setPick(read.mode) }
+            // The pick follows the modem unless the owner picked another mode (the same mode in another
+            // order, as the window's menu names it, is not another).
+            if pickedMode == nil || pickedMode == pickedFrom
+                || (pickedMode.flatMap { p in pickedFrom.map { sameMode(p, $0) } } ?? false) {
+                setPick(read.mode)
+            }
         case .failure(let failure):
             infoFailure = failure.message
         }
@@ -329,8 +344,9 @@ final class ModemController: ObservableObject {
         return true
     }
 
-    /// The quit was cancelled elsewhere (the Messages controller's call failed): working again, the shown
-    /// tab read at once. A quit of this controller that still waited is cancelled too and never answered.
+    /// The quit was cancelled elsewhere (the Messages controller's call failed; QuitGate.swift): working
+    /// again, the shown tab read at once. A quit of this controller that still waited is cancelled too and
+    /// never answered.
     func resumeAfterCancelledQuit() {
         stopping = false
         quitWaits = false
@@ -422,7 +438,9 @@ final class ModemController: ObservableObject {
         guard canonicalMode(mode) != nil else {
             return refuse("RMNet cannot set the network mode \(modemTextSafe(mode)). Nothing was changed.")
         }
-        guard mode != info?.mode else { return refuse("The network mode is already \(modeWords(mode)). Nothing was changed.") }
+        guard !(info?.mode.map { sameMode(mode, $0) } ?? false) else {
+            return refuse("The network mode is already \(modeWords(mode)). Nothing was changed.")
+        }
         guard change == nil else { return refuse(ModemController.anotherChange) }
         submit(.mode, line: "Changing the network mode to \(modeWords(mode))…",
                quitLine: "RMNet quits when the network mode has been changed.",
@@ -440,7 +458,10 @@ final class ModemController: ObservableObject {
                 undo = canonicalMode(done.before) != nil ? .mode(done.before) : nil
             }
             setPick(done.after)
-            setResult(modeSentence(done), failure: false)
+            // A mode before that RMNet cannot set again: said, as `RMNet mode` says it (ruling R8).
+            let noWayBack = puttingBack || canonicalMode(done.before) != nil ? ""
+                : " The earlier value \(modemTextSafe(done.before)) cannot be set by RMNet; set it again on the modem's console."
+            setResult(modeSentence(done) + noWayBack, failure: false)
         case .failure(let failure):
             setPick(info?.mode)
             setResult(failure.message, failure: true)
@@ -479,6 +500,14 @@ final class ModemController: ObservableObject {
             setResult(profileSentence(done), failure: !succeeded)
         case .failure(let failure):
             // The form is kept as it is (ruling R11): an edit can be corrected and applied again.
+            if let before = failure.profileBefore {
+                // The change may have reached the modem (ruling R19): the way back to the settings before it.
+                // A Put Back keeps its undo, the settings it was to restore (they would be lost otherwise). An
+                // edited form's source is no longer known to be what the modem has, so the earlier settings
+                // typed again still count as a change; an unedited form follows the next read.
+                if !puttingBack { undo = .profile(id: id, before) }
+                if formEdited { formSource = nil }
+            }
             setResult(failure.message, failure: true)
             succeeded = false
         }

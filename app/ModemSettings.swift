@@ -12,8 +12,13 @@ import Foundation
 
 // MARK: - Values
 
-/// A sentence for the owner.
-struct ModemFailure: Error, Equatable { let message: String }
+/// A sentence for the owner. A profile change that failed after its line may have reached the modem also
+/// carries the profile's settings before it (ruling R19), so that the way back can be shown; nil otherwise.
+/// Its string conversions show no password: ProfileSettings shows only whether one is set.
+struct ModemFailure: Error, Equatable {
+    let message: String
+    var profileBefore: ProfileSettings? = nil
+}
 
 /// So `error.localizedDescription` is the owner's sentence, not "The operation couldn't be completed".
 extension ModemFailure: LocalizedError { var errorDescription: String? { message } }
@@ -67,8 +72,13 @@ enum RedialResult: Equatable { case notAsked, radioWasOff, done(RadioChange), ra
 
 struct ProfileChange: Equatable { let id: Int; let before: ProfileSettings; let after: ProfileSettings; let redial: RedialResult }
 
-/// Whether the SIM took the PIN, and the SIM read again after it (nil when that read failed).
-struct PinOutcome: Equatable { let accepted: Bool; let sim: SimInfo? }
+/// Whether the SIM took the PIN, the SIM read again after it (nil when that read failed), and, when it was
+/// not taken, the modem's error line (`+CME ERROR: 16` is a wrong PIN; another, such as 14, SIM busy, is not).
+struct PinOutcome: Equatable {
+    let accepted: Bool
+    let sim: SimInfo?
+    var refusal: String? = nil
+}
 
 /// The modem over its spare AT port. Each call blocks until done; callers keep it off the main thread.
 protocol ModemServing {
@@ -107,24 +117,8 @@ private func firstAnswer(_ lines: [String], _ prefix: String) -> [String]? {
 
 // MARK: - Network mode
 
-/// What the window offers, in this order.
+/// What the window offers, in this order. canonicalMode is in ModemNetwork.swift, with modeWords.
 let networkModeChoices = ["AUTO", "LTE:NR5G", "NR5G", "LTE"]
-
-private let modeRATs = ["WCDMA", "LTE", "NR5G"]
-
-/// The mode_pref value for what the owner typed, ignoring case: `auto` alone, or RATs from `wcdma`,
-/// `lte` and `nr5g` joined by `:`, each at most once, returned in the order WCDMA, LTE, NR5G
-/// (`nr5g:lte` → `LTE:NR5G`). nil for anything else: empty, an unknown name, a repeat, `auto` with
-/// others, an empty piece.
-func canonicalMode(_ argument: String) -> String? {
-    if argument.lowercased() == "auto" { return "AUTO" }
-    var picked = Set<String>()
-    for piece in argument.lowercased().split(separator: ":", omittingEmptySubsequences: false) {
-        guard let rat = modeRATs.first(where: { $0.lowercased() == piece }), !picked.contains(rat) else { return nil }
-        picked.insert(rat)
-    }
-    return picked.isEmpty ? nil : modeRATs.filter { picked.contains($0) }.joined(separator: ":")
-}
 
 /// AT+QNWPREFCFG="mode_pref",<mode>: written to the modem's NVM, in effect at once.
 func modeCommand(_ mode: String) -> String {
@@ -162,19 +156,23 @@ func profileCommand(_ id: Int, _ s: ProfileSettings) -> String {
     "AT+QICSGP=\(id),\(s.type.rawValue),\"\(s.apn)\",\"\(s.user)\",\"\(s.password)\",\(s.auth.rawValue)"
 }
 
-private let apnRule = "An APN is at most 100 characters of ASCII letters, digits, dots, hyphens and underscores, "
-    + "and does not start or end with a dot."
+private let apnRule = "An APN is at most 100 characters of ASCII letters, digits, dots, hyphens and underscores; it does not "
+    + "start or end with a dot or a hyphen, has no two dots in a row, and has no hyphen next to a dot."
 private let userRule = "A user name is at most 127 characters of printable ASCII, without a double quote (\") or a backslash (\\)."
 private let passwordRule = "A password is at most 127 characters of printable ASCII, without a double quote (\") or a backslash (\\)."
 private let noAuthenticationRule = "With no authentication the user name and password must be empty; "
     + "choose PAP, CHAP or PAP or CHAP to use them."
 
-/// Up to 100 of ASCII letters, digits, `.`, `-`, `_`, not starting or ending with `.`; empty is allowed
-/// (the network chooses). Checked by Unicode scalar, so a combining mark is a character of its own.
+/// Up to 100 of ASCII letters, digits, `.`, `-`, `_`, in labels joined by dots, none empty and none starting
+/// or ending with `-` (3GPP TS 23.003's DNS rules, ruling R21: so `apn set --apn --no-redial` is refused);
+/// empty is allowed (the network chooses). Checked by Unicode scalar, so a combining mark is a character of
+/// its own.
 private func apnAllowed(_ apn: String) -> Bool {
     let scalars = apn.unicodeScalars
     guard scalars.count <= 100 else { return false }
-    guard scalars.first != ".", scalars.last != "." else { return false }
+    guard !scalars.isEmpty else { return true }
+    let labels = scalars.split(separator: ".", omittingEmptySubsequences: false)
+    guard labels.allSatisfy({ !$0.isEmpty && $0.first != "-" && $0.last != "-" }) else { return false }
     return scalars.allSatisfy { c in
         switch c.value {
         case 0x30...0x39, 0x41...0x5A, 0x61...0x7A: return true
@@ -190,12 +188,17 @@ private func credentialAllowed(_ value: String) -> Bool {
     return scalars.count <= 127 && scalars.allSatisfy { (0x20...0x7E).contains($0.value) && $0 != "\"" && $0 != "\\" }
 }
 
+/// nil for a profile RMNet can change (1 to 16); else the sentence.
+func profileNumberProblem(_ id: Int) -> String? {
+    (1...16).contains(id) ? nil : "Profile \(id) cannot be changed by RMNet: AT+QICSGP takes profiles 1 to 16."
+}
+
 /// nil when the settings can be sent to profile `id`; else the sentence saying which rule they break
 /// (the profile number first, then the APN, the user name, the password, then that with no authentication
 /// both are empty; never quoting the password). With authentication 0 the modem turns a profile that has a
 /// password into CHAP by itself (seen on 2026-11-15, ruling R15), so RMNet does not send such a profile.
 func profileProblem(_ id: Int, _ s: ProfileSettings) -> String? {
-    if !(1...16).contains(id) { return "Profile \(id) cannot be changed by RMNet: AT+QICSGP takes profiles 1 to 16." }
+    if let problem = profileNumberProblem(id) { return problem }
     if !apnAllowed(s.apn) { return apnRule }
     if !credentialAllowed(s.user) { return userRule }
     if !credentialAllowed(s.password) { return passwordRule }
@@ -273,6 +276,18 @@ func profileRestoreArguments(_ s: ProfileSettings) -> String {
                  "--user", shellQuoted(modemTextSafe(s.user)), "--auth", authOption(s.auth),
                  s.password.isEmpty ? "--no-password" : "--password"]
     return words.joined(separator: " ")
+}
+
+/// The command that puts a profile back to `s`, as `apn set` and the window show it: `RMNet apn set
+/// <profileRestoreArguments(s)>` (never the password: `--password` asks for it).
+func profileRestoreCommand(_ s: ProfileSettings) -> String {
+    "RMNet apn set " + profileRestoreArguments(s)
+}
+
+/// The command that puts the network mode back to `before`, as the modem gave it, lower-cased (ruling R8:
+/// `NR5G:LTE` is put back as `nr5g:lte`); nil for a value RMNet cannot set.
+func modeRestoreCommand(_ before: String) -> String? {
+    canonicalMode(before) == nil ? nil : "RMNet mode \(before.lowercased())"
 }
 
 private func orNull<T>(_ value: T?) -> Any {
@@ -454,6 +469,15 @@ func pinQuestion(attempts: Int) -> (title: String, message: String) {
     return (title: "Send the PIN to the SIM?", message: message)
 }
 
+/// The window's checkbox while the SIM has 1 PIN attempt left, its `--last-attempt` (ruling R20).
+let lastAttemptChoice = "Use the last attempt (a wrong PIN blocks the SIM until its PUK is entered)"
+
+/// Whether the window's Unlock… may be pressed: a PIN of 4 to 8 digits, at least 1 attempt left, and at the
+/// last attempt the checkbox ticked (ruling R20).
+func unlockAllowed(pin: String, attempts: Int, lastAttemptTicked: Bool) -> Bool {
+    pinProblem(pin) == nil && attempts >= 1 && (attempts > 1 || lastAttemptTicked)
+}
+
 // MARK: - After a change: the sentences
 
 /// Registered: "The radio is on; <registration words> after <n> s." (ruling R5: the words already say
@@ -509,6 +533,10 @@ func pinSentence(_ o: PinOutcome) -> String {
         if sim.state == .ready { return "The SIM accepted the PIN and is ready." }
         return "The SIM accepted the PIN (SIM: \(simStateWords(sim.state)))."
     }
+    // Only +CME ERROR: 16 (incorrect password) is the SIM refusing the PIN; another line (such as 14, SIM
+    // busy) is the modem not taking it, which may or may not have used an attempt (F10).
+    let wrongPin = o.refusal.flatMap { atFields($0, prefix: "+CME ERROR") }.flatMap { answerInt($0, 0) } == 16
+    guard wrongPin else { return pinNotTakenSentence(o) }
     guard let sim = o.sim else {
         return "The SIM refused the PIN. Its state could not be read; check the attempts left (RMNet sim) before entering it again."
     }
@@ -523,5 +551,25 @@ func pinSentence(_ o: PinOutcome) -> String {
         return "The SIM refused the PIN. \(attemptsLeft(n))."
     default:
         return "The SIM refused the PIN (SIM: \(simStateWords(sim.state)))."
+    }
+}
+
+/// A PIN not taken with a line other than +CME ERROR: 16: the line (display-safe), then the attempts left
+/// as read again, to be checked before the PIN is entered again.
+private func pinNotTakenSentence(_ o: PinOutcome) -> String {
+    let start = "The modem did not take the PIN" + (o.refusal.map { " (\(modemTextSafe($0)))" } ?? "") + "."
+    guard let sim = o.sim else {
+        return "\(start) The SIM's state could not be read; check the attempts left (RMNet sim) before entering it again."
+    }
+    switch sim.state {
+    case .puk:
+        return "\(start) The SIM is now blocked: it needs its PUK from the carrier. RMNet does not enter PUKs."
+    case .pin:
+        guard let n = sim.pinAttempts else {
+            return "\(start) The attempts left could not be read; check them (RMNet sim) before entering it again."
+        }
+        return "\(start) \(attemptsLeft(n)); check them before entering it again."
+    default:
+        return "\(start) SIM: \(simStateWords(sim.state))."
     }
 }
