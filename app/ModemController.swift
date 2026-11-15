@@ -458,9 +458,10 @@ final class ModemController: ObservableObject {
                 undo = canonicalMode(done.before) != nil ? .mode(done.before) : nil
             }
             setPick(done.after)
-            // A mode before that RMNet cannot set again: said, as `RMNet mode` says it (ruling R8).
+            // A mode before that RMNet cannot set again: said, with its `RMNet at` line, as `RMNet mode` says it
+            // (ruling R8).
             let noWayBack = puttingBack || canonicalMode(done.before) != nil ? ""
-                : " The earlier value \(modemTextSafe(done.before)) cannot be set by RMNet; set it again on the modem's console."
+                : " The earlier value \(modemTextSafe(done.before)) \(modeAtWayBack(done.before))"
             setResult(modeSentence(done) + noWayBack, failure: false)
         case .failure(let failure):
             setPick(info?.mode)

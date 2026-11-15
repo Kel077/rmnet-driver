@@ -8,7 +8,9 @@
 #   scripts/soak.sh --classify <file> [<exit status>]
 #                                 (prints the status class, below, that a sample gets when
 #                                 `RMNet status --json` printed <file> and exited with <exit status>,
-#                                 0 if not given, and exits 0; it reads nothing else and sends nothing)
+#                                 0 if not given, and exits 0; besides <file> it reads only
+#                                 config.local, through scripts/config.sh, as every run does (a
+#                                 malformed one refuses, exit 2), and it sends nothing)
 #
 # <minutes> may have a fraction (0.5 is 30 s); the run lasts that many minutes rounded to the second.
 #

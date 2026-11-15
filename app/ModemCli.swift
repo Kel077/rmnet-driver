@@ -7,9 +7,11 @@
 //
 // Each verb prints lines starting `<verb>: ` (the `network` rows and the `apn` profile lines aside; `usbmode`
 // prints `usb mode: `, `usb mode set to …`, its other-mode warning and `cancelled; nothing changed`; `bands`
-// prints `<RAT>: …` and its indented `supported: …`, and `<RAT> bands: …` and `<RAT> bands set to …`) and
-// returns 0, or 1 after a failure, printed as one line `<verb>: <sentence>` (a `bands reset` of all three that
-// stops at a failure adds `bands: not reset: …`). `at` prints the modem's answer as
+// prints `<RAT>: …` and its indented `supported: …`, and `<RAT> bands: …` and `<RAT> bands set to …`). The exit
+// codes: 0 on success; 1 after a failure, printed as one line `<verb>: <sentence>` (a `bands reset` of all three
+// that stops at a failure adds `bands: not reset: …`), or the modem's error line for `at`; 2 for wrong usage
+// (main.swift, which never opens the port), for `at` refusing its command (nothing sent), and for `usbmode set`
+// with no terminal to ask on before a restart (nothing changed). `at` prints the modem's answer as
 // an AT terminal shows it, and its own lines (`at: …`) on standard error: see `sendAt`. A password or PIN goes
 // from readSecret to the service and nowhere else: no line printed holds one. Nothing here logs.
 import Foundation
@@ -342,7 +344,8 @@ private func showMode(_ service: ModemServing, _ output: (String) -> Void) -> In
     }
 }
 
-/// The change, then the way back (ruling R8): a mode RMNet can set again is put back as the modem gave it.
+/// The change, then the way back (ruling R8): a mode RMNet can set again is put back as the modem gave it;
+/// another, with its AT command for `RMNet at` (modeAtWayBack).
 private func setMode(_ service: ModemServing, _ mode: String, _ output: (String) -> Void) -> Int32 {
     switch service.setMode(mode) {
     case .failure(let failure): return fail("mode", failure.message, output)
@@ -351,8 +354,7 @@ private func setMode(_ service: ModemServing, _ mode: String, _ output: (String)
         if let back = modeRestoreCommand(change.before) {
             output("mode: to put it back: \(back)")
         } else {
-            output("mode: the earlier value \(modemTextSafe(change.before)) cannot be set by RMNet; "
-                   + "set it again on the modem's console.")
+            output("mode: the earlier value \(modemTextSafe(change.before)) \(modeAtWayBack(change.before))")
         }
         return 0
     }
@@ -625,7 +627,8 @@ private func changeBands(_ service: ModemServing, _ rats: [BandRat], _ output: (
 }
 
 /// One AT command, its answer printed as an AT terminal shows it: each answer line on standard output, then
-/// `OK`, exit 0; the modem's error line (`ERROR`, `+CME ERROR: …`, `+CMS ERROR: …`) on standard output, exit 1.
+/// `OK`, exit 0; the modem's error line (`ERROR`, `+CME ERROR: …`, `+CMS ERROR: …`, or another V.250 final
+/// result such as `NO CARRIER`, which `ATA` gives at once with no call) on standard output, exit 1.
 /// On standard error, exit 1: `at: no answer in <n> s` (the timeout given), or `at: <sentence>` for any
 /// other failure. What the modem sends is printed display-safe, as all text from it (`modemTextSafe`); the
 /// line sent and its answer go to the terminal only, never to a log.
@@ -649,11 +652,43 @@ private func sendAt(_ service: ModemServing, _ line: String, timeout: Int, _ out
     }
 }
 
-/// Shows `question` on the terminal (no line end after it) and reads one line. nil, asking nothing, when
-/// standard input is not a terminal; "" at the end of input (Ctrl-D), which the caller takes as no.
+/// Shows `question` on the terminal (no line end after it) and reads one line from standard input. nil, asking
+/// nothing, when standard input is not a terminal; "" at the end of input (Ctrl-D), which the caller takes as
+/// no. The question goes to /dev/tty, as readSecret's prompt does, so it is seen also when standard output is
+/// piped; to standard output when /dev/tty cannot be opened or written.
 func askOnTerminal(_ question: String) -> String? {
-    guard isatty(0) == 1 else { return nil }
-    print(question, terminator: "")
-    fflush(stdout)
-    return readLine(strippingNewline: true) ?? ""
+    askOnTerminal(question, inputIsTerminal: isatty(0) == 1, terminal: writeToTerminal,
+                  output: { text in
+                      print(text, terminator: "")
+                      fflush(stdout)
+                  },
+                  readAnswer: { readLine(strippingNewline: true) })
+}
+
+/// askOnTerminal's steps, each given (the tests give fakes): whether standard input is a terminal; `terminal`
+/// writes the question to /dev/tty and says whether it could; `output` writes it to standard output instead;
+/// `readAnswer` reads one line from standard input (nil at its end).
+func askOnTerminal(_ question: String, inputIsTerminal: Bool, terminal: (String) -> Bool, output: (String) -> Void,
+                   readAnswer: () -> String?) -> String? {
+    guard inputIsTerminal else { return nil }
+    if !terminal(question) { output(question) }
+    return readAnswer() ?? ""
+}
+
+/// Writes `text` to /dev/tty, the process's controlling terminal. false, with nothing written, when /dev/tty
+/// does not open (no controlling terminal) or its first write fails; a write cut short later is not repeated
+/// on standard output.
+private func writeToTerminal(_ text: String) -> Bool {
+    let fd = open("/dev/tty", O_WRONLY | O_NOCTTY | O_CLOEXEC)
+    guard fd >= 0 else { return false }
+    defer { close(fd) }
+    let bytes = Array(text.utf8)
+    var done = 0
+    while done < bytes.count {
+        let n = bytes[done...].withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+        if n < 0 && errno == EINTR { continue }
+        if n <= 0 { return done > 0 }
+        done += n
+    }
+    return true
 }

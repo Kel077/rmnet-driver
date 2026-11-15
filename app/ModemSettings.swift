@@ -533,6 +533,28 @@ func modeRestoreCommand(_ before: String) -> String? {
     canonicalMode(before) == nil ? nil : "RMNet mode \(before.lowercased())"
 }
 
+/// The `RMNet at` line that sets the network mode to `before` as it is: `RMNet at '<modeCommand(before)>'`.
+/// nil unless `before` is printable ASCII without quotes, so that it goes into the shell's single quotes and
+/// the AT line unchanged, and `RMNet at` would send that line as it is: not empty, no space at its end (the
+/// verb drops it), and a line `atCommandProblem` accepts.
+func modeAtRestoreCommand(_ before: String) -> String? {
+    let command = modeCommand(before)
+    guard !before.isEmpty, !before.hasSuffix(" "),
+          before.unicodeScalars.allSatisfy({ (0x20...0x7E).contains($0.value) && $0 != "\"" && $0 != "'" }),
+          atCommandProblem(command) == nil else { return nil }
+    return "RMNet at '\(command)'"
+}
+
+/// The way back from a mode change for an earlier value RMNet's `mode` cannot set (modeRestoreCommand is nil,
+/// ruling R8), to follow a phrase naming that value: `cannot be set by RMNet; to put it back: <its RMNet at
+/// line>`, or, without such a line, `cannot be set by RMNet; set it again with RMNet at
+/// 'AT+QNWPREFCFG="mode_pref",<value>'`, `<value>` as written. No period after it: one would join the
+/// pasted command's last word.
+func modeAtWayBack(_ before: String) -> String {
+    if let line = modeAtRestoreCommand(before) { return "cannot be set by RMNet; to put it back: \(line)" }
+    return "cannot be set by RMNet; set it again with RMNet at '\(modeCommand("<value>"))'"
+}
+
 private func orNull<T>(_ value: T?) -> Any {
     if let value { return value }
     return NSNull()
@@ -665,11 +687,12 @@ func radioOffQuestion() -> (title: String, message: String) {
 }
 
 /// The way back from a mode change: for any mode `canonicalMode` accepts, which the service sends in the
-/// modem's own order (ruling R8: `NR5G:LTE` is put back as `NR5G:LTE`); not for another value.
+/// modem's own order (ruling R8: `NR5G:LTE` is put back as `NR5G:LTE`); for another value, its `RMNet at`
+/// line (modeAtWayBack).
 private func modeWayBack(_ from: String?) -> String {
     guard let from else { return "After the change, RMNet says how to put the earlier mode back." }
     guard canonicalMode(from) != nil else {
-        return "RMNet cannot set \(from) again; to put it back, set it again on the modem's console."
+        return "The current mode \(modemTextSafe(from)) \(modeAtWayBack(from))"
     }
     return "To put it back, press Put Back in the window or run `RMNet mode \(from.lowercased())`."
 }

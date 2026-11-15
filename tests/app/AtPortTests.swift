@@ -104,6 +104,39 @@ struct AtPortTests {
         expect("AT+X\r\r\nERROR\r\n", echo: "AT+X", .modemError("ERROR"), "ERROR ends it")
         expect("AT\r\r\nOK\r\n+CMTI: \"ME\",1\r\n", echo: "AT", .answer([]), "bytes after the final result are ignored")
 
+        // --- V.250's other final results: each ends the answer as the modem's error line ------------
+        // (`RMNet at ATA` with no call: NO CARRIER at once, not a wait for OK until the timeout.)
+        for final in ["NO CARRIER", "BUSY", "NO ANSWER", "NO DIALTONE"] {
+            expect("ATA\r\r\n\(final)\r\n", echo: "ATA", .modemError(final), "\(final) ends it")
+            expect("ATA\r\r\n+X: 1\r\n\r\n\(final)\r\n", echo: "ATA", .modemError(final),
+                   "\(final) after an answer line ends it as an error")
+            expect("\r\n\(final)\r\n", echo: nil, .modemError(final), "no echo: \(final) ends it")
+            expect("AT+CMGS=23\r\r\n\(final)\r\n", echo: "AT+CMGS=23", prompt: true, .modemError(final),
+                   "\(final) instead of the prompt")
+            expectAfterPayload("\r\n\(final)\r\n", payload: "0011000B916407281553F80000AA0AE8329BFD4697D9EC37",
+                               .modemError(final), "\(final) after a payload")
+            expect("\r\n\(final)\r\nATA\r\r\nOK\r\n", echo: "ATA", .answer([]), "a late \(final) before the echo is discarded")
+            expect("ATA\r\r\n \(final) \r\n", echo: "ATA", .modemError(final), "\(final) with spaces around it ends it")
+            expectProbe(["\r\n\(final)\r\n", "AT\r\r\nOK\r\n", "AT\r\r\nOK\r\n"],
+                        [.probeAgain, .probeAgain, .settled(echoes: true)],
+                        "a late \(final) before the probe makes it probe again, not fail")
+        }
+        expect("AT+X\r\r\nNO CARRIERS\r\n+X: BUSY\r\nBUSY LINE\r\nNO ANSWER YET\r\nNO DIALTONE!\r\nNO  CARRIER\r\nno carrier\r\nOK\r\n",
+               echo: "AT+X",
+               .answer(["NO CARRIERS", "+X: BUSY", "BUSY LINE", "NO ANSWER YET", "NO DIALTONE!", "NO  CARRIER", "no carrier"]),
+               "the other final results inside other text, or in another case, do not end the answer")
+        // OK, ERROR, +CME ERROR and +CMS ERROR as before.
+        for (line, want) in [("OK", AtAnswerCollector.Outcome.answer(["+X: 1"])), ("ERROR", .modemError("ERROR")),
+                             ("+CME ERROR: 10", .modemError("+CME ERROR: 10")),
+                             ("+CMS ERROR: 500", .modemError("+CMS ERROR: 500"))] {
+            expect("AT+X\r\r\n+X: 1\r\n\r\n\(line)\r\nNO CARRIER\r\n", echo: "AT+X", want,
+                   "\(line) still ends it; a NO CARRIER after it is ignored")
+        }
+        check(["NO CARRIER", "BUSY", "NO ANSWER", "NO DIALTONE", "ERROR", "+CME ERROR: 3", "+CMS ERROR: 500"]
+                .allSatisfy(AtAnswerCollector.isErrorResult)
+              && !["OK", "CONNECT", "RING", "NO CARRIERS", "+X: BUSY", ""].contains(where: AtAnswerCollector.isErrorResult),
+              "isErrorResult: the error final results, and nothing else")
+
         // --- the prompt ----------------------------------------------------------------------------
         expect("AT+CMGS=23\r\r\n> ", echo: "AT+CMGS=23", prompt: true, .prompt, "prompt after the echo")
         expect("\r\n> ", echo: "AT+CMGS=23", prompt: true, .waiting, "a prompt before the echo is not taken")
@@ -137,6 +170,8 @@ struct AtPortTests {
         // --- a port that does not echo ---------------------------------------------------------------
         expect("\r\nQuectel\r\nRM520N-GL\r\n\r\nOK\r\n", echo: nil, .answer(["Quectel", "RM520N-GL"]), "no echo: answer")
         expect("\r\n+CME ERROR: 10\r\n", echo: nil, .modemError("+CME ERROR: 10"), "no echo: error")
+        expect("\r\nERROR\r\n", echo: nil, .modemError("ERROR"), "no echo: ERROR")
+        expect("\r\n+CMS ERROR: 500\r\n", echo: nil, .modemError("+CMS ERROR: 500"), "no echo: +CMS ERROR")
         expect("\r\n> ", echo: nil, prompt: true, .prompt, "no echo: prompt")
 
         // --- learning whether the port echoes: two agreeing probes -------------------------------

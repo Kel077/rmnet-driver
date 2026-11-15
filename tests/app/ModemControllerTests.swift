@@ -737,9 +737,28 @@ struct ModemControllerTests {
         check(o.undo == nil && !o.resultIsFailure && o.undoCommand == nil,
               "mode: no undo and no command when the mode before cannot be set by RMNet")
         check(o.result == modeSentence(ModeChange(before: "GSM:LTE", after: "LTE"))
-                + " The earlier value GSM:LTE cannot be set by RMNet; set it again on the modem's console.",
-              "mode: the result line says the mode before cannot be put back by RMNet (R8)", o.result)
+                + " The earlier value GSM:LTE cannot be set by RMNet; "
+                + "to put it back: RMNet at 'AT+QNWPREFCFG=\"mode_pref\",GSM:LTE'",
+              "mode: the result line says the mode before cannot be put back by RMNet, and its AT command (R8)", o.result)
         o.setTabShown(nil)
+
+        // An earlier value that is not printable ASCII without quotes: the AT command with `<value>` as written.
+        let rig4 = Rig()
+        let q = rig4.controller
+        q.setTabShown(.network)
+        rig4.answerInfo(1, .success(network("GSM\"LTE")), "a mode with a quote")
+        q.pickedMode = "LTE"
+        q.changeMode()
+        rig4.waitForCall(2, "the change reaches the service")
+        rig4.fake.releaseMode(.success(ModeChange(before: "GSM\"LTE", after: "LTE")))
+        rig4.answerInfo(3, .success(network("LTE")), "the read after the change")
+        check(q.undo == nil && !q.resultIsFailure && q.undoCommand == nil,
+              "mode: no undo and no command when the mode before has a quote")
+        check(q.result == modeSentence(ModeChange(before: "GSM\"LTE", after: "LTE"))
+                + " The earlier value GSM\"LTE cannot be set by RMNet; "
+                + "set it again with RMNet at 'AT+QNWPREFCFG=\"mode_pref\",<value>'",
+              "mode: a value that cannot go into the command is written <value> (R8)", q.result)
+        q.setTabShown(nil)
     }
 
     // setRadio: its sentence, no undo of its own (an earlier one stays), the tab read again; not while

@@ -96,7 +96,7 @@ ping -c 3 -b en33 1.1.1.1       # bound to the port, whatever the service order
 | `RMNet deactivate` | Remove the driver; macOS asks for an administrator's password (below). |
 
 - The modem commands (`sms`, `network`, `radio`, `mode`, `bands`, `apn`, `sim`, `usbmode`, `at`) use the modem's spare AT port, USB interface 3. They exit 0 on success, 1 on a failure (one line saying why) and 2 on wrong usage; `usbmode set` also exits 2, changing nothing, when it has no terminal to ask on (run from a script, give it `--yes`). `at` prints the modem's error line as its answer (exit 1), and its own refusals (exit 2, nothing sent) and failures on standard error.
-- Ctrl-C does not interrupt a command that changes the modem (except at a password or PIN prompt, before anything is sent), so a redial is never cut short with the radio off. `RMNet at` is not one of them: Ctrl-C stops it, though a command already sent may still be carried out.
+- Ctrl-C does not interrupt `sms send` or a command that changes the modem (`radio on|off`, `mode <value>`, `apn set`, `sim unlock`, `usbmode set`, `bands set`, `bands reset`), except at a password or PIN prompt, before anything is sent, so a message is never left half sent and a redial is never cut short with the radio off. `RMNet at` is not one of them: Ctrl-C stops it, though a command already sent may still be carried out.
 - RMNet never logs or writes to disk message texts, phone numbers, passwords, PINs, your position, or what `RMNet at` sends and prints.
 - Every option and every line each command prints is in [docs/reference.md](docs/reference.md), "Driver".
 

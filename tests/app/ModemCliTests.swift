@@ -532,8 +532,19 @@ struct ModemCliTests {
         fake.modeResult = .success(ModeChange(before: "GSM:LTE", after: "LTE"))
         expectLines(run(["mode", "lte"], fake, "mode lte from GSM:LTE"),
                     ["mode: " + modeSentence(ModeChange(before: "GSM:LTE", after: "LTE")),
-                     "mode: the earlier value GSM:LTE cannot be set by RMNet; set it again on the modem's console."],
-                    code: 0, "mode: an earlier value RMNet cannot set (R8)")
+                     "mode: the earlier value GSM:LTE cannot be set by RMNet; "
+                        + "to put it back: RMNet at 'AT+QNWPREFCFG=\"mode_pref\",GSM:LTE'"],
+                    code: 0, "mode: an earlier value RMNet cannot set (R8): its AT command, the value filled in")
+        // A value that is not printable ASCII without quotes: the command with `<value>` as written.
+        for (before, shown) in [("GSM:\u{FFFD}", "GSM:\u{FFFD}"), ("GSM\"LTE", "GSM\"LTE"), ("it's", "it's")] {
+            fake = FakeModem()
+            fake.modeResult = .success(ModeChange(before: before, after: "LTE"))
+            expectLines(run(["mode", "lte"], fake, "mode lte from \(before)"),
+                        ["mode: " + modeSentence(ModeChange(before: before, after: "LTE")),
+                         "mode: the earlier value \(shown) cannot be set by RMNet; "
+                            + "set it again with RMNet at 'AT+QNWPREFCFG=\"mode_pref\",<value>'"],
+                        code: 0, "mode: an earlier value \(before.debugDescription) is not filled in")
+        }
         fake = FakeModem()
         fake.modeResult = .failure(ModemFailure(message: "Fake: refused. It was AUTO."))
         expectLines(run(["mode", "nr5g"], fake, "mode nr5g failed"), ["mode: Fake: refused. It was AUTO."], code: 1,
@@ -1068,11 +1079,13 @@ struct ModemCliTests {
         expectOutput(run(["at", "AT+CMGL=4"], fake, "at, unsafe text"), out: ["a\u{FFFD}b\u{FFFD}c", "OK"], err: [], code: 0,
                      "at: an answer line is made display-safe")
 
-        // The modem's error line: on standard output, as an AT terminal shows it; exit 1.
-        for errorLine in ["ERROR", "+CME ERROR: 10", "+CMS ERROR: 500"] {
+        // The modem's error line: on standard output, as an AT terminal shows it; exit 1. V.250's other final
+        // results (AtPort ends the answer on them) are such lines too: `RMNet at ATA` with no call prints
+        // NO CARRIER.
+        for errorLine in ["ERROR", "+CME ERROR: 10", "+CMS ERROR: 500", "NO CARRIER", "BUSY", "NO ANSWER", "NO DIALTONE"] {
             fake = FakeModem()
             fake.atResult = .failure(ModemFailure(message: errorLine, atKind: .modemError))
-            expectOutput(run(["at", "AT+QGPS=1"], fake, "at, \(errorLine)"), out: [errorLine], err: [], code: 1,
+            expectOutput(run(["at", "ATA"], fake, "at, \(errorLine)"), out: [errorLine], err: [], code: 1,
                          "at: \(errorLine) on standard output, exit 1")
         }
 
@@ -1254,6 +1267,41 @@ struct ModemCliTests {
         let unread = run(["usbmode", "set", "ecm", "--yes"], fake, answer: "y", "set ecm, read failed")
         expectLines(unread, ["usb mode: Fake: no modem."], code: 1, "usbmode set ecm: the read failed")
         check(unread.questions.isEmpty && fake.usbModesSet.isEmpty, "usbmode set ecm: the read failed, nothing asked or set")
+
+        // The real `ask` (askOnTerminal), its steps injected: the question goes to /dev/tty when that opens, as
+        // the PIN prompt does (so it is seen also when standard output is piped), else to standard output as
+        // before; the answer is read from standard input, and only when standard input is a terminal.
+        func askSteps(stdinIsTerminal: Bool, ttyOpens: Bool, answer: String?) -> (got: String?, steps: [String]) {
+            var steps: [String] = []
+            let got = askOnTerminal(question, inputIsTerminal: stdinIsTerminal,
+                                    terminal: { text in
+                                        steps.append(ttyOpens ? "tty: \(text)" : "tty did not open")
+                                        return ttyOpens
+                                    },
+                                    output: { text in steps.append("stdout: \(text)") },
+                                    readAnswer: {
+                                        steps.append("read")
+                                        return answer
+                                    })
+            return (got, steps)
+        }
+        let onTty = askSteps(stdinIsTerminal: true, ttyOpens: true, answer: "y")
+        check(onTty.got == "y" && onTty.steps == ["tty: \(question)", "read"],
+              "askOnTerminal: the question on /dev/tty, nothing on standard output, then the answer read",
+              "\(onTty)")
+        let noTty = askSteps(stdinIsTerminal: true, ttyOpens: false, answer: "n")
+        check(noTty.got == "n" && noTty.steps == ["tty did not open", "stdout: \(question)", "read"],
+              "askOnTerminal: /dev/tty does not open: the question on standard output, then the answer read",
+              "\(noTty)")
+        let ended = askSteps(stdinIsTerminal: true, ttyOpens: true, answer: nil)
+        check(ended.got == "" && ended.steps == ["tty: \(question)", "read"],
+              "askOnTerminal: the end of input (Ctrl-D) is an empty answer, which cancels", "\(ended)")
+        for ttyOpens in [true, false] {
+            let piped = askSteps(stdinIsTerminal: false, ttyOpens: ttyOpens, answer: "y")
+            check(piped.got == nil && piped.steps.isEmpty,
+                  "askOnTerminal: standard input not a terminal: nil, nothing shown or read (tty opens: \(ttyOpens))",
+                  "\(piped)")
+        }
     }
 
     // --- bands -----------------------------------------------------------------------------------
