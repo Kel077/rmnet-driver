@@ -170,4 +170,4 @@ The documents:
 
 ## Licence
 
-Not yet chosen; until a LICENSE file is added, all rights are reserved by the author.
+MIT; see [LICENSE](LICENSE).
