@@ -4,7 +4,8 @@
 import Foundation
 import SystemExtensions
 
-let driverID = "io.rmnetdriver.RMNet.driver"
+// The driver's bundle ID: this app's own with ".driver" (gen.rb names the two targets that way).
+let driverID = (Bundle.main.bundleIdentifier ?? "io.rmnetdriver.RMNet") + ".driver"
 
 // The CFBundleVersion of the driver embedded in this app, or nil if this binary is not running
 // from an app bundle that carries one.

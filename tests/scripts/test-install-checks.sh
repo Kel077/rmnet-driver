@@ -1,7 +1,8 @@
 #!/bin/sh
-# Tests of scripts/install-checks.sh, the two decisions scripts/install-driver.sh takes from it:
-# which listed driver versions have no kept app (missing_kept_apps), and the line about the running
-# driver (running_line). The listings under fixtures/ are in `systemextensionsctl list` format. Run by
+# Tests of scripts/install-checks.sh, the three decisions scripts/install-driver.sh takes from it:
+# whether the installed app has the configured bundle ID (installed_id_line), which listed driver
+# versions have no kept app (missing_kept_apps), and the line about the running driver
+# (running_line). The listings under fixtures/ are in `systemextensionsctl list` format. Run by
 # `make script-test`; it installs nothing and reads nothing of the system's.
 set -u
 
@@ -31,6 +32,23 @@ KEEP=$(mktemp -d "${TMPDIR:-/tmp}/install-checks.XXXXXX") || exit 1
 EMPTY_KEEP=$(mktemp -d "${TMPDIR:-/tmp}/install-checks.XXXXXX") || exit 1
 trap 'rm -rf "$KEEP" "$EMPTY_KEEP"' EXIT
 mkdir "$KEEP/RMNet-317.18.40.app"
+
+# --- installed_id_line <installed app's bundle ID> <configured bundle ID> ---
+
+# The line and the return status: "<line>|<status>".
+id_line() {
+  il=$(installed_id_line "$1" "$2")
+  echo "$il|$?"
+}
+REFUSAL_END='as configured (config.local or the environment): replacing it would leave its driver with no app that can deactivate it; see README, Removing the driver; nothing was changed'
+check "no installed app" "|0" "$(id_line '' io.rmnetdriver.RMNet)"
+check "the installed app has the configured bundle ID" "|0" "$(id_line io.rmnetdriver.RMNet io.rmnetdriver.RMNet)"
+check "the installed app has another bundle ID: refused, naming both" \
+  "the installed app's bundle ID is io.rmnetdriver.RMNet, not io.rmnetdriver.RMnet $REFUSAL_END|1" \
+  "$(id_line io.rmnetdriver.RMNet io.rmnetdriver.RMnet)"
+check "the installed app's bundle ID could not be read: refused" \
+  "the installed app's bundle ID is (none readable), not com.example.RMNet $REFUSAL_END|1" \
+  "$(id_line '(none readable)' com.example.RMNet)"
 
 # --- missing_kept_apps ---
 

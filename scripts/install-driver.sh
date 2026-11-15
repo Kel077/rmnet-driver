@@ -4,7 +4,9 @@
 # CFBundleVersion must be a valid kext version (major up to 4 digits, minor and revision up to 2),
 # so it is <days since 2026-01-01>.<hour>.<minute>, in UTC. Two installs in the same minute get the
 # same version; the script refuses the second rather than install a build the system would not load.
-# The first activation needs the owner's approval in System Settings.
+# The first activation needs the owner's approval in System Settings. The signing team and the
+# bundle IDs come from config.local or the environment (scripts/config.sh, config.example); the
+# script refuses, before anything is built, unless both are set.
 #
 # A driver can only be deactivated by an app that embeds that exact driver version, so a copy of
 # every app that asks for activation is kept in build/installed/RMNet-<version>.app (README,
@@ -15,14 +17,27 @@
 set -eu
 
 cd "$(dirname "$0")/.." || exit 1
-. ./scripts/install-checks.sh # missing_kept_apps, running_line
+. ./scripts/install-checks.sh # installed_id_line, missing_kept_apps, running_line
+. ./scripts/config.sh         # rmnet_config_require: TEAM_ID, BUNDLE_ID, DRIVER_ID
+rmnet_config_require || exit 2
 
-TEAM=ABCDE12345
 BUILD="$PWD/build/xcode-signed"
 NEW="$BUILD/Release/RMNet.app"
 APP=/Applications/RMNet.app
 KEEP="$PWD/build/installed"
-DRIVER_ID=io.rmnetdriver.RMNet.driver
+
+# The app to be replaced must have the configured bundle ID, before anything is built or changed:
+# every check below goes by $DRIVER_ID, so an app under another ID (config.local changed, or a typo)
+# would be removed without a kept copy.
+installed_id=
+if [ -e "$APP" ]; then
+  installed_id=$(/usr/bin/defaults read "$APP/Contents/Info" CFBundleIdentifier 2>/dev/null) &&
+    [ -n "$installed_id" ] || installed_id='(none readable)'
+fi
+if ! id_line=$(installed_id_line "$installed_id" "$BUNDLE_ID"); then
+  echo "install-driver: $APP: $id_line" >&2
+  exit 2
+fi
 
 now=$(date -u +%s)
 epoch=$(date -u -j -f '%Y-%m-%d %H:%M:%S' '2026-01-01 00:00:00' +%s)
@@ -82,8 +97,8 @@ if [ "$installed" = "$VERSION" ]; then
   exit 1
 fi
 
-step "generate RMNet.xcodeproj for team $TEAM"
-/usr/bin/ruby gen.rb "$TEAM"
+step "generate RMNet.xcodeproj for team $TEAM_ID, bundle ID $BUNDLE_ID"
+/usr/bin/ruby gen.rb --team "$TEAM_ID" --bundle-id "$BUNDLE_ID"
 
 step "signed build, version $VERSION"
 rm -rf "$NEW"
@@ -138,7 +153,7 @@ active=$(active_version)
 # A running RMNetDriver is not stopped by a replacement (its services refuse to terminate), so the
 # new build only loads when the modem re-enumerates. Say so rather than leave the old one running.
 step "check the running driver"
-new=$(codesign -dvvv "$APP/Contents/Library/SystemExtensions/io.rmnetdriver.RMNet.driver.dext" 2>&1 | sed -n 's/^CDHash=//p')
+new=$(codesign -dvvv "$APP/Contents/Library/SystemExtensions/$DRIVER_ID.dext" 2>&1 | sed -n 's/^CDHash=//p')
 running=$(ioreg -r -n RMNetDriver -d 1 -w0 | sed -n 's/.*"IOUserServerCDHash" = "\([0-9a-f]*\)".*/\1/p' | head -1)
 running_line "$new" "$running" "$VERSION"
 

@@ -1,6 +1,23 @@
-# The two checks of scripts/install-driver.sh that can be tested without an install, sourced by it
+# The three checks of scripts/install-driver.sh that can be tested without an install, sourced by it
 # and by tests/scripts/test-install-checks.sh (`make script-test`). Functions only: sourcing this file
 # runs nothing. Their variables start with ic_, so they do not change the caller's.
+
+# installed_id_line <installed app's bundle ID> <configured bundle ID>
+# Succeeds, printing nothing, when there is no installed app (the first argument is empty) or it has
+# the configured bundle ID. Otherwise prints the refusal line, naming both, and fails: the kept-app
+# checks below and the driver version read from the app go by the configured driver ID, so an app
+# (and its listed driver) under another ID would be replaced without a kept copy, and a second driver
+# with the same personalities activated beside it. The caller passes "(none readable)" for an app
+# whose bundle ID cannot be read, which is refused like any other.
+installed_id_line() {
+  if [ -z "$1" ] || [ "$1" = "$2" ]; then
+    return 0
+  fi
+  echo "the installed app's bundle ID is $1, not $2 as configured (config.local or the environment):" \
+    "replacing it would leave its driver with no app that can deactivate it; see README, Removing the driver;" \
+    "nothing was changed"
+  return 1
+}
 
 # missing_kept_apps <listing-text-file> <keep-dir> <driver-id>
 # Prints, one per line in listing order, every version listed for <driver-id> in the file (the output
