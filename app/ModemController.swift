@@ -1,6 +1,7 @@
 // The Network and SIM & APN tabs' state and the calls they make to the modem: reads only while a tab is
 // shown in a visible window, one call at a time, the result line of the last change, a way back (Put Back)
-// for a mode or profile change, and quitting that waits for a running call. It takes any ModemServing,
+// for a mode or profile change, the bands each RAT may use (changed or reset to every supported band), and
+// quitting that waits for a running call. It takes any ModemServing,
 // and the two AppKit calls it needs (the answer to the terminate question, the request for attention) and
 // the driver's profile number are closures given by the app delegate, so it uses no AppKit or SwiftUI and
 // is tested with a fake service (tests/app/ModemControllerTests.swift), as SmsController is.
@@ -15,7 +16,7 @@ import Foundation
 enum ModemTab: Equatable { case network, simAndApn }
 
 /// What is running on the service's queue; at most one call at a time.
-enum ModemActivity: Equatable { case reading, radio, mode, profile, pin }
+enum ModemActivity: Equatable { case reading, radio, mode, profile, pin, bands }
 
 /// The way back from the last mode or profile change: the mode before (as the modem gave it, ruling R8), or
 /// the profile's settings before, password included (in memory only).
@@ -74,6 +75,10 @@ final class ModemController: ObservableObject {
     @Published private(set) var info: NetworkInfo? = nil         // the last network read that succeeded
     @Published private(set) var infoAt: Date? = nil
     @Published private(set) var infoFailure: String? = nil       // the last network read's failure; nil after a success
+    // The last bands() that succeeded (read with each network read), in BandRat.allCases order; a RAT changed
+    // since shows the bands its change read back.
+    @Published private(set) var bands: [BandSet]? = nil
+    @Published private(set) var bandsFailure: String? = nil      // the last bands read's failure; nil after a success
     @Published private(set) var profiles: [DataProfile] = []     // the last profiles() that succeeded
     @Published private(set) var sim: SimInfo? = nil               // the last SIM read that succeeded
     @Published private(set) var settingsAt: Date? = nil           // the last settings read whose two parts succeeded
@@ -94,6 +99,7 @@ final class ModemController: ObservableObject {
 
     private static let readingQuitLine = "RMNet quits when the current request to the modem has finished."
     private static let radioOnQuitLine = "RMNet quits when the radio has been switched back on."
+    private static let bandsQuitLine = "RMNet quits when the bands have been changed."
     private static let anotherChange = "Another change to the modem has not finished yet. Nothing was changed; try again when it has."
 
     private let service: ModemServing
@@ -148,6 +154,22 @@ final class ModemController: ObservableObject {
         return attempts >= 1
     }
     var refreshEnabled: Bool { changeFree && !confirming }
+    /// Change… for a RAT's bands: once the bands are read.
+    var bandsChangeEnabled: Bool { refreshEnabled && bands != nil }
+    /// Reset for `rat`: while it does not allow every supported band.
+    func bandsResetEnabled(_ rat: BandRat) -> Bool {
+        refreshEnabled && (bandSet(rat).map(bandsLocked) ?? false)
+    }
+    /// Reset all: while any RAT does not allow every supported band.
+    var resetAllBandsEnabled: Bool { refreshEnabled && (bands?.contains(where: bandsLocked) ?? false) }
+    /// The bands sheet's Apply, for `selection` as `rat`'s bands: a change that the modem can take (at least one
+    /// band, every band supported: bandsProblem), and not the bands allowed now. Not turned off by the open
+    /// sheet itself (it is a confirmation: `setConfirming`).
+    func bandsApplyEnabled(_ rat: BandRat, _ selection: [Int]) -> Bool {
+        guard changeFree, let set = bandSet(rat) else { return false }
+        let wanted = bandSorted(selection)
+        return bandsProblem(rat, wanted, supported: set.supported) == nil && Set(wanted) != Set(set.allowed)
+    }
     /// What Put Back does, as a command for a terminal, since Put Back is lost when the app quits:
     /// `RMNet mode <m>`, or `RMNet apn set …` (never the password: `--password` asks for it). nil without an
     /// undo, and for a profile other than the driver's one now (`apn set` changes the driver's profile).
@@ -164,6 +186,11 @@ final class ModemController: ObservableObject {
     /// The driver's profile's settings in the last profiles read; nil when it is not listed or not read.
     private var driverSettings: ProfileSettings? {
         profiles.first(where: { $0.id == profileID })?.settings
+    }
+
+    /// `rat`'s bands in the last read; nil when not read.
+    private func bandSet(_ rat: BandRat) -> BandSet? {
+        bands?.first(where: { $0.rat == rat })
     }
 
     // MARK: When the modem is read
@@ -229,9 +256,9 @@ final class ModemController: ObservableObject {
         refresh()
     }
 
-    /// Reads what the shown tab needs: the Network tab networkInfo(); the SIM & APN tab profiles() then
-    /// sim(), in one block on the queue. Nothing while a call runs, no tab is shown, the window is hidden,
-    /// a confirmation is open or the app quits.
+    /// Reads what the shown tab needs: the Network tab networkInfo() then bands() (also when networkInfo()
+    /// failed); the SIM & APN tab profiles() then sim(); each in one block on the queue. Nothing while a call
+    /// runs, no tab is shown, the window is hidden, a confirmation is open or the app quits.
     func refresh() {
         guard running == nil, active, !confirming, let tab else { return }
         readWanted = false
@@ -242,7 +269,8 @@ final class ModemController: ObservableObject {
         case .network:
             queue.async {
                 let read = service.networkInfo()
-                DispatchQueue.main.async { self.finishNetwork(read) }
+                let sets = service.bands()
+                DispatchQueue.main.async { self.finishNetwork(read, sets) }
             }
         case .simAndApn:
             queue.async {
@@ -253,9 +281,16 @@ final class ModemController: ObservableObject {
         }
     }
 
-    private func finishNetwork(_ outcome: Result<NetworkInfo, ModemFailure>) {
+    private func finishNetwork(_ outcome: Result<NetworkInfo, ModemFailure>, _ sets: Result<[BandSet], ModemFailure>) {
         running = nil
         readingTab = nil
+        switch sets {
+        case .success(let read):
+            bands = read
+            bandsFailure = nil
+        case .failure(let failure):
+            bandsFailure = failure.message
+        }
         switch outcome {
         case .success(let read):
             info = read
@@ -565,8 +600,165 @@ final class ModemController: ObservableObject {
         }
     }
 
+    // MARK: The bands
+    //
+    // Never sent: an empty list or a band the modem does not support (bandsProblem, against the supported
+    // bands as last read; the service checks again against what it reads first). A change takes effect at once
+    // and the modem keeps it; it has no Put Back: Reset is the way back to every supported band.
+
+    /// Sets `rat`'s bands to `wanted`, sorted, each band once.
+    func changeBands(_ rat: BandRat, to wanted: [Int]) {
+        guard !stopping else { return }
+        guard let set = bandSet(rat) else { return refuse("The \(rat.name) bands have not been read. Nothing was changed.") }
+        let list = bandSorted(wanted)
+        if let problem = bandsProblem(rat, list, supported: set.supported) { return refuse("\(problem) Nothing was changed.") }
+        guard Set(list) != Set(set.allowed) else {
+            return refuse("The \(rat.name) bands are already \(bandsWords(list, set.supported)). Nothing was changed.")
+        }
+        guard change == nil else { return refuse(ModemController.anotherChange) }
+        runBands([BandsStep(rat: rat, bands: list, supported: set.supported)],
+                 line: "Changing the \(rat.name) bands to \(bandsWords(list, set.supported))…")
+    }
+
+    /// Sets `rat`'s bands to every band it supports.
+    func resetBands(_ rat: BandRat) {
+        guard !stopping else { return }
+        guard let set = bandSet(rat) else { return refuse("The \(rat.name) bands have not been read. Nothing was changed.") }
+        let all = bandSorted(set.supported)
+        if let problem = bandsProblem(rat, all, supported: all) { return refuse("\(problem) Nothing was changed.") }
+        guard bandsLocked(set) else {
+            return refuse("The \(rat.name) bands are already \(bandsWords(all, all)). Nothing was changed.")
+        }
+        guard change == nil else { return refuse(ModemController.anotherChange) }
+        runBands([BandsStep(rat: rat, bands: all, supported: all)],
+                 line: "Resetting the \(rat.name) bands to \(bandsWords(all, all))…")
+    }
+
+    /// Sets each RAT that does not allow every supported band to all of them, in the order LTE, 5G NSA, 5G
+    /// SA, in one change that stops at the first failure (a RAT that allows them all is left alone).
+    func resetAllBands() {
+        guard !stopping else { return }
+        guard let sets = bands else { return refuse("The bands have not been read. Nothing was changed.") }
+        let locked = BandRat.allCases.compactMap(bandSet).filter(bandsLocked)
+        guard !locked.isEmpty else {
+            return refuse("\(ratList(sets.map { $0.rat })) already allow all their supported bands. Nothing was changed.")
+        }
+        let steps = locked.map { BandsStep(rat: $0.rat, bands: bandSorted($0.supported), supported: bandSorted($0.supported)) }
+        for step in steps {
+            if let problem = bandsProblem(step.rat, step.bands, supported: step.supported) {
+                return refuse("\(problem) Nothing was changed.")
+            }
+        }
+        guard change == nil else { return refuse(ModemController.anotherChange) }
+        runBands(steps, line: "Resetting the \(ratList(steps.map { $0.rat })) bands to all supported bands…")
+    }
+
+    /// `steps` in order on the queue, one setBands each, as one change (`.bands`), stopping at the first
+    /// failure; then the result line, and the tab read again (after a failure too).
+    private func runBands(_ steps: [BandsStep], line: String) {
+        submit(.bands, line: line, quitLine: ModemController.bandsQuitLine, {
+            (service: ModemServing) -> Result<BandsOutcome, ModemFailure> in
+            var outcome = BandsOutcome()
+            for step in steps {
+                switch service.setBands(step.rat, to: step.bands) {
+                case .success(let change): outcome.done.append((step.rat, change))
+                case .failure(let failure):
+                    outcome.failed = failure
+                    return .success(outcome)
+                }
+            }
+            return .success(outcome)
+        }) { ended in
+            switch ended {
+            case .success(let outcome): self.finishBands(outcome, steps)
+            case .failure(let failure): self.finishBands(BandsOutcome(done: [], failed: failure), steps)
+            }
+        }
+    }
+
+    private func finishBands(_ outcome: BandsOutcome, _ steps: [BandsStep]) {
+        changeEnded()
+        // Each RAT set shows at once the bands its change read back (the read that follows replaces them).
+        if var sets = bands {
+            for (rat, change) in outcome.done {
+                if let i = sets.firstIndex(where: { $0.rat == rat }) {
+                    sets[i] = BandSet(rat: rat, allowed: change.after, supported: sets[i].supported)
+                }
+            }
+            bands = sets
+        }
+        let line: String
+        if steps.count == 1 {
+            let step = steps[0]
+            if let failure = outcome.failed {
+                line = failure.message
+            } else if let done = outcome.done.first?.change, done.before == done.after {
+                // The modem had them already (changed elsewhere since the last read): nothing was written.
+                line = "The \(step.rat.name) bands are already \(bandsWords(done.after, step.supported)). Nothing was changed."
+            } else {
+                line = "\(step.rat.name) bands set to \(bandsWords(outcome.done.first?.change.after ?? step.bands, step.supported))"
+            }
+        } else {
+            let reset = outcome.done.map { $0.rat }
+            let made = reset.isEmpty ? "" : "\(ratList(reset)) bands set to all supported bands"
+            if let failure = outcome.failed {
+                let notReset = steps.dropFirst(reset.count).map { $0.rat }
+                line = (made.isEmpty ? "" : "\(made). ") + "\(failure.message) Not reset: \(ratList(notReset))."
+            } else {
+                line = made
+            }
+        }
+        setResult(line, failure: outcome.failed != nil)
+        finished(succeeded: outcome.failed == nil, changed: true)
+    }
+
     private func setResult(_ line: String, failure: Bool) {
         result = line
         resultIsFailure = failure
     }
+}
+
+/// One RAT's part of a bands change: the bands it is set to, and those it supports (as last read).
+private struct BandsStep {
+    let rat: BandRat
+    let bands: [Int]       // sorted, each band once
+    let supported: [Int]
+}
+
+/// What a bands change did: the RATs set, in order, with what each read back; then the failure that stopped it.
+private struct BandsOutcome {
+    var done: [(rat: BandRat, change: BandChange)] = []
+    var failed: ModemFailure? = nil
+}
+
+// MARK: - The bands' words
+
+/// A RAT's bands as the Network tab shows them, the words `RMNet bands` prints: `all 31 supported bands
+/// allowed`, or `2 of 31 supported bands allowed: 3, 41` (compared as sets).
+func bandsSummary(_ set: BandSet) -> String {
+    let allowed = Set(set.allowed)
+    if !allowed.isEmpty && allowed == Set(set.supported) { return "all \(allowed.count) supported bands allowed" }
+    return "\(allowed.count) of \(Set(set.supported).count) supported bands allowed: \(bandListWords(set.allowed))"
+}
+
+/// A band as the bands sheet labels it, as 3GPP names it: `B3` for LTE, `n41` for 5G (NSA and SA).
+func bandLabel(_ rat: BandRat, _ band: Int) -> String {
+    rat == .lte ? "B\(band)" : "n\(band)"
+}
+
+/// The RAT does not allow every band it supports (compared as sets): Reset has something to do.
+func bandsLocked(_ set: BandSet) -> Bool {
+    Set(set.allowed) != Set(set.supported)
+}
+
+/// `3, 41`, or `all 28 supported bands` when `bands` are every one of `supported`.
+private func bandsWords(_ bands: [Int], _ supported: [Int]) -> String {
+    !bands.isEmpty && Set(bands) == Set(supported) ? "all \(Set(supported).count) supported bands" : bandListWords(bands)
+}
+
+/// `LTE`, `5G NSA and 5G SA`, `LTE, 5G NSA and 5G SA`.
+private func ratList(_ rats: [BandRat]) -> String {
+    let names = rats.map { $0.name }
+    guard let last = names.last, names.count > 1 else { return names.first ?? "" }
+    return names.dropLast().joined(separator: ", ") + " and " + last
 }
