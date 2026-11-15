@@ -20,10 +20,25 @@ func check(_ ok: Bool, _ name: String, _ detail: @autoclosure () -> String = "")
 let enabled = ExtensionEntry(version: "316.19.56", enabled: true, awaitingApproval: false, uninstalling: false)
 let attached4 = ModemState.qmi(interface: 4)
 
-func status(_ entries: [ExtensionEntry], _ modem: ModemState = attached4, attached: Bool = false,
-            _ properties: [String: String] = [:]) -> DriverStatus {
-    DriverStatus(entries: entries, modem: modem, attached: attached, properties: properties)
+func status(_ entries: [ExtensionEntry], _ modem: ModemState = attached4, model: QuectelModel? = nil,
+            attached: Bool = false, _ properties: [String: String] = [:]) -> DriverStatus {
+    DriverStatus(entries: entries, modem: modem, modemModel: model, attached: attached, properties: properties)
 }
+
+// The QMI-mode lines of the advice, word for word: for the RM520N-GL (the verb first, the two AT
+// commands as the fallback) and for any other model or none known (the two AT commands only).
+let rm520NotQMILines = [
+    "The modem is attached but not in QMI mode. Run this command in Terminal, answer y when it asks before restarting the modem, and wait for the modem to come back (RMNet is /Applications/RMNet.app/Contents/MacOS/RMNet):",
+    "RMNet usbmode set qmi",
+    "Or, from any AT terminal (RMNet has no general one), send these two AT commands, then wait for the modem to come back; unplugging it and plugging it in again does the same as the second:",
+    "AT+QCFG=\"usbnet\",0",
+    "AT+CFUN=1,1",
+]
+let otherNotQMILines = [
+    "The modem is attached but not in QMI mode. Send it these two AT commands, then wait for it to come back:",
+    "AT+QCFG=\"usbnet\",0",
+    "AT+CFUN=1,1",
+]
 
 func expectHeadline(_ s: DriverStatus, _ want: String, _ name: String) {
     let got = headline(s)
@@ -72,6 +87,29 @@ struct StatusModelTests {
         check(notQMI.contains("AT+QCFG=\"usbnet\",0"), "advice: notQMI names AT+QCFG=\"usbnet\",0", "\(notQMI)")
         check(notQMI.contains("AT+CFUN=1,1"), "advice: notQMI names AT+CFUN=1,1", "\(notQMI)")
         check(notQMI.last == alwaysLine, "advice: notQMI ends with the standing line", "\(notQMI)")
+        check(notQMI == otherNotQMILines + [alwaysLine], "advice: notQMI, model not known, gives the two AT commands only",
+              "\(notQMI)")
+
+        // The RM520N-GL (2c7c:0801, the one product the app's AT port opens): `RMNet usbmode set qmi`
+        // first, then the two AT commands as the fallback.
+        let rm520Model = quectelModel(product: 0x0801)
+        let rm520NotQMI = advice(status([enabled], .notQMI, model: rm520Model), bundledVersion: "316.19.56")
+        check(rm520NotQMI == rm520NotQMILines + [alwaysLine],
+              "advice: an RM520N-GL not in QMI mode leads with RMNet usbmode set qmi, the AT commands as the fallback",
+              "\(rm520NotQMI)")
+        check(rm520NotQMI.firstIndex(of: usbModeQmiCommand) == 1, "advice: the verb is the line after the first",
+              "\(rm520NotQMI)")
+        // Any other model: today's advice, the two AT commands only (RMNet's AT port does not open it).
+        for product in [0x0125, 0x0121, 0x0800] {
+            let other = advice(status([enabled], .notQMI, model: quectelModel(product: product)), bundledVersion: "316.19.56")
+            check(other == otherNotQMILines + [alwaysLine],
+                  "advice: model \(String(format: "%04x", product)) not in QMI mode gives the two AT commands only", "\(other)")
+            check(!other.contains { $0.contains("usbmode") }, "advice: model \(String(format: "%04x", product)) is not told usbmode",
+                  "\(other)")
+        }
+        // The model alone, without .notQMI, adds no QMI-mode line.
+        let rm520Up = advice(status([enabled], model: rm520Model, attached: true, ["RMNetState": "up"]), bundledVersion: "316.19.56")
+        check(rm520Up == [alwaysLine], "advice: an RM520N-GL in QMI mode, connected, gives only the standing line", "\(rm520Up)")
 
         let two = advice(status([enabled, ExtensionEntry(version: "316.20.1", enabled: false, awaitingApproval: false, uninstalling: false)]),
                          bundledVersion: "316.19.56")
@@ -154,6 +192,13 @@ struct StatusModelTests {
                 && !leavingNotQMI.contains { $0.contains("build/installed/") || $0.contains("Use Remove") },
               "advice: only uninstalling entries, modem not in QMI mode, ends with the removal line and names no Remove",
               "\(leavingNotQMI)")
+        check(leavingNotQMI == otherNotQMILines + [removalUnderWayLine],
+              "advice: only uninstalling entries, model not known, not in QMI mode: the AT commands, then the removal line",
+              "\(leavingNotQMI)")
+        let leavingRm520 = advice(status([leaving], .notQMI, model: quectelModel(product: 0x0801)), bundledVersion: "316.21.4")
+        check(leavingRm520 == rm520NotQMILines + [removalUnderWayLine],
+              "advice: only uninstalling entries, an RM520N-GL not in QMI mode: the verb, the fallback, then the removal line",
+              "\(leavingRm520)")
 
         // --- removalPlan, for an app carrying B = 316.21.4 (A = 316.19.56) --------------------
         let b = "316.21.4"
