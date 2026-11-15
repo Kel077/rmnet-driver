@@ -113,13 +113,16 @@ void StartIdleSuspend(IOService* service, RMNetSerial_IVars* ivars, IdleKeyKind 
     on = false;
   }
   ivars->lowPower = on;
+  // Wanted (s.ms > 0, s.text "on") but no queue to ask on: the port stays in its on state, so idle
+  // suspend is not in effect for it, and the line says that rather than s.text.
+  bool noQueue = !on && s.ms > 0;
   char how[96];
   idle_key_text(key, value, bits, how, sizeof how);
   LOG("serial %{public}s: RMNetIdleSuspendMs: %{public}s; idle suspend %{public}s (remote wakeup %u)%{public}s",
-      ivars->name, how, s.text, remoteWakeup ? 1u : 0u,
+      ivars->name, how, noQueue ? "not in effect for this port" : s.text, remoteWakeup ? 1u : 0u,
       on ? "; the low power state is asked for after Start"
-         : (s.ms > 0 ? "; not asked for: no Default queue" : ""));
-  if (!on && s.ms > 0) LOG("serial %{public}s: CopyDispatchQueue 0x%x", ivars->name, ret);
+         : (noQueue ? "; no Default queue to ask for the low power state on, so the port stays on" : ""));
+  if (noQueue) LOG("serial %{public}s: CopyDispatchQueue 0x%x", ivars->name, ret);
   if (on) AskLowPowerLater(service, ivars);
 }
 
