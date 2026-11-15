@@ -51,13 +51,13 @@
 
 **`RMNet gps` is included.** It only reads `/dev/cu.RM520N-GL-NMEA`; it never changes a modem setting (GNSS on and off stay on the owner's console). Positions are printed to the terminal only; nothing logs or stores them.
 
-**Proven compile.** A spike with the class below, built by `make driver` on 2026-11-15, compiled and linked (`** BUILD SUCCEEDED **`, `driver build ok`): `/private/tmp/claude-501/-Users-you-personal-RM520N-GL/3397de07-3dc6-4077-a22d-37ade8341883/scratchpad/spike/RMNetSerial.iig` and `RMNetSerial.cpp` (scratch; may be gone). Its override signatures are the ones in Task 2.
+**Proven compile.** A spike with the class below, built by `make driver` on 2026-11-15, compiled and linked (`** BUILD SUCCEEDED **`, `driver build ok`): `.../scratchpad/spike/RMNetSerial.iig` and `RMNetSerial.cpp` in the session's scratch directory (scratch; may be gone). Its override signatures are the ones in Task 2.
 
 ## Global Constraints
 
-- Work only in `~/personal/RM520N-GL/worktrees/serial-ports` on branch `serial-ports`. Never touch `~/personal/RM520N-GL/rmnet-driver` or `~/personal/RM520N-GL/worktrees/app-controls`.
+- Work only in `<project>/worktrees/serial-ports` on branch `serial-ports`. Never touch `<project>/rmnet-driver` or `<project>/worktrees/app-controls`.
 - No serial personality on interface 2, 3 or 4; serial personalities on interfaces 0 and 1 only.
-- Implementer subagents never install (`scripts/install-driver.sh`), never re-enumerate the modem, never send AT commands, never run `~/personal/RM520N-GL/at.py`, and never run `measure.sh` or `soak.sh` (the SIM is metered). Task 4 is the controller's, with the owner's approval.
+- Implementer subagents never install (`scripts/install-driver.sh`), never re-enumerate the modem, never send AT commands, never run the owner's own AT tool, and never run `measure.sh` or `soak.sh` (the SIM is metered). Task 4 is the controller's, with the owner's approval.
 - No sudo, no passwords, no System Settings or `sysctl` changes. Never edit or delete `build/installed/` in the main checkout.
 - Commits: only the files of the task, `git add <paths>` (never `-A`), conventional prefixes (`feat:`, `test:`, `docs:`, `chore:`), no attribution or co-author lines. Never push. If `git commit` reports `index.lock`, wait a few seconds and retry.
 - Core code (`core/`): C++17, `-Wall -Wextra -Werror -fno-exceptions -fno-rtti`, no heap, no STL; namespace `rmnet`.

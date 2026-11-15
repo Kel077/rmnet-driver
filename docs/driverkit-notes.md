@@ -4,7 +4,7 @@ Date: 2026-11-13. macOS 27.0, Xcode 27.1, DriverKit SDK 27.0, Apple silicon.
 
 This is reference material for writing the dext. Every API below was compiled and linked against DriverKit SDK 27.0 in a throwaway spike, unless it is marked **[not compiled]**. Anything marked **[runtime]** can only be settled by loading a real driver; compiling proves nothing about it.
 
-- Spike: `/private/tmp/claude-501/-Users-you--claude-spares-spare-GDJ2gj/3d0de6da-24d1-49cc-a5d9-0a21dc065501/scratchpad/dext-spike/` (`gen.rb`, `Driver/NetSpike.iig`, `Driver/NetSpike.cpp`, `Driver/Info.plist`, `Driver/Driver.entitlements`, `Host/`). It is a scratch directory and may not survive, so the examples below are copied out of it.
+- Spike: `.../scratchpad/dext-spike/`, in the session's scratch directory (`gen.rb`, `Driver/NetSpike.iig`, `Driver/NetSpike.cpp`, `Driver/Info.plist`, `Driver/Driver.entitlements`, `Host/`). It is a scratch directory and may not survive, so the examples below are copied out of it.
 - `$FW` below means `/Applications/Xcode.app/Contents/Developer/Platforms/DriverKit.platform/Developer/SDKs/DriverKit27.0.sdk/System/DriverKit/System/Library/Frameworks`. Declarations are quoted from the `.iig` files. The generated `.h` next to each one has the same declarations plus the RPC plumbing.
 - The other source of truth was macOS's own network dexts in `/System/Library/DriverExtensions/`: `com.apple.DriverKit.AppleUserECM.dext` (USB), `AppleEthernetE1000` and `AppleEthernetIXL` (PCI). I read only their `Info.plist`, entitlements, imported and exported symbol names (`nm`), and strings. **All three use the same older API shape**: uppercase `Start`/`Stop`, queues made with `Create(..., IODispatchQueue*, ...)`, and data-available handlers. The spike follows that shape because it is what ships on this OS.
 
@@ -867,7 +867,7 @@ Spike settings: those of `spike-dext/gen.rb`, plus the Core settings above. Ther
 
 ```
 cd .../scratchpad/dext-spike
-/usr/bin/ruby gen.rb ~/personal/RM520N-GL/rmnet-driver
+/usr/bin/ruby gen.rb <path of the rmnet-driver checkout>
 xcodebuild -project NetSpike.xcodeproj -target NetSpikeDriver -configuration Debug \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
 ```
@@ -1626,3 +1626,13 @@ The owner closed the lid with the modem attached and opened it again at 20:48 ("
 - **The driver:** the same instances as at the install (`RMNetDriver` 0x1001ca3a6, the serial ports 0x1001ca3a7 and 0x1001ca3a8), so no re-enumeration and no `Stop`. `RMNetSleeps` 17, `RMNetWakes` 17, `RMNetWakeRetries` 0, `RMNetUsbRecoveries` 0, `RMNetSleepLastStatus` 0, every USB error counter 0; `RMNetLastWakeUpMs` 1191 (link up 1.19 s after the last wake call); `RMNetState` `up`, `RMNetLastPowerFlags` 2.
 - **The Mac:** `en33` had a new IPv4 address (10.76.172.x, against 10.104.52.x before); pings 3 of 3 on IPv4 and IPv6; `www.apple.com` resolved through the port's own DNS server (`ipconfig getoption en33 domain_name_server`, 203.0.113.209); both serial devices present; `sms list` exit 0; `configd` up since 12:31 with no new spin report.
 - So the wake path built after 317.9.11 (hold at power off, resume and restart at power on, the retry) works across many real sleeps with the modem kept powered. Its retry branch did not run (no not-ready bus). Not seen: a re-enumeration on wake (the modem stayed powered), transfers cancelled during sleep, `Stop` while asleep.
+
+## Runtime findings (open-source cleanup, build 318.14.2, 2026-11-15 22:03)
+
+Plan `docs/superpowers/plans/2026-11-15-open-source-cleanup.md`, "After the tasks"; checked by the coordinator.
+
+- **`AT+QCFG="usbnet"` read and written, no restart** (2026-11-15 at about 20:55, on the console, USB interface 2): the read gave 0; the write `AT+QCFG="usbnet",1` answered `OK`, and the read then gave 1 (the query reports the saved value immediately after a write); the write `AT+QCFG="usbnet",0` answered `OK`, and the read gave 0. The modem was not restarted. The answer's form, `+QCFG: "usbnet",<n>`, is confirmed.
+- **Build 318.14.2**, 22:03 to 22:06 (branch `open-source` at `695e35f`; `config.local` with the owner's team and the bundle ID `io.rmnetdriver.RMNet`): installed with `scripts/install-driver.sh`, whose check of the installed app's bundle ID passed (the same ID), and loaded by `AT+CFUN=1,1` through the console. The running dext's CDHash matched the installed one; `en33` had its IPv4 address about 37 s after; pings 3 of 3 on IPv4 and IPv6.
+- **`RMNet usbmode` on the modem:** `RMNet usbmode` printed `usb mode: qmi (the RMNet driver works in this mode)`, and `RMNet usbmode --json` gave `mode` `qmi`, `value` 0, `driverWorks` true. `usbmode set qmi --yes`, and `usbmode set qmi` with no terminal, each printed `usb mode: already qmi; nothing changed` and exited 0, with no restart. `usbmode set ecm` with no terminal printed the warning for a mode other than qmi (`In ecm mode this driver does not work; …`), then the refusal line (`usb mode: no terminal to ask on, so nothing changed; …`), and exited 2; the mode stayed `qmi`.
+- **The rest:** `sms list` works; both serial ports present; `configd` steady (up since 12:31, no new report).
+- **Not run on hardware:** `usbmode set` into another mode (it would take the network port away), and the app's own `AT+CFUN=1,1` after a set. Earlier, the console's `AT+CFUN=1,1` (interface 2) answered `OK` before the modem left USB; that the app's interface 3 does the same is assumed, not seen.

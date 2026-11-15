@@ -15,7 +15,7 @@
 - Branch `driver-features`, cut from `main` at `61e2941`. Tasks run one at a time, in order, in this checkout.
 - With the shipped `driver/Info.plist`, the driver on the RM520N-GL (2c7c:0801, interface 4) behaves as today except: the held-drain restarts Task 1 adds, the new counters and properties, and the new log lines. The existing `RMNetDriver` personality stays byte-for-byte as it is; `RMNetIdleSuspendMs` is not added to it.
 - After every task: `make test`, `make driver-test`, `make check-driverkit`, `make app-test`, `make script-test` all pass (170, 7, 11 files, 150/312/129/87, 16 and 15 at the start), and `make driver` (unsigned Xcode build of the driver and app) succeeds.
-- No hardware in Tasks 1 to 3: no install, no modem reboot, no AT command, never `~/personal/RM520N-GL/at.py`, no `sudo`, no script on `en33`. Never write to `build/installed/`. Never touch `~/personal/RM520N-GL/worktrees/`.
+- No hardware in Tasks 1 to 3: no install, no modem reboot, no AT command, never the owner's own AT tool, no `sudo`, no script on `en33`. Never write to `build/installed/`. Never touch `<project>/worktrees/`.
 - Text messages and phone numbers stored in the modem are private.
 - Commit at the end of every task with the message given; no attribution lines.
 

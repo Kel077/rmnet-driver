@@ -25,10 +25,10 @@
 
 ## Global Constraints
 
-- Branch `idle-suspend`, cut from `main` at `8824d57`. Task 1 is done in the worktree `~/personal/RM520N-GL/worktrees/idle-suspend-trial` on branch `idle-suspend-trial`, Task 2 in `~/personal/RM520N-GL/worktrees/idle-suspend-driver` on branch `idle-suspend-driver`; the coordinator merges both into `idle-suspend`.
+- Branch `idle-suspend`, cut from `main` at `8824d57`. Task 1 is done in the worktree `<project>/worktrees/idle-suspend-trial` on branch `idle-suspend-trial`, Task 2 in `<project>/worktrees/idle-suspend-driver` on branch `idle-suspend-driver`; the coordinator merges both into `idle-suspend`.
 - With the shipped `driver/Info.plist` the driver behaves exactly as at `8824d57`: neither new key is in any personality, no new call is made, the trace stays silent, and `make check-driverkit` passes unchanged.
 - After every task: `make test`, `make driver-test`, `make check-driverkit`, `make app-test`, `make script-test` all pass, and `make driver` (unsigned Xcode build) succeeds.
-- No hardware in Tasks 1 and 2: no install, no activation, no modem reboot, no AT command, never `~/personal/RM520N-GL/at.py`, no `sudo`, nothing sent on `en33`. Never write to or delete from `build/installed/` (tests use their own temporary directories). Never touch `/Applications/RMNet.app`.
+- No hardware in Tasks 1 and 2: no install, no activation, no modem reboot, no AT command, never the owner's own AT tool, no `sudo`, nothing sent on `en33`. Never write to or delete from `build/installed/` (tests use their own temporary directories). Never touch `/Applications/RMNet.app`.
 - Never `ifconfig en33` (or `ifconfig` with any interface name) in the script: it can hang for minutes. Use `ifconfig -l` and `ipconfig getifaddr en33`, each under a timeout.
 - Text messages and phone numbers stored in the modem are private.
 - Commit at the end of every task with the message given; no attribution lines.
@@ -57,7 +57,7 @@
 - Produces: `scripts/power-trial.sh --test <kept app> --good <kept app> [--window <s>] [--out <dir>] [--detach] [--dry-run]`.
 
 Behaviour of `power-trial.sh`:
-1. **Refuses** (exit 2, one line on stderr, nothing changed) unless: both apps are directories inside `build/installed/` and embed `Contents/Library/SystemExtensions/io.rmnetdriver.RMNet.driver.dext` with a `CFBundleVersion`; the two versions differ; `--window` is an integer from 10 to 180 (default 60); the modem is attached (`ioreg -p IOUSB -l` shows `"idProduct" = 2049` with `"idVendor" = 11388`); the console answers `AT` with `OK` (`POST http://127.0.0.1:8730/at`, body `AT`, `/usr/bin/curl --noproxy '*' -m 10`); and `~/personal/RM520N-GL/.modem-lock` can be taken with `mkdir` (owner file: `power-trial <pid> <ISO time> test <version>`).
+1. **Refuses** (exit 2, one line on stderr, nothing changed) unless: both apps are directories inside `build/installed/` and embed `Contents/Library/SystemExtensions/io.rmnetdriver.RMNet.driver.dext` with a `CFBundleVersion`; the two versions differ; `--window` is an integer from 10 to 180 (default 60); the modem is attached (`ioreg -p IOUSB -l` shows `"idProduct" = 2049` with `"idVendor" = 11388`); the owner's console tool answers `AT` with `OK` (an HTTP `POST` to it with the body `AT`, `/usr/bin/curl --noproxy '*' -m 10`); and `<project>/.modem-lock` can be taken with `mkdir` (owner file: `power-trial <pid> <ISO time> test <version>`).
 2. `--out` defaults to `build/trials/<UTC stamp>-<test version>/` (`build/` is git-ignored). Everything below is written there: `run.log` (each step with a UTC time), `samples.tsv`, `dext.log`, `summary.txt`.
 3. `--detach` re-runs the script itself under `nohup`, in a new session (`setsid` is absent on macOS; use `nohup` with stdin from `/dev/null` and the output to `run.log`), prints the out directory, and exits 0 at once. The detached run must survive the parent shell and the Claude session ending.
 4. `--dry-run` prints each step it would take, one per line, starting `dry-run: `, and changes nothing; the refusal checks of step 1 still run, except the modem, console and lock checks, which print what they would check.
