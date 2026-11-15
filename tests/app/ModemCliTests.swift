@@ -1,5 +1,5 @@
-// Tests for app/ModemCli.swift: the command-line verbs `network`, `radio`, `mode`, `apn`, `sim`, `usbmode`
-// and `at`. The parser for every form and each wrong usage or refusal, and what each verb prints (on standard
+// Tests for app/ModemCli.swift: the command-line verbs `network`, `radio`, `mode`, `apn`, `sim`, `usbmode`,
+// `at` and `bands`. The parser for every form and each wrong usage or refusal, and what each verb prints (on standard
 // output and standard error) and returns, against a fake
 // ModemServing that records its calls and returns set results (no port is opened). The fixtures are the
 // modem's real answers (2026-11-15, firmware RM520NGLAAR03A04M4G_01.204.01.204). A password or PIN that
@@ -75,6 +75,19 @@ let fixtureProfiles: [DataProfile] = listed.map { p in
     return DataProfile(id: p.id, pdpType: p.pdpType, apn: p.apn, settings: s)
 }
 
+// The bands, as the modem answered on 2026-11-15: every supported band allowed.
+let lteSupported = [1, 2, 3, 4, 5, 7, 8, 12, 13, 14, 17, 18, 19, 20, 25, 26, 28, 29, 30, 32, 34, 38, 39, 40, 41, 42, 43,
+                    46, 48, 66, 71]
+let nrSupported = [1, 2, 3, 5, 7, 8, 12, 13, 14, 18, 20, 25, 26, 28, 29, 30, 38, 40, 41, 48, 66, 70, 71, 75, 76, 77, 78, 79]
+let lteWords = "1, 2, 3, 4, 5, 7, 8, 12, 13, 14, 17, 18, 19, 20, 25, 26, 28, 29, 30, 32, 34, 38, 39, 40, 41, 42, 43, 46, 48, "
+    + "66, 71"
+let nrWords = "1, 2, 3, 5, 7, 8, 12, 13, 14, 18, 20, 25, 26, 28, 29, 30, 38, 40, 41, 48, 66, 70, 71, 75, 76, 77, 78, 79"
+
+func bandSets(lte: [Int] = lteSupported, nsa: [Int] = nrSupported, sa: [Int] = nrSupported) -> [BandSet] {
+    [BandSet(rat: .lte, allowed: lte, supported: lteSupported), BandSet(rat: .nsa, allowed: nsa, supported: nrSupported),
+     BandSet(rat: .sa, allowed: sa, supported: nrSupported)]
+}
+
 let homeSA = Registration(status: .home, domain: "5GS")
 let radioOn = RadioChange(on: true, registration: homeSA, secondsToRegister: 12)
 let radioOff = RadioChange(on: false, registration: nil, secondsToRegister: nil)
@@ -103,6 +116,8 @@ final class FakeModem: ModemServing {
     var usbModeResult: Result<UsbModeInfo, ModemFailure> = .success(UsbModeInfo(value: 0))
     var setUsbModeResult: Result<UsbModeChange, ModemFailure>? = nil  // nil: rebooting, or set for the next restart
     var atResult: Result<[String], ModemFailure> = .success([])
+    var bandsResult: Result<[BandSet], ModemFailure> = .success(bandSets())
+    var setBandsResults: [BandRat: Result<BandChange, ModemFailure>] = [:]   // none: from the allowed list to the one asked
 
     var radioAsked: [Bool] = []
     var modesAsked: [String] = []
@@ -110,6 +125,7 @@ final class FakeModem: ModemServing {
     var pinsEntered: [(pin: String, shownAttempts: Int)] = []
     var usbModesSet: [String] = []                                    // "<mode> reboot" or "<mode> no reboot"
     var atSent: [String] = []                                         // "<line> <timeout>"
+    var bandsAsked: [String] = []                                     // "<rat> <bands joined by :>"
 
     func networkInfo() -> Result<NetworkInfo, ModemFailure> {
         events.append("networkInfo")
@@ -158,6 +174,17 @@ final class FakeModem: ModemServing {
         events.append("at")
         atSent.append("\(line) \(timeout)")
         return atResult
+    }
+    func bands() -> Result<[BandSet], ModemFailure> {
+        events.append("bands")
+        return bandsResult
+    }
+    func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure> {
+        events.append("setBands")
+        bandsAsked.append("\(rat.rawValue) \(bands.map { String($0) }.joined(separator: ":"))")
+        if let result = setBandsResults[rat] { return result }
+        let before = (try? bandsResult.get())?.first(where: { $0.rat == rat })?.allowed ?? []
+        return .success(BandChange(before: before, after: bands))
     }
 }
 
@@ -275,12 +302,14 @@ let restoreProfile1 = "apn: to put it back: RMNet apn set --apn '' --type ipv4v6
 struct ModemCliTests {
     static func main() {
         // --- the verbs and the usage -------------------------------------------------------------
-        check(modemVerbs == ["network", "radio", "mode", "apn", "sim", "usbmode", "at"], "modemVerbs", "\(modemVerbs.sorted())")
+        check(modemVerbs == ["network", "radio", "mode", "apn", "sim", "usbmode", "at", "bands"], "modemVerbs",
+              "\(modemVerbs.sorted())")
         check(modemUsage == "network [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | apn [show] [--json] | "
               + "apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] [--password | --no-password] "
               + "[--auth none|pap|chap|pap-or-chap] [--no-redial] | sim [--json] | sim unlock [--last-attempt] | "
               + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes] | "
-              + "at [--timeout <seconds>] <command>",
+              + "at [--timeout <seconds>] <command> | "
+              + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa]",
               "modemUsage: the brief's usage without the leading RMNet", modemUsage)
 
         // --- parseModem: every form --------------------------------------------------------------
@@ -375,10 +404,11 @@ struct ModemCliTests {
         // --- changesModem: exactly the changing forms --------------------------------------------
         let changing: [ModemCommand] = [.radio(on: true), .radio(on: false), .mode("LTE"), apnSet(apn: "x"),
                                         .simUnlock(lastAttempt: false), .simUnlock(lastAttempt: true),
-                                        .usbModeSet(.qmi, reboot: true, yes: false), .usbModeSet(.ecm, reboot: false, yes: true)]
+                                        .usbModeSet(.qmi, reboot: true, yes: false), .usbModeSet(.ecm, reboot: false, yes: true),
+                                        .bandsSet(.sa, [41]), .bandsSet(.lte, [3, 41]), .bandsReset(nil), .bandsReset(.nsa)]
         let reading: [ModemCommand] = [.network(json: false), .network(json: true), .radio(on: nil), .mode(nil),
                                        .apnShow(json: false), .apnShow(json: true), .sim(json: false), .sim(json: true),
-                                       .usbMode(json: false), .usbMode(json: true)]
+                                       .usbMode(json: false), .usbMode(json: true), .bands(json: false), .bands(json: true)]
         for c in changing { check(c.changesModem, "changesModem: \(c) changes the modem") }
         for c in reading { check(!c.changesModem, "changesModem: \(c) only reads") }
         // `at` sends what the owner typed, also a change such as AT+CFUN=1,1, and Ctrl-C stops it all the same.
@@ -901,6 +931,7 @@ struct ModemCliTests {
 
         usbModeVerb()
         atVerb()
+        bandsVerb()
 
         print("modem cli: \(checks) checks passed")
     }
@@ -1201,5 +1232,215 @@ struct ModemCliTests {
         let unread = run(["usbmode", "set", "ecm", "--yes"], fake, answer: "y", "set ecm, read failed")
         expectLines(unread, ["usb mode: Fake: no modem."], code: 1, "usbmode set ecm: the read failed")
         check(unread.questions.isEmpty && fake.usbModesSet.isEmpty, "usbmode set ecm: the read failed, nothing asked or set")
+    }
+
+    // --- bands -----------------------------------------------------------------------------------
+    static func bandsVerb() {
+        func warning(_ name: String, _ list: String, was: String) -> String {
+            "\(name) bands: \(list) (was \(was)); the modem may re-select a cell and drop the connection for a few seconds"
+        }
+        func joined(_ bands: [Int]) -> String { bands.map { String($0) }.joined(separator: ":") }
+        func calls(_ fake: FakeModem) -> [String] { fake.events.filter { $0 != "output" } }
+        func with(_ sets: [BandSet]) -> FakeModem {
+            let fake = FakeModem()
+            fake.bandsResult = .success(sets)
+            return fake
+        }
+        let refused = ModemFailure(message: "Fake: refused.")
+
+        // Parsing: every form.
+        expectParse(["bands"], .bands(json: false))
+        expectParse(["bands", "--json"], .bands(json: true))
+        expectParse(["bands", "set", "sa", "n41"], .bandsSet(.sa, [41]))
+        expectParse(["bands", "set", "sa", "41"], .bandsSet(.sa, [41]))
+        expectParse(["bands", "set", "lte", "3,41"], .bandsSet(.lte, [3, 41]))
+        expectParse(["bands", "set", "nsa", "41:78"], .bandsSet(.nsa, [41, 78]))
+        expectParse(["bands", "set", "sa", "n41:n78"], .bandsSet(.sa, [41, 78]))
+        expectParse(["bands", "set", "sa", "N78,n41"], .bandsSet(.sa, [41, 78]))
+        expectParse(["bands", "set", "nsa", "n78:41,N1"], .bandsSet(.nsa, [1, 41, 78]))
+        expectParse(["bands", "set", "lte", "b3,B41"], .bandsSet(.lte, [3, 41]))
+        expectParse(["bands", "set", "lte", "41,3,b3,3"], .bandsSet(.lte, [3, 41]))       // each band once, ascending
+        expectParse(["bands", "set", "lte", "99"], .bandsSet(.lte, [99]))                // not supported: the run refuses it
+        expectParse(["bands", "reset"], .bandsReset(nil))
+        expectParse(["bands", "reset", "lte"], .bandsReset(.lte))
+        expectParse(["bands", "reset", "nsa"], .bandsReset(.nsa))
+        expectParse(["bands", "reset", "sa"], .bandsReset(.sa))
+
+        // Parsing: wrong usage (exit 2, nothing opened).
+        for words in [
+            ["bands", "set"], ["bands", "set", "sa"], ["bands", "set", "xx", "41"], ["bands", "set", "sa", "n41,abc"],
+            ["bands", "reset", "foo"], ["bands", "set", "sa", "41", "78"], ["bands", "set", "sa", "41", "--json"],
+            ["bands", "reset", "lte", "sa"], ["bands", "reset", "--json"], ["bands", "--json", "--json"], ["bands", "show"],
+            ["bands", "json"], ["bands", "--json", "set", "sa", "41"], ["bands", "set", "41"], ["bands", "set", "SA", "41"],
+            ["bands", "set", "Lte", "3"], ["bands", "reset", "LTE"], ["bands", "set", "5g", "41"], ["bands", "set", "nr5g", "41"],
+            // A prefix for the other RAT: b only for lte, n only for nsa and sa.
+            ["bands", "set", "lte", "n3"], ["bands", "set", "lte", "N3"], ["bands", "set", "sa", "b41"],
+            ["bands", "set", "nsa", "B41"], ["bands", "set", "lte", "3,n41"],
+            // Not a list of band numbers.
+            ["bands", "set", "sa", ""], ["bands", "set", "sa", ","], ["bands", "set", "sa", "41,"], ["bands", "set", "sa", ",41"],
+            ["bands", "set", "sa", "41,,78"], ["bands", "set", "sa", "41::78"], ["bands", "set", "sa", "n"],
+            ["bands", "set", "sa", "nn41"], ["bands", "set", "sa", "n 41"], ["bands", "set", "sa", "4 1"],
+            ["bands", "set", "sa", "+41"], ["bands", "set", "sa", "-41"], ["bands", "set", "sa", "0"], ["bands", "set", "sa", "n0"],
+            ["bands", "set", "sa", "41;78"], ["bands", "set", "sa", "41.5"], ["bands", "set", "sa", "41n"],
+            ["bands", "set", "lte", "\u{0663}"], ["bands", "set", "sa", "99999999999999999999"], ["bands", "set", "sa", "all"],
+            ["Bands"], ["band"],
+        ] {
+            expectWrongUsage(words)
+        }
+
+        // Showing: one line per RAT, then its supported bands, indented.
+        var fake = FakeModem()
+        let shown = run(["bands"], fake, "bands")
+        expectLines(shown, ["LTE: all 31 supported bands allowed", "  supported: \(lteWords)",
+                            "5G NSA: all 28 supported bands allowed", "  supported: \(nrWords)",
+                            "5G SA: all 28 supported bands allowed", "  supported: \(nrWords)"],
+                    code: 0, "bands: every supported band allowed")
+        check(calls(fake) == ["bands"], "bands: one read, nothing set", "\(fake.events)")
+        fake = with(bandSets(lte: [3, 41], nsa: [], sa: [41]))
+        expectLines(run(["bands"], fake, "bands, locked"),
+                    ["LTE: 2 of 31 supported bands allowed: 3, 41", "  supported: \(lteWords)",
+                     "5G NSA: 0 of 28 supported bands allowed: none", "  supported: \(nrWords)",
+                     "5G SA: 1 of 28 supported bands allowed: 41", "  supported: \(nrWords)"],
+                    code: 0, "bands: locked to some bands")
+        // The same bands in another order are all of them.
+        fake = with(bandSets(lte: lteSupported.reversed()))
+        check(run(["bands"], fake, "bands, reversed").lines.first == "LTE: all 31 supported bands allowed",
+              "bands: compared as a set")
+
+        // --json: one array, a RAT an object.
+        fake = with(bandSets(sa: [41, 78]))
+        let json = run(["bands", "--json"], fake, "bands --json")
+        let want: [[String: Any]] = [["rat": "lte", "allowed": lteSupported, "supported": lteSupported],
+                                     ["rat": "nsa", "allowed": nrSupported, "supported": nrSupported],
+                                     ["rat": "sa", "allowed": [41, 78], "supported": nrSupported]]
+        let wantText = String(data: try! JSONSerialization.data(withJSONObject: want, options: [.prettyPrinted, .sortedKeys]),
+                              encoding: .utf8)!
+        expectLines(json, [wantText], code: 0, "bands --json: pretty, sorted keys")
+        if let data = json.lines.first?.data(using: .utf8),
+           let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            check(array.map { $0["rat"] as? String } == ["lte", "nsa", "sa"]
+                  && array.allSatisfy { $0.keys.sorted() == ["allowed", "rat", "supported"] }
+                  && array[2]["allowed"] as? [Int] == [41, 78] && array[0]["supported"] as? [Int] == lteSupported,
+                  "bands --json: [{\"rat\":\"lte\",\"allowed\":[…],\"supported\":[…]}, …]", json.lines[0])
+        } else {
+            check(false, "bands --json: one JSON array", linesText(json.lines))
+        }
+        for words in [["bands"], ["bands", "--json"]] {
+            fake = FakeModem()
+            fake.bandsResult = .failure(ModemFailure(message: "Fake: no modem."))
+            expectLines(run(words, fake, "\(words) failed"), ["bands: Fake: no modem."], code: 1, "\(words): a failure")
+        }
+
+        // set: the warning, the change, the result; no prompt.
+        fake = FakeModem()
+        let setSA = run(["bands", "set", "sa", "n41"], fake, answer: nil, "bands set sa n41")
+        expectLines(setSA, [warning("5G SA", "41", was: "all supported"), "5G SA bands set to 41"], code: 0, "bands set sa n41")
+        check(fake.bandsAsked == ["sa 41"], "bands set sa n41: setBands(.sa, [41])", "\(fake.bandsAsked)")
+        check(fake.events == ["bands", "output", "setBands", "output"] && setSA.questions.isEmpty,
+              "bands set sa n41: read, warn, set, say; nothing asked", "\(fake.events)")
+        fake = FakeModem()
+        expectLines(run(["bands", "set", "lte", "3,41"], fake, "bands set lte 3,41"),
+                    [warning("LTE", "3, 41", was: "all supported"), "LTE bands set to 3, 41"], code: 0, "bands set lte 3,41")
+        check(fake.bandsAsked == ["lte 3:41"], "bands set lte 3,41: setBands(.lte, [3, 41])", "\(fake.bandsAsked)")
+        fake = FakeModem()
+        expectLines(run(["bands", "set", "nsa", "78:n41,41"], fake, "bands set nsa 78:n41,41"),
+                    [warning("5G NSA", "41, 78", was: "all supported"), "5G NSA bands set to 41, 78"], code: 0,
+                    "bands set nsa: sorted, each band once")
+        check(fake.bandsAsked == ["nsa 41:78"], "bands set nsa: setBands(.nsa, [41, 78])", "\(fake.bandsAsked)")
+        fake = with(bandSets(lte: [3, 41]))
+        expectLines(run(["bands", "set", "lte", "b3"], fake, "bands set lte b3 from 3, 41"),
+                    [warning("LTE", "3", was: "3, 41"), "LTE bands set to 3"], code: 0, "bands set lte: was a list")
+
+        // Already allowed: nothing set.
+        for words in [["bands", "set", "lte", "41,3"], ["bands", "set", "lte", "b3:B41:3"]] {
+            fake = with(bandSets(lte: [3, 41]))
+            expectLines(run(words, fake, "\(words), already"), ["LTE bands: already 3, 41; nothing changed"], code: 0,
+                        "\(words): already allowed")
+            check(calls(fake) == ["bands"], "\(words): already allowed, nothing set", "\(fake.events)")
+        }
+
+        // Refused before the warning: a band the modem does not support (exit 1, nothing set).
+        fake = FakeModem()
+        expectLines(run(["bands", "set", "sa", "n99"], fake, "bands set sa n99"),
+                    ["bands: The modem does not support 5G SA band 99 (supported: \(nrWords)). Nothing was changed."],
+                    code: 1, "bands set sa n99: not supported")
+        check(calls(fake) == ["bands"], "bands set sa n99: nothing set", "\(fake.events)")
+        fake = FakeModem()
+        expectLines(run(["bands", "set", "lte", "41,9,6"], fake, "bands set lte 41,9,6"),
+                    ["bands: The modem does not support LTE bands 6, 9 (supported: \(lteWords)). Nothing was changed."],
+                    code: 1, "bands set lte 41,9,6: names the bands not supported")
+        check(fake.bandsAsked.isEmpty, "bands set lte 41,9,6: nothing set")
+
+        // Failures.
+        fake = FakeModem()
+        fake.bandsResult = .failure(ModemFailure(message: "Fake: no modem."))
+        expectLines(run(["bands", "set", "sa", "41"], fake, "bands set, read failed"),
+                    ["bands: Fake: no modem. Nothing was changed."], code: 1, "bands set: the read failed")
+        check(fake.bandsAsked.isEmpty, "bands set: the read failed, nothing set")
+        fake = FakeModem()
+        fake.setBandsResults[.sa] = .failure(refused)
+        expectLines(run(["bands", "set", "sa", "41"], fake, "bands set, refused"),
+                    [warning("5G SA", "41", was: "all supported"), "bands: Fake: refused."], code: 1, "bands set: a failure")
+        fake = FakeModem()
+        fake.setBandsResults[.sa] = .success(BandChange(before: [41], after: [41]))
+        expectLines(run(["bands", "set", "sa", "41"], fake, "bands set, unchanged meanwhile"),
+                    [warning("5G SA", "41", was: "all supported"), "5G SA bands: already 41; nothing changed"], code: 0,
+                    "bands set: the service found it already set")
+        fake = with([BandSet(rat: .lte, allowed: lteSupported, supported: lteSupported)])
+        expectLines(run(["bands", "set", "sa", "41"], fake, "bands set, no SA read"),
+                    ["bands: The modem did not report its 5G SA bands. Nothing was changed."], code: 1,
+                    "bands set: a RAT not read")
+        check(fake.bandsAsked.isEmpty, "bands set: a RAT not read, nothing set")
+
+        // reset one RAT: to every supported band.
+        fake = with(bandSets(sa: [41]))
+        expectLines(run(["bands", "reset", "sa"], fake, "bands reset sa"),
+                    [warning("5G SA", nrWords, was: "41"), "5G SA bands set to \(nrWords)"], code: 0, "bands reset sa")
+        check(fake.bandsAsked == ["sa \(joined(nrSupported))"], "bands reset sa: setBands(.sa, supported)", "\(fake.bandsAsked)")
+        fake = FakeModem()
+        expectLines(run(["bands", "reset", "lte"], fake, "bands reset lte, already"),
+                    ["LTE bands: already \(lteWords); nothing changed"], code: 0, "bands reset lte: already every band")
+        check(calls(fake) == ["bands"], "bands reset lte: already, nothing set", "\(fake.events)")
+        fake = with([BandSet(rat: .lte, allowed: [3], supported: []), BandSet(rat: .nsa, allowed: [], supported: nrSupported),
+                     BandSet(rat: .sa, allowed: [], supported: nrSupported)])
+        expectLines(run(["bands", "reset", "lte"], fake, "bands reset lte, none supported"),
+                    ["bands: At least one LTE band is needed. Nothing was changed."], code: 1,
+                    "bands reset lte: no band supported, never an empty write")
+        check(fake.bandsAsked.isEmpty, "bands reset lte: no band supported, nothing set")
+
+        // reset all: lte, nsa, sa in that order, each reported.
+        fake = with(bandSets(lte: [3, 41], sa: [41]))
+        expectLines(run(["bands", "reset"], fake, "bands reset"),
+                    [warning("LTE", lteWords, was: "3, 41"), "LTE bands set to \(lteWords)",
+                     "5G NSA bands: already \(nrWords); nothing changed",
+                     warning("5G SA", nrWords, was: "41"), "5G SA bands set to \(nrWords)"], code: 0, "bands reset: all three")
+        check(fake.bandsAsked == ["lte \(joined(lteSupported))", "sa \(joined(nrSupported))"],
+              "bands reset: lte and sa set, nsa already", "\(fake.bandsAsked)")
+        check(fake.events == ["bands", "output", "setBands", "output", "output", "output", "setBands", "output"],
+              "bands reset: one read, then each RAT in order", "\(fake.events)")
+        fake = FakeModem()
+        expectLines(run(["bands", "reset"], fake, "bands reset, already"),
+                    ["LTE bands: already \(lteWords); nothing changed", "5G NSA bands: already \(nrWords); nothing changed",
+                     "5G SA bands: already \(nrWords); nothing changed"], code: 0, "bands reset: all already")
+        check(calls(fake) == ["bands"], "bands reset: all already, nothing set", "\(fake.events)")
+
+        // reset all stops at the first failure.
+        fake = with(bandSets(lte: [3], nsa: [41], sa: [78]))
+        fake.setBandsResults[.nsa] = .failure(refused)
+        expectLines(run(["bands", "reset"], fake, "bands reset, nsa fails"),
+                    [warning("LTE", lteWords, was: "3"), "LTE bands set to \(lteWords)", warning("5G NSA", nrWords, was: "41"),
+                     "bands: Fake: refused."], code: 1, "bands reset: stops at the NSA failure")
+        check(fake.bandsAsked == ["lte \(joined(lteSupported))", "nsa \(joined(nrSupported))"],
+              "bands reset: nothing set after the failure", "\(fake.bandsAsked)")
+        fake = with(bandSets(lte: [3], nsa: [41], sa: [78]))
+        fake.setBandsResults[.lte] = .failure(refused)
+        expectLines(run(["bands", "reset"], fake, "bands reset, lte fails"),
+                    [warning("LTE", lteWords, was: "3"), "bands: Fake: refused."], code: 1, "bands reset: stops at the LTE failure")
+        check(fake.bandsAsked == ["lte \(joined(lteSupported))"], "bands reset: only LTE tried", "\(fake.bandsAsked)")
+        fake = FakeModem()
+        fake.bandsResult = .failure(ModemFailure(message: "Fake: no modem."))
+        expectLines(run(["bands", "reset"], fake, "bands reset, read failed"),
+                    ["bands: Fake: no modem. Nothing was changed."], code: 1, "bands reset: the read failed")
+        check(fake.bandsAsked.isEmpty, "bands reset: the read failed, nothing set")
     }
 }

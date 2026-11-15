@@ -1,12 +1,13 @@
 // The command-line verbs for the modem's network and settings: `network`, `radio`, `mode`, `apn`, `sim`,
-// `usbmode`, and `at`, which sends one AT command as typed. The parser (wrong usage is nil: main.swift prints
-// the usage line and exits 2 without opening the port; `at` is never nil, see `parseAt`) and what each verb
-// prints, over a `ModemServing`, the readSecret that reads a password or a PIN without echo, the question
-// asked on the terminal before a restart, and the output. Foundation only, with ModemNetwork.swift and
-// ModemSettings.swift: `make app-test` builds it with them and a fake service.
+// `usbmode`, `bands`, and `at`, which sends one AT command as typed. The parser (wrong usage is nil:
+// main.swift prints the usage line and exits 2 without opening the port; `at` is never nil, see `parseAt`) and
+// what each verb prints, over a `ModemServing`, the readSecret that reads a password or a PIN without echo, the
+// question asked on the terminal before a restart, and the output. Foundation only, with ModemNetwork.swift
+// and ModemSettings.swift: `make app-test` builds it with them and a fake service.
 //
 // Each verb prints lines starting `<verb>: ` (the `network` rows and the `apn` profile lines aside; `usbmode`
-// prints `usb mode: `, `usb mode set to …`, its other-mode warning and `cancelled; nothing changed`) and
+// prints `usb mode: `, `usb mode set to …`, its other-mode warning and `cancelled; nothing changed`; `bands`
+// prints `<RAT>: …` and its indented `supported: …`, and `<RAT> bands: …` and `<RAT> bands set to …`) and
 // returns 0, or 1 after a failure, printed as one line `<verb>: <sentence>`. `at` prints the modem's answer as
 // an AT terminal shows it, and its own lines (`at: …`) on standard error: see `sendAt`. A password or PIN goes
 // from readSecret to the service and nowhere else: no line printed holds one. Nothing here logs.
@@ -27,28 +28,32 @@ enum ModemCommand: Equatable {
     case usbModeSet(UsbNetMode, reboot: Bool, yes: Bool)    // reboot: no --no-reboot; yes: --yes
     case at(String, timeout: Int)               // one line atCommandProblem accepts; seconds, 1 to 300
     case atRefused(String)                      // `at` with a command or option it does not take: why
+    case bands(json: Bool)
+    case bandsSet(BandRat, [Int])               // the bands sorted, each once (at least one)
+    case bandsReset(BandRat?)                   // nil: lte, nsa and sa, in that order
 
-    /// Radio on or off, a mode set, apn set, sim unlock and usbmode set: main.swift ignores the stopping
-    /// signals for these. Not `at`: it sends what the owner typed, as an AT terminal would, and Ctrl-C stops
-    /// it (the modem may still carry out a command already sent).
+    /// Radio on or off, a mode set, apn set, sim unlock, usbmode set, bands set and bands reset: main.swift
+    /// ignores the stopping signals for these. Not `at`: it sends what the owner typed, as an AT terminal would,
+    /// and Ctrl-C stops it (the modem may still carry out a command already sent).
     var changesModem: Bool {
         switch self {
-        case .network, .apnShow, .sim, .usbMode, .at, .atRefused: return false
+        case .network, .apnShow, .sim, .usbMode, .at, .atRefused, .bands: return false
         case .radio(let on): return on != nil
         case .mode(let mode): return mode != nil
-        case .apnSet, .simUnlock, .usbModeSet: return true
+        case .apnSet, .simUnlock, .usbModeSet, .bandsSet, .bandsReset: return true
         }
     }
 }
 
-let modemVerbs: Set<String> = ["network", "radio", "mode", "apn", "sim", "usbmode", "at"]
+let modemVerbs: Set<String> = ["network", "radio", "mode", "apn", "sim", "usbmode", "at", "bands"]
 
 /// Appended to main.swift's usage line.
 let modemUsage = "network [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | apn [show] [--json] | "
     + "apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] [--password | --no-password] "
     + "[--auth none|pap|chap|pap-or-chap] [--no-redial] | sim [--json] | sim unlock [--last-attempt] | "
     + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes] | "
-    + "at [--timeout <seconds>] <command>"
+    + "at [--timeout <seconds>] <command> | "
+    + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa]"
 
 // MARK: - Parsing
 
@@ -85,9 +90,38 @@ func parseModem(_ words: [String]) -> ModemCommand? {
         return parseUsbModeSet(Array(rest.dropFirst()))
     case "at":
         return parseAt(rest)
+    case "bands":
+        switch rest.first {
+        case "set":
+            return parseBandsSet(Array(rest.dropFirst()))
+        case "reset":
+            switch rest.count {
+            case 1: return .bandsReset(nil)
+            case 2: return BandRat(rawValue: rest[1]).map { .bandsReset($0) }
+            default: return nil
+            }
+        default:
+            return jsonOption(rest).map { .bands(json: $0) }
+        }
     default:
         return nil
     }
+}
+
+/// The words after `bands set`: the RAT (lower case, as printed in the usage), then one word of band numbers
+/// separated by `,` or `:`, each prefixed `b` or `B` (lte) or `n` or `N` (nsa, sa) or not at all; sorted, each
+/// band once. A prefix of the other RAT, an empty number or anything but ASCII digits after the prefix is wrong
+/// usage; a band the modem does not support is refused when run.
+private func parseBandsSet(_ words: [String]) -> ModemCommand? {
+    guard words.count == 2, let rat = BandRat(rawValue: words[0]) else { return nil }
+    let prefixes: Set<Character> = rat == .lte ? ["b", "B"] : ["n", "N"]
+    var bands: [Int] = []
+    for item in words[1].split(omittingEmptySubsequences: false, whereSeparator: { $0 == "," || $0 == ":" }) {
+        let number = item.first.map { prefixes.contains($0) } == true ? item.dropFirst() : item
+        guard let band = parseBandNumber(number) else { return nil }
+        bands.append(band)
+    }
+    return .bandsSet(rat, bandSorted(bands))
 }
 
 /// `at --timeout`'s range, and the wait without it, in seconds.
@@ -248,6 +282,12 @@ func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int
         // Nothing is sent: the port is not even opened.
         errorOutput("at: \(reason)")
         return 2
+    case .bands(let json):
+        return showBands(service, json: json, output)
+    case let .bandsSet(rat, bands):
+        return changeBands(service, [rat], output) { _ in bands }
+    case .bandsReset(let rat):
+        return changeBands(service, rat.map { [$0] } ?? BandRat.allCases, output) { $0.supported }
     }
 }
 
@@ -257,8 +297,8 @@ private func fail(_ verb: String, _ sentence: String, _ output: (String) -> Void
     return 1
 }
 
-/// The object pretty-printed with sorted keys, as one output.
-private func outputJSON(_ verb: String, _ object: [String: Any], _ output: (String) -> Void) -> Int32 {
+/// The object (or array) pretty-printed with sorted keys, as one output.
+private func outputJSON(_ verb: String, _ object: Any, _ output: (String) -> Void) -> Int32 {
     guard JSONSerialization.isValidJSONObject(object),
           let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]),
           let text = String(data: data, encoding: .utf8) else {
@@ -506,6 +546,68 @@ private func setUsbMode(_ service: ModemServing, _ mode: UsbNetMode, reboot: Boo
         output("usb mode set to \(mode.name); the modem is restarting")
     case .success(.setTakesEffectAfterRestart):
         output("usb mode set to \(mode.name); it takes effect at the next restart (AT+CFUN=1,1 or a replug)")
+    }
+    return 0
+}
+
+/// Each RAT's line, `LTE: all 31 supported bands allowed` or `LTE: 2 of 31 supported bands allowed: 3, 41`
+/// (compared as sets), then its supported bands, indented: `  supported: 1, 2, 3, …`.
+private func showBands(_ service: ModemServing, json: Bool, _ output: (String) -> Void) -> Int32 {
+    switch service.bands() {
+    case .failure(let failure): return fail("bands", failure.message, output)
+    case .success(let sets):
+        if json { return outputJSON("bands", sets.map(bandsJSON), output) }
+        for set in sets {
+            let allowed = Set(set.allowed)
+            if !allowed.isEmpty && allowed == Set(set.supported) {
+                output("\(set.rat.name): all \(allowed.count) supported bands allowed")
+            } else {
+                output("\(set.rat.name): \(allowed.count) of \(Set(set.supported).count) supported bands allowed: "
+                       + bandListWords(set.allowed))
+            }
+            output("  supported: \(bandListWords(set.supported))")
+        }
+        return 0
+    }
+}
+
+/// Reads the bands once, then puts each of `rats`, in order, to `target` of its bands as read; stops at the
+/// first failure (exit 1). A RAT's bands are checked first (`bandsProblem`: not empty, every band supported),
+/// and a RAT that already allows exactly those (as a set) is said to and left alone; otherwise the warning,
+/// naming the bands before (`all supported` when they were), then the change. No question, as `mode`. A failure
+/// before a RAT's write ends `Nothing was changed.` (in a reset of all three, the lines before it show any RAT
+/// already set).
+private func changeBands(_ service: ModemServing, _ rats: [BandRat], _ output: (String) -> Void,
+                         to target: (BandSet) -> [Int]) -> Int32 {
+    let sets: [BandSet]
+    switch service.bands() {
+    case .failure(let failure): return fail("bands", "\(failure.message) Nothing was changed.", output)
+    case .success(let read): sets = read
+    }
+    for rat in rats {
+        guard let set = sets.first(where: { $0.rat == rat }) else {
+            return fail("bands", "The modem did not report its \(rat.name) bands. Nothing was changed.", output)
+        }
+        let wanted = bandSorted(target(set))
+        if let problem = bandsProblem(rat, wanted, supported: set.supported) {
+            return fail("bands", "\(problem) Nothing was changed.", output)
+        }
+        let list = bandListWords(wanted)
+        if Set(set.allowed) == Set(wanted) {
+            output("\(rat.name) bands: already \(list); nothing changed")
+            continue
+        }
+        let was = Set(set.allowed) == Set(set.supported) ? "all supported" : bandListWords(set.allowed)
+        output("\(rat.name) bands: \(list) (was \(was)); the modem may re-select a cell and drop the connection for a few "
+               + "seconds")
+        switch service.setBands(rat, to: wanted) {
+        case .failure(let failure):
+            return fail("bands", failure.message, output)
+        case .success(let change) where change.before == change.after:
+            output("\(rat.name) bands: already \(bandListWords(change.after)); nothing changed")
+        case .success(let change):
+            output("\(rat.name) bands set to \(bandListWords(change.after))")
+        }
     }
     return 0
 }

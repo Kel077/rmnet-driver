@@ -97,6 +97,8 @@ struct NoModem: ModemServing {
     func usbMode() -> Result<UsbModeInfo, ModemFailure> { .failure(failure) }
     func setUsbMode(_ mode: UsbNetMode, reboot: Bool) -> Result<UsbModeChange, ModemFailure> { .failure(failure) }
     func at(_ line: String, timeout: TimeInterval) -> Result<[String], ModemFailure> { .failure(failure) }
+    func bands() -> Result<[BandSet], ModemFailure> { .failure(failure) }
+    func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure> { .failure(failure) }
 }
 
 @main

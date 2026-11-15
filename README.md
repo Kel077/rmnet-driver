@@ -87,6 +87,7 @@ ping -c 3 -b en33 1.1.1.1       # bound to the port, whatever the service order
 | `RMNet network [--json]` | Registration, operator, technology, band, signal and cell. |
 | `RMNet radio [on\|off]` | Show the radio's state, or switch it. `off` is airplane mode: no connection until `radio on`. |
 | `RMNet mode [auto\|nr5g\|lte\|lte:nr5g\|…]` | Show or set the network mode. The modem keeps it; the command prints how to put it back. |
+| `RMNet bands [--json]`<br>`RMNet bands set lte\|nsa\|sa <bands>`<br>`RMNet bands reset [lte\|nsa\|sa]` | The LTE, 5G NSA and 5G SA bands the modem supports and the ones each may use. `set` locks one of them to some of its bands (`RMNet bands set sa n41`, `RMNet bands set lte 3,41`); `reset` allows every supported band again, for one or all three. The modem keeps a lock; a RAT locked to bands with no cell nearby has no service until `RMNet bands reset` (the AT port still works, so the reset always can). |
 | `RMNet apn [show] [--json]`<br>`RMNet apn set [--apn <name>] [--type ipv4\|ipv6\|ipv4v6] [--user <name>] [--password \| --no-password] [--auth none\|pap\|chap\|pap-or-chap] [--no-redial]` | Show the data profiles, or change the one the driver dials. A change redials: the connection drops for about 10 to 30 s. |
 | `RMNet sim [--json]`<br>`RMNet sim unlock [--last-attempt]` | The SIM's state and the attempts left; enter its PIN (asked without echo; the last attempt only with `--last-attempt`). |
 | `RMNet usbmode [--json]`<br>`RMNet usbmode set qmi\|ecm\|mbim\|rndis [--no-reboot] [--yes]` | Show or set the modem's USB mode (above). |
@@ -94,7 +95,7 @@ ping -c 3 -b en33 1.1.1.1       # bound to the port, whatever the service order
 | `RMNet activate` | Install or update the driver this app carries (the install script runs it). |
 | `RMNet deactivate` | Remove the driver; macOS asks for an administrator's password (below). |
 
-- The modem commands (`sms`, `network`, `radio`, `mode`, `apn`, `sim`, `usbmode`, `at`) use the modem's spare AT port, USB interface 3. They exit 0 on success, 1 on a failure (one line saying why) and 2 on wrong usage; `usbmode set` also exits 2, changing nothing, when it has no terminal to ask on (run from a script, give it `--yes`). `at` prints the modem's error line as its answer (exit 1), and its own refusals (exit 2, nothing sent) and failures on standard error.
+- The modem commands (`sms`, `network`, `radio`, `mode`, `bands`, `apn`, `sim`, `usbmode`, `at`) use the modem's spare AT port, USB interface 3. They exit 0 on success, 1 on a failure (one line saying why) and 2 on wrong usage; `usbmode set` also exits 2, changing nothing, when it has no terminal to ask on (run from a script, give it `--yes`). `at` prints the modem's error line as its answer (exit 1), and its own refusals (exit 2, nothing sent) and failures on standard error.
 - Ctrl-C does not interrupt a command that changes the modem (except at a password or PIN prompt, before anything is sent), so a redial is never cut short with the radio off. `RMNet at` is not one of them: Ctrl-C stops it, though a command already sent may still be carried out.
 - RMNet never logs or writes to disk message texts, phone numbers, passwords, PINs, your position, or what `RMNet at` sends and prints.
 - Every option and every line each command prints is in [docs/reference.md](docs/reference.md), "Driver".

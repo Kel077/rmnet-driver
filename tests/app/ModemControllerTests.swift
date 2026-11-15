@@ -122,6 +122,11 @@ final class FakeService: ModemServing, CustomReflectable {
     func at(_ line: String, timeout: TimeInterval) -> Result<[String], ModemFailure> {
         .failure(ModemFailure(message: "not used"))
     }
+    // Nor does it show or lock the bands (only `RMNet bands` does): never called.
+    func bands() -> Result<[BandSet], ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure> {
+        .failure(ModemFailure(message: "not used"))
+    }
 
     func releaseInfo(_ r: Result<NetworkInfo, ModemFailure>) { locked { infoResults.append(r) }; gate.signal() }
     func releaseRadio(_ r: Result<RadioChange, ModemFailure>) { locked { radioResults.append(r) }; gate.signal() }

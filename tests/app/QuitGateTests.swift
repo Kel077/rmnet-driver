@@ -145,6 +145,10 @@ final class FakeModem: ModemServing {
     func at(_ line: String, timeout: TimeInterval) -> Result<[String], ModemFailure> {
         .failure(ModemFailure(message: "not used"))
     }
+    func bands() -> Result<[BandSet], ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure> {
+        .failure(ModemFailure(message: "not used"))
+    }
 
     func releaseInfo(_ outcome: Result<NetworkInfo, ModemFailure>) {
         calls.locked { infoOutcome = outcome }

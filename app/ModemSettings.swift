@@ -1,5 +1,6 @@
 // The modem's settings and the changes RMNet makes to them: the radio, the network mode, the USB network
-// mode, the data profiles (APN, user name, password, authentication) and the SIM's PIN. Here are the
+// mode, the bands LTE and 5G may use, the data profiles (APN, user name, password, authentication) and the
+// SIM's PIN. Here are the
 // reading of their AT answers, the checks of what the owner types (also the one AT command `RMNet at`
 // sends), the AT lines that change the modem, the questions asked before a change and the sentences said
 // after it, and `ModemServing`, the interface of the service that does the I/O. Foundation only: pure
@@ -115,6 +116,38 @@ struct UsbModeInfo: Equatable {
 /// restart (it goes away from USB for about 30 s); or set, in effect at the next restart.
 enum UsbModeChange: Equatable { case unchanged, rebooting, setTakesEffectAfterRestart }
 
+/// The radio access technologies whose bands `RMNet bands` shows and locks, in the order it shows them:
+/// LTE, 5G non-standalone (EN-DC) and 5G standalone.
+enum BandRat: String, CaseIterable {
+    case lte, nsa, sa
+
+    /// Its AT+QNWPREFCFG setting, the bands it may use; also its line in AT+QNWPREFCFG="ue_capability_band",
+    /// the bands the modem supports.
+    var key: String {
+        switch self {
+        case .lte: return "lte_band"
+        case .nsa: return "nsa_nr5g_band"
+        case .sa: return "nr5g_band"
+        }
+    }
+
+    /// As `RMNet bands` prints it.
+    var name: String {
+        switch self {
+        case .lte: return "LTE"
+        case .nsa: return "5G NSA"
+        case .sa: return "5G SA"
+        }
+    }
+}
+
+/// One RAT's bands: those it may use and those the modem supports, each sorted, each band once.
+struct BandSet: Equatable { let rat: BandRat; let allowed: [Int]; let supported: [Int] }
+
+/// A RAT's allowed bands before and after a change, each sorted, each band once; the same when nothing was
+/// written (they were already the ones asked).
+struct BandChange: Equatable { let before: [Int]; let after: [Int] }
+
 /// The modem over its spare AT port. Each call blocks until done; callers keep it off the main thread.
 protocol ModemServing {
     func networkInfo() -> Result<NetworkInfo, ModemFailure>
@@ -127,6 +160,8 @@ protocol ModemServing {
     func usbMode() -> Result<UsbModeInfo, ModemFailure>
     func setUsbMode(_ mode: UsbNetMode, reboot: Bool) -> Result<UsbModeChange, ModemFailure>
     func at(_ line: String, timeout: TimeInterval) -> Result<[String], ModemFailure>   // one atCommandProblem accepts
+    func bands() -> Result<[BandSet], ModemFailure>                                  // in BandRat.allCases order
+    func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure> // refuses what bandsProblem does
 }
 
 // MARK: - Answer lines
@@ -188,6 +223,64 @@ func usbModeName(_ value: Int) -> String {
 /// `RMNet usbmode --json`: `{"mode":"qmi","value":0,"driverWorks":true}`.
 func usbModeJSON(_ info: UsbModeInfo) -> [String: Any] {
     ["mode": usbModeName(info.value), "value": info.value, "driverWorks": info.mode == .qmi]
+}
+
+// MARK: - Bands
+
+/// Sorted, each band once.
+func bandSorted(_ bands: [Int]) -> [Int] {
+    Array(Set(bands)).sorted()
+}
+
+/// A band number as written: ASCII digits only (no sign, no space), at least 1; nil otherwise.
+func parseBandNumber(_ text: Substring) -> Int? {
+    guard !text.isEmpty, text.unicodeScalars.allSatisfy({ (0x30...0x39).contains($0.value) }),
+          let n = Int(text), n >= 1 else { return nil }
+    return n
+}
+
+/// The first line `+QNWPREFCFG: "<key>",<list>`, the list band numbers joined by `:` (`0` alone: none): the
+/// bands sorted, each once. nil without a line for the key, or when its list is not such a list (an empty
+/// number, a letter or sign, a `0` among other numbers, or a field after it).
+func parseBandList(_ lines: [String], key: String) -> [Int]? {
+    for line in lines {
+        guard let f = atFields(line, prefix: "+QNWPREFCFG"), answerField(f, 0) == key else { continue }
+        guard f.count == 2 else { return nil }
+        if f[1] == "0" { return [] }
+        var bands: [Int] = []
+        for number in f[1].split(separator: ":", omittingEmptySubsequences: false) {
+            guard let band = parseBandNumber(number) else { return nil }
+            bands.append(band)
+        }
+        return bandSorted(bands)
+    }
+    return nil
+}
+
+/// AT+QNWPREFCFG="<key>",<b1>:<b2>:…, the bands sorted, each once: kept by the modem, in effect at once. Check
+/// `bandsProblem` first (never an empty list, which would read as no list).
+func bandsCommand(_ rat: BandRat, _ bands: [Int]) -> String {
+    "AT+QNWPREFCFG=\"\(rat.key)\"," + bandSorted(bands).map { String($0) }.joined(separator: ":")
+}
+
+/// `3, 41`: ascending, each band once; `none` for no band.
+func bandListWords(_ bands: [Int]) -> String {
+    bands.isEmpty ? "none" : bandSorted(bands).map { String($0) }.joined(separator: ", ")
+}
+
+/// nil when `bands` may be written as `rat`'s bands; else why not: an empty list (the RAT would have no band
+/// left), or bands the modem does not support, named, with the ones it does.
+func bandsProblem(_ rat: BandRat, _ bands: [Int], supported: [Int]) -> String? {
+    if bands.isEmpty { return "At least one \(rat.name) band is needed." }
+    let unsupported = bandSorted(bands.filter { !supported.contains($0) })
+    guard !unsupported.isEmpty else { return nil }
+    return "The modem does not support \(rat.name) \(unsupported.count == 1 ? "band" : "bands") "
+        + "\(bandListWords(unsupported)) (supported: \(bandListWords(supported)))."
+}
+
+/// `RMNet bands --json`, one RAT: `{"rat":"lte","allowed":[3,41],"supported":[1,2,…]}`.
+func bandsJSON(_ set: BandSet) -> [String: Any] {
+    ["rat": set.rat.rawValue, "allowed": set.allowed, "supported": set.supported]
 }
 
 // MARK: - One AT command as typed (`RMNet at`)

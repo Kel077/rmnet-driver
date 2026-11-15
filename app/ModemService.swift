@@ -1,5 +1,6 @@
 // The modem over its spare AT port (USB interface 3): the network read, the radio, the network mode, the
-// USB network mode (with the restart that puts it in effect), one command as the owner typed it (`RMNet at`),
+// USB network mode (with the restart that puts it in effect), the bands LTE and 5G may use, one command as the
+// owner typed it (`RMNet at`),
 // the data profiles (with the redial that makes the driver dial with new settings) and the SIM's PIN. The
 // models in ModemNetwork.swift and ModemSettings.swift read the answers and write the lines that change the
 // modem; this file only puts them in order. Each call opens a port, works and closes it, also on failure.
@@ -77,6 +78,8 @@ final class ModemService: ModemServing {
     private static let reopenRetries = Int(reopenWait / reopenInterval)
 
     private static let modeRead = "AT+QNWPREFCFG=\"mode_pref\""
+    private static let bandCapabilityRead = "AT+QNWPREFCFG=\"ue_capability_band\""
+    private static func bandRead(_ rat: BandRat) -> String { "AT+QNWPREFCFG=\"\(rat.key)\"" }
     private static let usbModeRead = "AT+QCFG=\"usbnet\""
     private static let restart = "AT+CFUN=1,1"
     private static let simStateRead = "AT+CPIN?"
@@ -275,6 +278,106 @@ final class ModemService: ModemServing {
             case .failure(let error):
                 return failure("The USB mode is now \(mode.name). It is not known whether the modem is restarting. "
                                + "\(describe(error)) If it does not restart, the new mode \(nextRestart)")
+            }
+        }
+    }
+
+    // MARK: The bands
+
+    /// AT+QNWPREFCFG="ue_capability_band" (the bands the modem supports, every RAT's on one answer), then each
+    /// RAT's own setting (the bands it may use), in BandRat.allCases order, 3 s each. Fails on a read that is
+    /// refused, times out or fails, and on an answer without a RAT's list.
+    func bands() -> Result<[BandSet], ModemFailure> {
+        withPort({ describe($0) }) { link in
+            let supported: [BandRat: [Int]]
+            switch readSupportedBands(link, BandRat.allCases) {
+            case .success(let lists): supported = lists
+            case .failure(let f): return .failure(f)
+            }
+            var sets: [BandSet] = []
+            for rat in BandRat.allCases {
+                switch readAllowedBands(link, rat) {
+                case .success(let allowed): sets.append(BandSet(rat: rat, allowed: allowed, supported: supported[rat] ?? []))
+                case .failure(let f): return .failure(f)
+                }
+            }
+            return .success(sets)
+        }
+    }
+
+    /// AT+QNWPREFCFG="ue_capability_band": the supported bands of each of `rats`; a failure when one is not there.
+    private func readSupportedBands(_ link: Link, _ rats: [BandRat]) -> Result<[BandRat: [Int]], ModemFailure> {
+        switch link.command(ModemService.bandCapabilityRead, timeout: ModemService.readTimeout) {
+        case .success(let lines):
+            var supported: [BandRat: [Int]] = [:]
+            for rat in rats {
+                guard let list = parseBandList(lines, key: rat.key) else {
+                    return failure("The modem did not report its supported \(rat.name) bands.")
+                }
+                supported[rat] = list
+            }
+            return .success(supported)
+        case .failure(let error):
+            return failure("The supported bands could not be read. \(describe(error))")
+        }
+    }
+
+    /// AT+QNWPREFCFG="<key>": the bands `rat` may use.
+    private func readAllowedBands(_ link: Link, _ rat: BandRat) -> Result<[Int], ModemFailure> {
+        switch link.command(ModemService.bandRead(rat), timeout: ModemService.readTimeout) {
+        case .success(let lines):
+            guard let allowed = parseBandList(lines, key: rat.key) else {
+                return failure("The modem did not report its allowed \(rat.name) bands.")
+            }
+            return .success(allowed)
+        case .failure(let error):
+            return failure("The allowed \(rat.name) bands could not be read. \(describe(error))")
+        }
+    }
+
+    /// Reads `rat`'s supported and allowed bands first. Refused, nothing written: an empty list (before the
+    /// port is opened) or a band the modem does not support (`bandsProblem`). When the bands allowed are
+    /// already those asked (as a set), nothing more is sent. Otherwise the change (5 s), sorted, each band once,
+    /// and its read-back, which must be the bands asked as a set.
+    func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure> {
+        let wanted = bandSorted(bands)
+        if wanted.isEmpty, let problem = bandsProblem(rat, wanted, supported: []) {
+            return failure("\(problem) Nothing was changed.")
+        }
+        return withPort({ "\(describe($0)) Nothing was changed." }) { link in
+            let supported: [Int]
+            switch readSupportedBands(link, [rat]) {
+            case .success(let lists): supported = lists[rat] ?? []
+            case .failure(let f): return failure("\(f.message) Nothing was changed.")
+            }
+            let before: [Int]
+            switch readAllowedBands(link, rat) {
+            case .success(let allowed): before = allowed
+            case .failure(let f): return failure("\(f.message) Nothing was changed.")
+            }
+            if let problem = bandsProblem(rat, wanted, supported: supported) { return failure("\(problem) Nothing was changed.") }
+            if before == wanted { return .success(BandChange(before: before, after: before)) }   // both sorted, each once
+            let was = "They were \(bandListWords(before))."
+            switch link.command(bandsCommand(rat, wanted), timeout: ModemService.writeTimeout) {
+            case .success:
+                break
+            case .failure(let error) where isRefusal(error):
+                return failure("The \(rat.name) bands were not changed. \(describe(error))")
+            case .failure(let error):
+                return failure("It is not known whether the \(rat.name) bands changed. \(describe(error)) \(was)")
+            }
+            switch link.command(ModemService.bandRead(rat), timeout: ModemService.readTimeout) {
+            case .success(let lines):
+                guard let after = parseBandList(lines, key: rat.key) else {
+                    return failure("The modem answered OK but did not report its \(rat.name) bands. \(was)")
+                }
+                guard after == wanted else {
+                    return failure("The modem answered OK but now reports \(rat.name) bands \(bandListWords(after)). \(was)")
+                }
+                return .success(BandChange(before: before, after: after))
+            case .failure(let error):
+                return failure("The modem answered OK, but the \(rat.name) bands could not be read back. \(describe(error)) "
+                               + was)
             }
         }
     }
