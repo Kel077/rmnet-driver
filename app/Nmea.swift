@@ -176,14 +176,23 @@ enum GpsEnd: Equatable {
     case failed(elapsed: Int, reason: String)       // select or read failed; reason is strerror(errno)
 }
 
+// What the gps verb knows of GNSS while it reads: not known to be on (its state could not be read, or
+// switching it on failed), on before this run, or switched on by this run.
+enum GnssKnown: Equatable {
+    case notKnownOn
+    case alreadyOn
+    case switchedOn
+}
+
 // The lines the gps verb prints after asking for `seconds` of reading that ended as `end` says, and its
 // exit code: 0 with a fix, 1 without. A fix is printed however the reading ended. Without one, a port
 // that closed or failed is reported as such, never as the receiver's state: only a reading that ended by
 // its time (or one second after a fix that was then lost) says that there were no sentences or no fix.
-// With no sentences, unless GNSS is known to be on (`gnssKnownOn`: it was on, or this run switched it
-// on), it adds that GNSS may be off and the commands that show and switch it. Only numbers parsed from
-// the sentences are printed, never a field as it came.
-func gpsOutcome(_ report: GpsReport, seconds: Int, end: GpsEnd, gnssKnownOn: Bool) -> (lines: [String], code: Int32) {
+// With no sentences, unless GNSS is known to be on (`gnss`), it adds that GNSS may be off and the commands
+// that show and switch it. With sentences but no fix, when this run switched GNSS on and read for less than
+// a minute, it adds that a first fix can take minutes and how to give it them. Only numbers parsed from the
+// sentences are printed, never a field as it came.
+func gpsOutcome(_ report: GpsReport, seconds: Int, end: GpsEnd, gnss: GnssKnown) -> (lines: [String], code: Int32) {
     if !report.hasFix {
         switch end {
         case .deadline:
@@ -195,12 +204,16 @@ func gpsOutcome(_ report: GpsReport, seconds: Int, end: GpsEnd, gnssKnownOn: Boo
         }
     }
     guard report.sentences > 0 else {
-        let hint = gnssKnownOn ? "" : "; GNSS may be off (RMNet at AT+QGPS? shows it, RMNet at AT+QGPS=1 switches it on)"
+        let hint = gnss != .notKnownOn ? ""
+            : "; GNSS may be off (RMNet at AT+QGPS? shows it, RMNet at AT+QGPS=1 switches it on, "
+                + "RMNet at AT+QGPSEND switches it off)"
         return (["gps: no NMEA sentences in \(seconds) s" + hint], 1)
     }
     guard let latitude = report.latitude, let longitude = report.longitude else {
+        let wait = gnss == .switchedOn && seconds < 60
+            ? "; a first fix can take minutes: try RMNet gps 120, or --keep-on" : ""
         return (["gps: no fix after \(seconds) s (\(report.sentences) sentences, "
-                 + "\(report.satellitesInView) satellites in view)"], 1)
+                 + "\(report.satellitesInView) satellites in view)" + wait], 1)
     }
     var lines = [String(format: "gps: fix %.6f, %.6f", latitude, longitude)]
     var parts: [String] = []
@@ -254,8 +267,10 @@ func parseGnssState(_ lines: [String]) -> Bool? {
 }
 
 // The lines the gps verb writes to standard error about switching GNSS; `reason` is a failure in words.
+// `mayBeOn` is for --keep-on after a switch on whose answer was lost (no answer in time, an I/O error).
 enum GnssLine {
     static func checkFailed(_ reason: String) -> String { "gps: could not check GNSS (\(reason)); reading anyway" }
+    static let alreadyOn = "gps: GNSS was already on; left on"
     static let switchedOn = "gps: GNSS switched on; a first fix outdoors can take a minute or more"
     static func switchOnFailed(_ reason: String) -> String { "gps: could not switch GNSS on (\(reason)); reading anyway" }
     static let switchedOff = "gps: GNSS switched off again"
@@ -263,4 +278,5 @@ enum GnssLine {
         "gps: could not switch GNSS off (\(reason)); RMNet at AT+QGPSEND does it"
     }
     static let leftOn = "gps: GNSS left on (RMNet at AT+QGPSEND switches it off)"
+    static let mayBeOn = "gps: GNSS may be on (RMNet at AT+QGPS? shows it, RMNet at AT+QGPSEND switches it off)"
 }
