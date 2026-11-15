@@ -258,10 +258,11 @@ void UsbIo::read_serial(char* out, size_t cap) {
 
 // Synchronous calls on the Default queue, made at Start between open and start: nothing is posted on
 // any pipe yet, nothing is held (no sleep can come before Start returns: SetPowerState runs on the
-// same queue) and nothing is stopping. Each result is logged; the first failure ends the calls.
+// same queue) and nothing is stopping. Each result is logged; the first failure ends the calls. Bulk
+// OUT gets no policy (idle_suspend.h, IdlePolicyCall).
 IdlePolicyResult UsbIo::set_idle_policy(uint32_t ms) {
   if (ms == 0) return IdlePolicyResult{IdlePolicyCall::None, 0};  // off: no call (the driver never asks)
-  if (phase_ != Phase::Running || !opened_ || !bulk_in_ || !bulk_out_ || !intr_in_) {
+  if (phase_ != Phase::Running || !opened_ || !bulk_in_ || !intr_in_) {
     LOG("idle suspend: SetIdlePolicy not called (usb not open)");
     return IdlePolicyResult{IdlePolicyCall::Interface, static_cast<uint32_t>(kIOReturnNotOpen)};
   }
@@ -273,7 +274,6 @@ IdlePolicyResult UsbIo::set_idle_policy(uint32_t ms) {
     IOUSBHostPipe* pipe;
   } pipes[] = {
       {IdlePolicyCall::BulkIn, bulk_in_},
-      {IdlePolicyCall::BulkOut, bulk_out_},
       {IdlePolicyCall::Interrupt, intr_in_},
   };
   for (const auto& p : pipes) {

@@ -23,6 +23,11 @@ public:
     virtual kern_return_t Start(IOService * provider) override;
     virtual kern_return_t Stop(IOService * provider) override;
 
+    // Passed to the superclass. With idle suspend asked for in the personality (RMNetIdleSuspendMs,
+    // driver/idle_suspend.h) the port also tracks sleep and wake and asks for the low power state
+    // again after the on state; otherwise it does nothing else.
+    virtual kern_return_t SetPowerState(uint32_t powerFlags) override;
+
     // A port being opened and closed: forwarded to IOUserUSBSerial, which copies and releases the
     // pipes.
     virtual kern_return_t HwActivate() override;

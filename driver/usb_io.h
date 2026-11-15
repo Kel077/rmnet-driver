@@ -112,8 +112,9 @@ class UsbIo final : public UsbPort {
   // Opt-in idle suspend (driver/idle_suspend.h; the driver decides whether to call it, and never
   // does with RMNetIdleSuspendMs absent or 0 or without remote wakeup). Called once, after open and
   // before start, so nothing is posted on the pipes yet: SetIdlePolicy(ms) on the interface, then on
-  // the bulk IN, bulk OUT and interrupt IN pipes, each result logged. The first failure ends the
-  // calls (those before it stay made) and is returned. When every call succeeded, idle suspend is on:
+  // the bulk IN and interrupt IN pipes (not bulk OUT: idle_suspend.h), each result logged. The first
+  // failure ends the calls (those before it stay made) and is returned. When every call succeeded,
+  // idle suspend is on (and the driver asks for the low power state):
   // from then on each tick reads the interface's port status (GetPortStatus) and counts the ticks
   // that find it suspended (suspended_ticks) and the calls that fail (port_status_failures); a
   // failure is counted and logged, nothing else. Not called again after a wake: the SDK headers keep

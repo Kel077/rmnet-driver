@@ -231,30 +231,28 @@ bool ReadFlowControl(IOService* service) {
 }
 
 // The idle suspend timeout from the service's RMNetIdleSuspendMs property (no shipped personality sets
-// it): an integer number of milliseconds, at most kIdleSuspendMaxMs (idle_suspend_ms: a larger value,
-// a negative integer among them since it reads as a huge one, is taken as that, with a log line).
-// 0, no such property, or anything but an integer is off (0), with a log line.
+// it), by idle_suspend_key's rules, with one log line saying how it was taken: an integer number of
+// milliseconds, 1 to 49 raised to 50, above 60000 taken as 60000; 0, negative, not an integer or no
+// such property is off (0). RMNetSerial reads its own personality's key by the same rules.
 uint32_t ReadIdleSuspendMs(IOService* service) {
   OSDictionary* props = nullptr;
   kern_return_t ret = service->CopyProperties(&props);
-  uint32_t ms = 0;
   if (ret != kIOReturnSuccess || !props) {
     LOG("RMNetIdleSuspendMs: properties not readable (0x%x); idle suspend off", ret);
-  } else {
-    OSObject* obj = props->getObject(kIdleSuspendKey);
-    OSNumber* num = OSDynamicCast(OSNumber, obj);
-    if (!obj) {
-      LOG("RMNetIdleSuspendMs: no such property; idle suspend off");
-    } else if (!num) {
-      LOG("RMNetIdleSuspendMs: not an integer; idle suspend off");
-    } else {
-      uint64_t value = num->unsigned64BitValue();
-      ms = idle_suspend_ms(value);
-      if (value > ms) LOG("RMNetIdleSuspendMs: %llu is above %u; taken as %u", value, (unsigned)kIdleSuspendMaxMs, ms);
-    }
+    OSSafeReleaseNULL(props);
+    return 0;
   }
-  OSSafeReleaseNULL(props);
-  return ms;
+  OSObject* obj = props->getObject(kIdleSuspendKey);
+  OSNumber* num = OSDynamicCast(OSNumber, obj);
+  IdleKeyKind kind = !obj ? IdleKeyKind::Absent : (num ? IdleKeyKind::Integer : IdleKeyKind::NotInteger);
+  uint64_t value = num ? num->unsigned64BitValue() : 0;
+  uint32_t bits = num ? static_cast<uint32_t>(num->numberOfBits()) : 0;
+  OSSafeReleaseNULL(props);  // getObject does not retain: nothing taken from it is used after this
+  IdleKey key = idle_suspend_key(kind, value, bits);
+  char how[96];
+  idle_key_text(key, value, bits, how, sizeof how);
+  LOG("RMNetIdleSuspendMs: %{public}s", how);
+  return key.ms;
 }
 
 // Whether the modem offers remote wakeup: bit 5 of bmAttributes of the configuration descriptor the
@@ -300,16 +298,19 @@ void PublishIdleSuspend(IOService* service, const IdleSuspendState& s, bool remo
 // interface and its pipes and before anything is posted on them (UsbIo::start, the bulk reads). The
 // remote wakeup bit is read and published either way. Only when RMNetIdleSuspendMs asks for a timeout
 // and the modem offers remote wakeup does UsbIo set the idle policies (UsbIo::set_idle_policy), and
-// only when all of them succeed does its tick sample the port status; otherwise no SetIdlePolicy and
-// no GetPortStatus call is made. Nothing here fails Start.
-void SetUpIdleSuspend(IOService* service, IOService* provider, UsbIo& usb) {
+// only when all of them succeed is idle suspend on: its tick then samples the port status and the
+// driver asks for the low power state (AskLowPower). Otherwise no SetIdlePolicy, GetPortStatus or
+// ChangePowerState call is made. Returns whether it is on. Nothing here fails Start.
+bool SetUpIdleSuspend(IOService* service, IOService* provider, UsbIo& usb) {
   uint32_t ms = ReadIdleSuspendMs(service);
   bool remoteWakeup = ReadRemoteWakeup(provider);
   IdlePolicyResult result{IdlePolicyCall::None, 0};
   if (idle_suspend_wanted(ms, remoteWakeup)) result = usb.set_idle_policy(ms);
   IdleSuspendState s = idle_suspend_state(ms, remoteWakeup, result);
-  LOG("idle suspend %{public}s (asked %u ms, remote wakeup %u)", s.text, ms, remoteWakeup ? 1u : 0u);
+  LOG("idle suspend %{public}s (asked %u ms, remote wakeup %u)%{public}s", s.text, ms, remoteWakeup ? 1u : 0u,
+      s.ms > 0 ? "; the low power state is asked for after Start" : "");
   PublishIdleSuspend(service, s, remoteWakeup);
+  return s.ms > 0;
 }
 
 uint64_t NowNs() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
@@ -338,7 +339,7 @@ struct RxBridge final : RxSink {
 };
 
 // What PublishCounters last published, in its order.
-enum : uint32_t { kCounterCount = 63 };
+enum : uint32_t { kCounterCount = 65 };
 
 struct RMNetDriver_IVars {
   IODispatchQueue* queue;  // the service's Default queue; everything runs on it
@@ -434,6 +435,14 @@ struct RMNetDriver_IVars {
   uint64_t wakeRetries;
   uint64_t wakeRetriesNow;
   uint32_t lastPowerFlags;
+  // Idle suspend (SetUpIdleSuspend, AskLowPower). lowPower: it is on, so the driver asks for the low
+  // power state and takes that state as powered (power_call). lowPowerDue: the next full tick asks
+  // (set at Start and after every SetPowerState that brings the on state). lowPowerAsks counts the
+  // ChangePowerState calls made; lowPowerLastResult is the last one's result. All stay 0 while off.
+  bool lowPower;
+  bool lowPowerDue;
+  uint64_t lowPowerAsks;
+  uint32_t lowPowerLastResult;
   uint32_t txQueueCapacity;  // the TX submission queue's capacity once made (0 until then)
   bool countersPublished;
   uint64_t counters[kCounterCount];
@@ -453,6 +462,30 @@ kern_return_t CreateTxSubmitQueue(RMNetDriver_IVars* ivars, IOService* owner, ui
   ivars->txSubmit = q;
   ivars->txQueueCapacity = capacity;
   return kIOReturnSuccess;
+}
+
+// idle_suspend.h restates SetPowerState's flags so that it builds on the host; they must be the SDK's.
+static_assert(kPowerCapabilityOff == kIOServicePowerCapabilityOff, "kIOServicePowerCapabilityOff");
+static_assert(kPowerCapabilityOn == kIOServicePowerCapabilityOn, "kIOServicePowerCapabilityOn");
+static_assert(kPowerCapabilityLow == kIOServicePowerCapabilityLow, "kIOServicePowerCapabilityLow");
+
+// Idle suspend is on: asks for the low power state (IOService::ChangePowerState). IOUSBHostFamily.h
+// disables idle suspend while a power child of the IOUSBHostDevice "resides in a power state with an
+// input power requirement that does not include kIOPMLowPower", and this dext is a direct power child
+// of the modem's IOUSBHostDevice, in its on state unless it asks (ioreg -p IOPower). Called from a full
+// tick only (TimerFired_Impl), so after Start has returned, never inside a SetPowerState call, never
+// while asleep, while a wake's resume is pending, or while stopping. Counted (RMNetLowPowerAsks), its
+// result kept (RMNetLowPowerLastResult), and logged the first time, at power-of-two counts, and on a
+// failure. The low state, when it comes, changes nothing in the driver (power_call, PowerOn).
+void AskLowPower(IOService* service, RMNetDriver_IVars* ivars) {
+  ivars->lowPowerDue = false;
+  kern_return_t ret = service->ChangePowerState(kIOServicePowerCapabilityLow);
+  ivars->lowPowerAsks++;
+  ivars->lowPowerLastResult = static_cast<uint32_t>(ret);
+  if (ret != kIOReturnSuccess || rmnet::worth(ivars->lowPowerAsks)) {
+    LOG("idle suspend: ChangePowerState(low) 0x%x (ask %llu; last SetPowerState 0x%x)", ret, ivars->lowPowerAsks,
+        ivars->lastPowerFlags);
+  }
 }
 
 }  // namespace
@@ -537,7 +570,10 @@ kern_return_t RMNetDriver::Start_Impl(IOService* provider) {
     PublishProfile(profile);
     bool flowControl = ReadFlowControl(this);
     LOG("flow control %u", flowControl ? 1u : 0u);
-    SetUpIdleSuspend(this, provider, *ivars->usb);  // off unless the personality asks for it
+    // Off unless the personality asks for it. When on, the first full tick asks for the low power
+    // state: after Start has returned (TimerFired_Impl, AskLowPower).
+    ivars->lowPower = SetUpIdleSuspend(this, provider, *ivars->usb);
+    ivars->lowPowerDue = ivars->lowPower;
     ivars->rxBridge = new RxBridge(this);
     if (ivars->rxBridge) {
       ivars->core = new CoreHost(*ivars->usb, *ivars->rxBridge, macs, profile, flowControl, qmiInterface);
@@ -787,6 +823,12 @@ kern_return_t RMNetDriver::Stop_Impl(IOService* provider) {
 // - A power off while the resume is pending ends it; the next power on is a fresh wake.
 // - Anything else (power on while not asleep, pending or not, a second power off, low power):
 //   nothing.
+// Idle suspend on (lowPower; idle_suspend.h, power_call): the driver asks for the low power state, so
+// the low state counts as power on too. While asleep it is the wake (the system may bring the driver
+// straight back to the state it asked for); while awake it changes nothing, as power on while awake
+// does: nothing is held and the data path goes on. After every call that brings the on state (the one
+// at every start, or a wake to on), the next full tick asks for the low state again
+// (low_power_ask_after, AskLowPower). With idle suspend off, the low state is nothing, as before.
 kern_return_t RMNetDriver::SetPowerState_Impl(uint32_t powerFlags) {
   LOG("SetPowerState 0x%x%{public}s", powerFlags,
       !ivars ? ""
@@ -794,11 +836,13 @@ kern_return_t RMNetDriver::SetPowerState_Impl(uint32_t powerFlags) {
                               : (ivars->resumePending ? " (resume pending)" : (ivars->stopping ? " (stopping)" : ""))));
   if (ivars) {
     ivars->lastPowerFlags = powerFlags;
-    if (powerFlags == kIOServicePowerCapabilityOff) {
+    PowerCall call = power_call(powerFlags, ivars->lowPower);
+    if (call == PowerCall::Off) {
       PowerOff();
-    } else if (powerFlags & kIOServicePowerCapabilityOn) {
+    } else if (call == PowerCall::On) {
       PowerOn(powerFlags);
     }
+    if (low_power_ask_after(powerFlags, ivars->lowPower) && !ivars->stopping) ivars->lowPowerDue = true;
     if (!ivars->stopping && ivars->core && ivars->usb) PublishCounters();
   }
   // Like every other entry into the driver, retries a failed arm. At a wake this is what restarts
@@ -1379,8 +1423,11 @@ void RMNetDriver::OnUplinkUsable() {
 // left to complete; RMNetTickRxFlushes the ticks that found refused receive packets still waiting.
 // Idle suspend (only while it is on, else both 0): RMNetSuspendedTicks counts the ticks whose
 // GetPortStatus found the modem's port suspended, each about 100 ms suspended; RMNetPortStatusFailures
-// the GetPortStatus calls that failed. RMNetIdleSuspendMs, RMNetRemoteWakeup and RMNetIdleSuspend are
-// published once, at Start (SetUpIdleSuspend).
+// the GetPortStatus calls that failed; RMNetLowPowerAsks the ChangePowerState(low) calls made
+// (AskLowPower) and RMNetLowPowerLastResult the last one's result (0: success, or none made; not a
+// counter). Whether the low state came shows in RMNetLastPowerFlags (65536, kIOServicePowerCapabilityLow).
+// RMNetIdleSuspendMs, RMNetRemoteWakeup and RMNetIdleSuspend are published once, at Start
+// (SetUpIdleSuspend).
 void RMNetDriver::PublishCounters() {
   const DataCounters& c = ivars->core->counters();
   uint32_t txPending = ivars->txPendingCount - ivars->txPendingNext;
@@ -1458,6 +1505,8 @@ void RMNetDriver::PublishCounters() {
       {"RMNetTickRxFlushes", ivars->tickRxFlushes},
       {"RMNetSuspendedTicks", u.suspended_ticks},
       {"RMNetPortStatusFailures", u.port_status_failures},
+      {"RMNetLowPowerAsks", ivars->lowPowerAsks},
+      {"RMNetLowPowerLastResult", ivars->lowPowerLastResult},
   };
   bool changed = !ivars->countersPublished;
   for (uint32_t i = 0; i < kCounterCount; i++) {
@@ -1577,6 +1626,10 @@ void RMNetDriver::TimerFired_Impl(OSAction*, uint64_t) {
   // completion flushes first. Counted before the tick's first FlushRx (ApplyCore's, then the one
   // below), so a tick whose ApplyCore hands them up counts too.
   if (ivars->rxOutCount > 0) ivars->tickRxFlushes++;
+  // Idle suspend on: the low power state is asked for here, the first full tick after Start or after a
+  // SetPowerState that brought the on state (not while asleep, resume pending or stopping: those
+  // return above).
+  if (ivars->lowPowerDue) AskLowPower(this, ivars);
   uint64_t now = NowMs();
   if (ivars->usb) ivars->usb->tick();  // bounds a bulk pipe recovery; may report on_fatal
   if (!ivars->coreStopped) {
