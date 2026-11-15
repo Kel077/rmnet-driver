@@ -291,7 +291,7 @@ Plan `docs/superpowers/plans/2026-11-14-sms-in-the-app.md`, branch `sms`, build 
 ## The owner's steps done (2026-11-15)
 
 - Done by the owner on 317.16.8: the window, unplug and replug during a ping, the port switched off and on, Internet Sharing offered, `Remove…` then `Install` then replug. The stop of an instance with USB requests in flight has therefore run on hardware at least once (during the unplug), but without a log.
-- Still open: a sleep and wake on the current build. (The throughput line was settled by the same-half-hour comparison; see "Receive speed (2026-11-15)".)
+- **Closed (2026-11-15 20:49):** a sleep and wake on the current build: the owner's lid-closed sleep on 318.9.29, 17 sleeps and wakes, the connection back on its own (notes, "Runtime findings (lid-closed sleep on 318.9.29)"). (The throughput line was settled by the same-half-hour comparison; see "Receive speed (2026-11-15)".)
 
 ## Sent here by the same-half-hour comparison (2026-11-15)
 
@@ -322,5 +322,5 @@ Plan `docs/superpowers/plans/2026-11-15-driver-features.md`, branch `driver-feat
 - **Idle suspend takes the network port away.** With `RMNetIdleSuspendMs` 2000 in all three personalities (318.1.4, working tree only) the three dexts went to their low state, the modem's USB device suspended (`RMNetSuspendedTicks` 234) and the low-power ask ran once — but `en33` disappeared while the QMI session stayed up. The networking family's behaviour in the dext's low state is the open question (`IOUserNetworkEthernet` overrides `SetPowerState`). Options: keep `RMNetDriver` on and lower only the serial ports (then the device cannot suspend, by the USB family's power-child rule); find a networking-family call that keeps the interface registered in a low state; or give up idle suspend. Off as shipped.
 - The 13 other Quectel models are matched but untested; the RG255C is excluded (its QMI interface is ff/ff/50).
 - Low-power re-asks have no cap (seen 1 ask, not climbing).
-- Not run on hardware: the uplink-usable drain (no uplink transfer failed), and a sleep and wake on 318.4.36 (the owner's step: close the lid and open it).
+- Not run on hardware: the uplink-usable drain (no uplink transfer failed), and a sleep and wake on 318.4.36 (done instead on 318.9.29, which has the same wake path: notes, "Runtime findings (lid-closed sleep on 318.9.29)").
 - Several APNs at once (multi-PDN) is the next design, as its own plan.
