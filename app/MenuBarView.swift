@@ -1,13 +1,15 @@
-// The menu bar item (a MenuBarExtra in RMNetApp, StatusView.swift): its icon, and the panel it opens with the
-// Driver tab's headline, the addresses while the link is up, a few lines about the network read over the AT
-// port when the panel opens, `Open RMNet` and `Quit RMNet`. MenuBarStatus (MenuBarStatus.swift) holds the
-// state and decides when the port is read; this file only shows it.
+// The menu bar item (a MenuBarExtra in RMNetApp, StatusView.swift): its icon (MenuBarLabel), and the panel it
+// opens with the Driver tab's headline, the addresses while the link is up, a few lines about the network read
+// over the AT port when the panel opens, the window's quit lines while a quit waits, `Open RMNet` and `Quit
+// RMNet`. MenuBarStatus (MenuBarStatus.swift) holds the state and decides when the port is read; this file only
+// shows it.
 import AppKit
 import SwiftUI
 
 extension MenuBarStatus {
-    /// The app's one: the registry and the system's listing from launch and every 5 s, and the network read
-    /// with ModemService on `queue`, the queue the window's tabs share for the AT port.
+    /// The app's one, on the registry, the system's listing (asked with a 10 s limit) and the network read with
+    /// ModemService on `queue`, the queue the window's tabs share for the AT port. The app delegate starts its
+    /// polls at launch (`start`).
     static func forApp(queue: DispatchQueue) -> MenuBarStatus {
         let manager = ExtensionManager()
         let service = ModemService()
@@ -21,14 +23,28 @@ extension MenuBarStatus {
             },
             network: { service.networkInfo() },
             queue: queue)
-        status.start()
         return status
+    }
+}
+
+/// The item's icon in the menu bar: the antenna, struck through unless the link is up; its title, the
+/// accessibility label, is not drawn. The only view of the item that observes the model besides the panel.
+struct MenuBarLabel: View {
+    @ObservedObject var status: MenuBarStatus
+
+    var body: some View {
+        Label(status.icon.accessibilityLabel, systemImage: status.icon.symbolName)
+            .labelStyle(.iconOnly)
     }
 }
 
 /// The panel, about 280 pt wide.
 struct MenuBarPanel: View {
     @ObservedObject var status: MenuBarStatus
+    // The controllers' quit lines (quitNoticeLines), shown above the buttons while a quit waits: `Quit RMNet`
+    // pressed while a send or a change runs says why RMNet has not quit yet.
+    @ObservedObject var quitNotice: SmsQuitNotice
+    @ObservedObject var modemQuitNotice: ModemQuitNotice
     /// Shows the RMNet window, given the panel's own way of opening it (for when it is not open). The app
     /// passes AppDelegate.showStatusWindow, which brings an open window forward first.
     var showWindow: (_ open: @escaping () -> Void) -> Void = { open in
@@ -72,6 +88,10 @@ struct MenuBarPanel: View {
                 }
             }
             Divider()
+            let quitLines = quitNoticeLines(messages: quitNotice.line, modem: modemQuitNotice.line)
+            if !quitLines.isEmpty {
+                Lines(quitLines)
+            }
             HStack {
                 Button("Open RMNet") {
                     let open = openWindow
@@ -112,7 +132,9 @@ private struct Lines: View {
 /// at most once in 10 s. Nothing is called while the panel is not on screen, so the port is not read at
 /// launch, and resigning key never calls it (menuBarPanelSignal), so no read starts as the panel closes.
 /// Calls `hidden` when it is no longer on screen or the view leaves it, so that the model stops asking for
-/// the listing.
+/// the listing. Whether the panel is on screen is read when the event comes; the call is made on a later turn
+/// of the main queue, in order, since the first comes while SwiftUI inserts the view (viewDidMoveToWindow), when
+/// the model's published values must not change.
 private struct PanelShownObserver: NSViewRepresentable {
     let shown: () -> Void
     let hidden: () -> Void
@@ -161,11 +183,13 @@ private struct PanelShownObserver: NSViewRepresentable {
 
         private func signal(_ event: MenuBarPanelEvent) {
             let onScreen = window.map { $0.isVisible && $0.occlusionState.contains(.visible) } ?? false
+            let call: () -> Void
             switch menuBarPanelSignal(event, onScreen: onScreen) {
-            case .shown: onShown()
-            case .hidden: onHidden()
-            case nil: break
+            case .shown: call = onShown
+            case .hidden: call = onHidden
+            case nil: return
             }
+            DispatchQueue.main.async { call() }
         }
 
         private func stopObserving() {

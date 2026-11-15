@@ -9,9 +9,6 @@ import SwiftUI
 
 struct RMNetApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    // The menu bar item's state, polled from launch for as long as the app runs. Observed here, so that the
-    // item's icon follows it.
-    @StateObject private var menuBar = MenuBarStatus.forApp(queue: AppDelegate.modemQueue)
 
     var body: some Scene {
         Window("RMNet", id: "status") {
@@ -19,10 +16,15 @@ struct RMNetApp: App {
                         modem: appDelegate.modem, modemQuitNotice: appDelegate.modem.quitNotice)
         }
         .defaultSize(width: 520, height: 480)
-        // The icon only; the title is its accessibility label.
-        MenuBarExtra(menuBar.icon.accessibilityLabel, systemImage: menuBar.icon.symbolName) {
-            MenuBarPanel(status: menuBar, showWindow: { open in _ = AppDelegate.showStatusWindow(using: open) })
+        // The App observes nothing: the item's label and its panel observe the menu bar model (kept by the app
+        // delegate), so a change of the icon redraws only the label.
+        MenuBarExtra {
+            MenuBarPanel(status: appDelegate.menuBar, quitNotice: appDelegate.messages.quitNotice,
+                         modemQuitNotice: appDelegate.modem.quitNotice,
+                         showWindow: { open in _ = AppDelegate.showStatusWindow(using: open) })
                 .background(OpenWindowKeeper())
+        } label: {
+            MenuBarLabel(status: appDelegate.menuBar)
         }
         .menuBarExtraStyle(.window)
     }
@@ -40,7 +42,7 @@ enum WindowTab: Hashable {
 // modem only while one of theirs is shown and this window itself can be seen (WindowVisibility.swift: not
 // NSApp.occlusionState, which the menu bar item's windows would keep visible). The controllers are not observed
 // here, so typing a message does not redraw the Driver tab; only their small quit notices are: while a
-// quit waits for a call to the modem, a line above the tabs says so.
+// quit waits for a call to the modem, a line above the tabs says so (quitNoticeLines, as the menu bar's panel).
 struct RMNetWindow: View {
     let messages: SmsController
     @ObservedObject var quitNotice: SmsQuitNotice
@@ -50,14 +52,8 @@ struct RMNetWindow: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if !quitNotice.line.isEmpty {
-                Text(verbatim: quitNotice.line)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding([.horizontal, .top])
-            }
-            if !modemQuitNotice.line.isEmpty {
-                Text(verbatim: modemQuitNotice.line)
+            ForEach(quitNoticeLines(messages: quitNotice.line, modem: modemQuitNotice.line), id: \.self) { line in
+                Text(verbatim: line)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding([.horizontal, .top])
@@ -82,7 +78,12 @@ struct RMNetWindow: View {
         .onDisappear { messages.setTabShown(false) }
         .onAppear { modem.setTabShown(modemTab(tab)) }
         .onChange(of: tab) { _, shown in modem.setTabShown(modemTab(shown)) }
-        .onDisappear { modem.setTabShown(nil) }
+        .onDisappear {
+            modem.setTabShown(nil)
+            // The controller outlives the window: a confirmation or the bands sheet that closed with it must not
+            // keep its reads paused when the window opens again.
+            modem.setConfirming(false)
+        }
         .background(WindowVisibilityObserver { visible in
             messages.setWindowVisible(visible)
             modem.setWindowVisible(visible)
@@ -92,8 +93,10 @@ struct RMNetWindow: View {
 }
 
 /// Reports whether the window this view is in can be seen: its own occlusion state, and not visible once it
-/// closes or the view leaves it (WindowVisibility.swift). The app's other windows do not count. Also marks the
-/// window as the RMNet window (AppDelegate.statusWindow) while it is open, so a reopen can find it.
+/// closes or the view leaves it (WindowVisibility.swift). The app's other windows do not count. Each report is
+/// delivered on a later turn of the main queue, in order: the first comes while SwiftUI inserts the view
+/// (viewDidMoveToWindow), when the controllers' published values must not change. Also marks the window as the
+/// RMNet window (AppDelegate.statusWindow) while it is open, so a reopen can find it.
 private struct WindowVisibilityObserver: NSViewRepresentable {
     let report: (Bool) -> Void
 
@@ -106,7 +109,8 @@ private struct WindowVisibilityObserver: NSViewRepresentable {
 
         init(report: @escaping (Bool) -> Void) {
             visibility = WindowVisibility(occlusionChanged: NSWindow.didChangeOcclusionStateNotification,
-                                          willClose: NSWindow.willCloseNotification, report: report)
+                                          willClose: NSWindow.willCloseNotification,
+                                          report: { visible in DispatchQueue.main.async { report(visible) } })
             super.init(frame: .zero)
         }
 
@@ -174,6 +178,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         replyToQuit: { [unowned self] succeeded in self.quitGate.replied(AppDelegate.modemMember, succeeded) },
         requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
 
+    // The menu bar item's state, polled from launch (applicationDidFinishLaunching) for as long as the app runs.
+    // Kept here rather than in the App, so that only the item's label and panel observe it.
+    private(set) lazy var menuBar: MenuBarStatus = MenuBarStatus.forApp(queue: AppDelegate.modemQueue)
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        menuBar.start()
+    }
+
     // Both controllers are asked at once when the app is to quit, since a call of one can wait behind a call
     // of the other on the shared queue: the app ends when every call the quit waited for has succeeded, and
     // the first that did not cancels the quit and resumes the other controller (QuitGate.swift).
@@ -227,8 +239,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Every way of quitting (Cmd-Q, the Dock's Quit, `Quit RMNet` in the menu bar item's panel, logout) comes
     // here. With a call to the modem running, the app ends only when it has finished; a send is never cut
     // short. A send, delete or change that does not succeed cancels the quit, so that its result can be read.
+    // While it waits, the window shows why above its tabs (and the panel above its buttons); so a quit that
+    // waits opens the window, or brings it forward, when it cannot be seen (quitShowsWindow).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        quitGate.ask() ? .terminateLater : .terminateNow
+        let waits = quitGate.ask()
+        if quitShowsWindow(waits: waits, windowSeen: AppDelegate.statusWindowSeen) {
+            _ = AppDelegate.showStatusWindow(using: AppDelegate.openStatusWindow)
+        }
+        return waits ? .terminateLater : .terminateNow
+    }
+
+    // The RMNet window is open and some of it can be seen (not minimized, hidden or covered).
+    private static var statusWindowSeen: Bool {
+        guard let window = statusWindow.flatMap({ marked in NSApp.windows.first(where: { $0 === marked }) }) else {
+            return false
+        }
+        return window.isVisible && window.occlusionState.contains(.visible)
     }
 }
 

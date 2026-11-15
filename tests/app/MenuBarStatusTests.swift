@@ -158,6 +158,7 @@ struct MenuBarStatusTests {
         headlines()
         addresses()
         polling()
+        starting()
         listingWhenNeeded()
         staleListing()
         panelSignals()
@@ -178,19 +179,20 @@ struct MenuBarStatusTests {
         let s = rig.status!
         equal(s.icon, .noDriver, "icon: before any poll")
 
-        rig.listing.answer = []
-        s.poll()
-        equal(s.icon, .noDriver, "icon: no properties, nothing listed")
-        rig.listing.answer = [enabled]
-        rig.modem = (.qmi(interface: 4), rm520)
-        s.poll()
-        equal(s.icon, .noDriver, "icon: no properties, the driver listed and enabled")
-        rig.listing.answer = nil
-        s.poll()
-        equal(s.icon, .noDriver, "icon: no properties, no listing")
-        rig.listing.answer = [awaiting]
-        s.poll()
-        equal(s.icon, .waitingForApproval, "icon: the listing says waiting for approval")
+        // No driver: the first poll asks the listing at once (a fresh model each time).
+        func noDriverIcon(_ answer: [ExtensionEntry]?, modem: (ModemState, QuectelModel?) = (.absent, nil)) -> MenuBarIcon {
+            let r = Rig()
+            r.listing.answer = answer
+            r.modem = modem
+            r.status.poll()
+            equal(r.listing.asked, 1, "icon: the listing asked with no driver")
+            return r.status.icon
+        }
+        equal(noDriverIcon([]), .noDriver, "icon: no properties, nothing listed")
+        equal(noDriverIcon([enabled], modem: (.qmi(interface: 4), rm520)), .noDriver,
+              "icon: no properties, the driver listed and enabled")
+        equal(noDriverIcon(nil), .noDriver, "icon: no properties, no listing")
+        equal(noDriverIcon([awaiting]), .waitingForApproval, "icon: the listing says waiting for approval")
 
         rig.listing.answer = [enabled]
         for state in ["up", "refreshing"] {
@@ -208,13 +210,13 @@ struct MenuBarStatusTests {
         equal(s.icon, .down, "icon: attached without RMNetState")
         // The connection decides while the driver is attached, whatever the listing says (an update waiting for
         // approval while the old build runs).
+        equal(menuBarIcon(properties: ["RMNetState": "up"], entries: [enabled, awaiting]), .up,
+              "icon: up while a new version waits for approval")
+        equal(menuBarIcon(properties: ["RMNetState": "up"], entries: nil), .up, "icon: up while the system gives no listing")
         rig.properties = ["RMNetState": "up"]
         rig.listing.answer = [enabled, awaiting]
-        s.poll()
-        equal(s.icon, .up, "icon: up while a new version waits for approval")
-        rig.listing.answer = nil
-        s.poll()
-        equal(s.icon, .up, "icon: up while the system gives no listing")
+        rig.open()
+        equal(s.icon, .up, "icon: up with the panel open and the listing saying an update waits")
 
         equal(MenuBarIcon.up.symbolName, "antenna.radiowaves.left.and.right", "symbol: up")
         for icon in [MenuBarIcon.down, .noDriver, .waitingForApproval] {
@@ -224,35 +226,61 @@ struct MenuBarStatusTests {
         equal(MenuBarIcon.down.accessibilityLabel, "RMNet: not connected", "label: down")
         equal(MenuBarIcon.noDriver.accessibilityLabel, "RMNet: no driver", "label: no driver")
         equal(MenuBarIcon.waitingForApproval.accessibilityLabel, "RMNet: waiting for approval", "label: waiting")
-        equal(rig.network.calls, 0, "icons: no network read")
+        s.panelClosed()
     }
 
-    // The Driver tab's headline: "Asking the system…" until the listing first answers, "Unknown" while the system
-    // gives none, else headline() over the listing, the modem and the registry. With the driver attached the
-    // listing is asked only while the panel is open, so the panel is open here.
+    // The headline. With the driver attached: the Driver tab's headline for it from the registry at once
+    // (`Connected`, `Connecting`, `Link down`), never `Asking the system…`, also when the panel opens; once the
+    // listing answers, headline() over it (`Needs attention` while an update waits beside the old build). With
+    // no driver: "Asking the system…" until the listing first answers, "Unknown" while the system gives none, else
+    // headline() over the listing, the modem and the registry.
     static func headlines() {
         let rig = Rig()
         let s = rig.status!
         rig.listing.holding = true
+        rig.modem = (.qmi(interface: 4), rm520)
         rig.properties = ["RMNetState": "up"]
         s.poll()
-        equal(s.headline, "Asking the system…", "headline: before the listing answers")
+        equal(rig.listing.asked, 0, "listing: not asked with the driver attached and the panel closed")
+        equal(s.headline, "Connected", "headline: with the driver attached, from the registry before any listing")
         equal(s.icon, .up, "headline: the icon does not wait for the listing")
         rig.open()
         equal(rig.listing.asked, 1, "listing: asked when the panel opens")
+        equal(s.headline, "Connected", "headline: no `Asking the system…` when the panel opens with the driver attached")
         s.poll()
         equal(rig.listing.asked, 1, "listing: not asked again while a question is pending")
-        equal(s.headline, "Asking the system…", "headline: still asking")
-        rig.listing.answerWaiting([enabled])
-        equal(s.headline, "Connected", "headline: connected")
+        rig.listing.answerWaiting([enabled, awaiting])
+        equal(s.headline, "Needs attention", "headline: the listing's once it answers (an update waits beside the old build)")
         rig.listing.answerWaiting(nil)   // nothing waits: no change
-        equal(s.headline, "Connected", "headline: a stray answer changes nothing")
+        equal(s.headline, "Needs attention", "headline: a stray answer changes nothing")
         s.poll()
         equal(rig.listing.asked, 2, "listing: asked again on the next poll")
         rig.listing.answerWaiting(nil)
-        equal(s.headline, "Unknown", "headline: the system gave no listing")
+        equal(s.headline, "Connected", "headline: the system gave no listing: the registry's, with the driver attached")
+        for (state, want) in [("connecting", "Connecting"), ("backoff", "Link down"), ("refreshing", "Connected"),
+                              ("", "Connecting")] {
+            rig.properties = ["RMNetState": state]
+            s.poll()
+            equal(s.headline, want, "headline: RMNetState \"\(state)\" from the registry while the listing is pending")
+            rig.listing.answerWaiting(nil)
+        }
+
+        // The panel closed: the answer is dropped, and the headline is the registry's again.
+        s.panelClosed()
+        rig.properties = ["RMNetState": "up"]
+        s.poll()
+        equal(s.headline, "Connected", "headline: the registry's once the answer is dropped")
+        // No driver: asking until the system answers; Unknown while it gives no listing.
+        rig.properties = nil
+        rig.modem = (.absent, nil)
+        s.poll()
+        equal(s.headline, "Asking the system…", "headline: no driver, before the listing answers")
+        rig.listing.answerWaiting(nil)
+        equal(s.headline, "Unknown", "headline: no driver, the system gave no listing")
         rig.listing.holding = false
 
+        // The panel open (the listing asked on each poll), each state with its answer.
+        rig.open()
         let cases: [(DriverProperties?, ModemState, [ExtensionEntry], String)] = [
             (nil, .absent, [], "Not installed"),
             (nil, .absent, [awaiting], "Waiting for approval in System Settings"),
@@ -271,6 +299,24 @@ struct MenuBarStatusTests {
             s.poll()
             equal(s.headline, want, "headline: \(want)")
         }
+        s.panelClosed()
+
+        // The rule itself.
+        for (state, want) in [("up", "Connected"), ("refreshing", "Connected"), ("starting", "Connecting"),
+                              ("connecting", "Connecting"), ("backoff", "Link down"), ("usb failed", "Link down")] {
+            equal(menuBarHeadline(driver: ["RMNetState": state], modem: .qmi(interface: 4), model: rm520, answered: false,
+                                  entries: nil), want, "rule: attached, not answered, \(state)")
+        }
+        equal(menuBarHeadline(driver: ["RMNetState": "up"], modem: .qmi(interface: 4), model: rm520, answered: true,
+                              entries: nil), "Connected", "rule: attached, no listing: the registry's")
+        equal(menuBarHeadline(driver: ["RMNetState": "up"], modem: .qmi(interface: 4), model: rm520, answered: true,
+                              entries: [enabled, awaiting]), "Needs attention", "rule: attached, the listing's")
+        equal(menuBarHeadline(driver: nil, modem: .absent, model: nil, answered: false, entries: nil), "Asking the system…",
+              "rule: no driver, not answered")
+        equal(menuBarHeadline(driver: nil, modem: .absent, model: nil, answered: true, entries: nil), "Unknown",
+              "rule: no driver, no listing")
+        equal(menuBarHeadline(driver: nil, modem: .absent, model: nil, answered: true, entries: [awaiting]),
+              "Waiting for approval in System Settings", "rule: no driver, the listing's")
     }
 
     // The addresses only while the connection is up: the address and its prefix (not the gateway); "none" and
@@ -299,7 +345,9 @@ struct MenuBarStatusTests {
         equal(s.addressLines, [], "addresses: none without the driver")
     }
 
-    // poll() reads the registry and asks the listing; it never reads the network, also over many turns.
+    // poll() reads the registry each time and never reads the network, also over many turns. With the driver
+    // attached and the panel closed it never asks the listing; with no driver it asks at once (no fresh answer:
+    // at launch, or once the driver has gone away) and then on every 12th poll, about once a minute.
     static func polling() {
         let rig = Rig()
         let s = rig.status!
@@ -308,25 +356,62 @@ struct MenuBarStatusTests {
             s.poll()
             rig.clock = rig.clock.addingTimeInterval(5)
         }
+        equal(rig.listing.asked, 0, "poll: the listing is not asked with the driver attached")
         rig.properties = nil
-        for _ in 0..<20 {
+        var askedAt: [Int] = []
+        for n in 1...25 {
+            let before = rig.listing.asked
             s.poll()
+            if rig.listing.asked > before { askedAt.append(n) }
             rig.clock = rig.clock.addingTimeInterval(5)
         }
         settle()
+        equal(askedAt, [1, 13, 25], "poll: with no driver, the listing at once, then on every 12th poll")
         equal(rig.network.calls, 0, "poll: never reads the network")
-        equal(rig.registryReads, 40, "poll: reads the registry each time")
-        equal(rig.listing.asked, 20, "poll: asks the listing only while no driver is attached")
+        equal(rig.registryReads, 45, "poll: reads the registry each time")
         equal(MenuBarStatus.pollInterval, 5, "poll: every 5 s")
+        equal(MenuBarStatus.listingEvery, 12, "poll: the listing every 12th poll with no driver: once a minute")
         equal(MenuBarStatus.networkSpacing, 10, "network: at most once in 10 s")
         check(!s.reading, "poll: nothing is being read")
         equal(s.networkLines, [], "poll: no network lines")
         check(s.networkAt == nil && s.networkNote == nil, "poll: no network time or note")
+
+        // A question still pending when the 12th poll comes: not asked twice; the next poll asks.
+        let slow = Rig()
+        let t = slow.status!
+        slow.listing.holding = true
+        t.poll()
+        equal(slow.listing.asked, 1, "poll: asked at launch with no driver")
+        for _ in 0..<12 { t.poll() }
+        equal(slow.listing.asked, 1, "poll: not asked again while the question is pending")
+        slow.listing.answerWaiting([])
+        t.poll()
+        equal(slow.listing.asked, 2, "poll: asked on the next poll once the pending question has answered")
+        slow.listing.answerWaiting([])
+        slow.listing.holding = false
     }
 
-    // The listing (the system's properties request) is asked only when needed: while the registry shows no
-    // driver (no driver, or waiting for approval?), and while the panel is open (its headline). With the driver
-    // attached and the panel closed, a poll reads the registry only. Opening the panel asks it at once.
+    // start() polls at once (the listing asked at launch while no driver is attached), then every 5 s on a timer
+    // that may fire up to 1 s late (its tolerance, so the system can group wake-ups); a second start does nothing.
+    static func starting() {
+        let rig = Rig()
+        let s = rig.status!
+        s.start()
+        equal(rig.registryReads, 1, "start: polls at once")
+        equal(rig.listing.asked, 1, "start: asks the listing at launch with no driver")
+        let timer = Mirror(reflecting: s).children.first(where: { $0.label == "timer" }).flatMap { $0.value as? Timer }
+        check(timer != nil && timer!.isValid, "start: a timer runs")
+        equal(timer?.timeInterval, 5, "start: every 5 s")
+        equal(timer?.tolerance, 1, "start: up to 1 s late")
+        s.start()
+        equal(rig.registryReads, 1, "start: a second start does nothing")
+        timer?.invalidate()
+    }
+
+    // The listing (the system's properties request) is asked only when needed: while the panel is open (its
+    // headline), and while the registry shows no driver (no driver, or waiting for approval?) at once and then
+    // every 12th poll. With the driver attached and the panel closed, a poll reads the registry only. Opening the
+    // panel asks it at once.
     static func listingWhenNeeded() {
         let rig = Rig()
         let s = rig.status!
@@ -337,16 +422,19 @@ struct MenuBarStatusTests {
         equal(rig.listing.asked, 0, "listing: not asked with the driver attached and the panel closed")
         rig.properties = nil
         s.poll()
-        equal(rig.listing.asked, 1, "listing: asked with no driver")
+        equal(rig.listing.asked, 1, "listing: asked at once when no driver is attached")
         rig.listing.answer = [awaiting]
+        for _ in 0..<11 { s.poll() }
+        equal(rig.listing.asked, 1, "listing: not asked on the next 11 polls with no driver")
+        equal(s.icon, .noDriver, "listing: the last answer is kept until the next question")
         s.poll()
-        equal(rig.listing.asked, 2, "listing: asked on each poll with no driver")
+        equal(rig.listing.asked, 2, "listing: asked again on the 12th poll")
         equal(s.icon, .waitingForApproval, "listing: tells waiting for approval apart")
         rig.listing.answer = [enabled]
         rig.properties = upProperties
         s.poll()
         equal(rig.listing.asked, 2, "listing: not asked once the driver is attached")
-        equal(s.headline, "Asking the system…", "listing: an answer not asked again is stale, not shown")
+        equal(s.headline, "Connected", "listing: an answer not asked again is stale: the registry's headline, not its own")
 
         rig.open()
         equal(rig.listing.asked, 3, "listing: asked when the panel opens")
@@ -364,6 +452,18 @@ struct MenuBarStatusTests {
         equal(rig.listing.asked, 6, "listing: not asked once the panel is closed")
         s.panelClosed()
         equal(rig.listing.asked, 6, "listing: closing twice is harmless")
+
+        // With no driver and the panel open: asked on each poll, not only every 12th.
+        rig.properties = nil
+        s.poll()
+        equal(rig.listing.asked, 7, "listing: asked at once when the driver has gone away")
+        rig.open()
+        s.poll()
+        s.poll()
+        equal(rig.listing.asked, 10, "listing: asked on each poll while the panel is open, also with no driver")
+        s.panelClosed()
+        s.poll()
+        equal(rig.listing.asked, 10, "listing: then every 12th poll again")
     }
 
     // A listing that was not asked again (the driver attached, the panel closed) is stale: when the driver goes
@@ -391,13 +491,15 @@ struct MenuBarStatusTests {
         equal(s.icon, .waitingForApproval, "stale: the fresh answer says waiting")
         equal(s.headline, "Waiting for approval in System Settings", "stale: and its headline")
 
-        // A question asked while no driver was attached, answered after it attached: still the latest answer.
+        // A question asked while no driver was attached (the 12th poll), answered after it attached: still the
+        // latest answer, and its headline is used.
         rig.properties = nil
-        s.poll()
+        for _ in 0..<MenuBarStatus.listingEvery { s.poll() }
+        equal(rig.listing.asked, 3, "stale: the 12th poll with no driver asks")
         rig.properties = ["RMNetState": "up"]
         s.poll()
-        rig.listing.answerWaiting([enabled])
-        equal(s.headline, "Connected", "stale: an answer to a question already asked is used")
+        rig.listing.answerWaiting([enabled, awaiting])
+        equal(s.headline, "Needs attention", "stale: an answer to a question already asked is used")
         rig.listing.holding = false
     }
 

@@ -3,7 +3,8 @@
 // state changing, and its closing. The app's other windows (the menu bar item's panel, the status item's own
 // window) post the same notifications for themselves and are not followed: NSApp.occlusionState, which counts
 // every window of the app, would keep the tabs reading the port while the RMNet window is covered, hidden
-// (Cmd-H), minimized or closed but the panel is open or the status item counts as visible.
+// (Cmd-H), minimized or closed but the panel is open or the status item counts as visible. Also how the window
+// is shown again (windowReopen) and when a quit shows it (quitShowsWindow).
 //
 // Foundation only, so `make app-test` tests it without AppKit (tests/app/WindowVisibilityTests.swift): the
 // window is any object, and the notification names and its occlusion state are given by the window's view
@@ -61,10 +62,11 @@ final class WindowVisibility {
     }
 }
 
-/// How the RMNet window is shown on a Dock click, a second launch (`open /Applications/RMNet.app`) or `Open RMNet`
-/// in the menu bar item's panel. The window itself first, when it is open (found among the app's windows by the
-/// mark its view sets, until it closes): deminiaturized when minimized, made key and ordered front. Else the
-/// openWindow action kept from SwiftUI. Else, with neither, AppKit's and SwiftUI's own handling of a reopen.
+/// How the RMNet window is shown on a Dock click, a second launch (`open /Applications/RMNet.app`), `Open RMNet`
+/// in the menu bar item's panel, or a quit that waits (quitShowsWindow). The window itself first, when it is
+/// open (found among the app's windows by the mark its view sets, until it closes): deminiaturized when
+/// minimized, made key and ordered front. Else the openWindow action kept from SwiftUI. Else, with neither,
+/// AppKit's and SwiftUI's own handling of a reopen.
 enum WindowReopen: Equatable {
     case bringForward(deminiaturize: Bool)
     case openWithAction
@@ -77,4 +79,13 @@ enum WindowReopen: Equatable {
 func windowReopen(windowFound: Bool, minimized: Bool, actionAvailable: Bool) -> WindowReopen {
     if windowFound { return .bringForward(deminiaturize: minimized) }
     return actionAvailable ? .openWithAction : .leaveToAppKit
+}
+
+/// Whether a quit shows the RMNet window first (applicationShouldTerminate, then as windowReopen above): only
+/// when the quit waits for a call to the modem (`terminateLater`) and the window cannot be seen (closed,
+/// minimized, hidden or covered), since the line above its tabs says what RMNet waits for; otherwise `Quit
+/// RMNet` with the window closed would seem to do nothing. A quit that ends at once, or a window already in
+/// view, is left alone.
+func quitShowsWindow(waits: Bool, windowSeen: Bool) -> Bool {
+    waits && !windowSeen
 }

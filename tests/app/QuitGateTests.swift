@@ -1,9 +1,10 @@
 // Tests for app/QuitGate.swift: the one answer to the app's quit question from the modem tabs' controller
 // and the Messages tab's (ruling R18). First the gate's rules, with members the test answers for by hand;
-// then the whole-branch review's case and its neighbours with the real controllers (app/ModemController.swift
-// and app/SmsController.swift) on one serial queue, as in the app, each with a fake service whose calls
-// block until the test releases them, wired to the gate as the app delegate (app/StatusView.swift) wires
-// them. Built with swiftc by `make app-test` together with app/SmsModel.swift, app/SmsController.swift,
+// then the quit lines the window and the menu bar's panel show (quitNoticeLines); then the whole-branch
+// review's case and its neighbours with the real controllers (app/ModemController.swift and
+// app/SmsController.swift) on one serial queue, as in the app, each with a fake service whose calls block
+// until the test releases them, wired to the gate as the app delegate (app/StatusView.swift) wires them.
+// Built with swiftc by `make app-test` together with app/SmsModel.swift, app/SmsController.swift,
 // app/ModemNetwork.swift, app/ModemSettings.swift and app/ModemController.swift; needs no AppKit, no window
 // and no modem. Stops at the first failure, prints which check failed and exits 1.
 import Foundation
@@ -228,6 +229,7 @@ let notAnswered = ModemFailure(message: "The modem did not answer in time.")
 struct QuitGateTests {
     static func main() {
         rules()
+        lines()
         reviewCase()
         modemFailsFirst()
         bothSucceed()
@@ -321,6 +323,39 @@ struct QuitGateTests {
         }
     }
 
+    // The lines the window and the menu bar's panel show while a quit waits (quitNoticeLines): the Messages
+    // controller's, then the modem tabs', only those set, and a line both give once; with the real controllers,
+    // a listing and the Network tab's read both waiting give the read's line once.
+    static func lines() {
+        let send = "RMNet quits when the message being sent has finished."
+        let reading = "RMNet quits when the current request to the modem has finished."
+        let bands = "RMNet quits when the bands have been changed."
+        check(quitNoticeLines(messages: "", modem: "") == [], "lines: none while no quit waits")
+        check(quitNoticeLines(messages: send, modem: "") == [send], "lines: the Messages tab's alone")
+        check(quitNoticeLines(messages: "", modem: bands) == [bands], "lines: the modem tabs' alone")
+        check(quitNoticeLines(messages: send, modem: bands) == [send, bands], "lines: both, the Messages tab's first")
+        check(quitNoticeLines(messages: reading, modem: reading) == [reading], "lines: the same line once")
+
+        let app = App()
+        app.messages.setTabShown(true)
+        pump(until: { app.calls.log == ["list"] && app.calls.blocked == 1 }, "lines: the listing runs")
+        app.modem.setTabShown(.network)
+        holdTimer(app.modem)
+        check(app.quit() == true, "lines: the quit waits")
+        check(quitNoticeLines(messages: app.messages.quitNotice.line, modem: app.modem.quitNotice.line) == [reading],
+              "lines: a listing and a read waiting: the read's line once",
+              "\(app.messages.quitNotice.line) | \(app.modem.quitNotice.line)")
+        app.calls.release()
+        pump(until: { app.calls.log == ["list", "networkInfo"] && app.calls.blocked == 1 }, "lines: the modem's read runs")
+        app.calls.release()
+        pump(until: { !app.replies.isEmpty }, "lines: the answer")
+        check(app.replies == [true], "lines: the quit goes ahead", "\(app.replies)")
+        check(quitNoticeLines(messages: app.messages.quitNotice.line, modem: app.modem.quitNotice.line) == [],
+              "lines: none once the quit has its answer")
+        app.modem.setTabShown(nil)
+        app.messages.setTabShown(false)
+    }
+
     // The whole-branch review's case: a send runs, the Network tab's read waits behind it on the shared
     // queue, Cmd-Q, the send fails. The failed send cancels the quit (its sentence stays on screen), and the
     // modem read that succeeds afterwards does not end the app.
@@ -335,6 +370,9 @@ struct QuitGateTests {
         check(app.messages.quitNotice.line == "RMNet quits when the message being sent has finished."
               && app.modem.quitNotice.line == "RMNet quits when the current request to the modem has finished.",
               "review case: both quit lines show", "\(app.messages.quitNotice.line) | \(app.modem.quitNotice.line)")
+        check(quitNoticeLines(messages: app.messages.quitNotice.line, modem: app.modem.quitNotice.line)
+              == [app.messages.quitNotice.line, app.modem.quitNotice.line],
+              "review case: the window and the panel show both lines, the Messages tab's first")
         app.smsFake.releaseSend(.failure(notKnown))
         pump(until: { !app.replies.isEmpty }, "review case: the answer")
         check(app.replies == [false], "review case: the failed send cancels the quit", "\(app.replies)")

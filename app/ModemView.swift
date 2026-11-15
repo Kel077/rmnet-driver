@@ -1,10 +1,12 @@
 // The window's Network and SIM & APN tabs. Network: what the modem says about the network, the radio
 // (Radio Off…, Radio On), the network mode (Change…, Put Back) and the bands each RAT may use (Change…, a
-// sheet of checkboxes; Reset; Reset all). SIM & APN: the SIM (Unlock… while it
-// asks for its PIN), the data profiles, and an editor for the profile the driver dials (Apply…, Put
-// Back…). ModemController (ModemController.swift) holds the state, reads the shown tab and runs one call
-// at a time; the rows, questions and sentences come from ModemNetwork.swift and ModemSettings.swift. Each
-// change asks first, with words taken when its confirmation opens.
+// sheet of checkboxes; Reset; Reset all). SIM & APN: the SIM (Unlock… while it asks for its PIN), the data
+// profiles, and an editor for the profile the driver dials (Apply…, Put Back…). ModemController
+// (ModemController.swift) holds the state, reads the shown tab and runs one call at a time; the rows,
+// questions and sentences come from ModemNetwork.swift and ModemSettings.swift. Radio Off…, the mode's
+// Change… and Put Back…, Apply…, the profile's Put Back… and Unlock… ask first, with words taken when their
+// confirmation opens; a RAT's Change… opens the bands sheet, which is its question. Radio On, Reset and Reset
+// all ask nothing (for the bands, the line beside Reset all warns instead).
 //
 // Nothing here logs, prints or stores what is typed. The PIN is only in the SIM & APN tab's own state and
 // is cleared as soon as its confirmation is confirmed or cancelled; the profile's password is only in the
