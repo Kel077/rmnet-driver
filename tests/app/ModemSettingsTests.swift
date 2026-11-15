@@ -530,8 +530,15 @@ struct ModemSettingsTests {
               "modeQuestion: the modem's own order (NR5G:LTE) is offered as the way back (R8)", fromReordered.message)
         let fromOdd = modeQuestion(from: "GSM:LTE", to: "LTE")
         check(!fromOdd.message.contains("RMNet mode") && !fromOdd.message.contains("Put Back")
-                && fromOdd.message.contains("RMNet cannot set GSM:LTE again"),
-              "modeQuestion: a mode RMNet cannot set is not offered as the way back", fromOdd.message)
+                && fromOdd.message.hasSuffix(" The current mode GSM:LTE cannot be set by RMNet; "
+                                             + "to put it back: RMNet at 'AT+QNWPREFCFG=\"mode_pref\",GSM:LTE'"),
+              "modeQuestion: a mode RMNet cannot set is not offered as the way back; its AT command is", fromOdd.message)
+        let fromQuoted = modeQuestion(from: "GSM'LTE", to: "LTE")
+        check(fromQuoted.message.hasSuffix(" The current mode GSM'LTE cannot be set by RMNet; "
+                                           + "set it again with RMNet at 'AT+QNWPREFCFG=\"mode_pref\",<value>'"),
+              "modeQuestion: a mode with a quote: the AT command with <value> as written", fromQuoted.message)
+        check(![toLTE, fromBoth, fromReordered, fromOdd, fromQuoted].contains { $0.message.contains("console") },
+              "modeQuestion: no message points to a console", fromOdd.message)
         let fromUnknown = modeQuestion(from: nil, to: "LTE")
         check(!fromUnknown.message.contains("RMNet mode") && fromUnknown.message.contains("could not be read")
                 && fromUnknown.message.contains("The modem keeps this setting"),
@@ -579,6 +586,25 @@ struct ModemSettingsTests {
         }
         for before in ["GSM:LTE", "", "LTE:LTE"] {
             check(modeRestoreCommand(before) == nil, "modeRestoreCommand: \"\(before)\" cannot be set by RMNet (R8)")
+        }
+        // Such a value goes back with `RMNet at` and modeCommand, filled in when it is printable ASCII without
+        // quotes (and `RMNet at` would send the line as it is); otherwise `<value>` as written.
+        for before in ["GSM:LTE", "LTE:LTE", "AUTO", "GSM LTE", "x!$`\\;&"] {
+            let want = "RMNet at '\(modeCommand(before))'"
+            check(modeAtRestoreCommand(before) == want, "modeAtRestoreCommand: \(before.debugDescription)",
+                  "\(String(describing: modeAtRestoreCommand(before)))")
+            check(modeAtWayBack(before) == "cannot be set by RMNet; to put it back: \(want)",
+                  "modeAtWayBack: \(before.debugDescription) filled in", modeAtWayBack(before))
+        }
+        check(modeAtRestoreCommand("GSM:LTE") == "RMNet at 'AT+QNWPREFCFG=\"mode_pref\",GSM:LTE'",
+              "modeAtRestoreCommand: GSM:LTE word for word", "\(String(describing: modeAtRestoreCommand("GSM:LTE")))")
+        for before in ["", "GSM\"LTE", "it's", "GSM:\u{FFFD}", "LTE\u{7F}", "LTE\t", "é", "LTE\n", "LTE ", "LTE&W",
+                       String(repeating: "L", count: 512)] {
+            check(modeAtRestoreCommand(before) == nil, "modeAtRestoreCommand: \(before.debugDescription) is not filled in",
+                  "\(String(describing: modeAtRestoreCommand(before)))")
+            check(modeAtWayBack(before)
+                    == "cannot be set by RMNet; set it again with RMNet at 'AT+QNWPREFCFG=\"mode_pref\",<value>'",
+                  "modeAtWayBack: \(before.debugDescription) is written <value>", modeAtWayBack(before))
         }
         check(profileNumberProblem(1) == nil && profileNumberProblem(16) == nil, "profileNumberProblem: 1 and 16")
         check(profileNumberProblem(17) == "Profile 17 cannot be changed by RMNet: AT+QICSGP takes profiles 1 to 16."

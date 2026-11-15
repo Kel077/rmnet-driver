@@ -11,7 +11,8 @@ enum AtError: Error, Equatable {
     case busy                  // another program holds the interface
     case io(Int32)             // an IOKit status from a transfer or the open
     case timeout               // no final result (or no prompt) in time
-    case modem(String)         // the modem's own error line: "ERROR", "+CME ERROR: 10", "+CMS ERROR: 500"
+    case modem(String)         // the modem's own error line: "ERROR", "+CME ERROR: 10", "+CMS ERROR: 500", or
+                               // another V.250 final result: "NO CARRIER", "BUSY", "NO ANSWER", "NO DIALTONE"
 }
 
 // The answer to one line sent to the modem, assembled from the bytes as they arrive. Pure: no I/O.
@@ -20,7 +21,9 @@ enum AtError: Error, Equatable {
 // removed from each line and empty lines are dropped. When the port echoes (`echo` is the line that
 // was sent), the echo is the gate: every line before it is stale (the late answer of an earlier
 // command) or unsolicited, and is discarded. After the echo, a line that is exactly "OK" ends the
-// answer with the lines before it; "ERROR", "+CME ERROR:…" or "+CMS ERROR:…" ends it as an error.
+// answer with the lines before it; "ERROR", "+CME ERROR:…" or "+CMS ERROR:…" ends it as an error, and
+// so do V.250's other final results, each exactly that line: "NO CARRIER" (ATA with no call, say),
+// "BUSY", "NO ANSWER" and "NO DIALTONE"; otherwise such an answer would wait for an OK until its timeout.
 // With `prompt`, the answer is instead the "> " prompt (no line end after it), recognised only after
 // the echo; an error line before it still ends the answer. When the port does not echo (`echo` nil),
 // there is no gate.
@@ -95,8 +98,11 @@ struct AtAnswerCollector {
         return text.isEmpty || payload.range(of: text) != nil
     }
 
+    // V.250's other final results, in their verbose form (CONNECT, which starts data mode, is left out).
+    private static let otherFinalResults: Set<String> = ["NO CARRIER", "BUSY", "NO ANSWER", "NO DIALTONE"]
+
     static func isErrorResult(_ line: String) -> Bool {
-        line == "ERROR" || line.hasPrefix("+CME ERROR:") || line.hasPrefix("+CMS ERROR:")
+        line == "ERROR" || line.hasPrefix("+CME ERROR:") || line.hasPrefix("+CMS ERROR:") || otherFinalResults.contains(line)
     }
 
     private static func clean(_ bytes: ArraySlice<UInt8>) -> String {

@@ -27,7 +27,8 @@ func status(_ entries: [ExtensionEntry], _ modem: ModemState = attached4, model:
 
 // The QMI-mode lines of the advice, word for word: for the RM520N-GL (the verb first, the two AT
 // commands sent with `RMNet at` as the fallback) and for any other model or none known (the two AT
-// commands only: RMNet's AT port does not open those models).
+// commands, for a terminal program of the owner's, a replug in place of the second, and why not RMNet's
+// verbs: its AT port does not open those models).
 let rm520NotQMILines = [
     "The modem is attached but not in QMI mode. Run this command in Terminal, answer y when it asks before restarting the modem, and wait for the modem to come back (RMNet is /Applications/RMNet.app/Contents/MacOS/RMNet):",
     "RMNet usbmode set qmi",
@@ -36,9 +37,10 @@ let rm520NotQMILines = [
     "RMNet at AT+CFUN=1,1",
 ]
 let otherNotQMILines = [
-    "The modem is attached but not in QMI mode. Send it these two AT commands, then wait for it to come back:",
+    "The modem is attached but not in QMI mode. Send it these two AT commands from a terminal program of your own, then wait for it to come back (RMNet at and RMNet usbmode work only with the RM520N-GL):",
     "AT+QCFG=\"usbnet\",0",
     "AT+CFUN=1,1",
+    "(or unplug and replug the modem instead of AT+CFUN=1,1)",
 ]
 
 func expectHeadline(_ s: DriverStatus, _ want: String, _ name: String) {
@@ -106,13 +108,22 @@ struct StatusModelTests {
               "advice: the RM520N-GL's advice no longer says RMNet has no AT terminal", "\(rm520NotQMI)")
         check(rm520NotQMI.firstIndex(of: usbModeQmiCommand) == 1, "advice: the verb is the line after the first",
               "\(rm520NotQMI)")
-        // Any other model: today's advice, the two AT commands only (RMNet's AT port does not open it).
+        // Any other model: the two AT commands, for a terminal program of the owner's, and a replug in place of
+        // the second; RMNet's verbs are named only to say they work with the RM520N-GL alone (its AT port opens
+        // no other model).
         for product in [0x0125, 0x0121, 0x0800] {
+            let name = String(format: "%04x", product)
             let other = advice(status([enabled], .notQMI, model: quectelModel(product: product)), bundledVersion: "316.19.56")
             check(other == otherNotQMILines + [alwaysLine],
-                  "advice: model \(String(format: "%04x", product)) not in QMI mode gives the two AT commands only", "\(other)")
-            check(!other.contains { $0.contains("usbmode") }, "advice: model \(String(format: "%04x", product)) is not told usbmode",
+                  "advice: model \(name) not in QMI mode gives the two AT commands, the replug, and RMNet's limits", "\(other)")
+            check(!other.contains(usbModeQmiCommand) && !other.contains { atFallbackCommands.contains($0) }
+                    && !other.contains { $0.contains("RMNet usbmode set") || $0.contains("RMNet at '") },
+                  "advice: model \(name) is given no RMNet usbmode or RMNet at command", "\(other)")
+            check(other[0].contains("RMNet at and RMNet usbmode work only with the RM520N-GL")
+                    && other.contains("(or unplug and replug the modem instead of AT+CFUN=1,1)"),
+                  "advice: model \(name) is told RMNet's AT verbs work only with the RM520N-GL, and that a replug will do",
                   "\(other)")
+            check(!other.contains { $0.contains("console") }, "advice: model \(name): no console", "\(other)")
         }
         // The model alone, without .notQMI, adds no QMI-mode line.
         let rm520Up = advice(status([enabled], model: rm520Model, attached: true, ["RMNetState": "up"]), bundledVersion: "316.19.56")
