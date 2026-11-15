@@ -1,6 +1,6 @@
 // Tests for app/Nmea.swift: sentence parsing, coordinates, the report the gps verb builds from the
-// sentences, its outcome text (also after the port closed or failed), the line buffer and the verb's
-// arguments. Built with swiftc by
+// sentences, its outcome text (also after the port closed or failed), the line buffer, the verb's
+// arguments, the answer to AT+QGPS? and the lines about switching GNSS. Built with swiftc by
 // `make app-test`; needs no Xcode project and no hardware (nothing here opens the port).
 // Stops at the first failure, prints which check failed and exits 1.
 import Foundation
@@ -54,11 +54,15 @@ func report(_ lines: [String], into start: GpsReport = GpsReport()) -> GpsReport
     return r
 }
 
-// The outcome after asking for 10 s, the reading having ended as `end` says.
-func expectOutcome(_ r: GpsReport, _ lines: [String], _ code: Int32, _ name: String, end: GpsEnd) {
-    let got = gpsOutcome(r, seconds: 10, end: end)
-    check(got.lines == lines && got.code == code, "outcome: \(name)",
-          "want \(lines) \(code), got \(got.lines) \(got.code)")
+// The outcome after asking for 10 s, the reading having ended as `end` says. Unless `onlyKnownOn`, the
+// same lines whether or not GNSS was known to be on.
+func expectOutcome(_ r: GpsReport, _ lines: [String], _ code: Int32, _ name: String, end: GpsEnd,
+                   gnssKnownOn: Bool = true, onlyKnownOn: Bool = false) {
+    for known in onlyKnownOn ? [gnssKnownOn] : [true, false] {
+        let got = gpsOutcome(r, seconds: 10, end: end, gnssKnownOn: known)
+        check(got.lines == lines && got.code == code, "outcome: \(name) (GNSS known on: \(known))",
+              "want \(lines) \(code), got \(got.lines) \(got.code)")
+    }
 }
 
 // The ways the same bytes may arrive in reads.
@@ -181,9 +185,16 @@ struct NmeaTests {
         check(!badLatitude.hasFix && badLatitude.latitude == nil && badLatitude.longitude == nil,
               "report: RMC with 60 minutes of latitude has no position")
 
-        // --- outcome: nothing read -----------------------------------------------------------------
-        expectOutcome(GpsReport(), ["gps: no NMEA sentences in 10 s; GNSS may be off (AT+QGPS? on the console shows it, "
-                                    + "AT+QGPS=1 switches it on)"], 1, "no sentences", end: .deadline)
+        // --- outcome: nothing read: the hint only when GNSS is not known to be on -------------------
+        expectOutcome(GpsReport(), ["gps: no NMEA sentences in 10 s"], 1, "no sentences, GNSS known on", end: .deadline,
+                      gnssKnownOn: true, onlyKnownOn: true)
+        expectOutcome(GpsReport(), ["gps: no NMEA sentences in 10 s; GNSS may be off (RMNet at AT+QGPS? shows it, "
+                                    + "RMNet at AT+QGPS=1 switches it on)"], 1, "no sentences, GNSS's state unknown",
+                      end: .deadline, gnssKnownOn: false, onlyKnownOn: true)
+        for known in [true, false] {
+            let line = gpsOutcome(GpsReport(), seconds: 10, end: .deadline, gnssKnownOn: known).lines.joined()
+            check(!line.contains("console"), "outcome: no sentences never mentions a console", line)
+        }
 
         // --- outcome: the port closed or failed: never reported as the receiver's state ------------
         expectOutcome(noFix, ["gps: the NMEA port closed after 0 s (4 sentences read)"], 1, "port closed, no fix",
@@ -219,13 +230,43 @@ struct NmeaTests {
               "got \(decoded)")
 
         // --- parseGps ------------------------------------------------------------------------------
-        check(parseGps([]) == 10, "parseGps: no argument is 10 s")
-        check(parseGps(["30"]) == 30, "parseGps: 30")
-        check(parseGps(["1"]) == 1, "parseGps: 1")
-        check(parseGps(["600"]) == 600, "parseGps: 600")
-        for words in [["0"], ["601"], ["x"], ["10", "20"], ["-5"], [""], ["1.5"]] {
+        check(parseGps([]) == GpsOptions(seconds: 10, keepOn: false), "parseGps: no argument is 10 s")
+        check(parseGps(["30"]) == GpsOptions(seconds: 30, keepOn: false), "parseGps: 30")
+        check(parseGps(["1"]) == GpsOptions(seconds: 1, keepOn: false), "parseGps: 1")
+        check(parseGps(["600"]) == GpsOptions(seconds: 600, keepOn: false), "parseGps: 600")
+        check(parseGps(["--keep-on"]) == GpsOptions(seconds: 10, keepOn: true), "parseGps: --keep-on alone is 10 s")
+        check(parseGps(["30", "--keep-on"]) == GpsOptions(seconds: 30, keepOn: true), "parseGps: 30 --keep-on")
+        check(parseGps(["--keep-on", "30"]) == GpsOptions(seconds: 30, keepOn: true), "parseGps: --keep-on 30")
+        for words in [["0"], ["601"], ["x"], ["10", "20"], ["-5"], [""], ["1.5"], ["--keep-on", "--keep-on"],
+                      ["--keep"], ["--keep-on=1"], ["10", "--keep-on", "20"], ["--KEEP-ON"], ["-k"]] {
             check(parseGps(words) == nil, "parseGps: \(words) is wrong usage")
         }
+
+        // --- parseGnssState: the answer to AT+QGPS? ------------------------------------------------
+        check(parseGnssState(["+QGPS: 0"]) == false, "parseGnssState: +QGPS: 0 is off")
+        check(parseGnssState(["+QGPS: 1"]) == true, "parseGnssState: +QGPS: 1 is on")
+        check(parseGnssState(["+QGPS:1"]) == true, "parseGnssState: no space after the colon")
+        check(parseGnssState(["+QGPS: 1 "]) == true, "parseGnssState: a space after the value")
+        check(parseGnssState(["+QIND: \"gnss\"", "+QGPS: 0"]) == false, "parseGnssState: another line before it")
+        for lines in [[], ["+QGPS: 2"], ["+QGPS: "], ["+QGPS: 01"], ["+QGPS: on"], ["QGPS: 1"], ["+QGPSCFG: 1"]] {
+            check(parseGnssState(lines) == nil, "parseGnssState: \(lines) says nothing")
+        }
+
+        // --- the lines about switching GNSS --------------------------------------------------------
+        let reason = "the modem did not answer in time"
+        check(GnssLine.checkFailed(reason) == "gps: could not check GNSS (the modem did not answer in time); reading anyway",
+              "GnssLine: check failed", GnssLine.checkFailed(reason))
+        check(GnssLine.switchedOn == "gps: GNSS switched on; a first fix outdoors can take a minute or more",
+              "GnssLine: switched on", GnssLine.switchedOn)
+        check(GnssLine.switchOnFailed(reason)
+              == "gps: could not switch GNSS on (the modem did not answer in time); reading anyway",
+              "GnssLine: switch on failed", GnssLine.switchOnFailed(reason))
+        check(GnssLine.switchedOff == "gps: GNSS switched off again", "GnssLine: switched off", GnssLine.switchedOff)
+        check(GnssLine.switchOffFailed(reason)
+              == "gps: could not switch GNSS off (the modem did not answer in time); RMNet at AT+QGPSEND does it",
+              "GnssLine: switch off failed", GnssLine.switchOffFailed(reason))
+        check(GnssLine.leftOn == "gps: GNSS left on (RMNet at AT+QGPSEND switches it off)", "GnssLine: left on",
+              GnssLine.leftOn)
 
         print("nmea-test: \(checks) checks passed")
     }

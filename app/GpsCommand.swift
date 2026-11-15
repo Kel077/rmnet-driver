@@ -1,10 +1,201 @@
 // The gps verb: reads the NMEA sentences of the modem's GNSS receiver from its NMEA interface (USB
-// interface 1), which the driver presents as a serial device, and prints the position. It only reads:
-// nothing is written to the port, so no modem setting changes (GNSS is switched on and off on the
-// owner's console), and nothing is logged. The position goes to standard output only.
+// interface 1), which the driver presents as a serial device, and prints the position. Nothing is
+// written to the NMEA port. GNSS itself is switched over the modem's spare AT port (USB interface 3,
+// AtPort): on when it is off, and off again afterwards on every way out, Ctrl-C included, unless
+// --keep-on. Nothing is logged; the position goes to standard output only.
 import Foundation
 
 let nmeaPortPath = "/dev/cu.RM520N-GL-NMEA"
+
+// MARK: - Switching GNSS
+
+// Why GNSS could not be checked or switched, in words that fit in a line's parentheses.
+struct GnssFailure: Error, Equatable {
+    let reason: String
+}
+
+// The modem's GNSS receiver: whether it is on, and switching it on and off. Each call blocks until done.
+protocol GnssSwitching {
+    func state() -> Result<Bool, GnssFailure>      // true: on
+    func switchOn() -> Result<Void, GnssFailure>
+    func switchOff() -> Result<Void, GnssFailure>
+}
+
+// describe's sentence for an AT port failure as a clause: its first letter lower-cased and its final
+// period dropped ("the modem did not answer in time").
+func gnssReason(_ error: AtError) -> String {
+    var sentence = describe(error)
+    if sentence.hasSuffix(".") { sentence.removeLast() }
+    return sentence.prefix(1).lowercased() + sentence.dropFirst()
+}
+
+// GNSS over the modem's spare AT port. Each call opens a port (AtPort.open waits up to 2 s while another
+// program holds it), sends one command and closes the port, also on failure. The timeouts are the modem
+// service's: 3 s for the read, 5 s for each switch.
+final class AtGnssSwitch: GnssSwitching {
+    private static let readTimeout: TimeInterval = 3
+    private static let switchTimeout: TimeInterval = 5
+    private let open: () -> Result<AtCommanding, AtError>
+
+    init(open: @escaping () -> Result<AtCommanding, AtError> = { AtPort.open().map { $0 as AtCommanding } }) {
+        self.open = open
+    }
+
+    private func command(_ line: String, timeout: TimeInterval) -> Result<[String], AtError> {
+        switch open() {
+        case .failure(let error):
+            return .failure(error)
+        case .success(let port):
+            defer { port.close() }
+            return port.command(line, timeout: timeout)
+        }
+    }
+
+    // AT+QGPS?: "+QGPS: 1" is on, "+QGPS: 0" off.
+    func state() -> Result<Bool, GnssFailure> {
+        switch command("AT+QGPS?", timeout: AtGnssSwitch.readTimeout) {
+        case .success(let lines):
+            guard let on = parseGnssState(lines) else {
+                return .failure(GnssFailure(reason: "the modem did not say whether GNSS is on"))
+            }
+            return .success(on)
+        case .failure(let error):
+            return .failure(GnssFailure(reason: gnssReason(error)))
+        }
+    }
+
+    // AT+QGPS=1. Its error 504 (a GNSS session is already running) means GNSS is on.
+    func switchOn() -> Result<Void, GnssFailure> {
+        switch command("AT+QGPS=1", timeout: AtGnssSwitch.switchTimeout) {
+        case .success, .failure(.modem("+CME ERROR: 504")):
+            return .success(())
+        case .failure(let error):
+            return .failure(GnssFailure(reason: gnssReason(error)))
+        }
+    }
+
+    // AT+QGPSEND. Its error 505 (no GNSS session is running) means GNSS is off.
+    func switchOff() -> Result<Void, GnssFailure> {
+        switch command("AT+QGPSEND", timeout: AtGnssSwitch.switchTimeout) {
+        case .success, .failure(.modem("+CME ERROR: 505")):
+            return .success(())
+        case .failure(let error):
+            return .failure(GnssFailure(reason: gnssReason(error)))
+        }
+    }
+}
+
+// The GNSS side of one gps run: begin() switches GNSS on when it is off, and end() is the one way back,
+// called both at the run's normal end and by the signal handler. Both hold one lock, so a signal during
+// begin() waits for it (and then switches GNSS off if it was switched on), and the way back runs once.
+// The lines go to `errorOutput`.
+final class GnssSession {
+    private let gnss: GnssSwitching
+    private let keepOn: Bool
+    private let errorOutput: (String) -> Void
+    private let lock = NSLock()
+    private var switchedOn = false   // this run switched GNSS on
+    private var ended = false
+
+    init(gnss: GnssSwitching, keepOn: Bool, errorOutput: @escaping (String) -> Void) {
+        self.gnss = gnss
+        self.keepOn = keepOn
+        self.errorOutput = errorOutput
+    }
+
+    // Asks whether GNSS is on and, when it is off, switches it on. True when GNSS is known to be on (it was,
+    // or this run switched it on); false when its state could not be read or switching it on failed. After
+    // end() it asks and switches nothing (false).
+    func begin() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !ended else { return false }
+        switch gnss.state() {
+        case .failure(let failure):
+            errorOutput(GnssLine.checkFailed(failure.reason))
+            return false
+        case .success(true):
+            return true
+        case .success(false):
+            switch gnss.switchOn() {
+            case .success:
+                switchedOn = true
+                errorOutput(GnssLine.switchedOn)
+                return true
+            case .failure(let failure):
+                errorOutput(GnssLine.switchOnFailed(failure.reason))
+                return false
+            }
+        }
+    }
+
+    // The way back, the first time only: if this run switched GNSS on, switches it off again, or with
+    // --keep-on says that it is left on. Otherwise nothing.
+    func end() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !ended else { return }
+        ended = true
+        guard switchedOn else { return }
+        if keepOn {
+            errorOutput(GnssLine.leftOn)
+            return
+        }
+        switch gnss.switchOff() {
+        case .success: errorOutput(GnssLine.switchedOff)
+        case .failure(let failure): errorOutput(GnssLine.switchOffFailed(failure.reason))
+        }
+    }
+}
+
+// While it runs, `signals` neither end the process nor interrupt a wait: each is ignored, and `handler`
+// runs for it on a global queue (a dispatch source, which sees a signal also while it is ignored and
+// whichever thread blocks it). A signal the process already ignored when the watch began (SIGINT in a
+// background job of a script, SIGHUP under nohup) stays ignored and is not watched. stop() ends the watch
+// and gives each signal back its earlier action.
+final class SignalWatch {
+    private var sources: [DispatchSourceSignal] = []
+    private var earlier: [(signal: Int32, action: sig_t?)] = []
+
+    init(_ signals: [Int32], handler: @escaping (Int32) -> Void) {
+        for sig in signals {
+            let action = signal(sig, SIG_IGN)
+            guard !SignalWatch.isIgnore(action) else { continue }
+            earlier.append((signal: sig, action: action))
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .global(qos: .userInitiated))
+            source.setEventHandler { handler(sig) }
+            source.resume()
+            sources.append(source)
+        }
+    }
+
+    // Whether `action` is SIG_IGN (C function pointers cannot be compared in Swift; their bits can).
+    static func isIgnore(_ action: sig_t?) -> Bool {
+        guard let action else { return false }  // SIG_DFL
+        return unsafeBitCast(action, to: Int.self) == unsafeBitCast(SIG_IGN, to: Int.self)
+    }
+
+    func stop() {
+        for source in sources { source.cancel() }
+        for (sig, action) in earlier { signal(sig, action) }
+    }
+}
+
+// Ends the process by `sig` as if it had not been caught (Ctrl-C still ends the verb as interrupted): the
+// default action again, the signal unblocked on this thread (a dispatch queue's thread blocks signals),
+// and raised on it. Standard output is flushed first.
+func dieBySignal(_ sig: Int32) {
+    fflush(stdout)
+    signal(sig, SIG_DFL)
+    var set = sigset_t()
+    sigemptyset(&set)
+    sigaddset(&set, sig)
+    pthread_sigmask(SIG_UNBLOCK, &set, nil)
+    raise(sig)
+    exit(128 + sig)  // not reached
+}
+
+// MARK: - Reading the NMEA port
 
 // What reading a port gave: no such path, a port that could not be opened or set up (with strerror's
 // text), or the report and how the reading ended.
@@ -86,22 +277,50 @@ func readGps(path: String, seconds: Int) -> GpsRead {
     return .read(report, end)
 }
 
-// Reads the NMEA port for `seconds` (readGps), then prints what it gave and returns the exit code: 1
-// when the port is missing or cannot be opened or set up, otherwise gpsOutcome's code.
-func runGps(seconds: Int) -> Int32 {
-    switch readGps(path: nmeaPortPath, seconds: seconds) {
-    case .notFound:
-        print("gps: \(nmeaPortPath) not found (the driver is not attached to the modem's NMEA interface)")
+// MARK: - The verb
+
+// Without the NMEA port, prints that it is missing and asks nothing of GNSS. Otherwise: switches GNSS on
+// when it is off (GnssSession.begin), reads the port for `seconds` (`read`, readGps), prints what it gave,
+// and then takes the way back (GnssSession.end: GNSS off again if this run switched it on, unless
+// `keepOn`). From before GNSS is asked until the way back, `signals` (Ctrl-C, SIGTERM, a hang-up) take the
+// way back at once and are then handed to `afterSignal`, which ends the process by that signal. Returns
+// the exit code: 1 when the port is missing or cannot be opened or set up, otherwise gpsOutcome's code;
+// how GNSS was switched does not change it. The reading's lines go to `output`, the GNSS lines to
+// `errorOutput`. Blocks: run it off the main thread.
+func runGps(seconds: Int, keepOn: Bool, gnss: GnssSwitching = AtGnssSwitch(), path: String = nmeaPortPath,
+            read: (String, Int) -> GpsRead = readGps(path:seconds:),
+            signals: [Int32] = [SIGINT, SIGTERM, SIGHUP], afterSignal: @escaping (Int32) -> Void = dieBySignal,
+            output: (String) -> Void = { print($0); fflush(stdout) },
+            errorOutput: @escaping (String) -> Void = { fputs("\($0)\n", stderr) }) -> Int32 {
+    let notFound = "gps: \(path) not found (the driver is not attached to the modem's NMEA interface)"
+    guard FileManager.default.fileExists(atPath: path) else {
+        output(notFound)
         return 1
-    case .cannotOpen(let reason):
-        print("gps: cannot open \(nmeaPortPath): \(reason)")
-        return 1
-    case .cannotSetUp(let reason):
-        print("gps: cannot set up \(nmeaPortPath): \(reason)")
-        return 1
-    case .read(let report, let end):
-        let outcome = gpsOutcome(report, seconds: seconds, end: end)
-        for line in outcome.lines { print(line) }
-        return outcome.code
     }
+    let session = GnssSession(gnss: gnss, keepOn: keepOn, errorOutput: errorOutput)
+    let watch = SignalWatch(signals) { sig in
+        session.end()
+        afterSignal(sig)
+    }
+    defer { watch.stop() }
+    let gnssKnownOn = session.begin()
+
+    let code: Int32
+    switch read(path, seconds) {
+    case .notFound:
+        output(notFound)
+        code = 1
+    case .cannotOpen(let reason):
+        output("gps: cannot open \(path): \(reason)")
+        code = 1
+    case .cannotSetUp(let reason):
+        output("gps: cannot set up \(path): \(reason)")
+        code = 1
+    case .read(let report, let end):
+        let outcome = gpsOutcome(report, seconds: seconds, end: end, gnssKnownOn: gnssKnownOn)
+        for line in outcome.lines { output(line) }
+        code = outcome.code
+    }
+    session.end()
+    return code
 }

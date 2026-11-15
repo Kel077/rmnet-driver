@@ -69,10 +69,11 @@ check-driverkit:
 	./scripts/check-personalities.sh
 
 # The app's status model, SMS model, AT answer logic, the Messages tab's controller, the gps verb's
-# NMEA logic and its port reader, the network model, the settings model, the modem service (against a
-# scripted port), the modem verbs (against a fake service), the modem tabs' controller and the quit gate
-# (with both controllers), tested without Xcode or hardware (neither the AT port nor the NMEA port is
-# opened: the reader reads a pseudo-terminal the test makes, and no window is made).
+# NMEA logic, its port reader and its GNSS switching (against a fake switch and a scripted port), the
+# network model, the settings model, the modem service (against a scripted port), the modem verbs (against
+# a fake service), the modem tabs' controller and the quit gate (with both controllers), tested without
+# Xcode or hardware (neither the AT port nor the NMEA port is opened: the reader reads a pseudo-terminal
+# the test makes, and no window is made).
 app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/nmea-tests build/gpsread-tests \
 		build/modemnet-tests build/modemset-tests build/modemsvc-tests build/modemcli-tests build/modemui-tests \
 		build/quit-tests
@@ -109,7 +110,10 @@ build/nmea-tests: app/Nmea.swift tests/app/NmeaTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
-build/gpsread-tests: app/Nmea.swift app/GpsCommand.swift tests/app/GpsReadTests.swift
+# The gps verb switches GNSS over the AT port: AtPort.swift, ModemService.swift (AtCommanding), SmsService.swift
+# (describe) and what they need. The tests drive a fake switch and a scripted port; no port is opened.
+build/gpsread-tests: app/AtPort.swift app/SmsModel.swift app/SmsService.swift app/ModemNetwork.swift \
+		app/ModemSettings.swift app/ModemService.swift app/Nmea.swift app/GpsCommand.swift tests/app/GpsReadTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 

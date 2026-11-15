@@ -83,7 +83,7 @@ ping -c 3 -b en33 1.1.1.1       # bound to the port, whatever the service order
 |---|---|
 | `RMNet status [--json]` | Whether the driver is installed and the modem attached in QMI mode; the driver's state, addresses and counters. |
 | `RMNet sms list [--json]`<br>`RMNet sms send <number> <text>`<br>`RMNet sms delete <index>...` | List, send and delete the modem's text messages. Each message sent costs a carrier fee. |
-| `RMNet gps [seconds]` | The position from the modem's GNSS receiver. It needs the driver attached (it reads the NMEA serial port) and GNSS already switched on, which `gps` does not do: `RMNet at AT+QGPS=1`. |
+| `RMNet gps [seconds] [--keep-on]` | The position from the modem's GNSS receiver, read for `seconds` (10 without). It switches GNSS on when it is off and back off afterwards, also after Ctrl-C; `--keep-on` leaves it on (`RMNet at AT+QGPSEND` switches it off). It needs the driver attached (it reads the NMEA serial port) and a GNSS antenna on the modem; a first fix outdoors can take a minute or more, so give it time: `RMNet gps 120`. |
 | `RMNet network [--json]` | Registration, operator, technology, band, signal and cell. |
 | `RMNet radio [on\|off]` | Show the radio's state, or switch it. `off` is airplane mode: no connection until `radio on`. |
 | `RMNet mode [auto\|nr5g\|lte\|lte:nr5g\|…]` | Show or set the network mode. The modem keeps it; the command prints how to put it back. |

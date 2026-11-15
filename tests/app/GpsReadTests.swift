@@ -1,7 +1,11 @@
-// Tests for readGps (app/GpsCommand.swift) against a pseudo-terminal the test makes itself: the reader
-// opens the pty's slave as it would the NMEA port, and a background thread plays the modem on the
-// master. Never opens a real port. Built with swiftc by `make app-test`, with app/Nmea.swift; needs no
-// Xcode project and no hardware. Stops at the first failure, prints which check failed and exits 1.
+// Tests for app/GpsCommand.swift. readGps reads a pseudo-terminal the test makes itself: the reader opens
+// the pty's slave as it would the NMEA port, and a background thread plays the modem on the master. runGps
+// runs with a fake GNSS switch that records its calls, on that pty (or with a reading given to it), with
+// real signals sent to this process during the read; AtGnssSwitch runs against a scripted AT port. Never
+// opens a real port: neither the NMEA port nor the AT port. Built with swiftc by `make app-test`, with
+// app/Nmea.swift and the AT port's files (app/AtPort.swift, app/ModemService.swift for AtCommanding,
+// app/SmsService.swift for describe, and what they need); needs no Xcode project and no hardware. Stops
+// at the first failure, prints which check failed and exits 1.
 import Foundation
 
 var checks = 0
@@ -100,6 +104,201 @@ func readWhile(_ pty: Pty, seconds: Int, play: @escaping () -> Void) -> (GpsRead
     return (result, Date().timeIntervalSince(start))
 }
 
+// MARK: - runGps with a fake GNSS switch
+
+// Everything runGps did, in order: "call: <name>" for each call of the switch and of the reader, "out: "
+// and "err: " for each line written to standard output and standard error. Locked: the signal handler
+// writes from another thread.
+final class Log {
+    private let lock = NSLock()
+    private var all: [String] = []
+
+    func call(_ name: String) { add("call: " + name) }
+    func out(_ line: String) { add("out: " + line) }
+    func err(_ line: String) { add("err: " + line) }
+
+    var lines: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return all
+    }
+
+    func count(_ line: String) -> Int { lines.filter { $0 == line }.count }
+
+    private func add(_ line: String) {
+        lock.lock()
+        all.append(line)
+        lock.unlock()
+    }
+}
+
+// A GNSS switch that answers as it is told and notes each call in the log.
+final class FakeGnss: GnssSwitching {
+    private let log: Log
+    private let stateAnswer: Result<Bool, GnssFailure>
+    private let onAnswer: Result<Void, GnssFailure>
+    private let offAnswer: Result<Void, GnssFailure>
+
+    init(_ log: Log, state: Result<Bool, GnssFailure>, on: Result<Void, GnssFailure> = .success(()),
+         off: Result<Void, GnssFailure> = .success(())) {
+        self.log = log
+        stateAnswer = state
+        onAnswer = on
+        offAnswer = off
+    }
+
+    func state() -> Result<Bool, GnssFailure> {
+        log.call("state")
+        return stateAnswer
+    }
+
+    func switchOn() -> Result<Void, GnssFailure> {
+        log.call("on")
+        return onAnswer
+    }
+
+    func switchOff() -> Result<Void, GnssFailure> {
+        log.call("off")
+        return offAnswer
+    }
+}
+
+// What the signal handler handed on, in place of ending the process.
+final class Caught {
+    private let lock = NSLock()
+    private var all: [Int32] = []
+
+    func add(_ sig: Int32) {
+        lock.lock()
+        all.append(sig)
+        lock.unlock()
+    }
+
+    var signals: [Int32] {
+        lock.lock()
+        defer { lock.unlock() }
+        return all
+    }
+}
+
+let busy = GnssFailure(reason: "another program is using the modem's spare AT port")
+let noAnswer = GnssFailure(reason: "the modem did not answer in time")
+let hint = "; GNSS may be off (RMNet at AT+QGPS? shows it, RMNet at AT+QGPS=1 switches it on)"
+let fixOutput = ["out: gps: fix 48.117300, 11.516667", "out:   altitude 545.4 m, 8 satellites used, 12:35:19 UTC"]
+
+// runGps on `path` with the fake, writing to `log`; the reader is readGps, noted in the log as "read", or
+// `reading` when given. No signal is watched unless `signals` are given; then a caught signal is handed to
+// `caught` instead of ending the process.
+func run(_ log: Log, _ gnss: GnssSwitching, path: String, seconds: Int, keepOn: Bool = false,
+         reading: GpsRead? = nil, signals: [Int32] = [], caught: Caught = Caught()) -> Int32 {
+    runGps(seconds: seconds, keepOn: keepOn, gnss: gnss, path: path,
+           read: { path, seconds in
+               log.call("read")
+               return reading ?? readGps(path: path, seconds: seconds)
+           },
+           signals: signals, afterSignal: { caught.add($0) },
+           output: { log.out($0) }, errorOutput: { log.err($0) })
+}
+
+func expectLog(_ log: Log, _ want: [String], _ name: String) {
+    check(log.lines == want, name, "want \(want)\n  got  \(log.lines)")
+}
+
+// A report with the fix of fixLines.
+func fixReport() -> GpsReport {
+    var report = GpsReport()
+    for line in fixLines { if let s = Nmea.parse(line) { report.add(s) } }
+    return report
+}
+
+// MARK: - AtGnssSwitch against a scripted port
+
+// A port that gives one answer and records what was sent.
+final class OnePort: AtCommanding {
+    private let answer: Result<[String], AtError>
+    private(set) var sent: [(line: String, timeout: TimeInterval)] = []
+    private(set) var closed = false
+
+    init(_ answer: Result<[String], AtError>) { self.answer = answer }
+
+    func command(_ line: String, timeout: TimeInterval) -> Result<[String], AtError> {
+        sent.append((line: line, timeout: timeout))
+        return closed ? .failure(.io(Int32(bitPattern: 0xE000_02CD))) : answer
+    }
+
+    func close() { closed = true }
+}
+
+// An AtGnssSwitch whose opens give `port` (or fail with `openFailure`), counted.
+final class Opener {
+    let port: OnePort
+    let openFailure: AtError?
+    private(set) var opens = 0
+
+    init(_ answer: Result<[String], AtError>, openFailure: AtError? = nil) {
+        port = OnePort(answer)
+        self.openFailure = openFailure
+    }
+
+    var gnss: AtGnssSwitch {
+        AtGnssSwitch(open: {
+            self.opens += 1
+            if let failure = self.openFailure { return .failure(failure) }
+            return .success(self.port)
+        })
+    }
+
+    // One open, `line` sent once with `timeout`, and the port closed.
+    func sentOnce(_ line: String, _ timeout: TimeInterval) -> Bool {
+        opens == 1 && port.sent.count == 1 && port.sent[0].line == line && port.sent[0].timeout == timeout && port.closed
+    }
+}
+
+func expectSwitch<T: Equatable>(_ got: Result<T, GnssFailure>, _ want: Result<T, GnssFailure>, _ name: String) {
+    check(got == want, "AtGnssSwitch: \(name)", "want \(want), got \(got)")
+}
+
+func runGnssTests() {
+    let off = Opener(.success(["+QGPS: 0"]))
+    expectSwitch(off.gnss.state(), .success(false), "+QGPS: 0 is off")
+    check(off.sentOnce("AT+QGPS?", 3), "AtGnssSwitch: state sends AT+QGPS? once (3 s) on its own port, then closes it",
+          "opens \(off.opens), sent \(off.port.sent), closed \(off.port.closed)")
+    expectSwitch(Opener(.success(["+QGPS: 1"])).gnss.state(), .success(true), "+QGPS: 1 is on")
+    expectSwitch(Opener(.success([])).gnss.state(), .failure(GnssFailure(reason: "the modem did not say whether GNSS is on")),
+                 "an answer without +QGPS")
+    expectSwitch(Opener(.failure(.modem("+CME ERROR: 3"))).gnss.state(),
+                 .failure(GnssFailure(reason: "the modem refused the command (+CME ERROR: 3)")), "state refused")
+    let held = Opener(.success(["+QGPS: 0"]), openFailure: .busy)
+    expectSwitch(held.gnss.state(), .failure(busy), "the port held by another program")
+    check(held.opens == 1 && held.port.sent.isEmpty, "AtGnssSwitch: nothing sent when the open fails")
+
+    let on = Opener(.success([]))
+    expectSwitch(on.gnss.switchOn().map { true }, .success(true), "AT+QGPS=1 answered OK")
+    check(on.sentOnce("AT+QGPS=1", 5), "AtGnssSwitch: switchOn sends AT+QGPS=1 once (5 s), then closes the port",
+          "opens \(on.opens), sent \(on.port.sent), closed \(on.port.closed)")
+    expectSwitch(Opener(.failure(.modem("+CME ERROR: 504"))).gnss.switchOn().map { true }, .success(true),
+                 "+CME ERROR: 504 (a session is running) is on")
+    expectSwitch(Opener(.failure(.modem("+CME ERROR: 503"))).gnss.switchOn().map { true },
+                 .failure(GnssFailure(reason: "the modem refused the command (+CME ERROR: 503)")), "switch on refused")
+    let late = Opener(.failure(.timeout))
+    expectSwitch(late.gnss.switchOn().map { true }, .failure(noAnswer), "switch on: no answer")
+    check(late.port.closed, "AtGnssSwitch: the port is closed after a timeout too")
+
+    let offAgain = Opener(.success([]))
+    expectSwitch(offAgain.gnss.switchOff().map { true }, .success(true), "AT+QGPSEND answered OK")
+    check(offAgain.sentOnce("AT+QGPSEND", 5), "AtGnssSwitch: switchOff sends AT+QGPSEND once (5 s), then closes the port",
+          "opens \(offAgain.opens), sent \(offAgain.port.sent), closed \(offAgain.port.closed)")
+    expectSwitch(Opener(.failure(.modem("+CME ERROR: 505"))).gnss.switchOff().map { true }, .success(true),
+                 "+CME ERROR: 505 (no session) is off")
+    expectSwitch(Opener(.failure(.modem("+CME ERROR: 504"))).gnss.switchOff().map { true },
+                 .failure(GnssFailure(reason: "the modem refused the command (+CME ERROR: 504)")), "switch off refused")
+    expectSwitch(Opener(.success([]), openFailure: .modemNotAttached).gnss.switchOff().map { true },
+                 .failure(GnssFailure(reason: "the RM520N-GL (USB 2c7c:0801) is not attached")), "switch off: no modem")
+    let ioReason = gnssReason(.io(Int32(bitPattern: 0xE000_02ED)))
+    check(ioReason == "an I/O error occurred on the modem's spare AT port (code 0xe00002ed)", "gnssReason: an I/O error",
+          ioReason)
+}
+
 @main
 struct GpsReadTests {
     static func main() {
@@ -190,6 +389,214 @@ struct GpsReadTests {
         var isCannotOpen = false
         if case .cannotOpen(let reason) = unreadable, reason == String(cString: strerror(EACCES)) { isCannotOpen = true }
         check(isCannotOpen, "unreadable: cannot open (permission denied)", "got \(unreadable)")
+
+        // --- 7: runGps: GNSS off: on, the read (a fix), off ---------------------------------------
+        do {
+            let pty = Pty()
+            let log = Log()
+            Thread {
+                if waitFor({ pty.isRawWithClocal }) { _ = pty.write(fixLines) }
+            }.start()
+            let code = run(log, FakeGnss(log, state: .success(false)), path: pty.path, seconds: 10)
+            expectLog(log, ["call: state", "call: on", "err: " + GnssLine.switchedOn, "call: read"] + fixOutput
+                      + ["call: off", "err: " + GnssLine.switchedOff], "runGps: off, so on, read, off")
+            check(code == 0, "runGps: a fix exits 0", "got \(code)")
+            pty.closeAll()
+        }
+
+        // --- 8: runGps: GNSS already on: no switching; no hint after no sentences --------------------
+        do {
+            let pty = Pty()
+            let log = Log()
+            let code = run(log, FakeGnss(log, state: .success(true)), path: pty.path, seconds: 1)
+            expectLog(log, ["call: state", "call: read", "out: gps: no NMEA sentences in 1 s"],
+                      "runGps: already on, so neither on nor off")
+            check(code == 1, "runGps: no sentences exits 1", "got \(code)")
+            pty.closeAll()
+        }
+
+        // --- 9: runGps --keep-on: on, the read, left on -------------------------------------------
+        do {
+            let pty = Pty()
+            let log = Log()
+            Thread {
+                if waitFor({ pty.isRawWithClocal }) { _ = pty.write(noFixLines) }
+            }.start()
+            let code = run(log, FakeGnss(log, state: .success(false)), path: pty.path, seconds: 2, keepOn: true)
+            expectLog(log, ["call: state", "call: on", "err: " + GnssLine.switchedOn, "call: read",
+                            "out: gps: no fix after 2 s (4 sentences, 0 satellites in view)", "err: " + GnssLine.leftOn],
+                      "runGps --keep-on: no off, and says GNSS is left on")
+            check(code == 1, "runGps --keep-on: no fix exits 1", "got \(code)")
+            pty.closeAll()
+        }
+
+        // --- 10: runGps: the state cannot be read: reads anyway, switches nothing, gives the hint ----
+        do {
+            let pty = Pty()
+            let log = Log()
+            let code = run(log, FakeGnss(log, state: .failure(busy)), path: pty.path, seconds: 1)
+            expectLog(log, ["call: state", "err: " + GnssLine.checkFailed(busy.reason), "call: read",
+                            "out: gps: no NMEA sentences in 1 s" + hint],
+                      "runGps: state failed, so it reads anyway and says GNSS may be off")
+            check(pty.isRawWithClocal, "runGps: state failed, and the port was read")
+            check(code == 1, "runGps: state failed, no sentences: exit 1", "got \(code)")
+            pty.closeAll()
+        }
+
+        // --- 11: runGps: switching on fails: reads anyway, no off, gives the hint ------------------
+        do {
+            let pty = Pty()
+            let log = Log()
+            let code = run(log, FakeGnss(log, state: .success(false), on: .failure(noAnswer)), path: pty.path, seconds: 1)
+            expectLog(log, ["call: state", "call: on", "err: " + GnssLine.switchOnFailed(noAnswer.reason), "call: read",
+                            "out: gps: no NMEA sentences in 1 s" + hint],
+                      "runGps: switching on failed, so it reads anyway and never switches off")
+            check(code == 1, "runGps: switching on failed: exit 1", "got \(code)")
+            pty.closeAll()
+        }
+
+        // --- 12: runGps: the port closes during the read: off all the same -----------------------
+        do {
+            let pty = Pty()
+            let log = Log()
+            Thread {
+                guard waitFor({ pty.isRawWithClocal }), pty.write(noFixLines) else { return }
+                _ = waitFor { pty.unread == 0 }
+                close(pty.master)
+            }.start()
+            let code = run(log, FakeGnss(log, state: .success(false)), path: pty.path, seconds: 10)
+            // As in 3: end of file on this Mac, EIO elsewhere.
+            let ended = log.lines.count == 7 ? log.lines[4] : ""
+            check(ended == "out: gps: the NMEA port closed after 0 s (4 sentences read)"
+                  || ended.hasPrefix("out: gps: reading the NMEA port failed after 0 s: "),
+                  "runGps: the port closed: says so", "got \(log.lines)")
+            expectLog(log, ["call: state", "call: on", "err: " + GnssLine.switchedOn, "call: read", ended,
+                            "call: off", "err: " + GnssLine.switchedOff], "runGps: the port closed, and GNSS is off again")
+            check(code == 1, "runGps: the port closed: exit 1", "got \(code)")
+            close(pty.slave)
+        }
+
+        // --- 13: runGps: a read fails: off all the same ------------------------------------------
+        do {
+            let log = Log()
+            let failed = GpsRead.read(GpsReport(), .failed(elapsed: 3, reason: "Device not configured"))
+            let code = run(log, FakeGnss(log, state: .success(false)), path: "/dev/null", seconds: 10, reading: failed)
+            expectLog(log, ["call: state", "call: on", "err: " + GnssLine.switchedOn, "call: read",
+                            "out: gps: reading the NMEA port failed after 3 s: Device not configured",
+                            "call: off", "err: " + GnssLine.switchedOff], "runGps: a read failed, and GNSS is off again")
+            check(code == 1, "runGps: a read failed: exit 1", "got \(code)")
+        }
+
+        // --- 14: runGps: the port cannot be set up: off all the same -----------------------------
+        do {
+            let log = Log()
+            let code = run(log, FakeGnss(log, state: .success(false)), path: "/dev/null", seconds: 1)
+            var notTtyReason = ""
+            if case .cannotSetUp(let reason) = notTty { notTtyReason = reason }  // from 5
+            let setUp = "out: gps: cannot set up /dev/null: " + notTtyReason
+            expectLog(log, ["call: state", "call: on", "err: " + GnssLine.switchedOn, "call: read", setUp,
+                            "call: off", "err: " + GnssLine.switchedOff], "runGps: the port cannot be set up, and GNSS is off again")
+            check(code == 1, "runGps: cannot set up: exit 1", "got \(code)")
+        }
+
+        // --- 15: runGps: no port: GNSS is not touched -------------------------------------------
+        do {
+            let log = Log()
+            let code = run(log, FakeGnss(log, state: .success(false)), path: missing, seconds: 1)
+            expectLog(log, ["out: gps: \(missing) not found (the driver is not attached to the modem's NMEA interface)"],
+                      "runGps: no port, so neither the state nor a switch is asked")
+            check(code == 1, "runGps: no port: exit 1", "got \(code)")
+        }
+
+        // --- 16: runGps: switching off fails: says how to do it; the exit code is the reading's ----
+        do {
+            let log = Log()
+            let code = run(log, FakeGnss(log, state: .success(false), off: .failure(noAnswer)), path: "/dev/null",
+                           seconds: 10, reading: .read(fixReport(), .deadline))
+            expectLog(log, ["call: state", "call: on", "err: " + GnssLine.switchedOn, "call: read"] + fixOutput
+                      + ["call: off", "err: " + GnssLine.switchOffFailed(noAnswer.reason)],
+                      "runGps: switching off failed, and it says so")
+            check(code == 0, "runGps: a fix, then switching off failed: exit 0", "got \(code)")
+        }
+
+        // --- 17: runGps: SIGINT during the read: off at once, once --------------------------------
+        // The signal is sent to this process (again every 50 ms, for up to 1 s, until the handler has run:
+        // the watch is set up asynchronously); the handler hands it to `caught` instead of ending the process.
+        // Each signal's action is the default first: a shell starts a background job with SIGINT ignored.
+        for (sig, keepOn) in [(SIGINT, false), (SIGTERM, false), (SIGHUP, true)] {
+            let name = "runGps: signal \(sig)\(keepOn ? " with --keep-on" : "")"
+            let pty = Pty()
+            let log = Log()
+            let caught = Caught()
+            let after = keepOn ? GnssLine.leftOn : GnssLine.switchedOff
+            for s in [SIGINT, SIGTERM, SIGHUP] { signal(s, SIG_DFL) }
+            Thread {
+                guard waitFor({ pty.isRawWithClocal }) else { return }
+                for _ in 0..<20 where caught.signals.isEmpty {
+                    kill(getpid(), sig)
+                    usleep(50_000)
+                }
+            }.start()
+            let code = run(log, FakeGnss(log, state: .success(false)), path: pty.path, seconds: 2, keepOn: keepOn,
+                           signals: [SIGINT, SIGTERM, SIGHUP], caught: caught)
+            check(waitFor { !caught.signals.isEmpty } && caught.signals.allSatisfy { $0 == sig },
+                  "\(name): the handler ran for it", "caught \(caught.signals)")
+            let offs = keepOn ? [] : ["call: off"]
+            expectLog(log, ["call: state", "call: on", "err: " + GnssLine.switchedOn, "call: read"] + offs
+                      + ["err: " + after, "out: gps: no NMEA sentences in 2 s"],
+                      "\(name): GNSS \(keepOn ? "left on" : "off") during the read, once, then the reading's own end")
+            check(code == 1, "\(name): the reading's exit code", "got \(code)")
+            // The watch is over: each signal's action is back to the default it was before.
+            for s in [SIGINT, SIGTERM, SIGHUP] {
+                check(signal(s, SIG_DFL) == nil, "\(name): signal \(s) is back to its default action")
+            }
+            pty.closeAll()
+        }
+
+        // --- 17b: runGps: a signal ignored before the run (nohup) stays ignored and is not watched ----
+        do {
+            let pty = Pty()
+            let log = Log()
+            let caught = Caught()
+            signal(SIGINT, SIG_DFL)
+            signal(SIGHUP, SIG_IGN)
+            Thread {
+                guard waitFor({ pty.isRawWithClocal }) else { return }
+                for _ in 0..<5 {
+                    kill(getpid(), SIGHUP)
+                    usleep(50_000)
+                }
+            }.start()
+            let code = run(log, FakeGnss(log, state: .success(false)), path: pty.path, seconds: 1,
+                           signals: [SIGINT, SIGHUP], caught: caught)
+            check(caught.signals.isEmpty, "runGps: an ignored SIGHUP is not handled", "caught \(caught.signals)")
+            expectLog(log, ["call: state", "call: on", "err: " + GnssLine.switchedOn, "call: read",
+                            "out: gps: no NMEA sentences in 1 s", "call: off", "err: " + GnssLine.switchedOff],
+                      "runGps: an ignored SIGHUP changes nothing: off at the end as usual")
+            check(code == 1, "runGps: an ignored SIGHUP: the reading's exit code", "got \(code)")
+            check(SignalWatch.isIgnore(signal(SIGHUP, SIG_DFL)), "runGps: SIGHUP is still ignored after the run")
+            check(signal(SIGINT, SIG_DFL) == nil, "runGps: SIGINT is back to its default action after the run")
+            pty.closeAll()
+        }
+
+        // --- 18: GnssSession: the way back runs once, and nothing begins after it ------------------
+        do {
+            let log = Log()
+            let session = GnssSession(gnss: FakeGnss(log, state: .success(false)), keepOn: false, errorOutput: { log.err($0) })
+            check(session.begin(), "GnssSession: switched on, so GNSS is known on")
+            session.end()
+            session.end()
+            expectLog(log, ["call: state", "call: on", "err: " + GnssLine.switchedOn, "call: off", "err: " + GnssLine.switchedOff],
+                      "GnssSession: end twice switches off once")
+            let early = Log()
+            let ended = GnssSession(gnss: FakeGnss(early, state: .success(false)), keepOn: false, errorOutput: { early.err($0) })
+            ended.end()
+            check(!ended.begin(), "GnssSession: begin after end: GNSS not known on")
+            expectLog(early, [], "GnssSession: begin after end asks nothing and switches nothing")
+        }
+
+        // --- 19: AtGnssSwitch against a scripted port -----------------------------------------------
+        runGnssTests()
 
         print("gpsread-test: \(checks) checks passed")
     }
