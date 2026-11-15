@@ -1,6 +1,7 @@
 // The RMNet app's one window: on its Driver tab the driver's status, refreshed every 2 seconds, and the
 // buttons that install, update and remove it; on its Messages tab the modem's text messages (SmsView.swift);
-// on its Network and SIM & APN tabs the modem's network, settings and SIM (ModemView.swift).
+// on its Network and SIM & APN tabs the modem's network, settings and SIM (ModemView.swift). And its menu
+// bar item (MenuBarView.swift), which stays when the window is closed.
 // Started by main.swift when the app gets no command-line verb.
 import AppKit
 import Combine
@@ -8,6 +9,9 @@ import SwiftUI
 
 struct RMNetApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    // The menu bar item's state, polled from launch for as long as the app runs. Observed here, so that the
+    // item's icon follows it.
+    @StateObject private var menuBar = MenuBarStatus.forApp(queue: AppDelegate.modemQueue)
 
     var body: some Scene {
         Window("RMNet", id: "status") {
@@ -15,6 +19,12 @@ struct RMNetApp: App {
                         modem: appDelegate.modem, modemQuitNotice: appDelegate.modem.quitNotice)
         }
         .defaultSize(width: 520, height: 480)
+        // The icon only; the title is its accessibility label.
+        MenuBarExtra(menuBar.icon.accessibilityLabel, systemImage: menuBar.icon.symbolName) {
+            MenuBarPanel(status: menuBar, showWindow: { open in _ = AppDelegate.showStatusWindow(using: open) })
+                .background(OpenWindowKeeper())
+        }
+        .menuBarExtraStyle(.window)
     }
 }
 
@@ -27,7 +37,8 @@ enum WindowTab: Hashable {
 
 // The window's tabs: Driver (the status below), Messages (SmsView.swift), Network and SIM & APN
 // (ModemView.swift). The tab shown is tracked by the selection; the Messages tab and the modem tabs ask the
-// modem only while one of theirs is shown and the window can be seen. The controllers are not observed
+// modem only while one of theirs is shown and this window itself can be seen (WindowVisibility.swift: not
+// NSApp.occlusionState, which the menu bar item's windows would keep visible). The controllers are not observed
 // here, so typing a message does not redraw the Driver tab; only their small quit notices are: while a
 // quit waits for a call to the modem, a line above the tabs says so.
 struct RMNetWindow: View {
@@ -72,31 +83,93 @@ struct RMNetWindow: View {
         .onAppear { modem.setTabShown(modemTab(tab)) }
         .onChange(of: tab) { _, shown in modem.setTabShown(modemTab(shown)) }
         .onDisappear { modem.setTabShown(nil) }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeOcclusionStateNotification)) { _ in
-            messages.setWindowVisible(NSApp.occlusionState.contains(.visible))
-            modem.setWindowVisible(NSApp.occlusionState.contains(.visible))
+        .background(WindowVisibilityObserver { visible in
+            messages.setWindowVisible(visible)
+            modem.setWindowVisible(visible)
+        })
+        .background(OpenWindowKeeper())
+    }
+}
+
+/// Reports whether the window this view is in can be seen: its own occlusion state, and not visible once it
+/// closes or the view leaves it (WindowVisibility.swift). The app's other windows do not count. Also marks the
+/// window as the RMNet window (AppDelegate.statusWindow) while it is open, so a reopen can find it.
+private struct WindowVisibilityObserver: NSViewRepresentable {
+    let report: (Bool) -> Void
+
+    func makeNSView(context: Context) -> ObserverView { ObserverView(report: report) }
+    func updateNSView(_ view: ObserverView, context: Context) {}
+
+    final class ObserverView: NSView {
+        private let visibility: WindowVisibility
+        private var closeToken: NSObjectProtocol?
+
+        init(report: @escaping (Bool) -> Void) {
+            visibility = WindowVisibility(occlusionChanged: NSWindow.didChangeOcclusionStateNotification,
+                                          willClose: NSWindow.willCloseNotification, report: report)
+            super.init(frame: .zero)
+        }
+
+        required init?(coder: NSCoder) { nil }
+
+        deinit { stopMarking() }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            visibility.follow(window, visible: { [weak window] in
+                guard let window else { return false }
+                return window.isVisible && window.occlusionState.contains(.visible)
+            })
+            stopMarking()
+            guard let window else { return }
+            AppDelegate.statusWindow = window
+            closeToken = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window,
+                                                                queue: .main) { [weak window] _ in
+                if AppDelegate.statusWindow === window { AppDelegate.statusWindow = nil }
+            }
+        }
+
+        private func stopMarking() {
+            if let closeToken { NotificationCenter.default.removeObserver(closeToken) }
+            closeToken = nil
         }
     }
 }
 
+/// Keeps SwiftUI's way of opening the window (`openWindow(id: "status")`) in AppDelegate.openStatusWindow, for
+/// a Dock click or a second launch while the window is closed. In the window and in the menu bar item's panel;
+/// it reads nothing.
+private struct OpenWindowKeeper: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onAppear {
+                let open = openWindow
+                AppDelegate.openStatusWindow = { open(id: "status") }
+            }
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    // The one serial queue to the modem's AT port, shared by both controllers, so that the window never
-    // opens the port twice at once.
-    private let modemQueue = DispatchQueue(label: "io.rmnetdriver.RMNet.modem", qos: .userInitiated)
+    // The one serial queue to the modem's AT port, shared by both controllers and the menu bar item, so that
+    // the app never opens the port twice at once.
+    static let modemQueue = DispatchQueue(label: "io.rmnetdriver.RMNet.modem", qos: .userInitiated)
 
     // The process's one SmsController (its queue to the modem is the shared one): the window shows it, and
     // quitting waits for its running call. It lives as long as the app, so a window reopened from the Dock
     // shows the same messages and result line. Its answer to a quit goes through `quitGate`.
     private(set) lazy var messages: SmsController = SmsController(
         service: SmsService(),
-        queue: modemQueue,
+        queue: AppDelegate.modemQueue,
         replyToQuit: { [unowned self] succeeded in self.quitGate.replied(AppDelegate.messagesMember, succeeded) },
         requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
 
     // The process's one ModemController, for the Network and SIM & APN tabs, kept the same way.
     private(set) lazy var modem: ModemController = ModemController(
         service: ModemService(),
-        queue: modemQueue,
+        queue: AppDelegate.modemQueue,
         driverProfile: driverProfileNumber,
         replyToQuit: { [unowned self] succeeded in self.quitGate.replied(AppDelegate.modemMember, succeeded) },
         requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
@@ -112,11 +185,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                          resume: { [unowned self] in self.messages.resumeAfterCancelledQuit() })],
         reply: { NSApp.reply(toApplicationShouldTerminate: $0) })
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    // RMNet stays in the menu bar when its window is closed; `Open RMNet` in the item's panel opens it again.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
-    // Every way of quitting (Cmd-Q, the Dock's Quit, closing the last window, logout) comes here. With a
-    // call to the modem running, the app ends only when it has finished; a send is never cut short. A send,
-    // delete or change that does not succeed cancels the quit, so that its result can be read.
+    // SwiftUI's way of opening the window, kept by the window and the panel when they appear (OpenWindowKeeper);
+    // nil until one of them has. On the main thread only.
+    static var openStatusWindow: (() -> Void)?
+
+    // The RMNet window while it is open: marked by its view when the view moves into it, cleared when it closes
+    // (WindowVisibilityObserver). On the main thread only.
+    static weak var statusWindow: NSWindow?
+
+    // Shows the RMNet window (windowReopen in WindowVisibility.swift): the window itself when it is open, found
+    // among the app's windows, deminiaturized if minimized, made key and ordered front; else `open`, SwiftUI's
+    // openWindow; then the app is made active. False when there is neither, and nothing was done.
+    static func showStatusWindow(using open: (() -> Void)?) -> Bool {
+        let window = statusWindow.flatMap { marked in NSApp.windows.first(where: { $0 === marked }) }
+        let way = windowReopen(windowFound: window != nil, minimized: window?.isMiniaturized == true,
+                               actionAvailable: open != nil)
+        switch way {
+        case .bringForward(let deminiaturize):
+            if deminiaturize { window?.deminiaturize(nil) }
+            window?.makeKeyAndOrderFront(nil)
+        case .openWithAction:
+            open?()
+        case .leaveToAppKit:
+            return false
+        }
+        NSApp.activate()
+        return way.handled
+    }
+
+    // A click on the Dock icon, or `open /Applications/RMNet.app` while RMNet runs: shows the window as `Open
+    // RMNet` does. `hasVisibleWindows` is not trusted: the menu bar item's own windows can count as visible while
+    // the RMNet window is closed. False: shown here. True (no open window and no openWindow kept, which should
+    // not happen, since the window opens at launch): AppKit's and SwiftUI's own handling.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        !AppDelegate.showStatusWindow(using: AppDelegate.openStatusWindow)
+    }
+
+    // Every way of quitting (Cmd-Q, the Dock's Quit, `Quit RMNet` in the menu bar item's panel, logout) comes
+    // here. With a call to the modem running, the app ends only when it has finished; a send is never cut
+    // short. A send, delete or change that does not succeed cancels the quit, so that its result can be read.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         quitGate.ask() ? .terminateLater : .terminateNow
     }
