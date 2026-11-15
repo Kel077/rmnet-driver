@@ -28,8 +28,8 @@ build/obj/tests/%.o: tests/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(TEST_FLAGS) -Icore/include -Itests -MMD -MP -c $< -o $@
 
-# CoreHost (driver/core_host.cpp) on the host, behind fakes of UsbPort and RxSink, and the driver's
-# DriverKit-free decisions (driver/idle_suspend.h), built with Core's flags, tests and runner included.
+# CoreHost (driver/core_host.cpp) on the host, behind fakes of UsbPort and RxSink, built with Core's
+# flags, tests and runner included.
 # Every tests/driver/test_*.cpp is built. `make driver-test FILTER=kept` runs only tests whose name
 # contains it.
 DRIVER_TEST_SRCS := $(wildcard tests/driver/test_*.cpp)

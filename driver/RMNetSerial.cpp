@@ -11,9 +11,7 @@
 #include <USBSerialDriverKit/USBSerialDriverKit.h>
 
 #include "RMNetSerial.h"
-#include "idle_suspend.h"
 #include "rmnet/serial_port.h"
-#include "rmnet/util.h"
 
 #define LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "RMNet: " fmt, ##__VA_ARGS__)
 
@@ -24,8 +22,6 @@ namespace {
 constexpr const char* kNameKey = "RMNetSerialName";
 constexpr const char* kSubClassKey = "RMNetSerialSubClass";
 constexpr const char* kProtocolKey = "RMNetSerialProtocol";
-// Opt-in idle suspend, by RMNetDriver's rules (driver/idle_suspend.h); no shipped personality sets it.
-constexpr const char* kIdleSuspendKey = "RMNetIdleSuspendMs";
 
 // CDC SET_CONTROL_LINE_STATE: a class request to the interface, wValue bit 0 DTR and bit 1 RTS.
 constexpr uint8_t kClassInterfaceOut = 0x21;
@@ -54,14 +50,6 @@ struct RMNetSerial_IVars {
   bool dtr;  // what HwProgramMCR was last given
   bool rts;
   uint32_t logged;  // kLog* bits already logged
-  // Idle suspend (RMNetIdleSuspendMs with remote wakeup offered; all false or 0 otherwise). lowPower:
-  // the port asks for the low power state (AskLowPowerLater) and tracks sleep and wake in asleep.
-  // queue: the Default queue, retained when lowPower is set, for the asks. stopping: Stop has begun.
-  bool lowPower;
-  bool asleep;
-  bool stopping;
-  uint64_t lowPowerAsks;
-  IODispatchQueue* queue;
 };
 
 namespace {
@@ -73,59 +61,6 @@ bool FirstCall(RMNetSerial_IVars* ivars, uint32_t flag) {
   return true;
 }
 
-// Idle suspend on: asks for the low power state (IOService::ChangePowerState) once the current call on
-// the Default queue has returned: after Start, or after a SetPowerState call, never inside one. As
-// RMNetDriver does (AskLowPower), and for the same reason: IOUSBHostFamily.h disables idle suspend
-// while a power child of the IOUSBHostDevice, as each serial port is, is in a state whose input power
-// requirement lacks kIOPMLowPower. The port is retained until the block has run; nothing is asked once
-// Stop has begun or while asleep. Logged the first time, at power-of-two counts, and on a failure.
-void AskLowPowerLater(IOService* service, RMNetSerial_IVars* ivars) {
-  if (!ivars->queue) return;
-  service->retain();
-  ivars->queue->DispatchAsync(^{
-    if (!ivars->stopping && !ivars->asleep) {
-      kern_return_t ret = service->ChangePowerState(kIOServicePowerCapabilityLow);
-      ivars->lowPowerAsks++;
-      if (ret != kIOReturnSuccess || rmnet::worth(ivars->lowPowerAsks)) {
-        LOG("serial %{public}s: idle suspend: ChangePowerState(low) 0x%x (ask %llu)", ivars->name, ret,
-            ivars->lowPowerAsks);
-      }
-    }
-    service->release();  // last: the port, and ivars with it, may be freed here
-  });
-}
-
-// Opt-in idle suspend for a started port, by RMNetDriver's rules: the key as idle_suspend_key takes
-// it, and remote wakeup offered (idle_suspend_wanted). The port makes no SetIdlePolicy call (its pipes
-// are IOUserUSBSerial's); when on, it asks for the low power state once Start has returned and after
-// every on state (SetPowerState_Impl). With the key absent nothing here runs and nothing is logged,
-// so the port is as it was; with the key present one line says what was decided.
-void StartIdleSuspend(IOService* service, RMNetSerial_IVars* ivars, IdleKeyKind kind, uint64_t value, uint32_t bits,
-                      bool remoteWakeup) {
-  if (kind == IdleKeyKind::Absent) return;
-  IdleKey key = idle_suspend_key(kind, value, bits);
-  IdleSuspendState s = idle_suspend_state(key.ms, remoteWakeup, IdlePolicyResult{IdlePolicyCall::None, 0});
-  bool on = idle_suspend_wanted(key.ms, remoteWakeup);
-  kern_return_t ret = kIOReturnSuccess;
-  if (on) ret = service->CopyDispatchQueue(kIOServiceDefaultQueueName, &ivars->queue);
-  if (on && (ret != kIOReturnSuccess || !ivars->queue)) {
-    OSSafeReleaseNULL(ivars->queue);
-    on = false;
-  }
-  ivars->lowPower = on;
-  // Wanted (s.ms > 0, s.text "on") but no queue to ask on: the port stays in its on state, so idle
-  // suspend is not in effect for it, and the line says that rather than s.text.
-  bool noQueue = !on && s.ms > 0;
-  char how[96];
-  idle_key_text(key, value, bits, how, sizeof how);
-  LOG("serial %{public}s: RMNetIdleSuspendMs: %{public}s; idle suspend %{public}s (remote wakeup %u)%{public}s",
-      ivars->name, how, noQueue ? "not in effect for this port" : s.text, remoteWakeup ? 1u : 0u,
-      on ? "; the low power state is asked for after Start"
-         : (noQueue ? "; no Default queue to ask for the low power state on, so the port stays on" : ""));
-  if (noQueue) LOG("serial %{public}s: CopyDispatchQueue 0x%x", ivars->name, ret);
-  if (on) AskLowPowerLater(service, ivars);
-}
-
 }  // namespace
 
 bool RMNetSerial::init() {
@@ -135,10 +70,7 @@ bool RMNetSerial::init() {
 }
 
 void RMNetSerial::free() {
-  if (ivars) {
-    OSSafeReleaseNULL(ivars->interface);
-    OSSafeReleaseNULL(ivars->queue);
-  }
+  if (ivars) OSSafeReleaseNULL(ivars->interface);
   IOSafeDeleteNULL(ivars, RMNetSerial_IVars, 1);
   super::free();
 }
@@ -155,11 +87,9 @@ kern_return_t RMNetSerial::Start_Impl(IOService* provider) {
   uint8_t ifClass = 0;
   uint8_t ifSubClass = 0;
   uint8_t ifProtocol = 0;
-  bool remoteWakeup = false;  // kIOUSBConfigurationDescriptorAttributeRemoteWakeCapable, as RMNetDriver reads it
   if (intf) {
     const IOUSBConfigurationDescriptor* cfg = intf->CopyConfigurationDescriptor();
     if (cfg) {
-      remoteWakeup = (cfg->bmAttributes & kIOUSBConfigurationDescriptorAttributeRemoteWakeCapable) != 0;
       const IOUSBInterfaceDescriptor* id = intf->GetInterfaceDescriptor(cfg);
       if (id) {
         haveDescriptor = true;
@@ -181,19 +111,7 @@ kern_return_t RMNetSerial::Start_Impl(IOService* provider) {
   bool haveProtocol = false;
   uint64_t subClass = 0;
   uint64_t protocol = 0;
-  IdleKeyKind idleKind = IdleKeyKind::Absent;
-  uint64_t idleValue = 0;
-  uint32_t idleBits = 0;
   if (propsRet == kIOReturnSuccess && props) {
-    OSObject* idleObj = props->getObject(kIdleSuspendKey);
-    OSNumber* idleNum = OSDynamicCast(OSNumber, idleObj);
-    if (idleNum) {
-      idleKind = IdleKeyKind::Integer;
-      idleValue = idleNum->unsigned64BitValue();
-      idleBits = static_cast<uint32_t>(idleNum->numberOfBits());
-    } else if (idleObj) {
-      idleKind = IdleKeyKind::NotInteger;
-    }
     OSString* str = OSDynamicCast(OSString, props->getObject(kNameKey));
     if (str) {
       haveName = true;
@@ -283,39 +201,13 @@ kern_return_t RMNetSerial::Start_Impl(IOService* provider) {
     return ret;
   }
   LOG("serial %{public}s: started on interface %u", ivars->name, ivars->interfaceNumber);
-  StartIdleSuspend(this, ivars, idleKind, idleValue, idleBits, remoteWakeup);
   return kIOReturnSuccess;
 }
 
 kern_return_t RMNetSerial::Stop_Impl(IOService* provider) {
   LOG("serial %{public}s: stop", ivars->name);
-  ivars->stopping = true;  // an ask still queued (AskLowPowerLater) asks nothing
   OSSafeReleaseNULL(ivars->interface);
   return Stop(provider, SUPERDISPATCH);
-}
-
-// Always passed to the superclass (neither IOUserUSBSerial nor IOUserSerial overrides SetPowerState,
-// so this reaches IOService's, as before). With idle suspend off nothing else happens and nothing is
-// logged. With it on (lowPower), as RMNetDriver does (idle_suspend.h, power_call): power off marks the
-// port asleep; the on state, or the low state it asked for, while asleep is the wake; the low state
-// while awake changes nothing; and after every call that brings the on state (at every start, or a
-// wake to on) the low state is asked for again once this call has returned. The port has nothing to
-// hold or restart: IOUserUSBSerial moves its bytes and does not act on power states.
-kern_return_t RMNetSerial::SetPowerState_Impl(uint32_t powerFlags) {
-  if (ivars && ivars->lowPower) {
-    PowerCall call = power_call(powerFlags, true);
-    if (call == PowerCall::Off && !ivars->asleep) {
-      ivars->asleep = true;
-      LOG("serial %{public}s: SetPowerState 0x%x: asleep", ivars->name, powerFlags);
-    } else if (call == PowerCall::On && ivars->asleep) {
-      ivars->asleep = false;
-      LOG("serial %{public}s: SetPowerState 0x%x: awake", ivars->name, powerFlags);
-    } else {
-      LOG("serial %{public}s: SetPowerState 0x%x", ivars->name, powerFlags);
-    }
-    if (low_power_ask_after(powerFlags, true) && !ivars->stopping) AskLowPowerLater(this, ivars);
-  }
-  return SetPowerState(powerFlags, SUPERDISPATCH);
 }
 
 kern_return_t RMNetSerial::HwActivate_Impl() {

@@ -37,12 +37,6 @@ constexpr IOReturn kLegacyPipeStalled = (IOReturn)0xe000404f;
 // assumed, and the legacy transaction timeout code is accepted too. Neither seen on hardware.
 constexpr IOReturn kLegacyTransactionTimeout = (IOReturn)0xe0004051;
 
-// idle_suspend.h restates the port status bits it reads so that it builds on the host; they must be
-// the SDK's.
-static_assert(kPortStatusSuspended == kIOUSBHostPortStatusSuspended, "kIOUSBHostPortStatusSuspended");
-static_assert(kPortStatusConnectedSpeedMask == kIOUSBHostPortStatusConnectedSpeedMask,
-              "kIOUSBHostPortStatusConnectedSpeedMask");
-
 kern_return_t MakeBuffer(IOUSBHostInterface* intf, IOOptionBits dir, uint32_t size,
                          IOBufferMemoryDescriptor** buf, uint8_t** addr) {
   kern_return_t ret = intf->CreateIOBuffer(dir, size, buf);
@@ -112,8 +106,6 @@ UsbIo::UsbIo(UsbIoListener& listener)
       stats_(),
       logged_first_read_(false),
       logged_first_uplink_(false),
-      idle_ms_(0),
-      logged_first_suspended_(false),
       in_recovering_(false),
       out_recovering_(false),
       in_recoveries_(0),
@@ -254,35 +246,6 @@ void UsbIo::read_serial(char* out, size_t cap) {
   }
   out[n] = '\0';
   IOUSBHostFreeDescriptor(sd);
-}
-
-// Synchronous calls on the Default queue, made at Start between open and start: nothing is posted on
-// any pipe yet, nothing is held (no sleep can come before Start returns: SetPowerState runs on the
-// same queue) and nothing is stopping. Each result is logged; the first failure ends the calls. Bulk
-// OUT gets no policy (idle_suspend.h, IdlePolicyCall).
-IdlePolicyResult UsbIo::set_idle_policy(uint32_t ms) {
-  if (ms == 0) return IdlePolicyResult{IdlePolicyCall::None, 0};  // off: no call (the driver never asks)
-  if (phase_ != Phase::Running || !opened_ || !bulk_in_ || !intr_in_) {
-    LOG("idle suspend: SetIdlePolicy not called (usb not open)");
-    return IdlePolicyResult{IdlePolicyCall::Interface, static_cast<uint32_t>(kIOReturnNotOpen)};
-  }
-  kern_return_t ret = intf_->SetIdlePolicy(ms);
-  LOG("idle suspend: interface SetIdlePolicy(%u) 0x%x", ms, ret);
-  if (ret != kIOReturnSuccess) return IdlePolicyResult{IdlePolicyCall::Interface, static_cast<uint32_t>(ret)};
-  const struct {
-    IdlePolicyCall call;
-    IOUSBHostPipe* pipe;
-  } pipes[] = {
-      {IdlePolicyCall::BulkIn, bulk_in_},
-      {IdlePolicyCall::Interrupt, intr_in_},
-  };
-  for (const auto& p : pipes) {
-    ret = p.pipe->SetIdlePolicy(ms);
-    LOG("idle suspend: %{public}s pipe SetIdlePolicy(%u) 0x%x", idle_policy_call_name(p.call), ms, ret);
-    if (ret != kIOReturnSuccess) return IdlePolicyResult{p.call, static_cast<uint32_t>(ret)};
-  }
-  idle_ms_ = ms;
-  return IdlePolicyResult{IdlePolicyCall::None, 0};
 }
 
 kern_return_t UsbIo::start() {
@@ -749,13 +712,11 @@ void UsbIo::begin_out_recovery() {
   }
 }
 
-// The owner's 100 ms tick while running. While idle suspend is on, the port status is sampled
-// (sample_port_status). A recovery whose aborted requests have not all returned within
-// kRecoveryTicks is fatal, so a pipe cannot stay idle with the link reported up. Nothing happens
-// once stopping has begun, after a fatal failure, or while held.
+// The owner's 100 ms tick while running. A recovery whose aborted requests have not all returned
+// within kRecoveryTicks is fatal, so a pipe cannot stay idle with the link reported up. Nothing
+// happens once stopping has begun or after a fatal failure.
 void UsbIo::tick() {
   if (phase_ != Phase::Running || failed_ || held_) return;
-  if (idle_ms_ > 0) sample_port_status();
   if (in_recovering_ && ++in_recovery_ticks_ >= kRecoveryTicks) {
     LOG("bulk in recovery: %u reads still pending after %u ticks", reads_busy_, in_recovery_ticks_);
     fail("bulk in recovery did not finish within 1 s");
@@ -764,28 +725,6 @@ void UsbIo::tick() {
   if (out_recovering_ && ++out_recovery_ticks_ >= kRecoveryTicks) {
     LOG("bulk out recovery: %u transfers still in flight after %u ticks", uplinks_busy_, out_recovery_ticks_);
     fail("bulk out recovery did not finish within 1 s");
-  }
-}
-
-// While idle suspend is on, from tick only (so never while held, stopping or failed, and never after
-// close): one GetPortStatus on the interface. A port found suspended counts in suspended_ticks (the
-// first such tick is logged with the status); a failed call counts in port_status_failures, logged at
-// power-of-two counts. Neither does anything else: no failure limit, no device_gone, nothing fatal.
-void UsbIo::sample_port_status() {
-  uint32_t status = 0;
-  kern_return_t ret = intf_->GetPortStatus(&status);
-  if (ret != kIOReturnSuccess) {
-    stats_.port_status_failures++;
-    if (rmnet::worth(stats_.port_status_failures)) {
-      LOG("idle suspend: GetPortStatus failed: 0x%x (%llu failures)", ret, stats_.port_status_failures);
-    }
-    return;
-  }
-  if (!port_suspended(status)) return;
-  stats_.suspended_ticks++;
-  if (!logged_first_suspended_) {
-    logged_first_suspended_ = true;
-    LOG("idle suspend: port first found suspended (port status 0x%x)", status);
   }
 }
 

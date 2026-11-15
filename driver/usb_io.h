@@ -19,7 +19,6 @@
 
 #include <DriverKit/IOReturn.h>
 
-#include "idle_suspend.h"
 #include "rmnet/stall.h"
 #include "usb_port.h"
 
@@ -89,10 +88,6 @@ struct UsbIoStats {
   // among them. They are counted only here, never in the error counts above.
   uint64_t sleep_completions;
   uint32_t sleep_last_status;
-  // Idle suspend (set_idle_policy), only while it is on: ticks whose GetPortStatus showed the port
-  // suspended (port_suspended), and GetPortStatus calls that failed. Both stay 0 while it is off.
-  uint64_t suspended_ticks;
-  uint64_t port_status_failures;
 };
 
 // The UsbPort methods (send, start_bulk, the uplink buffers) are described in usb_port.h.
@@ -109,17 +104,6 @@ class UsbIo final : public UsbPort {
   // The device's USB serial number as ASCII, or an empty string. Reads the device and string
   // descriptors (once, at start).
   void read_serial(char* out, size_t cap);
-  // Opt-in idle suspend (driver/idle_suspend.h; the driver decides whether to call it, and never
-  // does with RMNetIdleSuspendMs absent or 0 or without remote wakeup). Called once, after open and
-  // before start, so nothing is posted on the pipes yet: SetIdlePolicy(ms) on the interface, then on
-  // the bulk IN and interrupt IN pipes (not bulk OUT: idle_suspend.h), each result logged. The first
-  // failure ends the calls (those before it stay made) and is returned. When every call succeeded,
-  // idle suspend is on (and the driver asks for the low power state):
-  // from then on each tick reads the interface's port status (GetPortStatus) and counts the ticks
-  // that find it suspended (suspended_ticks) and the calls that fail (port_status_failures); a
-  // failure is counted and logged, nothing else. Not called again after a wake: the SDK headers keep
-  // the policy on the interface and pipe objects, which a sleep does not replace (driverkit-notes).
-  IdlePolicyResult set_idle_policy(uint32_t ms);
   // Raises DTR, keeps one interrupt read posted, and reads any responses already waiting.
   kern_return_t start();
   bool send(const uint8_t* data, size_t len) override;
@@ -145,8 +129,7 @@ class UsbIo final : public UsbPort {
   // gone (a re-enumeration or an unplug), as opposed to a failure of a device still present.
   bool device_gone() const { return gone_; }
   // Called by the owner every 100 ms while running: bounds a pipe recovery to about 1 s, after
-  // which it is fatal, and, while idle suspend is on, samples the port status (set_idle_policy).
-  // Does nothing once finish_sending or abort has been called, after a fatal failure, or while held.
+  // which it is fatal. Does nothing once finish_sending or abort has been called, or while held.
   void tick();
   // Sleep. hold (the system is going to sleep): nothing is posted, re-posted, submitted or sent
   // and nothing is delivered to the listener: no interrupt or bulk read, no uplink transfer
@@ -239,7 +222,6 @@ class UsbIo final : public UsbPort {
   void begin_out_recovery();
   bool end_out_recovery();
   void report_uplink_usable();
-  void sample_port_status();
   void fail(const char* what);
   void note(IOReturn status);
   void note_held(const char* what, IOReturn status);
@@ -283,8 +265,6 @@ class UsbIo final : public UsbPort {
   UsbIoStats stats_;
   bool logged_first_read_;
   bool logged_first_uplink_;
-  uint32_t idle_ms_;  // the idle policy in force (set_idle_policy succeeded); 0: off, no sampling
-  bool logged_first_suspended_;
   bool in_recovering_;   // bulk IN: aborted for a stall, waiting for its reads to return
   bool out_recovering_;  // bulk OUT: the same for the uplink transfers
   uint32_t in_recoveries_;   // recoveries in a row with no successful read between

@@ -116,3 +116,11 @@ Before each trial: tell the owner the Mac's network may drop for up to the trial
 - **E1a:** `RMNetDriver` personality only: `RMNetLowPowerOnly` true, `RMNetLowPowerTrialSec` 20. Window 60 s.
 - **E1b** (only if E1a kept `en33` and `configd`): `RMNetIdleSuspendMs` 2000 and `RMNetLowPowerTrialSec` 20 in all three personalities. Window 60 s.
 - Read `samples.tsv`, `dext.log` and `summary.txt`; record them in `docs/driverkit-notes.md`; decide H1 or H2; write Phase 2 into this plan.
+
+## Phase 1 result (2026-11-15 14:55)
+
+E1a (build 318.6.51) settled it: the networking family calls `setInterfaceEnable 0` as part of the power change whenever the network dext enters its low state, and the interface is unusable (no address, no pings, the session stuck) until the dext is back on. **H1 holds.** E1b was not run. Details: `docs/driverkit-notes.md`, "Runtime findings (idle suspend: trial E1a)". Phase 2 would need an architecture change.
+
+## Decision (2026-11-15): dropped
+
+Offered the restructure (a USB power service that alone sleeps, the network service outside the power tree, relying on the undocumented `non-removable` rule), the owner answered "Give up then". There is no Phase 2. On `main` (branch `drop-idle-suspend`): `driver/` and `tests/driver/` back to their state before `00e5d1e` (the opt-in idle suspend removed), README and notes say why. Tasks 1 and 2 stay on branch `idle-suspend`, not merged.
