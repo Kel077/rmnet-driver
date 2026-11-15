@@ -14,8 +14,8 @@ installed_id_line() {
     return 0
   fi
   echo "the installed app's bundle ID is $1, not $2 as configured (config.local or the environment):" \
-    "replacing it would leave its driver with no app that can deactivate it; see docs/reference.md, Removing the driver;" \
-    "nothing was changed"
+    "if systemextensionsctl list still shows its driver, remove that first with this app" \
+    "(docs/reference.md, Removing the driver); then delete the app and run again; nothing was changed"
   return 1
 }
 

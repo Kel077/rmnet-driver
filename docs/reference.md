@@ -55,6 +55,8 @@ ditto build/installed/RMNet-<version>.app /Applications/RMNet.app
 
 If no copy exists, build one for that version: `/usr/bin/ruby gen.rb --team <your team ID> --bundle-id <your bundle ID>`, then the `xcodebuild` command in `scripts/install-driver.sh` with `CURRENT_PROJECT_VERSION=<version>`, and deactivate from that app the same way. Each installed entry needs its own matching app.
 
+To change the bundle ID (`RMNET_BUNDLE_ID`), remove the driver under the old ID first, with `Remove…` in the window or as above. Neither deletes the app, and `scripts/install-driver.sh` refuses while `/Applications/RMNet.app` has another bundle ID than the configured one, whether or not its driver is still listed. So once `systemextensionsctl list` shows no entry for the old `<bundle ID>.driver`, or only one being uninstalled, delete the app (`rm -rf /Applications/RMNet.app`), then change `config.local` and run the script.
+
 ### Serial ports
 
 The same driver also presents two of the modem's other USB interfaces as serial ports, with a second class, `RMNetSerial` (`driver/RMNetSerial.cpp`), which is installed, updated and removed with the rest of the driver:

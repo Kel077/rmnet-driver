@@ -9,7 +9,7 @@ In QMI mode the modem offers a USB interface that speaks Qualcomm's QMI protocol
 ## Requirements
 
 - A Mac with Apple silicon, on macOS 27.
-- Xcode 27.1 or later, signed in (Xcode → Settings → Accounts) to a team in the **paid** Apple Developer Program. A free Personal Team cannot sign DriverKit drivers. A paid team needs no special request to Apple: for a development build, Xcode's automatic signing registers the App IDs and your Mac and makes profiles with the driver's entitlements (DriverKit, USB, networking, serial).
+- Xcode 27.1 or later, signed in to a team in the **paid** Apple Developer Program. A free Personal Team cannot sign DriverKit drivers. A paid team needs no special request to Apple: for a development build, Xcode's automatic signing registers the App IDs and your Mac and makes profiles with the driver's entitlements (DriverKit, USB, networking, serial).
 - The Ruby gem `xcodeproj` for macOS's own Ruby (it generates the Xcode project). Check with `/usr/bin/ruby -e 'require "xcodeproj"'`; if that fails, run `/usr/bin/gem install --user-install xcodeproj`.
 - A Quectel RM520N-GL on USB, with a SIM that has a data plan.
 
@@ -21,7 +21,7 @@ In the repository's root:
 cp config.example config.local
 ```
 
-Then fill in its two lines, for example:
+Fill in its two lines, for example:
 
 ```sh
 RMNET_TEAM_ID=ABCDE12345
@@ -31,7 +31,7 @@ RMNET_BUNDLE_ID=com.example.RMNet
 - `RMNET_TEAM_ID` is your paid team's ID, 10 capital letters and digits (Xcode → Settings → Accounts).
 - `RMNET_BUNDLE_ID` is a bundle ID you own, such as your domain reversed; the driver gets it with `.driver` added. App IDs are unique across all of Apple, so the project's default, `io.rmnetdriver.RMNet`, is taken.
 - `config.local` is ignored by git and read as data, never run: it may hold only these two lines (with no comment after a value), comment lines and blank lines. Environment variables of the same names win over it.
-- Choose the bundle ID once. The install script refuses to replace an installed `/Applications/RMNet.app` with another bundle ID, since its driver would be left with no app that can remove it; to change the ID, remove the old driver first (below).
+- Choose the bundle ID once: the install script refuses to replace an installed `/Applications/RMNet.app` with another bundle ID, whose driver could be left with no app able to remove it. To change the ID, remove the old driver (below); when `systemextensionsctl list` shows no entry for it, or only an uninstalling one, delete `/Applications/RMNet.app`, then change `config.local`.
 
 ## The modem's USB mode
 
@@ -55,7 +55,7 @@ RMNet usbmode set qmi    # asks, then restarts the modem (about 30 s)
 scripts/install-driver.sh
 ```
 
-The script builds the app and its driver signed, under your team and bundle ID, with a new version number on each run. It keeps a copy of the app in `build/installed/`, copies it to `/Applications/RMNet.app` (an app must be in `/Applications` to activate a driver) and runs `RMNet activate`.
+The script builds the app and its driver signed, under your team and bundle ID, with a new version number on each run. It keeps a copy of the app in `build/installed/`, copies it to `/Applications/RMNet.app` (only an app there can activate a driver) and runs `RMNet activate`.
 
 - **The first time**, macOS asks for your approval: open System Settings → General → Login Items & Extensions → Driver Extensions, and turn the RMNet driver on. The script waits (`waiting for approval in System Settings`) until you do. Later builds need no new approval.
 - The script refuses, changing nothing, when `config.local` is missing or invalid, when `/Applications/RMNet.app` has another bundle ID, when an installed driver version has no kept app in `build/installed/`, or when a build was already installed in the same minute (wait a minute).
