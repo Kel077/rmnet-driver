@@ -30,7 +30,7 @@
 # the start, the port's byte counters (as netstat shows them, and moved since the start), the status
 # class, RMNetState, the counters listed in COUNTERS below (empty when the driver does not publish
 # one), and driver_pid, the process ID of the driver (`pgrep -f "$DRIVER_PROC"`, a pattern that
-# matches only a command line whose first word ends in .dext/io.rmnetdriver.RMNet.driver, the driver
+# matches only a command line whose first word ends in .dext/<driver ID>, the driver
 # extension's own executable, and not `log stream` of scripts/driver-log.sh or any other command that
 # merely names the driver; several are joined with ";"). The status comes from `RMNet status --json`
 # and is one of three things, kept apart:
@@ -62,7 +62,7 @@
 #   - no two samples are more than twice PERIOD apart (the Mac did not sleep, nothing stalled);
 #   - each ping lost at most 1 percent by its own summary, and sent at least 90 percent of the
 #     packets its running time allows (one every 0.5 s);
-#   - no new crash report whose name starts with io.rmnetdriver.RMNet.driver appeared in
+#   - no new crash report whose name starts with the driver's ID appeared in
 #     /Library/Logs/DiagnosticReports, ~/Library/Logs/DiagnosticReports or the Retired/ directory
 #     under either (a report is new when no report of that name was in any of them at the start, so
 #     one the system moves to Retired/ during the run is not new), and each of them that exists could
@@ -108,10 +108,15 @@ STATUS_CMD=/Applications/RMNet.app/Contents/MacOS/RMNet
 USAGE=build/installed/measure-usage.log
 TARGET4=223.5.5.5
 TARGET6=2400:3200::1
-# The driver's process: its executable, /Library/SystemExtensions/<UUID>/io.rmnetdriver.RMNet.driver.dext/
-# io.rmnetdriver.RMNet.driver, is the first word of its command line (an extended regular expression).
-DRIVER_PROC='^[^ ]*\.dext/io\.rmnetdriver\.RMNet\.driver( |$)'
-CRASH_PREFIX=io.rmnetdriver.RMNet.driver
+# The driver's ID, $DRIVER_ID (io.rmnetdriver.RMNet.driver unless config.local or the environment
+# sets another bundle ID; scripts/config.sh).
+. ./scripts/config.sh
+rmnet_config || exit 2
+# The driver's process: its executable, /Library/SystemExtensions/<UUID>/$DRIVER_ID.dext/$DRIVER_ID,
+# is the first word of its command line (an extended regular expression; a bundle ID's only special
+# character is the dot).
+DRIVER_PROC="^[^ ]*\\.dext/$(printf '%s\n' "$DRIVER_ID" | sed 's/\./\\./g')( |\$)"
+CRASH_PREFIX=$DRIVER_ID
 CRASH_DIRS="/Library/Logs/DiagnosticReports $HOME/Library/Logs/DiagnosticReports"
 NETSTAT=/usr/sbin/netstat
 ROUTE=/sbin/route

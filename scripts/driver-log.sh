@@ -8,9 +8,11 @@
 set -eu
 
 cd "$(dirname "$0")/.." || exit 1
+. ./scripts/config.sh # rmnet_config: DRIVER_ID, from config.local or the environment
+rmnet_config || exit 2
 mkdir -p build/logs
 file="build/logs/driver-$(date +%Y%m%d-%H%M%S).log"
 echo "saving to $file" >&2
 /usr/bin/log stream --style compact \
-  --predicate 'senderImagePath ENDSWITH "/io.rmnetdriver.RMNet.driver" OR eventMessage BEGINSWITH "RMNet:"' |
+  --predicate "senderImagePath ENDSWITH \"/$DRIVER_ID\" OR eventMessage BEGINSWITH \"RMNet:\"" |
   tee "$file"

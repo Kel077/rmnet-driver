@@ -142,19 +142,23 @@ build/quit-tests: app/SmsModel.swift app/SmsController.swift app/ModemNetwork.sw
 
 # The scripts' decisions that need neither the network nor an install: the install script's kept-app
 # and running-driver checks (scripts/install-checks.sh), soak.sh's status classes (--classify), and the
-# driver's personalities against the model list (scripts/check-personalities.sh).
+# driver's personalities against the model list (scripts/check-personalities.sh), and the build's
+# team and bundle IDs from config.local or the environment (scripts/config.sh, gen.rb's options).
 script-test:
 	sh tests/scripts/test-install-checks.sh
 	sh tests/scripts/test-soak-classify.sh
 	sh tests/scripts/test-personalities.sh
+	sh tests/scripts/test-config.sh
 
-# Unsigned build of the driver and the host app that embeds it. gen.rb writes RMNet.xcodeproj.
+# Unsigned build of the driver and the host app that embeds it. gen.rb writes RMNet.xcodeproj, with
+# the bundle ID in RMNET_BUNDLE_ID when it is set (environment or make's command line; config.local
+# is not read here), else the default.
 XCODEBUILD := xcodebuild -project RMNet.xcodeproj -configuration Debug -parallelizeTargets \
 	SYMROOT="$(CURDIR)/build/xcode" OBJROOT="$(CURDIR)/build/xcode/obj" \
 	CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 
 driver:
-	/usr/bin/ruby gen.rb
+	/usr/bin/ruby gen.rb $(if $(RMNET_BUNDLE_ID),--bundle-id $(RMNET_BUNDLE_ID))
 	$(XCODEBUILD) -target RMNetDriver build
 	$(XCODEBUILD) -target RMNet build
 	@echo "driver build ok"

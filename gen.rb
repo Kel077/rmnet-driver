@@ -1,9 +1,12 @@
 #!/usr/bin/ruby
 # Generates RMNet.xcodeproj: the RMNetDriver dext (driver/ plus Core) and the RMNet host app that embeds it.
 #
-# Usage: /usr/bin/ruby gen.rb [TEAM_ID]
+# Usage: /usr/bin/ruby gen.rb [--team TEAM_ID] [--bundle-id BUNDLE_ID]
 #   With a team ID both targets use Xcode automatic signing for that team; without one no signing
 #   settings are written and the project is only built with signing turned off (make driver).
+#   BUNDLE_ID is the app's (default io.rmnetdriver.RMNet); the driver's is BUNDLE_ID.driver.
+#   scripts/install-driver.sh passes both from config.local (scripts/config.sh); make driver passes
+#   --bundle-id only when RMNET_BUNDLE_ID is set.
 #
 # Every path in the project is relative to the repository root (this file's directory), and object
 # identifiers are derived from the project's contents, so the output is the same from any working
@@ -12,14 +15,24 @@
 require 'xcodeproj'
 
 ROOT    = __dir__
-APP_ID  = 'io.rmnetdriver.RMNet'
-DRV_ID  = "#{APP_ID}.driver"
 VERSION = '1.0'
 Obj     = Xcodeproj::Project::Object
+USAGE   = 'usage: /usr/bin/ruby gen.rb [--team TEAM_ID] [--bundle-id BUNDLE_ID]'
 
-team = ARGV[0]
-abort('usage: ruby gen.rb [TEAM_ID]') if ARGV.length > 1
+team   = nil
+app_id = 'io.rmnetdriver.RMNet'
+args   = ARGV.dup
+until args.empty?
+  case args.shift
+  when '--team'      then team = args.shift or abort(USAGE)
+  when '--bundle-id' then app_id = args.shift or abort(USAGE)
+  else abort(USAGE)
+  end
+end
 abort("gen.rb: '#{team}' is not a team ID") if team && team !~ /\A[A-Z0-9]{10}\z/
+abort("gen.rb: '#{app_id}' is not a bundle ID") if app_id !~ /\A[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\z/
+APP_ID = app_id
+DRV_ID = "#{APP_ID}.driver"
 
 signing = if team
             {
@@ -145,4 +158,4 @@ app.add_dependency(drv)
 # so it is stable only after a second pass.
 2.times { proj.predictabilize_uuids }
 proj.save
-puts "gen.rb: wrote RMNet.xcodeproj#{team ? " (signing team #{team})" : ' (no signing)'}"
+puts "gen.rb: wrote RMNet.xcodeproj for #{APP_ID}#{team ? " (signing team #{team})" : ' (no signing)'}"
