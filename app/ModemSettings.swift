@@ -195,11 +195,37 @@ func usbModeJSON(_ info: UsbModeInfo) -> [String: Any] {
 /// The longest command `RMNet at` sends, in characters.
 let atCommandLimit = 512
 
+/// The commands that answer with a "> " prompt and wait for a second stage (a message body, an SMS command
+/// PDU) that one line cannot give, each with what `RMNet at` says about it. The modem may ignore spaces in a
+/// command line and runs commands joined with `;`, so these are looked for anywhere in the line, spaces
+/// removed (also inside a quoted string, which is refused too).
+private let atPromptCommands: [(name: String, reason: String)] = [
+    ("+CMGS", "AT+CMGS needs a message body; use RMNet sms send"),
+    ("+CMGW", "AT+CMGW needs a message body; use RMNet sms send"),
+    ("+CMGC", "AT+CMGC needs a second stage after a > prompt; RMNet at sends one line only"),
+    ("+QCMGS", "AT+QCMGS needs a second stage after a > prompt; RMNet at sends one line only"),
+]
+
+/// The first basic command after AT that would take the AT port to data mode (D dials, O goes online) or
+/// change whether and how the modem answers (V: words or numbers; Q: result codes on or off).
+private let atLockoutFirstCommands: [Character] = ["D", "O", "V", "Q"]
+
+/// Anywhere in the line: the line-end characters the modem expects and answers with (S3, S4), and &W, which
+/// would keep such settings across a restart.
+private let atLockoutAnywhere = ["S3=", "S4=", "&W"]
+
+private func atLockout(_ what: String) -> String {
+    "RMNet at does not send \(what) (it would switch the AT port to data mode or change how the modem answers, "
+        + "and RMNet's own AT features would stop working)"
+}
+
 /// nil when `line` may be sent as one AT command; else why not, as `RMNet at` says it after `at: ` (never
 /// quoting the line). Refused: an empty line; a character outside printable ASCII (0x20–0x7E), so no CR or LF
 /// (which would end the line early and send a second command) and no Ctrl-Z (which ends a message body); more
-/// than 512 characters; a line that does not start with AT (any case); AT+CMGS and AT+CMGW at the start (any
-/// case), which wait at the "> " prompt for a message body that one line cannot give.
+/// than 512 characters; a line that does not start with AT (any case). Then, on the line upper-cased with its
+/// spaces removed: a prompt command anywhere (`atPromptCommands`); ATD, ATO, ATV or ATQ as the first basic
+/// command; S3=, S4= or &W anywhere. Those would leave the port waiting for a second stage, or unusable for
+/// RMNet's own AT features (AtPort expects verbose answers ending in OK, in command mode).
 func atCommandProblem(_ line: String) -> String? {
     let scalars = line.unicodeScalars
     if scalars.isEmpty { return "no command given; usage: RMNet at [--timeout <seconds>] <command>" }
@@ -209,9 +235,10 @@ func atCommandProblem(_ line: String) -> String? {
     if scalars.count > atCommandLimit { return "a command is at most \(atCommandLimit) characters" }
     let upper = line.uppercased()              // ASCII only by now
     guard upper.hasPrefix("AT") else { return "a command starts with AT" }
-    for withBody in ["AT+CMGS", "AT+CMGW"] where upper.hasPrefix(withBody) {
-        return "\(withBody) needs a message body; use RMNet sms send"
-    }
+    let compact = upper.replacingOccurrences(of: " ", with: "")
+    for command in atPromptCommands where compact.contains(command.name) { return command.reason }
+    if let first = compact.dropFirst(2).first, atLockoutFirstCommands.contains(first) { return atLockout("AT\(first)") }
+    for part in atLockoutAnywhere where compact.contains(part) { return atLockout("AT\(part)") }
     return nil
 }
 

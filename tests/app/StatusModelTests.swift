@@ -26,13 +26,14 @@ func status(_ entries: [ExtensionEntry], _ modem: ModemState = attached4, model:
 }
 
 // The QMI-mode lines of the advice, word for word: for the RM520N-GL (the verb first, the two AT
-// commands as the fallback) and for any other model or none known (the two AT commands only).
+// commands sent with `RMNet at` as the fallback) and for any other model or none known (the two AT
+// commands only: RMNet's AT port does not open those models).
 let rm520NotQMILines = [
     "The modem is attached but not in QMI mode. Run this command in Terminal, answer y when it asks before restarting the modem, and wait for the modem to come back (RMNet is /Applications/RMNet.app/Contents/MacOS/RMNet):",
     "RMNet usbmode set qmi",
-    "Or, from any AT terminal (RMNet has no general one), send these two AT commands, then wait for the modem to come back; unplugging it and plugging it in again does the same as the second:",
-    "AT+QCFG=\"usbnet\",0",
-    "AT+CFUN=1,1",
+    "Or send the two AT commands with RMNet at, then wait for the modem to come back; unplugging it and plugging it in again does the same as the second:",
+    "RMNet at 'AT+QCFG=\"usbnet\",0'",
+    "RMNet at AT+CFUN=1,1",
 ]
 let otherNotQMILines = [
     "The modem is attached but not in QMI mode. Send it these two AT commands, then wait for it to come back:",
@@ -91,12 +92,18 @@ struct StatusModelTests {
               "\(notQMI)")
 
         // The RM520N-GL (2c7c:0801, the one product the app's AT port opens): `RMNet usbmode set qmi`
-        // first, then the two AT commands as the fallback.
+        // first, then the two AT commands, sent with `RMNet at`, as the fallback.
         let rm520Model = quectelModel(product: 0x0801)
         let rm520NotQMI = advice(status([enabled], .notQMI, model: rm520Model), bundledVersion: "316.19.56")
         check(rm520NotQMI == rm520NotQMILines + [alwaysLine],
-              "advice: an RM520N-GL not in QMI mode leads with RMNet usbmode set qmi, the AT commands as the fallback",
+              "advice: an RM520N-GL not in QMI mode leads with RMNet usbmode set qmi, RMNet at as the fallback",
               "\(rm520NotQMI)")
+        check(atFallbackCommands == ["RMNet at 'AT+QCFG=\"usbnet\",0'", "RMNet at AT+CFUN=1,1"]
+                && rm520NotQMI.filter({ atFallbackCommands.contains($0) }) == atFallbackCommands,
+              "advice: the RM520N-GL's fallback lines are atFallbackCommands (the window shows them fixed-width)",
+              "\(atFallbackCommands)")
+        check(!rm520NotQMI.contains { $0.contains("no general one") || $0.contains("any AT terminal") },
+              "advice: the RM520N-GL's advice no longer says RMNet has no AT terminal", "\(rm520NotQMI)")
         check(rm520NotQMI.firstIndex(of: usbModeQmiCommand) == 1, "advice: the verb is the line after the first",
               "\(rm520NotQMI)")
         // Any other model: today's advice, the two AT commands only (RMNet's AT port does not open it).

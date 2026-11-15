@@ -833,7 +833,9 @@ struct ModemServiceTests {
         // A line the CLI refuses is not sent here either: no port is opened.
         let long = "AT+" + String(repeating: "A", count: 510)
         for line in ["", "hello", "ATI\rAT+CFUN=0", "ATI\n", "AT+CMGS=\"123\"\u{1A}", "AT\tI", "AT\u{E9}", "AT\u{7F}",
-                     long, "AT+CMGS=\"123\"", "at+cmgs=\"123\"", "AT+CMGW", "At+CmGw=\"123\""] {
+                     long, "AT+CMGS=\"123\"", "at+cmgs=\"123\"", "AT+CMGW", "At+CmGw=\"123\"",
+                     "AT+CSQ;+CMGS=\"1\"", "AT +CMGS=1", "AT+CMGC=1", "AT+QCMGS", "ATD*99#", "ATO", "ATV0", "ATQ1",
+                     "ATS3=10", "ATE1S4=10", "AT&W", "AT S3 = 13"] {
             let rig = Rig([])
             let message = failureMessage(rig.service.at(line, timeout: 10), "at, refused \(line.debugDescription)")
             check(message.hasSuffix("; nothing was sent"), "at: \(line.debugDescription) is refused, nothing sent", message)

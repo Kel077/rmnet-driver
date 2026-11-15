@@ -914,6 +914,12 @@ struct ModemCliTests {
         let tooLong = "at: a command is at most 512 characters"
         let cmgs = "at: AT+CMGS needs a message body; use RMNet sms send"
         let cmgw = "at: AT+CMGW needs a message body; use RMNet sms send"
+        let cmgc = "at: AT+CMGC needs a second stage after a > prompt; RMNet at sends one line only"
+        let qcmgs = "at: AT+QCMGS needs a second stage after a > prompt; RMNet at sends one line only"
+        func lockout(_ what: String) -> String {
+            "at: RMNet at does not send \(what) (it would switch the AT port to data mode or change how the modem answers, "
+                + "and RMNet's own AT features would stop working)"
+        }
         let longest = "AT+" + String(repeating: "A", count: 509)       // 512 characters
         let tooLongLine = longest + "A"                                // 513
 
@@ -931,6 +937,11 @@ struct ModemCliTests {
         expectParse(["at", "ati"], .at("ati", timeout: 10))
         expectParse(["at", "AT"], .at("AT", timeout: 10))
         expectParse(["at", "AT+CMGL=4"], .at("AT+CMGL=4", timeout: 10))
+        // The other SMS commands, and settings that leave the port working, are sent.
+        for line in ["AT+CMGR=1", "AT+QCMGR=1", "AT+CMGD=1", "AT+CMGF=0", "AT+CPMS?", "ATS3?", "ATS4?", "ATS0=0", "AT&F",
+                     "AT&V", "ATZ", "ATE0", "ATE1", "ATI", "AT+QCFG=\"usbnet\"", "AT+CGDCONT?"] {
+            expectParse(["at", line], .at(line, timeout: 10))
+        }
         expectParse(["at", longest], .at(longest, timeout: 10))
         // Spaces at the ends are dropped (the port's echo check would never match them); inside, kept.
         expectParse(["at", "ATI "], .at("ATI", timeout: 10))
@@ -954,6 +965,25 @@ struct ModemCliTests {
             (["at", tooLongLine], tooLong),
             (["at", "at+cmgs=\"123\""], cmgs), (["at", "AT+CMGS=\"123\""], cmgs), (["at", "At+CmGs"], cmgs),
             (["at", "AT+CMGS=23"], cmgs), (["at", "AT+CMGW"], cmgw), (["at", "at+cmgw=\"123\""], cmgw),
+            // A prompt command anywhere in the line, spaces removed; also inside a quoted string.
+            (["at", "AT+CSQ;+CMGS=\"1\""], cmgs), (["at", "ATE1+CMGS=1"], cmgs), (["at", "AT", "+CMGS=1"], cmgs),
+            (["at", "AT+C", "MGS=1"], cmgs), (["at", "AT+QCFG=\"x+cmgs\""], cmgs), (["at", "AT+CSQ;+cmgw=1"], cmgw),
+            (["at", "AT+CMGC=1"], cmgc), (["at", "at+cmgc"], cmgc), (["at", "AT+CSQ;+CMGC=2"], cmgc), (["at", "AT +CMGC"], cmgc),
+            (["at", "AT+QCMGS=\"1\",1,1,1"], qcmgs), (["at", "at+qcmgs"], qcmgs), (["at", "AT+CSQ;+QCMGS"], qcmgs),
+            (["at", "AT", "+QCMGS"], qcmgs),
+            // Data mode, and how the modem answers: the first basic command after AT, spaces removed.
+            (["at", "ATD*99#"], lockout("ATD")), (["at", "ATDT123;"], lockout("ATD")), (["at", "atd123"], lockout("ATD")),
+            (["at", "AT", "D123"], lockout("ATD")), (["at", "ATD"], lockout("ATD")),
+            (["at", "ATO"], lockout("ATO")), (["at", "ATO0"], lockout("ATO")), (["at", "ato"], lockout("ATO")),
+            (["at", "ATV0"], lockout("ATV")), (["at", "ATV1"], lockout("ATV")), (["at", "atv"], lockout("ATV")),
+            (["at", "AT V0"], lockout("ATV")),
+            (["at", "ATQ1"], lockout("ATQ")), (["at", "ATQ0"], lockout("ATQ")), (["at", "atq"], lockout("ATQ")),
+            // The line-end characters (S3, S4) anywhere, and &W, which would keep such settings.
+            (["at", "ATS3=10"], lockout("ATS3=")), (["at", "ATE1S3=13"], lockout("ATS3=")),
+            (["at", "AT", "S3", "=", "13"], lockout("ATS3=")), (["at", "ats3=13"], lockout("ATS3=")),
+            (["at", "ATS4=10"], lockout("ATS4=")), (["at", "AT+CSQ;S4=10"], lockout("ATS4=")),
+            (["at", "AT&W"], lockout("AT&W")), (["at", "AT&W0"], lockout("AT&W")), (["at", "ATE0&W"], lockout("AT&W")),
+            (["at", "AT&F&W"], lockout("AT&W")), (["at", "at&w"], lockout("AT&W")), (["at", "AT+CSQ;& W"], lockout("AT&W")),
         ]
         for (words, line) in refusals {
             let fake = FakeModem()
