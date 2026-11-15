@@ -527,7 +527,8 @@ private func setUsbMode(_ service: ModemServing, _ mode: UsbNetMode, reboot: Boo
     }
     if mode != .qmi {
         output("In \(mode.name) mode this driver does not work; to come back: RMNet usbmode set qmi (if RMNet cannot "
-               + "find the modem afterwards, switch back with any AT terminal: AT+QCFG=\"usbnet\",0 then AT+CFUN=1,1)")
+               + "find the modem afterwards, send AT+QCFG=\"usbnet\",0 then AT+CFUN=1,1 from other software that talks "
+               + "to the modem over USB, or from another computer)")
     }
     if reboot && !yes {
         guard let answer = ask(restartQuestion) else {
