@@ -94,6 +94,8 @@ struct NoModem: ModemServing {
     }
     func sim() -> Result<SimInfo, ModemFailure> { .failure(failure) }
     func enterPin(_ pin: String, shownAttempts: Int) -> Result<PinOutcome, ModemFailure> { .failure(failure) }
+    func usbMode() -> Result<UsbModeInfo, ModemFailure> { .failure(failure) }
+    func setUsbMode(_ mode: UsbNetMode, reboot: Bool) -> Result<UsbModeChange, ModemFailure> { .failure(failure) }
 }
 
 @main

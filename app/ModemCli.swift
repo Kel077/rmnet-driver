@@ -1,10 +1,12 @@
-// The command-line verbs for the modem's network and settings: `network`, `radio`, `mode`, `apn` and
-// `sim`. The parser (wrong usage is nil: main.swift prints the usage line and exits 2 without opening the
-// port) and what each verb prints, over a `ModemServing`, the readSecret that reads a password or a PIN
-// without echo, and the output. Foundation only, with ModemNetwork.swift and ModemSettings.swift:
-// `make app-test` builds it with them and a fake service.
+// The command-line verbs for the modem's network and settings: `network`, `radio`, `mode`, `apn`, `sim`
+// and `usbmode`. The parser (wrong usage is nil: main.swift prints the usage line and exits 2 without
+// opening the port) and what each verb prints, over a `ModemServing`, the readSecret that reads a password
+// or a PIN without echo, the question asked on the terminal before a restart, and the output. Foundation
+// only, with ModemNetwork.swift and ModemSettings.swift: `make app-test` builds it with them and a fake
+// service.
 //
-// Each verb prints lines starting `<verb>: ` (the `network` rows and the `apn` profile lines aside) and
+// Each verb prints lines starting `<verb>: ` (the `network` rows and the `apn` profile lines aside; `usbmode`
+// prints `usb mode: `, `usb mode set to …`, its other-mode warning and `cancelled; nothing changed`) and
 // returns 0, or 1 after a failure, printed as one line `<verb>: <sentence>`. A password or PIN goes from
 // readSecret to the service and nowhere else: no line printed holds one.
 import Foundation
@@ -20,24 +22,28 @@ enum ModemCommand: Equatable {
                 redial: Bool)
     case sim(json: Bool)
     case simUnlock(lastAttempt: Bool)
+    case usbMode(json: Bool)
+    case usbModeSet(UsbNetMode, reboot: Bool, yes: Bool)    // reboot: no --no-reboot; yes: --yes
 
-    /// Radio on or off, a mode set, apn set and sim unlock: main.swift ignores the stopping signals for these.
+    /// Radio on or off, a mode set, apn set, sim unlock and usbmode set: main.swift ignores the stopping
+    /// signals for these.
     var changesModem: Bool {
         switch self {
-        case .network, .apnShow, .sim: return false
+        case .network, .apnShow, .sim, .usbMode: return false
         case .radio(let on): return on != nil
         case .mode(let mode): return mode != nil
-        case .apnSet, .simUnlock: return true
+        case .apnSet, .simUnlock, .usbModeSet: return true
         }
     }
 }
 
-let modemVerbs: Set<String> = ["network", "radio", "mode", "apn", "sim"]
+let modemVerbs: Set<String> = ["network", "radio", "mode", "apn", "sim", "usbmode"]
 
 /// Appended to main.swift's usage line.
 let modemUsage = "network [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | apn [show] [--json] | "
     + "apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] [--password | --no-password] "
-    + "[--auth none|pap|chap|pap-or-chap] [--no-redial] | sim [--json] | sim unlock [--last-attempt]"
+    + "[--auth none|pap|chap|pap-or-chap] [--no-redial] | sim [--json] | sim unlock [--last-attempt] | "
+    + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes]"
 
 // MARK: - Parsing
 
@@ -69,9 +75,33 @@ func parseModem(_ words: [String]) -> ModemCommand? {
         case ["--last-attempt"]: return .simUnlock(lastAttempt: true)
         default: return nil                       // a PIN is never taken from the command line
         }
+    case "usbmode":
+        guard rest.first == "set" else { return jsonOption(rest).map { .usbMode(json: $0) } }
+        return parseUsbModeSet(Array(rest.dropFirst()))
     default:
         return nil
     }
+}
+
+private let usbModeOptions: [String: UsbNetMode] =
+    Dictionary(uniqueKeysWithValues: UsbNetMode.allCases.map { ($0.name, $0) })
+
+/// The words after `usbmode set`: the mode's name (lower case, as printed), then `--no-reboot` and `--yes`,
+/// each at most once, in either order.
+private func parseUsbModeSet(_ words: [String]) -> ModemCommand? {
+    guard let name = words.first, let mode = usbModeOptions[name] else { return nil }
+    var reboot = true
+    var yes = false
+    var seen = Set<String>()
+    for option in words.dropFirst() {
+        guard seen.insert(option).inserted else { return nil }
+        switch option {
+        case "--no-reboot": reboot = false
+        case "--yes": yes = true
+        default: return nil
+        }
+    }
+    return .usbModeSet(mode, reboot: reboot, yes: yes)
 }
 
 /// Nothing: false; `--json`: true; anything else: nil.
@@ -134,11 +164,13 @@ private func parseApnSet(_ words: [String]) -> ModemCommand? {
 
 // MARK: - Running
 
-/// Runs `command` (blocking: off the main thread) and returns the exit code, 0 or 1. `driverProfile` is the
-/// driver's `RMNetProfile` (nil when the driver is not attached); `readSecret` reads a password or PIN
-/// without echo after showing its prompt (nil without a terminal); `output` prints one line.
+/// Runs `command` (blocking: off the main thread) and returns the exit code: 0, 1, or 2 when `usbmode set`
+/// would restart the modem without a terminal to ask on. `driverProfile` is the driver's `RMNetProfile` (nil
+/// when the driver is not attached); `readSecret` reads a password or PIN without echo after showing its
+/// prompt (nil without a terminal); `ask` shows a question on the terminal and reads one line (nil without a
+/// terminal, see `askOnTerminal`); `output` prints one line.
 func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int?,
-              readSecret: (String) -> String?, output: (String) -> Void) -> Int32 {
+              readSecret: (String) -> String?, ask: (String) -> String?, output: (String) -> Void) -> Int32 {
     switch command {
     case .network(let json):
         return showNetwork(service, json: json, output)
@@ -172,6 +204,10 @@ func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int
         }
     case .simUnlock(let lastAttempt):
         return unlockSim(service, lastAttempt: lastAttempt, readSecret: readSecret, output)
+    case .usbMode(let json):
+        return showUsbMode(service, json: json, output)
+    case let .usbModeSet(mode, reboot, yes):
+        return setUsbMode(service, mode, reboot: reboot, yes: yes, ask: ask, output)
     }
 }
 
@@ -374,4 +410,71 @@ private func unlockSim(_ service: ModemServing, lastAttempt: Bool, readSecret: (
         output("sim: \(pinSentence(outcome))")
         return outcome.accepted ? 0 : 1
     }
+}
+
+private func showUsbMode(_ service: ModemServing, json: Bool, _ output: (String) -> Void) -> Int32 {
+    switch service.usbMode() {
+    case .failure(let failure): return fail("usb mode", failure.message, output)
+    case .success(let info):
+        if json { return outputJSON("usb mode", usbModeJSON(info), output) }
+        let name = usbModeName(info.value)
+        output(info.mode == .qmi ? "usb mode: \(name) (the RMNet driver works in this mode)"
+                                 : "usb mode: \(name) (the RMNet driver needs qmi: RMNet usbmode set qmi)")
+        return 0
+    }
+}
+
+/// The question before a change that restarts the modem.
+private let restartQuestion = "The modem will restart (about 30 s) and the network port will go away until it is back. "
+    + "Continue? [y/N] "
+
+/// Reads the mode first, and changes nothing when it is already the one asked. A mode other than qmi is
+/// warned about first, also with --yes. A change that restarts the modem is asked about on the terminal
+/// unless --yes: only `y` or `yes` (any case) goes on; without a terminal it is refused, exit 2, so the modem
+/// is never restarted unasked. With --no-reboot nothing restarts, so nothing is asked.
+private func setUsbMode(_ service: ModemServing, _ mode: UsbNetMode, reboot: Bool, yes: Bool,
+                        ask: (String) -> String?, _ output: (String) -> Void) -> Int32 {
+    switch service.usbMode() {
+    case .failure(let failure): return fail("usb mode", failure.message, output)
+    case .success(let info):
+        if info.value == mode.rawValue {
+            output("usb mode: already \(mode.name); nothing changed")
+            return 0
+        }
+    }
+    if mode != .qmi {
+        output("In \(mode.name) mode this driver does not work; to come back: RMNet usbmode set qmi (if RMNet cannot "
+               + "find the modem afterwards, switch back with any AT terminal: AT+QCFG=\"usbnet\",0 then AT+CFUN=1,1)")
+    }
+    if reboot && !yes {
+        guard let answer = ask(restartQuestion) else {
+            output("usb mode: no terminal to ask on, so nothing changed; run again with --yes to restart the modem "
+                   + "without asking")
+            return 2
+        }
+        guard ["y", "yes"].contains(answer.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
+            output("cancelled; nothing changed")
+            return 1
+        }
+    }
+    switch service.setUsbMode(mode, reboot: reboot) {
+    case .failure(let failure):
+        return fail("usb mode", failure.message, output)
+    case .success(.unchanged):
+        output("usb mode: already \(mode.name); nothing changed")
+    case .success(.rebooting):
+        output("usb mode set to \(mode.name); the modem is restarting")
+    case .success(.setTakesEffectAfterRestart):
+        output("usb mode set to \(mode.name); it takes effect at the next restart (AT+CFUN=1,1 or a replug)")
+    }
+    return 0
+}
+
+/// Shows `question` on the terminal (no line end after it) and reads one line. nil, asking nothing, when
+/// standard input is not a terminal; "" at the end of input (Ctrl-D), which the caller takes as no.
+func askOnTerminal(_ question: String) -> String? {
+    guard isatty(0) == 1 else { return nil }
+    print(question, terminator: "")
+    fflush(stdout)
+    return readLine(strippingNewline: true) ?? ""
 }

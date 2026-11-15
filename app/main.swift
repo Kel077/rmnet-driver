@@ -291,7 +291,8 @@ if verbs.first == "gps" {
     exit(runGps(seconds: seconds))
 }
 
-// network, radio, mode, apn, sim: over the modem's spare AT port, off the main thread, as the sms verbs.
+// network, radio, mode, apn, sim, usbmode: over the modem's spare AT port, off the main thread, as the sms
+// verbs.
 if let verb = verbs.first, modemVerbs.contains(verb) {
     guard let modemCommand = parseModem(verbs) else {
         print(usage)
@@ -308,10 +309,13 @@ if let verb = verbs.first, modemVerbs.contains(verb) {
     // catches Ctrl-C itself and gives nil, and the verb stops with nothing changed or sent. A hang-up can
     // still give an empty answer, which the verbs refuse. Each line is flushed at once, so that the attempts
     // left and the APN warning are out before a prompt (which goes to /dev/tty) also when output is piped.
+    // The usbmode question is read on the main thread too; there Ctrl-C is ignored (the signals above), and
+    // Return alone, or Ctrl-D, cancels it.
     DispatchQueue.global(qos: .userInitiated).async {
         let code = runModem(modemCommand, service: ModemService(),
                             driverProfile: readDriverProperties()?["RMNetProfile"].flatMap { Int($0) },
                             readSecret: { prompt in DispatchQueue.main.sync { readSecret(prompt: prompt) } },
+                            ask: { question in DispatchQueue.main.sync { askOnTerminal(question) } },
                             output: { print($0); fflush(stdout) })
         fflush(stdout)
         exit(code)

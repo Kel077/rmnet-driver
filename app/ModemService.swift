@@ -1,7 +1,8 @@
 // The modem over its spare AT port (USB interface 3): the network read, the radio, the network mode, the
-// data profiles (with the redial that makes the driver dial with new settings) and the SIM's PIN. The
-// models in ModemNetwork.swift and ModemSettings.swift read the answers and write the lines that change the
-// modem; this file only puts them in order. Each call opens a port, works and closes it, also on failure.
+// USB network mode (with the restart that puts it in effect), the data profiles (with the redial that
+// makes the driver dial with new settings) and the SIM's PIN. The models in ModemNetwork.swift and
+// ModemSettings.swift read the answers and write the lines that change the modem; this file only puts them
+// in order. Each call opens a port, works and closes it, also on failure.
 // After a timeout or an I/O error nothing more is sent on that port (AtPort closes itself after a timeout),
 // so the call ends there; only a redial then opens a second port, to switch the radio back on. Calls block
 // (a redial usually up to about 40 s, longer when the port fails) and must not be made on the main thread.
@@ -76,6 +77,8 @@ final class ModemService: ModemServing {
     private static let reopenRetries = Int(reopenWait / reopenInterval)
 
     private static let modeRead = "AT+QNWPREFCFG=\"mode_pref\""
+    private static let usbModeRead = "AT+QCFG=\"usbnet\""
+    private static let restart = "AT+CFUN=1,1"
     private static let simStateRead = "AT+CPIN?"
     private static let pinAttemptsRead = "AT+QPINC?"
     private static let pinLockRead = "AT+CLCK=\"SC\",2"
@@ -209,6 +212,69 @@ final class ModemService: ModemServing {
             case .failure(let error):
                 return failure("The modem answered OK, but the network mode could not be read back. \(describe(error)) "
                                + "It was \(before).")
+            }
+        }
+    }
+
+    // MARK: The USB network mode
+
+    func usbMode() -> Result<UsbModeInfo, ModemFailure> {
+        withPort({ describe($0) }) { readUsbMode($0) }
+    }
+
+    /// AT+QCFG="usbnet" (3 s); fails on an answer without its line, a refusal, a timeout or an I/O error.
+    private func readUsbMode(_ link: Link) -> Result<UsbModeInfo, ModemFailure> {
+        switch link.command(ModemService.usbModeRead, timeout: ModemService.readTimeout) {
+        case .success(let lines):
+            guard let info = parseUsbMode(lines) else { return failure("The modem did not say which USB mode it uses.") }
+            return .success(info)
+        case .failure(let error):
+            return failure("The USB mode could not be read. \(describe(error))")
+        }
+    }
+
+    /// Reads the mode first: when it is already `mode`, nothing more is sent. Otherwise the change (5 s) and
+    /// its read-back, which must be `mode`; then, only with `reboot`, AT+CFUN=1,1 (20 s, as AT+CFUN=), and
+    /// no wait for the modem to come back: it leaves USB while it restarts, and this port with it. Nothing
+    /// is restarted after a change that failed or did not read back as sent.
+    func setUsbMode(_ mode: UsbNetMode, reboot: Bool) -> Result<UsbModeChange, ModemFailure> {
+        withPort({ "\(describe($0)) Nothing was changed." }) { link in
+            let before: UsbModeInfo
+            switch readUsbMode(link) {
+            case .success(let info): before = info
+            case .failure(let f): return failure("\(f.message) Nothing was changed.")
+            }
+            if before.value == mode.rawValue { return .success(.unchanged) }
+            let was = "It was \(usbModeName(before.value)). The modem was not restarted."
+            switch link.command(usbModeCommand(mode), timeout: ModemService.writeTimeout) {
+            case .success:
+                break
+            case .failure(let error) where isRefusal(error):
+                return failure("The USB mode was not changed. \(describe(error))")
+            case .failure(let error):
+                return failure("It is not known whether the USB mode changed. \(describe(error)) \(was)")
+            }
+            switch link.command(ModemService.usbModeRead, timeout: ModemService.readTimeout) {
+            case .success(let lines):
+                let after = parseUsbMode(lines)
+                guard after?.value == mode.rawValue else {
+                    let reports = after.map { usbModeName($0.value) } ?? "no USB mode"
+                    return failure("The modem answered OK but now reports \(reports). \(was)")
+                }
+            case .failure(let error):
+                return failure("The modem answered OK, but the USB mode could not be read back. \(describe(error)) \(was)")
+            }
+            guard reboot else { return .success(.setTakesEffectAfterRestart) }
+            let nextRestart = "takes effect at the next restart (AT+CFUN=1,1 or a replug)."
+            switch link.command(ModemService.restart, timeout: ModemService.radioTimeout) {
+            case .success:
+                return .success(.rebooting)
+            case .failure(let error) where isRefusal(error):
+                return failure("The USB mode is now \(mode.name), but the modem was not restarted. \(describe(error)) "
+                               + "It \(nextRestart)")
+            case .failure(let error):
+                return failure("The USB mode is now \(mode.name). It is not known whether the modem is restarting. "
+                               + "\(describe(error)) If it does not restart, the new mode \(nextRestart)")
             }
         }
     }

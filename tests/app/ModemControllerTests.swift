@@ -113,6 +113,12 @@ final class FakeService: ModemServing, CustomReflectable {
         return locked { pinResults.removeFirst() }
     }
 
+    // The window does not read or set the USB mode (only `RMNet usbmode` does): these are never called.
+    func usbMode() -> Result<UsbModeInfo, ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func setUsbMode(_ mode: UsbNetMode, reboot: Bool) -> Result<UsbModeChange, ModemFailure> {
+        .failure(ModemFailure(message: "not used"))
+    }
+
     func releaseInfo(_ r: Result<NetworkInfo, ModemFailure>) { locked { infoResults.append(r) }; gate.signal() }
     func releaseRadio(_ r: Result<RadioChange, ModemFailure>) { locked { radioResults.append(r) }; gate.signal() }
     func releaseMode(_ r: Result<ModeChange, ModemFailure>) { locked { modeResults.append(r) }; gate.signal() }

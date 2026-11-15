@@ -1,10 +1,11 @@
-// The modem's settings and the changes RMNet makes to them: the radio, the network mode, the data
-// profiles (APN, user name, password, authentication) and the SIM's PIN. Here are the reading of their AT
-// answers, the checks of what the owner types, the AT lines that change the modem, the questions asked
-// before a change and the sentences said after it, and `ModemServing`, the interface of the service that
-// does the I/O. Foundation only: pure functions over the answer lines (AtPort's lines between the echo
-// and OK), so `make app-test` builds this file with ModemNetwork.swift alone. A missing field, `-` in
-// place of a number, or a short line reads as "not known"; nothing here crashes on an odd answer.
+// The modem's settings and the changes RMNet makes to them: the radio, the network mode, the USB network
+// mode, the data profiles (APN, user name, password, authentication) and the SIM's PIN. Here are the
+// reading of their AT answers, the checks of what the owner types, the AT lines that change the modem, the
+// questions asked before a change and the sentences said after it, and `ModemServing`, the interface of
+// the service that does the I/O. Foundation only: pure functions over the answer lines (AtPort's lines
+// between the echo and OK), so `make app-test` builds this file with ModemNetwork.swift alone. A missing
+// field, `-` in place of a number, or a short line reads as "not known"; nothing here crashes on an odd
+// answer.
 //
 // A profile's password is kept in memory only. No string conversion of any value here shows it (only
 // whether one is set); the one text that holds it is `profileCommand`, the line sent to the modem.
@@ -80,6 +81,32 @@ struct PinOutcome: Equatable {
     var refusal: String? = nil
 }
 
+/// AT+QCFG="usbnet" <net>: what the modem offers on USB for the network, in effect after a restart. 0 is
+/// RMNET (QMI), the one mode this driver works in; 1 ECM, 2 MBIM, 3 RNDIS.
+enum UsbNetMode: Int, CaseIterable {
+    case qmi = 0, ecm = 1, mbim = 2, rndis = 3
+
+    /// As `RMNet usbmode` prints and takes it.
+    var name: String {
+        switch self {
+        case .qmi: return "qmi"
+        case .ecm: return "ecm"
+        case .mbim: return "mbim"
+        case .rndis: return "rndis"
+        }
+    }
+}
+
+/// AT+QCFG="usbnet" as read: the number the modem gave, kept also when RMNet does not know it (`mode` nil).
+struct UsbModeInfo: Equatable {
+    let value: Int
+    var mode: UsbNetMode? { UsbNetMode(rawValue: value) }
+}
+
+/// After a USB mode change: it was already that mode (nothing sent but the read); set and the modem told to
+/// restart (it goes away from USB for about 30 s); or set, in effect at the next restart.
+enum UsbModeChange: Equatable { case unchanged, rebooting, setTakesEffectAfterRestart }
+
 /// The modem over its spare AT port. Each call blocks until done; callers keep it off the main thread.
 protocol ModemServing {
     func networkInfo() -> Result<NetworkInfo, ModemFailure>
@@ -89,6 +116,8 @@ protocol ModemServing {
     func setProfile(_ id: Int, to settings: ProfileSettings, redial: Bool) -> Result<ProfileChange, ModemFailure>
     func sim() -> Result<SimInfo, ModemFailure>
     func enterPin(_ pin: String, shownAttempts: Int) -> Result<PinOutcome, ModemFailure>
+    func usbMode() -> Result<UsbModeInfo, ModemFailure>
+    func setUsbMode(_ mode: UsbNetMode, reboot: Bool) -> Result<UsbModeChange, ModemFailure>
 }
 
 // MARK: - Answer lines
@@ -123,6 +152,33 @@ let networkModeChoices = ["AUTO", "LTE:NR5G", "NR5G", "LTE"]
 /// AT+QNWPREFCFG="mode_pref",<mode>: written to the modem's NVM, in effect at once.
 func modeCommand(_ mode: String) -> String {
     "AT+QNWPREFCFG=\"mode_pref\",\(mode)"
+}
+
+// MARK: - USB network mode
+
+/// AT+QCFG="usbnet": `+QCFG: "usbnet",<net>`. nil without that line, or with no number in it.
+func parseUsbMode(_ lines: [String]) -> UsbModeInfo? {
+    for line in lines {
+        if let f = atFields(line, prefix: "+QCFG"), answerField(f, 0) == "usbnet" {
+            return answerInt(f, 1).map { UsbModeInfo(value: $0) }
+        }
+    }
+    return nil
+}
+
+/// AT+QCFG="usbnet",<net>: kept by the modem, in effect at its next restart.
+func usbModeCommand(_ mode: UsbNetMode) -> String {
+    "AT+QCFG=\"usbnet\",\(mode.rawValue)"
+}
+
+/// `qmi`, `ecm`, `mbim`, `rndis`; `unknown (<n>)` for another number.
+func usbModeName(_ value: Int) -> String {
+    UsbNetMode(rawValue: value)?.name ?? "unknown (\(value))"
+}
+
+/// `RMNet usbmode --json`: `{"mode":"qmi","value":0,"driverWorks":true}`.
+func usbModeJSON(_ info: UsbModeInfo) -> [String: Any] {
+    ["mode": usbModeName(info.value), "value": info.value, "driverWorks": info.mode == .qmi]
 }
 
 // MARK: - Data profiles

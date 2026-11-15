@@ -99,11 +99,14 @@ final class FakeModem: ModemServing {
     var simResult: Result<SimInfo, ModemFailure> = .success(readySim)
     var pinResult: Result<PinOutcome, ModemFailure> =
         .success(PinOutcome(accepted: true, sim: SimInfo(state: .ready, pinLock: true, pinAttempts: 3, pukAttempts: 10)))
+    var usbModeResult: Result<UsbModeInfo, ModemFailure> = .success(UsbModeInfo(value: 0))
+    var setUsbModeResult: Result<UsbModeChange, ModemFailure>? = nil  // nil: rebooting, or set for the next restart
 
     var radioAsked: [Bool] = []
     var modesAsked: [String] = []
     var profilesSet: [(id: Int, settings: ProfileSettings, redial: Bool)] = []
     var pinsEntered: [(pin: String, shownAttempts: Int)] = []
+    var usbModesSet: [String] = []                                    // "<mode> reboot" or "<mode> no reboot"
 
     func networkInfo() -> Result<NetworkInfo, ModemFailure> {
         events.append("networkInfo")
@@ -139,36 +142,54 @@ final class FakeModem: ModemServing {
         pinsEntered.append((pin: pin, shownAttempts: shownAttempts))
         return pinResult
     }
+    func usbMode() -> Result<UsbModeInfo, ModemFailure> {
+        events.append("usbMode")
+        return usbModeResult
+    }
+    func setUsbMode(_ mode: UsbNetMode, reboot: Bool) -> Result<UsbModeChange, ModemFailure> {
+        events.append("setUsbMode")
+        usbModesSet.append("\(mode.name) \(reboot ? "reboot" : "no reboot")")
+        return setUsbModeResult ?? .success(reboot ? .rebooting : .setTakesEffectAfterRestart)
+    }
 }
 
-/// One run of a verb: what it printed, its exit code, the prompts the fake readSecret was asked.
+/// One run of a verb: what it printed, its exit code, the prompts the fake readSecret was asked, the
+/// questions the fake terminal was asked.
 struct Run {
     let lines: [String]
     let code: Int32
     let prompts: [String]
+    var questions: [String] = []
 }
 
-/// Parses `words` (which must be right usage) and runs it against `fake`; readSecret answers `secretAnswer`.
+/// Parses `words` (which must be right usage) and runs it against `fake`; readSecret answers `secretAnswer`,
+/// the terminal's question `answer` (nil: no terminal).
 @discardableResult
 func run(_ words: [String], _ fake: FakeModem, driverProfile: Int? = 1, secretAnswer: String? = nil,
-         _ name: String) -> Run {
+         answer: String? = nil, _ name: String) -> Run {
     guard let command = parseModem(words) else {
         check(false, "\(name): \(words.joined(separator: " ")) parses")
         return Run(lines: [], code: -1, prompts: [])
     }
     var lines: [String] = []
     var prompts: [String] = []
+    var questions: [String] = []
     let code = runModem(command, service: fake, driverProfile: driverProfile,
                         readSecret: { prompt in
                             fake.events.append("readSecret")
                             prompts.append(prompt)
                             return secretAnswer
                         },
+                        ask: { question in
+                            fake.events.append("ask")
+                            questions.append(question)
+                            return answer
+                        },
                         output: { line in
                             fake.events.append("output")
                             lines.append(line)
                         })
-    return Run(lines: lines, code: code, prompts: prompts)
+    return Run(lines: lines, code: code, prompts: prompts, questions: questions)
 }
 
 func linesText(_ lines: [String]) -> String {
@@ -231,10 +252,11 @@ let restoreProfile1 = "apn: to put it back: RMNet apn set --apn '' --type ipv4v6
 struct ModemCliTests {
     static func main() {
         // --- the verbs and the usage -------------------------------------------------------------
-        check(modemVerbs == ["network", "radio", "mode", "apn", "sim"], "modemVerbs", "\(modemVerbs.sorted())")
+        check(modemVerbs == ["network", "radio", "mode", "apn", "sim", "usbmode"], "modemVerbs", "\(modemVerbs.sorted())")
         check(modemUsage == "network [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | apn [show] [--json] | "
               + "apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] [--password | --no-password] "
-              + "[--auth none|pap|chap|pap-or-chap] [--no-redial] | sim [--json] | sim unlock [--last-attempt]",
+              + "[--auth none|pap|chap|pap-or-chap] [--no-redial] | sim [--json] | sim unlock [--last-attempt] | "
+              + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes]",
               "modemUsage: the brief's usage without the leading RMNet", modemUsage)
 
         // --- parseModem: every form --------------------------------------------------------------
@@ -284,6 +306,16 @@ struct ModemCliTests {
         expectParse(["sim", "--json"], .sim(json: true))
         expectParse(["sim", "unlock"], .simUnlock(lastAttempt: false))
         expectParse(["sim", "unlock", "--last-attempt"], .simUnlock(lastAttempt: true))
+        expectParse(["usbmode"], .usbMode(json: false))
+        expectParse(["usbmode", "--json"], .usbMode(json: true))
+        expectParse(["usbmode", "set", "qmi"], .usbModeSet(.qmi, reboot: true, yes: false))
+        expectParse(["usbmode", "set", "ecm"], .usbModeSet(.ecm, reboot: true, yes: false))
+        expectParse(["usbmode", "set", "mbim"], .usbModeSet(.mbim, reboot: true, yes: false))
+        expectParse(["usbmode", "set", "rndis"], .usbModeSet(.rndis, reboot: true, yes: false))
+        expectParse(["usbmode", "set", "qmi", "--no-reboot"], .usbModeSet(.qmi, reboot: false, yes: false))
+        expectParse(["usbmode", "set", "ecm", "--yes"], .usbModeSet(.ecm, reboot: true, yes: true))
+        expectParse(["usbmode", "set", "mbim", "--no-reboot", "--yes"], .usbModeSet(.mbim, reboot: false, yes: true))
+        expectParse(["usbmode", "set", "rndis", "--yes", "--no-reboot"], .usbModeSet(.rndis, reboot: false, yes: true))
 
         // --- parseModem: wrong usage -------------------------------------------------------------
         for words in [
@@ -305,15 +337,23 @@ struct ModemCliTests {
             ["apn", "set", "--apn", "x", "--pin", "1234"], ["apn", "set", "--password", "secret"],
             ["sim", "--xml"], ["sim", "lock"], ["sim", "unlock", "--last-attempt", "--last-attempt"],
             ["sim", "unlock", "--json"], ["sim", "--json", "unlock"], ["sim", "unlock", "--last-attempt", "1234"],
+            ["usbmode", "set"], ["usbmode", "set", "foo"], ["usbmode", "set", "qmi", "extra"], ["usbmode", "set", "QMI"],
+            ["usbmode", "set", "0"], ["usbmode", "set", "--yes", "qmi"], ["usbmode", "set", "--yes"],
+            ["usbmode", "set", "qmi", "--yes", "--yes"], ["usbmode", "set", "qmi", "--no-reboot", "--no-reboot"],
+            ["usbmode", "set", "qmi", "--json"], ["usbmode", "set", "qmi", "--reboot"], ["usbmode", "set", "qmi", "ecm"],
+            ["usbmode", "--json", "--json"], ["usbmode", "show"], ["usbmode", "qmi"], ["usbmode", "--yes"],
+            ["usbmode", "--json", "set", "qmi"], ["usbmode", "set", "rmnet"], ["usbmode", "set", ""], ["usbMode"],
         ] {
             expectWrongUsage(words)
         }
 
-        // --- changesModem: exactly the five changing forms ---------------------------------------
+        // --- changesModem: exactly the changing forms --------------------------------------------
         let changing: [ModemCommand] = [.radio(on: true), .radio(on: false), .mode("LTE"), apnSet(apn: "x"),
-                                        .simUnlock(lastAttempt: false), .simUnlock(lastAttempt: true)]
+                                        .simUnlock(lastAttempt: false), .simUnlock(lastAttempt: true),
+                                        .usbModeSet(.qmi, reboot: true, yes: false), .usbModeSet(.ecm, reboot: false, yes: true)]
         let reading: [ModemCommand] = [.network(json: false), .network(json: true), .radio(on: nil), .mode(nil),
-                                       .apnShow(json: false), .apnShow(json: true), .sim(json: false), .sim(json: true)]
+                                       .apnShow(json: false), .apnShow(json: true), .sim(json: false), .sim(json: true),
+                                       .usbMode(json: false), .usbMode(json: true)]
         for c in changing { check(c.changesModem, "changesModem: \(c) changes the modem") }
         for c in reading { check(!c.changesModem, "changesModem: \(c) only reads") }
 
@@ -830,6 +870,169 @@ struct ModemCliTests {
                     code: 1, "sim unlock: the read failed")
         check(fake.pinsEntered.isEmpty, "sim unlock: the read failed, nothing sent")
 
+        usbModeVerb()
+
         print("modem cli: \(checks) checks passed")
+    }
+
+    // --- usbmode ---------------------------------------------------------------------------------
+    static func usbModeVerb() {
+        let question = "The modem will restart (about 30 s) and the network port will go away until it is back. Continue? [y/N] "
+        func otherModeWarning(_ name: String) -> String {
+            "In \(name) mode this driver does not work; to come back: RMNet usbmode set qmi (if RMNet cannot find the modem "
+                + "afterwards, switch back with any AT terminal: AT+QCFG=\"usbnet\",0 then AT+CFUN=1,1)"
+        }
+        let noTerminal = "usb mode: no terminal to ask on, so nothing changed; run again with --yes to restart the modem "
+            + "without asking"
+        func reads(_ value: Int) -> FakeModem {
+            let fake = FakeModem()
+            fake.usbModeResult = .success(UsbModeInfo(value: value))
+            return fake
+        }
+        func calls(_ fake: FakeModem) -> [String] { fake.events.filter { $0 != "output" } }
+
+        // Showing.
+        var fake = FakeModem()
+        let shown = run(["usbmode"], fake, answer: "y", "usbmode")
+        expectLines(shown, ["usb mode: qmi (the RMNet driver works in this mode)"], code: 0, "usbmode: qmi")
+        check(calls(fake) == ["usbMode"] && shown.questions.isEmpty, "usbmode: one read, nothing asked", "\(fake.events)")
+        for (value, name) in [(1, "ecm"), (2, "mbim"), (3, "rndis"), (7, "unknown (7)"), (-1, "unknown (-1)")] {
+            fake = reads(value)
+            expectLines(run(["usbmode"], fake, "usbmode \(value)"),
+                        ["usb mode: \(name) (the RMNet driver needs qmi: RMNet usbmode set qmi)"], code: 0, "usbmode: \(name)")
+            check(fake.usbModesSet.isEmpty, "usbmode \(value): changes nothing")
+        }
+        fake = FakeModem()
+        let json = run(["usbmode", "--json"], fake, "usbmode --json")
+        expectLines(json, [prettyJSON(["mode": "qmi", "value": 0, "driverWorks": true])], code: 0,
+                    "usbmode --json: mode, value, driverWorks; pretty, sorted keys")
+        if let data = json.lines.first?.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            check(object.keys.sorted() == ["driverWorks", "mode", "value"] && object["mode"] as? String == "qmi"
+                  && object["value"] as? Int == 0 && object["driverWorks"] as? Bool == true,
+                  "usbmode --json: {\"mode\":\"qmi\",\"value\":0,\"driverWorks\":true}", json.lines[0])
+        } else {
+            check(false, "usbmode --json: one JSON object", linesText(json.lines))
+        }
+        for (value, name) in [(2, "mbim"), (9, "unknown (9)")] {
+            fake = reads(value)
+            expectLines(run(["usbmode", "--json"], fake, "usbmode --json \(value)"),
+                        [prettyJSON(["mode": name, "value": value, "driverWorks": false])], code: 0,
+                        "usbmode --json: \(name), the driver does not work")
+        }
+        for words in [["usbmode"], ["usbmode", "--json"]] {
+            fake = FakeModem()
+            fake.usbModeResult = .failure(ModemFailure(message: "Fake: no modem."))
+            expectLines(run(words, fake, "\(words) failed"), ["usb mode: Fake: no modem."], code: 1, "\(words): a failure")
+        }
+
+        // Already in the mode asked: nothing asked, nothing set, no restart.
+        for words in [["usbmode", "set", "qmi"], ["usbmode", "set", "qmi", "--yes"], ["usbmode", "set", "qmi", "--no-reboot"]] {
+            fake = FakeModem()
+            let already = run(words, fake, answer: "y", "\(words), already")
+            expectLines(already, ["usb mode: already qmi; nothing changed"], code: 0, "\(words): already qmi")
+            check(calls(fake) == ["usbMode"] && already.questions.isEmpty && fake.usbModesSet.isEmpty,
+                  "\(words): already qmi: one read, nothing asked or set", "\(fake.events)")
+        }
+        fake = reads(2)
+        expectLines(run(["usbmode", "set", "mbim"], fake, answer: "y", "set mbim, already"),
+                    ["usb mode: already mbim; nothing changed"], code: 0, "usbmode set mbim: already mbim")
+        check(fake.usbModesSet.isEmpty, "usbmode set mbim: already mbim, nothing set")
+
+        // To qmi: the question, then the change and the restart.
+        for typed in ["y", "yes", "Y", "YES", "Yes", " y ", "yes\r"] {
+            fake = reads(2)
+            let toQmi = run(["usbmode", "set", "qmi"], fake, answer: typed, "set qmi, \(typed.debugDescription)")
+            expectLines(toQmi, ["usb mode set to qmi; the modem is restarting"], code: 0,
+                        "usbmode set qmi: \(typed.debugDescription) restarts")
+            check(toQmi.questions == [question], "usbmode set qmi: the question", "\(toQmi.questions)")
+            check(fake.usbModesSet == ["qmi reboot"], "usbmode set qmi: setUsbMode(.qmi, reboot: true)", "\(fake.usbModesSet)")
+            check(fake.events == ["usbMode", "ask", "setUsbMode", "output"], "usbmode set qmi: read, ask, set, say",
+                  "\(fake.events)")
+        }
+        fake = reads(7)
+        expectLines(run(["usbmode", "set", "qmi"], fake, answer: "y", "set qmi from unknown"),
+                    ["usb mode set to qmi; the modem is restarting"], code: 0, "usbmode set qmi from an unknown mode")
+
+        // To another mode: the warning line, then the question.
+        for (mode, name) in [(UsbNetMode.ecm, "ecm"), (.mbim, "mbim"), (.rndis, "rndis")] {
+            fake = FakeModem()
+            let other = run(["usbmode", "set", name], fake, answer: "y", "set \(name)")
+            expectLines(other, [otherModeWarning(name), "usb mode set to \(name); the modem is restarting"], code: 0,
+                        "usbmode set \(name): the warning, then the result")
+            check(other.questions == [question], "usbmode set \(name): the question", "\(other.questions)")
+            check(fake.usbModesSet == ["\(mode.name) reboot"], "usbmode set \(name): setUsbMode(.\(name), reboot: true)",
+                  "\(fake.usbModesSet)")
+            check(fake.events == ["usbMode", "output", "ask", "setUsbMode", "output"],
+                  "usbmode set \(name): read, warn, ask, set, say", "\(fake.events)")
+        }
+
+        // Anything but y or yes cancels.
+        for typed in ["", "n", "no", "N", "yess", "y es", "ye", "ok", "q"] {
+            fake = reads(2)
+            let cancelled = run(["usbmode", "set", "qmi"], fake, answer: typed, "set qmi, \(typed.debugDescription)")
+            expectLines(cancelled, ["cancelled; nothing changed"], code: 1, "usbmode set qmi: \(typed.debugDescription) cancels")
+            check(fake.usbModesSet.isEmpty && calls(fake) == ["usbMode", "ask"],
+                  "usbmode set qmi: \(typed.debugDescription): nothing set", "\(fake.events)")
+        }
+        fake = FakeModem()
+        expectLines(run(["usbmode", "set", "ecm"], fake, answer: "n", "set ecm, n"),
+                    [otherModeWarning("ecm"), "cancelled; nothing changed"], code: 1, "usbmode set ecm: n cancels")
+        check(fake.usbModesSet.isEmpty, "usbmode set ecm: cancelled, nothing set")
+
+        // No terminal and no --yes: refused, exit 2, setUsbMode never called.
+        fake = reads(2)
+        let unasked = run(["usbmode", "set", "qmi"], fake, answer: nil, "set qmi, no terminal")
+        expectLines(unasked, [noTerminal], code: 2, "usbmode set qmi: no terminal, no --yes")
+        check(fake.usbModesSet.isEmpty && calls(fake) == ["usbMode", "ask"], "usbmode set qmi: no terminal: no setUsbMode",
+              "\(fake.events)")
+        fake = FakeModem()
+        expectLines(run(["usbmode", "set", "rndis"], fake, answer: nil, "set rndis, no terminal"),
+                    [otherModeWarning("rndis"), noTerminal], code: 2, "usbmode set rndis: no terminal, no --yes")
+        check(fake.usbModesSet.isEmpty, "usbmode set rndis: no terminal: no setUsbMode")
+
+        // --yes: nothing asked; the warning line still printed.
+        fake = reads(1)
+        let yesQmi = run(["usbmode", "set", "qmi", "--yes"], fake, answer: nil, "set qmi --yes")
+        expectLines(yesQmi, ["usb mode set to qmi; the modem is restarting"], code: 0, "usbmode set qmi --yes")
+        check(yesQmi.questions.isEmpty && fake.usbModesSet == ["qmi reboot"], "usbmode set qmi --yes: set without asking",
+              "\(fake.events)")
+        fake = FakeModem()
+        let yesEcm = run(["usbmode", "set", "ecm", "--yes"], fake, answer: "n", "set ecm --yes")
+        expectLines(yesEcm, [otherModeWarning("ecm"), "usb mode set to ecm; the modem is restarting"], code: 0,
+                    "usbmode set ecm --yes: the warning, no question")
+        check(yesEcm.questions.isEmpty && fake.events == ["usbMode", "output", "setUsbMode", "output"],
+              "usbmode set ecm --yes: read, warn, set, say", "\(fake.events)")
+
+        // --no-reboot: set for the next restart; nothing restarts, so nothing is asked.
+        for words in [["usbmode", "set", "qmi", "--no-reboot"], ["usbmode", "set", "qmi", "--no-reboot", "--yes"]] {
+            fake = reads(3)
+            let later = run(words, fake, answer: nil, "\(words)")
+            expectLines(later, ["usb mode set to qmi; it takes effect at the next restart (AT+CFUN=1,1 or a replug)"], code: 0,
+                        "\(words): set for the next restart")
+            check(later.questions.isEmpty && fake.usbModesSet == ["qmi no reboot"],
+                  "\(words): setUsbMode(.qmi, reboot: false), nothing asked", "\(fake.usbModesSet)")
+        }
+        fake = FakeModem()
+        expectLines(run(["usbmode", "set", "mbim", "--no-reboot"], fake, answer: nil, "set mbim --no-reboot"),
+                    [otherModeWarning("mbim"),
+                     "usb mode set to mbim; it takes effect at the next restart (AT+CFUN=1,1 or a replug)"],
+                    code: 0, "usbmode set mbim --no-reboot: the warning, then the result")
+        check(fake.usbModesSet == ["mbim no reboot"], "usbmode set mbim --no-reboot: reboot false", "\(fake.usbModesSet)")
+
+        // The service's answers.
+        fake = reads(2)
+        fake.setUsbModeResult = .success(.unchanged)
+        expectLines(run(["usbmode", "set", "qmi"], fake, answer: "y", "set qmi, unchanged meanwhile"),
+                    ["usb mode: already qmi; nothing changed"], code: 0, "usbmode set qmi: the service found it already qmi")
+        fake = FakeModem()
+        fake.setUsbModeResult = .failure(ModemFailure(message: "Fake: refused."))
+        expectLines(run(["usbmode", "set", "ecm"], fake, answer: "y", "set ecm failed"),
+                    [otherModeWarning("ecm"), "usb mode: Fake: refused."], code: 1, "usbmode set ecm: a failure")
+        fake = FakeModem()
+        fake.usbModeResult = .failure(ModemFailure(message: "Fake: no modem."))
+        let unread = run(["usbmode", "set", "ecm", "--yes"], fake, answer: "y", "set ecm, read failed")
+        expectLines(unread, ["usb mode: Fake: no modem."], code: 1, "usbmode set ecm: the read failed")
+        check(unread.questions.isEmpty && fake.usbModesSet.isEmpty, "usbmode set ecm: the read failed, nothing asked or set")
     }
 }
