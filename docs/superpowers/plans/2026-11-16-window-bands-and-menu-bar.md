@@ -29,7 +29,7 @@
 - A bands change counts as a change for the existing quit gate and for the controls that are disabled while something runs (one call to the modem at a time).
 - The menu bar item never opens the AT port except when its panel is opened, and then at most once per opening (and not more often than every 10 s); a busy port is shown as such, not as an error that hides the connection state.
 - Closing the window leaves RMNet running in the menu bar; "Quit RMNet" quits through the existing quit gate (a running SMS send or modem change still delays the quit as today).
-- The icon's state comes from the driver's registry properties only, and is right when the driver is absent, waiting for approval, attached but down, and up.
+- The icon's state comes from the driver's registry properties only, and is right when the driver is absent, waiting for approval, attached but down, and up. **Note (2026-11-16, final review):** "only" is not what was built, nor can it be: the registry cannot tell waiting for approval from no driver. The icon comes from the registry plus the system's extension listing, which is asked for those two states (no driver in the registry: waiting for approval or no driver) and while the panel is open; with the driver attached the registry alone decides.
 
 ---
 
@@ -82,4 +82,4 @@ What it shows:
 
 ## After the tasks (coordinator)
 
-Look at the renders. Install; start the app (`open /Applications/RMNet.app`); check from the shell that it keeps running and that the process's AT port use is quiet (no `RMNet` CLI call is refused as busy over a minute of `RMNet at AT+CSQ` every 5 s with the app open and its panel closed). Bands: through the CLI on hardware already proven; the window path is covered by the controller tests and renders. Ask the owner to look at the menu bar item and the Network tab's Bands section, since this session cannot see the screen. Record in `docs/status.md`; land on `main`.
+Look at the renders. Install; start the app (`open /Applications/RMNet.app`); check from the shell that it keeps running and that the process's AT port use is quiet (no `RMNet` CLI call is refused as busy over a minute of `RMNet at AT+CSQ` every 5 s with the app open and its panel closed). **Note (2026-11-16, final review):** the check must name the RMNet window's state: closed, or open on the `Driver` tab. With the `Network` tab shown in a visible window the tab reads the port every 5 s (the `Messages` and `SIM & APN` tabs read it too, less often), and a verb may then be refused as busy by design: the window and the verbs share the port. Bands: through the CLI on hardware already proven; the window path is covered by the controller tests and renders. Ask the owner to look at the menu bar item and the Network tab's Bands section, since this session cannot see the screen. Record in `docs/status.md`; land on `main`.
