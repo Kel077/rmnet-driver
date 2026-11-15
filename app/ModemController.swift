@@ -1,10 +1,10 @@
 // The Network and SIM & APN tabs' state and the calls they make to the modem: reads only while a tab is
 // shown in a visible window, one call at a time, the result line of the last change, a way back (Put Back)
 // for a mode or profile change, the bands each RAT may use (changed or reset to every supported band), and
-// quitting that waits for a running call. It takes any ModemServing,
-// and the two AppKit calls it needs (the answer to the terminate question, the request for attention) and
-// the driver's profile number are closures given by the app delegate, so it uses no AppKit or SwiftUI and
-// is tested with a fake service (tests/app/ModemControllerTests.swift), as SmsController is.
+// quitting that waits for a running call. It takes any ModemServing, and the two AppKit calls it needs (the
+// answer to the terminate question, the request for attention) and the driver's profile number are closures
+// given by the app delegate, so it uses no AppKit or SwiftUI and is tested with a fake service
+// (tests/app/ModemControllerTests.swift), as SmsController is.
 //
 // A PIN is passed to the service and never kept: no stored property holds it (only the block on the queue
 // does, until the call returns). A profile's old password is kept in memory only, in `undo`
@@ -75,8 +75,8 @@ final class ModemController: ObservableObject {
     @Published private(set) var info: NetworkInfo? = nil         // the last network read that succeeded
     @Published private(set) var infoAt: Date? = nil
     @Published private(set) var infoFailure: String? = nil       // the last network read's failure; nil after a success
-    // The last bands() that succeeded (read with each network read), in BandRat.allCases order; a RAT changed
-    // since shows the bands its change read back.
+    // The last bands() that succeeded, in BandRat.allCases order; a RAT changed since shows the bands its change
+    // read back. Read with a network read only while `bandsDue`.
     @Published private(set) var bands: [BandSet]? = nil
     @Published private(set) var bandsFailure: String? = nil      // the last bands read's failure; nil after a success
     @Published private(set) var profiles: [DataProfile] = []     // the last profiles() that succeeded
@@ -91,6 +91,12 @@ final class ModemController: ObservableObject {
     @Published private(set) var undo: ModemUndo? = nil
     @Published var form: ProfileSettings? = nil   // the editor's values for the driver's profile
     @Published var pickedMode: String? = nil      // the Network tab's picker
+    /// The next Network read also reads the bands: set when the Network tab comes into view (shown, or its
+    /// window seen again), on Refresh there and after every bands change; cleared only by a bands read that
+    /// succeeded, so a turn whose network read failed (the bands are then not read) or whose bands read failed
+    /// leaves them due for the next turn. Not on every 5 s turn: the bands take a port open and four reads of
+    /// their own, and change only when set.
+    private(set) var bandsDue = false
 
     let quitNotice = ModemQuitNotice()
 
@@ -207,10 +213,11 @@ final class ModemController: ObservableObject {
         updateTimer()
     }
 
-    /// While a confirmation is open the timer's turns skip and nothing new is read; a read that was due
-    /// meanwhile starts when it closes. The view calls the confirmed action (setRadio, changeMode,
-    /// applyProfile, putBack, enterPin) before `setConfirming(false)`, so that the change starts at once
-    /// rather than after that read (it would still be made after the read, not refused).
+    /// While a confirmation or the bands sheet is open the timer's turns skip and nothing new is read; a read
+    /// that was due meanwhile starts when it closes. The view calls the confirmed action (setRadio, changeMode,
+    /// applyProfile, putBack, enterPin, or changeBands from the sheet's Apply) before `setConfirming(false)`, so
+    /// that the change starts at once rather than after that read (it would still be made after the read, not
+    /// refused).
     func setConfirming(_ open: Bool) {
         confirming = open
         readIfDue()
@@ -219,7 +226,8 @@ final class ModemController: ObservableObject {
     private var active: Bool { tab != nil && windowVisible && !stopping }
 
     // Reads the shown tab at once when it becomes active (or another tab is shown), then on each turn of
-    // its timer (5 s Network, 30 s SIM & APN); stops when it is not active.
+    // its timer (5 s Network, 30 s SIM & APN); stops when it is not active. The Network tab coming into view
+    // makes the bands due.
     private func updateTimer() {
         guard active, let tab else {
             timer?.invalidate()
@@ -229,6 +237,7 @@ final class ModemController: ObservableObject {
             return
         }
         if timer != nil, timerTab == tab { return }
+        if tab == .network { bandsDue = true }
         timer?.invalidate()
         let interval = tab == .network ? ModemController.networkInterval : ModemController.settingsInterval
         let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
@@ -245,21 +254,28 @@ final class ModemController: ObservableObject {
         }
     }
 
-    /// Starts the read that is due, once nothing runs (`refresh` checks the rest).
+    /// Starts the read that is due, once nothing runs (`read` checks the rest).
     private func readIfDue() {
         guard readWanted, running == nil else { return }
-        refresh()
+        read(refreshing: false)
     }
 
     /// One turn of the timer: skipped while a confirmation is open or a call runs.
     func tick() {
-        refresh()
+        read(refreshing: false)
     }
 
-    /// Reads what the shown tab needs: the Network tab networkInfo() then bands() (also when networkInfo()
-    /// failed); the SIM & APN tab profiles() then sim(); each in one block on the queue. Nothing while a call
-    /// runs, no tab is shown, the window is hidden, a confirmation is open or the app quits.
+    /// Refresh: reads the shown tab at once, on the Network tab the bands too. Nothing (and the bands not made
+    /// due) when `read` would start nothing.
     func refresh() {
+        read(refreshing: true)
+    }
+
+    /// Reads what the shown tab needs: the Network tab networkInfo(), then bands() when they are due and
+    /// networkInfo() succeeded (after a failure the port is likely busy or the modem gone, and the bands stay
+    /// due); the SIM & APN tab profiles() then sim(); each in one block on the queue. Nothing while a call
+    /// runs, no tab is shown, the window is hidden, a confirmation is open or the app quits.
+    private func read(refreshing: Bool) {
         guard running == nil, active, !confirming, let tab else { return }
         readWanted = false
         running = .reading
@@ -267,29 +283,35 @@ final class ModemController: ObservableObject {
         let service = self.service
         switch tab {
         case .network:
+            if refreshing { bandsDue = true }
+            let withBands = bandsDue
             queue.async {
-                let read = service.networkInfo()
-                let sets = service.bands()
-                DispatchQueue.main.async { self.finishNetwork(read, sets) }
+                let info = service.networkInfo()
+                let sets = withBands && (try? info.get()) != nil ? service.bands() : nil
+                DispatchQueue.main.async { self.finishNetwork(info, sets) }
             }
         case .simAndApn:
             queue.async {
                 let listed = service.profiles()
-                let read = service.sim()
-                DispatchQueue.main.async { self.finishSettings(listed, read) }
+                let sim = service.sim()
+                DispatchQueue.main.async { self.finishSettings(listed, sim) }
             }
         }
     }
 
-    private func finishNetwork(_ outcome: Result<NetworkInfo, ModemFailure>, _ sets: Result<[BandSet], ModemFailure>) {
+    // `sets` nil: the bands were not read in this turn (not due, or the network read failed).
+    private func finishNetwork(_ outcome: Result<NetworkInfo, ModemFailure>, _ sets: Result<[BandSet], ModemFailure>?) {
         running = nil
         readingTab = nil
         switch sets {
-        case .success(let read):
+        case .success(let read)?:
             bands = read
             bandsFailure = nil
-        case .failure(let failure):
+            bandsDue = false
+        case .failure(let failure)?:
             bandsFailure = failure.message
+        case nil:
+            break
         }
         switch outcome {
         case .success(let read):
@@ -634,28 +656,33 @@ final class ModemController: ObservableObject {
                  line: "Resetting the \(rat.name) bands to \(bandsWords(all, all))…")
     }
 
-    /// Sets each RAT that does not allow every supported band to all of them, in the order LTE, 5G NSA, 5G
-    /// SA, in one change that stops at the first failure (a RAT that allows them all is left alone).
+    /// Sets every RAT to all the bands it supports, in the order LTE, 5G NSA, 5G SA, in one change that stops at
+    /// the first failure. Offered (and run) while the last read shows a RAT that does not allow them all, but all
+    /// three are sent, whatever that read showed (the bands may have changed elsewhere since): the service reads
+    /// each RAT's bands first and writes nothing for one that already allows every supported band.
     func resetAllBands() {
         guard !stopping else { return }
         guard let sets = bands else { return refuse("The bands have not been read. Nothing was changed.") }
-        let locked = BandRat.allCases.compactMap(bandSet).filter(bandsLocked)
-        guard !locked.isEmpty else {
+        guard sets.contains(where: bandsLocked) else {
             return refuse("\(ratList(sets.map { $0.rat })) already allow all their supported bands. Nothing was changed.")
         }
-        let steps = locked.map { BandsStep(rat: $0.rat, bands: bandSorted($0.supported), supported: bandSorted($0.supported)) }
+        let steps = BandRat.allCases.compactMap(bandSet).map {
+            BandsStep(rat: $0.rat, bands: bandSorted($0.supported), supported: bandSorted($0.supported))
+        }
         for step in steps {
             if let problem = bandsProblem(step.rat, step.bands, supported: step.supported) {
                 return refuse("\(problem) Nothing was changed.")
             }
         }
         guard change == nil else { return refuse(ModemController.anotherChange) }
-        runBands(steps, line: "Resetting the \(ratList(steps.map { $0.rat })) bands to all supported bands…")
+        runBands(steps, all: true,
+                 line: "Resetting the \(ratList(steps.map { $0.rat })) bands to all supported bands…")
     }
 
     /// `steps` in order on the queue, one setBands each, as one change (`.bands`), stopping at the first
-    /// failure; then the result line, and the tab read again (after a failure too).
-    private func runBands(_ steps: [BandsStep], line: String) {
+    /// failure; then the result line (`all`: Reset all's), and the tab read again with the bands (after a
+    /// failure too).
+    private func runBands(_ steps: [BandsStep], all: Bool = false, line: String) {
         submit(.bands, line: line, quitLine: ModemController.bandsQuitLine, {
             (service: ModemServing) -> Result<BandsOutcome, ModemFailure> in
             var outcome = BandsOutcome()
@@ -670,13 +697,13 @@ final class ModemController: ObservableObject {
             return .success(outcome)
         }) { ended in
             switch ended {
-            case .success(let outcome): self.finishBands(outcome, steps)
-            case .failure(let failure): self.finishBands(BandsOutcome(done: [], failed: failure), steps)
+            case .success(let outcome): self.finishBands(outcome, steps, all: all)
+            case .failure(let failure): self.finishBands(BandsOutcome(done: [], failed: failure), steps, all: all)
             }
         }
     }
 
-    private func finishBands(_ outcome: BandsOutcome, _ steps: [BandsStep]) {
+    private func finishBands(_ outcome: BandsOutcome, _ steps: [BandsStep], all: Bool) {
         changeEnded()
         // Each RAT set shows at once the bands its change read back (the read that follows replaces them).
         if var sets = bands {
@@ -687,25 +714,27 @@ final class ModemController: ObservableObject {
             }
             bands = sets
         }
+        bandsDue = true  // read again with the tab, after a failure too
         let line: String
-        if steps.count == 1 {
-            let step = steps[0]
+        if !all, let step = steps.first {
             if let failure = outcome.failed {
                 line = failure.message
             } else if let done = outcome.done.first?.change, done.before == done.after {
                 // The modem had them already (changed elsewhere since the last read): nothing was written.
                 line = "The \(step.rat.name) bands are already \(bandsWords(done.after, step.supported)). Nothing was changed."
             } else {
-                line = "\(step.rat.name) bands set to \(bandsWords(outcome.done.first?.change.after ?? step.bands, step.supported))"
+                let after = outcome.done.first?.change.after ?? step.bands
+                line = "\(step.rat.name) bands set to \(bandsWords(after, step.supported))."
             }
         } else {
-            let reset = outcome.done.map { $0.rat }
-            let made = reset.isEmpty ? "" : "\(ratList(reset)) bands set to all supported bands"
+            // Reset all: only the RATs whose bands changed are named (the service wrote nothing for the others).
+            let changed = outcome.done.filter { $0.change.before != $0.change.after }.map { $0.rat }
+            let made = changed.isEmpty ? "" : "\(ratList(changed)) bands set to all supported bands."
             if let failure = outcome.failed {
-                let notReset = steps.dropFirst(reset.count).map { $0.rat }
-                line = (made.isEmpty ? "" : "\(made). ") + "\(failure.message) Not reset: \(ratList(notReset))."
+                let notReset = steps.dropFirst(outcome.done.count).map { $0.rat }
+                line = (made.isEmpty ? "" : "\(made) ") + "\(failure.message) Not reset: \(ratList(notReset))."
             } else {
-                line = made
+                line = made.isEmpty ? "Bands: all supported bands were already allowed." : made
             }
         }
         setResult(line, failure: outcome.failed != nil)
