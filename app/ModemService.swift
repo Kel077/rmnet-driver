@@ -78,7 +78,9 @@ final class ModemService: ModemServing {
     private static let reopenRetries = Int(reopenWait / reopenInterval)
 
     private static let modeRead = "AT+QNWPREFCFG=\"mode_pref\""
-    private static let bandCapabilityRead = "AT+QNWPREFCFG=\"ue_capability_band\""
+    // The bands the modem's hardware supports. Not "ue_capability_band": on the RM520N-GL that follows a lock
+    // (after nr5g_band was set to 41 it listed only 41; seen on 2026-11-15), and rf_band does not.
+    private static let bandSupportRead = "AT+QNWPREFCFG=\"rf_band\""
     private static func bandRead(_ rat: BandRat) -> String { "AT+QNWPREFCFG=\"\(rat.key)\"" }
     private static let usbModeRead = "AT+QCFG=\"usbnet\""
     private static let restart = "AT+CFUN=1,1"
@@ -284,9 +286,9 @@ final class ModemService: ModemServing {
 
     // MARK: The bands
 
-    /// AT+QNWPREFCFG="ue_capability_band" (the bands the modem supports, every RAT's on one answer), then each
-    /// RAT's own setting (the bands it may use), in BandRat.allCases order, 3 s each. Fails on a read that is
-    /// refused, times out or fails, and on an answer without a RAT's list.
+    /// AT+QNWPREFCFG="rf_band" (the bands the modem's hardware supports, every RAT's on one answer, whatever is
+    /// locked), then each RAT's own setting (the bands it may use), in BandRat.allCases order, 3 s each. Fails on
+    /// a read that is refused, times out or fails, and on an answer without a RAT's list.
     func bands() -> Result<[BandSet], ModemFailure> {
         withPort({ describe($0) }) { link in
             let supported: [BandRat: [Int]]
@@ -305,9 +307,10 @@ final class ModemService: ModemServing {
         }
     }
 
-    /// AT+QNWPREFCFG="ue_capability_band": the supported bands of each of `rats`; a failure when one is not there.
+    /// AT+QNWPREFCFG="rf_band": the supported bands of each of `rats` (its lists are in quotes); a failure when
+    /// one is not there.
     private func readSupportedBands(_ link: Link, _ rats: [BandRat]) -> Result<[BandRat: [Int]], ModemFailure> {
-        switch link.command(ModemService.bandCapabilityRead, timeout: ModemService.readTimeout) {
+        switch link.command(ModemService.bandSupportRead, timeout: ModemService.readTimeout) {
         case .success(let lines):
             var supported: [BandRat: [Int]] = [:]
             for rat in rats {

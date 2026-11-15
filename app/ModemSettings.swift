@@ -121,8 +121,8 @@ enum UsbModeChange: Equatable { case unchanged, rebooting, setTakesEffectAfterRe
 enum BandRat: String, CaseIterable {
     case lte, nsa, sa
 
-    /// Its AT+QNWPREFCFG setting, the bands it may use; also its line in AT+QNWPREFCFG="ue_capability_band",
-    /// the bands the modem supports.
+    /// Its AT+QNWPREFCFG setting, the bands it may use; also its line in AT+QNWPREFCFG="rf_band", the bands
+    /// the modem's hardware supports (which a lock does not change).
     var key: String {
         switch self {
         case .lte: return "lte_band"
@@ -239,9 +239,10 @@ func parseBandNumber(_ text: Substring) -> Int? {
     return n
 }
 
-/// The first line `+QNWPREFCFG: "<key>",<list>`, the list band numbers joined by `:` (`0` alone: none): the
-/// bands sorted, each once. nil without a line for the key, or when its list is not such a list (an empty
-/// number, a letter or sign, a `0` among other numbers, or a field after it).
+/// The first line `+QNWPREFCFG: "<key>",<list>`, the list band numbers joined by `:` (`0` alone: none), in
+/// quotes or not (rf_band quotes it, a RAT's own setting does not): the bands sorted, each once. nil without a
+/// line for the key, or when its list is not such a list (an empty number, a letter or sign, a `0` among other
+/// numbers, or a field after it).
 func parseBandList(_ lines: [String], key: String) -> [Int]? {
     for line in lines {
         guard let f = atFields(line, prefix: "+QNWPREFCFG"), answerField(f, 0) == key else { continue }
