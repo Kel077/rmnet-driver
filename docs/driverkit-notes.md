@@ -1582,3 +1582,24 @@ Built and tested (`make driver`, `make test`, `make driver-test`, `make check-dr
   - The driver's own figures: `RMNetLowPowerAsks` at least 1, `RMNetLowPowerLastResult` 0, `RMNetLastPowerFlags` 65536.
   - The port must still pass traffic in the low state. Nothing documents whether the networking family acts on its dext's low state.
 - **Never run.** None of this has run on the modem. With the shipped `driver/Info.plist`, the only change on the modem is these log lines and properties: `RMNetIdleSuspend` `off`, `RMNetIdleSuspendMs` 0, `RMNetRemoteWakeup` with whatever the modem's descriptor says, and `RMNetLowPowerAsks` and `RMNetLowPowerLastResult` 0. The serial ports log nothing new.
+
+## Runtime findings (driver features, 2026-11-15 04:56 to 12:41)
+
+Plan `docs/superpowers/plans/2026-11-15-driver-features.md`. All runs under the shared modem lock, on cells PCI 32 and 893 with a weak uplink (RSRP -91 to -97, SINR 4 to 8).
+
+| | Before: 317.20.51 (main's serial-ports build), 04:56 | After: 318.1.0 (driver-features, idle suspend off), 09:01 |
+|---|---|---|
+| Idle minute, modem's USB `CurrentPowerState` | 2 (on) in all 60 samples | 2 (on) in all 60 samples |
+| First ping after the idle minute, then the next nine | 76 ms; 56 to 84 (one 275) | 59 ms; 61 to 120 |
+| `measure.sh en33 up` | 1.9 Mbit/s (best second 15.5), 3.6 MB out in 6 s; pings alongside avg 189, max 564 | 3.6 Mbit/s (best 4.1), 2.8 MB out in 6 s; pings avg 84, max 202 |
+| `measure.sh en33 both` | down 118.4 (best 144.9), up 13.5 (best 19.8); pings avg 177, max 875 | 1st: download 0 bytes in 8 s, up 1.2; 2nd (PCI 893): down 45.9 (best 60.8), up 0.5; pings avg 112 and 405 |
+| `measure.sh en33 down` | — | 103.5 Mbit/s (best 123.4) |
+
+- **The uplink was the radio's.** Both builds gave single-digit upload rates alone on the same cell; in the two-way runs a saturated uplink starved the other direction (the downloads' handshakes in the first, the upload in the second). The driver's counters show none of the branch's new uplink paths ran in these runs (`RMNetTxHolds` +1, `RMNetUplinkUsable` 0, no failed transfer, no error or drop), so the after figures exercise the same per-packet code as before.
+- **The two 100 ms timer waits did not happen.** `RMNetTxCompleteRefused`, `RMNetRxCompleteRefused`, `RMNetTickTxDrains` and `RMNetTickRxFlushes` stayed 0 through every run. Neither wait needs changing.
+- **The modem offers remote wakeup** (`RMNetRemoteWakeup` 1).
+- **Idle suspend on (318.1.4, `RMNetIdleSuspendMs` 2000 in all three personalities, working tree only, 09:05):** `RMNetIdleSuspend` `on`; one low-power ask, result 0, not repeated; `RMNetLastPowerFlags` 65536; `RMNetDriver` and both `RMNetSerial` instances at `CurrentPowerState` 1, `CapabilityFlags` 65536 in `ioreg -p IOPower`; the modem's USB device at `CurrentPowerState` 1 and `RMNetSuspendedTicks` 234: **the modem suspends**. But **`en33` was gone**: not in `ifconfig -l`, `ping -b en33` "bad interface name", `ifconfig en33` stalling for minutes and failing with "Device not configured", while `RMNetState` stayed `up` (the QMI session). No traffic could be tested. The build was reverted at once.
+- **Final build 318.4.36** (`driver-features` with `main` at `3304cdf` merged, idle suspend off), 12:40: up 37 s after `AT+CFUN=1,1`; `RMNetIdleSuspend` `off`, no low-power ask, the three dexts at full power; IPv4 and IPv6, pings 3 of 3 in each; `sms list` works; no new crash report.
+- The 13 other Quectel models and the uplink-usable drain did not run on hardware. A sleep and wake on 318.4.36 is the owner's step.
+
+**Data.** 205 MB recorded in all (102 MB before, 103 MB after); the idle-on build and the final checks moved only pings. On 2026-11-15 at 09:05 the owner gave 300 MB as all that is left for testing.
