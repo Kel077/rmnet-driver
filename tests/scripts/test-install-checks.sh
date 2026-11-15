@@ -40,7 +40,7 @@ id_line() {
   il=$(installed_id_line "$1" "$2")
   echo "$il|$?"
 }
-REFUSAL_END='as configured (config.local or the environment): replacing it would leave its driver with no app that can deactivate it; see README, Removing the driver; nothing was changed'
+REFUSAL_END='as configured (config.local or the environment): if systemextensionsctl list still shows its driver, remove that first with this app (docs/reference.md, Removing the driver); then delete the app and run again; nothing was changed'
 check "no installed app" "|0" "$(id_line '' io.rmnetdriver.RMNet)"
 check "the installed app has the configured bundle ID" "|0" "$(id_line io.rmnetdriver.RMNet io.rmnetdriver.RMNet)"
 check "the installed app has another bundle ID: refused, naming both" \

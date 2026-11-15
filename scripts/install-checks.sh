@@ -14,8 +14,8 @@ installed_id_line() {
     return 0
   fi
   echo "the installed app's bundle ID is $1, not $2 as configured (config.local or the environment):" \
-    "replacing it would leave its driver with no app that can deactivate it; see README, Removing the driver;" \
-    "nothing was changed"
+    "if systemextensionsctl list still shows its driver, remove that first with this app" \
+    "(docs/reference.md, Removing the driver); then delete the app and run again; nothing was changed"
   return 1
 }
 
@@ -23,7 +23,7 @@ installed_id_line() {
 # Prints, one per line in listing order, every version listed for <driver-id> in the file (the output
 # of `systemextensionsctl list`) whose state does not contain "uninstall" and for which
 # <keep-dir>/RMNet-<version>.app does not exist: each of them could not be deactivated without that
-# app (README, "Removing the driver"). An entry's version is the one after the "/" in
+# app (docs/reference.md, "Removing the driver"). An entry's version is the one after the "/" in
 # "<driver-id> (<short version>/<version>)". Fails if the file cannot be read.
 missing_kept_apps() {
   ic_versions=$(awk -F '\t' -v id="$3" '
