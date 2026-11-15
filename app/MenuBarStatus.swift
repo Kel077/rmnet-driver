@@ -4,10 +4,12 @@
 // its panel are in MenuBarView.swift.
 //
 // The icon, the headline and the addresses come from the I/O registry (the driver's RMNet* properties and
-// the modem on USB) and the system's listing of the driver, every 5 s (`poll`): never from the AT port. The
-// network lines come from the modem's spare AT port, read once when the panel opens (`panelOpened`) and not
-// again until 10 s after the last read finished, on the queue the window's tabs use, so that the app never
-// opens the port twice at once. Nothing read is logged or stored.
+// the modem on USB), read every 5 s (`poll`), and from the system's listing of the driver, asked only when it
+// is needed: while the registry shows no driver (to tell no driver from waiting for approval) and while the
+// panel is open (for its headline). Never from the AT port. The network lines come from the modem's spare AT
+// port, read once when the panel opens (`panelOpened`) and not again until 10 s after the last read finished,
+// on the queue the window's tabs use, so that the app never opens the port twice at once. Nothing read is
+// logged or stored.
 import Foundation
 
 /// The driver's RMNet* registry properties, as strings (readDriverProperties in Registry.swift).
@@ -148,6 +150,7 @@ final class MenuBarStatus: ObservableObject {
     private let queue: DispatchQueue
     private var timer: Timer?
     private var asking = false              // a listing question is pending
+    private var panelOpen = false           // between panelOpened() and panelClosed()
     private var listingAnswered = false     // the system has answered at least once
     private var entries: [ExtensionEntry]? = nil   // its last answer; nil: it gave no listing
     private var driver: DriverProperties? = nil
@@ -183,13 +186,15 @@ final class MenuBarStatus: ObservableObject {
         timer = t
     }
 
-    /// Reads the registry, and asks the system for its listing unless a question is pending (its answer
-    /// updates the headline when it comes). Never the AT port.
+    /// Reads the registry; asks the system for its listing too (its answer updates the icon and headline when
+    /// it comes) when no driver is attached or the panel is open, unless a question is pending. Never the AT
+    /// port. On the main thread only.
     func poll() {
+        dispatchPrecondition(condition: .onQueue(.main))
         driver = properties()
         usb = modem()
         update()
-        guard !asking else { return }
+        guard driver == nil || panelOpen, !asking else { return }
         asking = true
         listing { [weak self] answer in
             guard let self else { return }
@@ -200,9 +205,11 @@ final class MenuBarStatus: ObservableObject {
         }
     }
 
-    /// The panel opened: polls, then reads the network unless a read runs or one finished less than 10 s ago
-    /// (a clock set back since does not count).
+    /// The panel opened: polls (with the listing), then reads the network unless a read runs or one finished
+    /// less than 10 s ago (a clock set back since does not count). On the main thread only.
     func panelOpened() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        panelOpen = true
         poll()
         guard !reading else { return }
         if let last = lastReadFinished {
@@ -215,6 +222,13 @@ final class MenuBarStatus: ObservableObject {
             let result = network()
             DispatchQueue.main.async { self?.finishRead(result) }
         }
+    }
+
+    /// The panel closed: from now on the listing is asked only while no driver is attached. A read that runs
+    /// finishes. On the main thread only.
+    func panelClosed() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        panelOpen = false
     }
 
     private func finishRead(_ result: Result<NetworkInfo, ModemFailure>) {

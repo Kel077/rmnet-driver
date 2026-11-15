@@ -22,6 +22,7 @@ struct RMNetApp: App {
         // The icon only; the title is its accessibility label.
         MenuBarExtra(menuBar.icon.accessibilityLabel, systemImage: menuBar.icon.symbolName) {
             MenuBarPanel(status: menuBar)
+                .background(OpenWindowKeeper())
         }
         .menuBarExtraStyle(.window)
     }
@@ -36,7 +37,8 @@ enum WindowTab: Hashable {
 
 // The window's tabs: Driver (the status below), Messages (SmsView.swift), Network and SIM & APN
 // (ModemView.swift). The tab shown is tracked by the selection; the Messages tab and the modem tabs ask the
-// modem only while one of theirs is shown and the window can be seen. The controllers are not observed
+// modem only while one of theirs is shown and this window itself can be seen (WindowVisibility.swift: not
+// NSApp.occlusionState, which the menu bar item's windows would keep visible). The controllers are not observed
 // here, so typing a message does not redraw the Driver tab; only their small quit notices are: while a
 // quit waits for a call to the modem, a line above the tabs says so.
 struct RMNetWindow: View {
@@ -81,10 +83,59 @@ struct RMNetWindow: View {
         .onAppear { modem.setTabShown(modemTab(tab)) }
         .onChange(of: tab) { _, shown in modem.setTabShown(modemTab(shown)) }
         .onDisappear { modem.setTabShown(nil) }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeOcclusionStateNotification)) { _ in
-            messages.setWindowVisible(NSApp.occlusionState.contains(.visible))
-            modem.setWindowVisible(NSApp.occlusionState.contains(.visible))
+        .background(WindowVisibilityObserver { visible in
+            messages.setWindowVisible(visible)
+            modem.setWindowVisible(visible)
+        })
+        .background(OpenWindowKeeper())
+    }
+}
+
+/// Reports whether the window this view is in can be seen: its own occlusion state, and not visible once it
+/// closes or the view leaves it (WindowVisibility.swift). The app's other windows do not count.
+private struct WindowVisibilityObserver: NSViewRepresentable {
+    let report: (Bool) -> Void
+
+    func makeNSView(context: Context) -> ObserverView { ObserverView(report: report) }
+    func updateNSView(_ view: ObserverView, context: Context) {}
+
+    final class ObserverView: NSView {
+        private let visibility: WindowVisibility
+
+        init(report: @escaping (Bool) -> Void) {
+            visibility = WindowVisibility(occlusionChanged: NSWindow.didChangeOcclusionStateNotification,
+                                          willClose: NSWindow.willCloseNotification, report: report)
+            super.init(frame: .zero)
         }
+
+        required init?(coder: NSCoder) { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            visibility.follow(window, visible: { [weak window] in
+                guard let window else { return false }
+                return window.isVisible && window.occlusionState.contains(.visible)
+            })
+        }
+    }
+}
+
+/// Keeps the app's way of opening the window (`openWindow(id: "status")`, then activating the app, as `Open
+/// RMNet` does) in AppDelegate.openStatusWindow, for a Dock click or a second launch while the window is
+/// closed. In the window and in the menu bar item's panel; it reads nothing.
+private struct OpenWindowKeeper: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onAppear {
+                let open = openWindow
+                AppDelegate.openStatusWindow = {
+                    open(id: "status")
+                    NSApp.activate()
+                }
+            }
     }
 }
 
@@ -123,6 +174,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // RMNet stays in the menu bar when its window is closed; `Open RMNet` in the item's panel opens it again.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    // How `Open RMNet` opens the window, kept by the window and the panel when they appear (OpenWindowKeeper);
+    // nil until one of them has. On the main thread only.
+    static var openStatusWindow: (() -> Void)?
+
+    // A click on the Dock icon, or `open /Applications/RMNet.app` while RMNet runs: opens the window, or brings
+    // it forward, as `Open RMNet` does. `hasVisibleWindows` is not trusted: the menu bar item's own windows can
+    // count as visible while the RMNet window is closed. False: handled here. True (no way kept yet, which
+    // should not happen, since the window opens at launch): AppKit's own handling.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard let open = AppDelegate.openStatusWindow else { return true }
+        open()
+        return false
+    }
 
     // Every way of quitting (Cmd-Q, the Dock's Quit, `Quit RMNet` in the menu bar item's panel, logout) comes
     // here. With a call to the modem running, the app ends only when it has finished; a send is never cut

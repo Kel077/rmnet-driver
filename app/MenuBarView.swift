@@ -78,7 +78,7 @@ struct MenuBarPanel: View {
         }
         .padding(14)
         .frame(width: 280, alignment: .leading)
-        .background(PanelShownObserver { status.panelOpened() })
+        .background(PanelShownObserver(shown: { status.panelOpened() }, hidden: { status.panelClosed() }))
     }
 
     private var showsNetwork: Bool {
@@ -104,19 +104,26 @@ private struct Lines: View {
 /// Calls `shown` each time the panel's window comes on screen: when it becomes key (the menu bar panel does
 /// when it opens) or becomes visible. Several calls for one opening are harmless: the model reads the port
 /// at most once in 10 s. Nothing is called while the panel is not on screen, so the port is not read at
-/// launch.
+/// launch. Calls `hidden` when it is no longer on screen (it resigns key and goes, its occlusion state is
+/// no longer visible, or the view leaves it), so that the model stops asking for the listing.
 private struct PanelShownObserver: NSViewRepresentable {
     let shown: () -> Void
+    let hidden: () -> Void
 
-    func makeNSView(context: Context) -> ObserverView { ObserverView(shown: shown) }
-    func updateNSView(_ view: ObserverView, context: Context) { view.shown = shown }
+    func makeNSView(context: Context) -> ObserverView { ObserverView(shown: shown, hidden: hidden) }
+    func updateNSView(_ view: ObserverView, context: Context) {
+        view.onShown = shown
+        view.onHidden = hidden
+    }
 
     final class ObserverView: NSView {
-        var shown: () -> Void
+        var onShown: () -> Void
+        var onHidden: () -> Void   // not `hidden`: NSView has one
         private var tokens: [NSObjectProtocol] = []
 
-        init(shown: @escaping () -> Void) {
-            self.shown = shown
+        init(shown: @escaping () -> Void, hidden: @escaping () -> Void) {
+            onShown = shown
+            onHidden = hidden
             super.init(frame: .zero)
         }
 
@@ -127,19 +134,22 @@ private struct PanelShownObserver: NSViewRepresentable {
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             stopObserving()
-            guard let window else { return }
+            guard let window else {
+                onHidden()
+                return
+            }
             let center = NotificationCenter.default
-            for name in [NSWindow.didBecomeKeyNotification, NSWindow.didChangeOcclusionStateNotification] {
+            for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
+                         NSWindow.didChangeOcclusionStateNotification] {
                 tokens.append(center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
-                    self?.shownIfOnScreen()
+                    self?.check()
                 })
             }
-            shownIfOnScreen()
+            check()
         }
 
-        private func shownIfOnScreen() {
-            guard let window, window.isVisible, window.occlusionState.contains(.visible) else { return }
-            shown()
+        private func check() {
+            if let window, window.isVisible, window.occlusionState.contains(.visible) { onShown() } else { onHidden() }
         }
 
         private func stopObserving() {

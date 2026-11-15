@@ -158,6 +158,7 @@ struct MenuBarStatusTests {
         headlines()
         addresses()
         polling()
+        listingWhenNeeded()
         throttle()
         oneReadAtATime()
         notes()
@@ -225,7 +226,8 @@ struct MenuBarStatusTests {
     }
 
     // The Driver tab's headline: "Asking the system…" until the listing first answers, "Unknown" while the system
-    // gives none, else headline() over the listing, the modem and the registry.
+    // gives none, else headline() over the listing, the modem and the registry. With the driver attached the
+    // listing is asked only while the panel is open, so the panel is open here.
     static func headlines() {
         let rig = Rig()
         let s = rig.status!
@@ -234,8 +236,11 @@ struct MenuBarStatusTests {
         s.poll()
         equal(s.headline, "Asking the system…", "headline: before the listing answers")
         equal(s.icon, .up, "headline: the icon does not wait for the listing")
+        rig.open()
+        equal(rig.listing.asked, 1, "listing: asked when the panel opens")
         s.poll()
         equal(rig.listing.asked, 1, "listing: not asked again while a question is pending")
+        equal(s.headline, "Asking the system…", "headline: still asking")
         rig.listing.answerWaiting([enabled])
         equal(s.headline, "Connected", "headline: connected")
         rig.listing.answerWaiting(nil)   // nothing waits: no change
@@ -301,15 +306,63 @@ struct MenuBarStatusTests {
             s.poll()
             rig.clock = rig.clock.addingTimeInterval(5)
         }
+        rig.properties = nil
+        for _ in 0..<20 {
+            s.poll()
+            rig.clock = rig.clock.addingTimeInterval(5)
+        }
         settle()
         equal(rig.network.calls, 0, "poll: never reads the network")
-        equal(rig.registryReads, 20, "poll: reads the registry each time")
-        equal(rig.listing.asked, 20, "poll: asks the listing each time (it answers at once here)")
+        equal(rig.registryReads, 40, "poll: reads the registry each time")
+        equal(rig.listing.asked, 20, "poll: asks the listing only while no driver is attached")
         equal(MenuBarStatus.pollInterval, 5, "poll: every 5 s")
         equal(MenuBarStatus.networkSpacing, 10, "network: at most once in 10 s")
         check(!s.reading, "poll: nothing is being read")
         equal(s.networkLines, [], "poll: no network lines")
         check(s.networkAt == nil && s.networkNote == nil, "poll: no network time or note")
+    }
+
+    // The listing (the system's properties request) is asked only when needed: while the registry shows no
+    // driver (no driver, or waiting for approval?), and while the panel is open (its headline). With the driver
+    // attached and the panel closed, a poll reads the registry only. Opening the panel asks it at once.
+    static func listingWhenNeeded() {
+        let rig = Rig()
+        let s = rig.status!
+        rig.listing.answer = [enabled]
+        rig.properties = upProperties
+        s.poll()
+        s.poll()
+        equal(rig.listing.asked, 0, "listing: not asked with the driver attached and the panel closed")
+        rig.properties = nil
+        s.poll()
+        equal(rig.listing.asked, 1, "listing: asked with no driver")
+        rig.listing.answer = [awaiting]
+        s.poll()
+        equal(rig.listing.asked, 2, "listing: asked on each poll with no driver")
+        equal(s.icon, .waitingForApproval, "listing: tells waiting for approval apart")
+        rig.listing.answer = [enabled]
+        rig.properties = upProperties
+        s.poll()
+        equal(rig.listing.asked, 2, "listing: not asked once the driver is attached")
+        equal(s.headline, "Waiting for approval in System Settings",
+              "listing: the headline keeps the last answer while it is not asked")
+
+        rig.open()
+        equal(rig.listing.asked, 3, "listing: asked when the panel opens")
+        equal(s.headline, "Connected", "listing: the panel's headline is fresh")
+        s.poll()
+        s.poll()
+        equal(rig.listing.asked, 5, "listing: asked on each poll while the panel is open")
+        // Opened again within 10 s: no network read, but the listing is asked all the same.
+        rig.open()
+        equal(rig.listing.asked, 6, "listing: asked again when the panel opens again")
+        equal(rig.network.calls, 1, "listing: the network was read once")
+        s.panelClosed()
+        s.poll()
+        s.poll()
+        equal(rig.listing.asked, 6, "listing: not asked once the panel is closed")
+        s.panelClosed()
+        equal(rig.listing.asked, 6, "listing: closing twice is harmless")
     }
 
     // Opening the panel reads the network once, on the model's queue; opening it again less than 10 s after

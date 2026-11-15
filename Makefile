@@ -71,12 +71,13 @@ check-driverkit:
 # The app's status model, SMS model, AT answer logic, the Messages tab's controller, the gps verb's
 # NMEA logic, its port reader and its GNSS switching (against a fake switch and a scripted port), the
 # network model, the settings model, the modem service (against a scripted port), the modem verbs (against
-# a fake service), the modem tabs' controller, the quit gate (with both controllers) and the menu bar item's
-# model (against fake sources), tested without Xcode or hardware (neither the AT port nor the NMEA port is
-# opened: the reader reads a pseudo-terminal the test makes, and no window is made).
+# a fake service), the modem tabs' controller, the quit gate (with both controllers), the menu bar item's
+# model (against fake sources) and the window's own visibility for the modem tabs (against posted
+# notifications), tested without Xcode or hardware (neither the AT port nor the NMEA port is opened: the
+# reader reads a pseudo-terminal the test makes, and no window is made).
 app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/nmea-tests build/gpsread-tests \
 		build/modemnet-tests build/modemset-tests build/modemsvc-tests build/modemcli-tests build/modemui-tests \
-		build/quit-tests build/menubar-tests
+		build/quit-tests build/menubar-tests build/window-tests
 	./build/app-tests
 	./build/sms-tests
 	./build/at-tests
@@ -90,6 +91,7 @@ app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build
 	./build/modemui-tests
 	./build/quit-tests
 	./build/menubar-tests
+	./build/window-tests
 
 build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
 	@mkdir -p build
@@ -150,6 +152,10 @@ build/quit-tests: app/SmsModel.swift app/SmsController.swift app/ModemNetwork.sw
 build/menubar-tests: app/StatusModel.swift app/AtPort.swift app/SmsModel.swift app/SmsService.swift \
 		app/ModemNetwork.swift app/ModemSettings.swift app/ModemService.swift app/MenuBarStatus.swift \
 		tests/app/MenuBarStatusTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+build/window-tests: app/WindowVisibility.swift tests/app/WindowVisibilityTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
