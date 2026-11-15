@@ -1,5 +1,6 @@
 // Tests for app/WindowVisibility.swift: what the window's modem tabs are told about the RMNet window
-// (setWindowVisible), from that window's own notifications only. The window and the app's other windows (the
+// (setWindowVisible), from that window's own notifications only; how the window is shown again; and when a
+// quit shows it. The window and the app's other windows (the
 // menu bar item's panel, the status item's own window) are plain objects posting on a private notification
 // center; no AppKit, no window. Built with swiftc by `make app-test`.
 // Stops at the first failure, prints which check failed and exits 1.
@@ -59,6 +60,7 @@ struct WindowVisibilityTests {
         closing()
         leavingAndSwitching()
         reopening()
+        quitting()
         print("window visibility: \(checks) checks passed")
     }
 
@@ -136,6 +138,16 @@ struct WindowVisibilityTests {
         check(WindowReopen.leaveToAppKit.handled == false, "reopen: AppKit's handling is not handled here")
         check(WindowReopen.openWithAction.handled && WindowReopen.bringForward(deminiaturize: false).handled,
               "reopen: the other two are")
+    }
+
+    // A quit that waits for a call to the modem shows the RMNet window when it cannot be seen (closed, minimized,
+    // hidden or covered), so that its line says why RMNet has not quit yet; a quit that ends at once, or a window
+    // in view, is left alone.
+    static func quitting() {
+        check(quitShowsWindow(waits: true, windowSeen: false), "quit: waits, the window not seen: shown")
+        check(!quitShowsWindow(waits: true, windowSeen: true), "quit: waits, the window in view: left alone")
+        check(!quitShowsWindow(waits: false, windowSeen: false), "quit: ends at once, the window closed: not opened")
+        check(!quitShowsWindow(waits: false, windowSeen: true), "quit: ends at once, the window in view: left alone")
     }
 
     // Leaving the window (the view taken out of it) is not visible, and its later notifications are not

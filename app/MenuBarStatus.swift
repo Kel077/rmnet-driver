@@ -5,11 +5,12 @@
 //
 // The icon, the headline and the addresses come from the I/O registry (the driver's RMNet* properties and
 // the modem on USB), read every 5 s (`poll`), and from the system's listing of the driver, asked only when it
-// is needed: while the registry shows no driver (to tell no driver from waiting for approval) and while the
-// panel is open (for its headline). Never from the AT port. The network lines come from the modem's spare AT
-// port, read once when the panel opens (`panelOpened`) and not again until 10 s after the last read finished,
-// on the queue the window's tabs use, so that the app never opens the port twice at once. Nothing read is
-// logged or stored.
+// is needed: while the panel is open (for its headline), and while the registry shows no driver (to tell no
+// driver from waiting for approval) at once and then every 12th poll, about once a minute. With the driver
+// attached the headline comes from the registry until the listing answers. Never from the AT port. The
+// network lines come from the modem's spare AT port, read once when the panel opens (`panelOpened`) and not
+// again until 10 s after the last read finished, on the queue the window's tabs use, so that the app never
+// opens the port twice at once. Nothing read is logged or stored.
 import Foundation
 
 /// The driver's RMNet* registry properties, as strings (readDriverProperties in Registry.swift).
@@ -148,8 +149,27 @@ private func driverHeadline(_ status: DriverStatus) -> String {
     headline(status)
 }
 
-/// The app has one, made by the App (MenuBarView.swift). Its methods are called on the main thread; the
-/// network read runs on `queue` and its result comes back to the main thread.
+/// The panel's headline: with the system's last fresh answer (`entries`, nil: none yet, or no listing), the
+/// Driver tab's; with the driver attached and no such answer, the Driver tab's headline for an attached driver
+/// whose one listed entry is enabled (`Connected`, `Connecting` or `Link down`, from RMNetState), so that the
+/// panel never says `Asking the system…` while the driver runs; with no driver, `Asking the system…` until the
+/// system answers, `Unknown` while it gives no listing.
+func menuBarHeadline(driver: DriverProperties?, modem: ModemState, model: QuectelModel?, answered: Bool,
+                     entries: [ExtensionEntry]?) -> String {
+    if answered, let entries {
+        return driverHeadline(DriverStatus(entries: entries, modem: modem, modemModel: model, attached: driver != nil,
+                                           properties: driver ?? [:]))
+    }
+    if let driver {
+        let running = ExtensionEntry(version: "", enabled: true, awaitingApproval: false, uninstalling: false)
+        return driverHeadline(DriverStatus(entries: [running], modem: modem, modemModel: model, attached: true,
+                                           properties: driver))
+    }
+    return answered ? unknownHeadline : askingHeadline
+}
+
+/// The app has one, kept by the app delegate (StatusView.swift; MenuBarView.swift makes it). Its methods are
+/// called on the main thread; the network read runs on `queue` and its result comes back to the main thread.
 final class MenuBarStatus: ObservableObject {
     @Published private(set) var icon = MenuBarIcon.noDriver
     @Published private(set) var headline = askingHeadline
@@ -160,6 +180,8 @@ final class MenuBarStatus: ObservableObject {
     @Published private(set) var reading = false                 // a network read runs
 
     static let pollInterval: TimeInterval = 5
+    static let pollTolerance: TimeInterval = 1   // the system may fire a poll up to 1 s late, to save power
+    static let listingEvery = 12                 // polls between listing questions while no driver is attached
     static let networkSpacing: TimeInterval = 10
 
     private let properties: () -> DriverProperties?
@@ -173,6 +195,7 @@ final class MenuBarStatus: ObservableObject {
     private var panelOpen = false           // between panelOpened() and panelClosed()
     private var listingAnswered = false     // the system has answered since the listing was last dropped as stale
     private var entries: [ExtensionEntry]? = nil   // that answer; nil: none, or it gave no listing
+    private var pollsSinceAsked = 0         // polls since the listing was last asked
     private var driver: DriverProperties? = nil
     private var usb: (state: ModemState, model: QuectelModel?) = (.absent, nil)
     private var lastReadFinished: Date? = nil
@@ -196,32 +219,38 @@ final class MenuBarStatus: ObservableObject {
 
     deinit { timer?.invalidate() }
 
-    /// Polls now and every 5 s from then on, in the main run loop's common modes (so the icon also changes
-    /// while a menu is open).
+    /// Polls now and every 5 s from then on (up to 1 s late), in the main run loop's common modes (so the icon
+    /// also changes while a menu is open).
     func start() {
         guard timer == nil else { return }
         poll()
         let t = Timer(timeInterval: MenuBarStatus.pollInterval, repeats: true) { [weak self] _ in self?.poll() }
+        t.tolerance = MenuBarStatus.pollTolerance
         RunLoop.main.add(t, forMode: .common)
         timer = t
     }
 
     /// Reads the registry; asks the system for its listing too (its answer updates the icon and headline when
-    /// it comes) when no driver is attached or the panel is open, unless a question is pending. When it is not
-    /// asked, the last answer is stale and is dropped: a driver that goes away later shows no driver until a
-    /// fresh answer says the system waits for approval. Never the AT port. On the main thread only.
+    /// it comes), unless a question is pending: on each poll while the panel is open, and while no driver is
+    /// attached when there is no fresh answer (at launch, or once the driver has gone away) and then every 12th
+    /// poll. With the driver attached and the panel closed the answer is not kept fresh, so it is stale and is
+    /// dropped: a driver that goes away later shows no driver until a fresh answer says the system waits for
+    /// approval. Never the AT port. On the main thread only.
     func poll() {
         dispatchPrecondition(condition: .onQueue(.main))
         driver = properties()
         usb = modem()
-        let wanted = driver == nil || panelOpen
-        if !wanted && !asking {
+        pollsSinceAsked += 1
+        if driver != nil && !panelOpen && !asking {
             listingAnswered = false
             entries = nil
         }
         update()
+        let wanted = panelOpen
+            || (driver == nil && (!listingAnswered || pollsSinceAsked >= MenuBarStatus.listingEvery))
         guard wanted, !asking else { return }
         asking = true
+        pollsSinceAsked = 0
         listing { [weak self] answer in
             guard let self else { return }
             self.asking = false
@@ -250,8 +279,8 @@ final class MenuBarStatus: ObservableObject {
         }
     }
 
-    /// The panel closed: from now on the listing is asked only while no driver is attached. A read that runs
-    /// finishes. On the main thread only.
+    /// The panel closed: from now on the listing is asked only while no driver is attached (every 12th poll).
+    /// A read that runs finishes. On the main thread only.
     func panelClosed() {
         dispatchPrecondition(condition: .onQueue(.main))
         panelOpen = false
@@ -279,15 +308,8 @@ final class MenuBarStatus: ObservableObject {
     /// Sets what changed only, so that a poll that finds the same state redraws nothing.
     private func update() {
         let newIcon = menuBarIcon(properties: driver, entries: entries)
-        let newHeadline: String
-        if !listingAnswered {
-            newHeadline = askingHeadline
-        } else if let entries {
-            newHeadline = driverHeadline(DriverStatus(entries: entries, modem: usb.state, modemModel: usb.model,
-                                                      attached: driver != nil, properties: driver ?? [:]))
-        } else {
-            newHeadline = unknownHeadline
-        }
+        let newHeadline = menuBarHeadline(driver: driver, modem: usb.state, model: usb.model, answered: listingAnswered,
+                                          entries: entries)
         let newAddresses = newIcon == .up ? menuBarAddressLines(driver ?? [:]) : []
         if icon != newIcon { icon = newIcon }
         if headline != newHeadline { headline = newHeadline }
