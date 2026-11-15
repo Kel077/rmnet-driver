@@ -57,6 +57,13 @@ func quectelModel(product: Int) -> QuectelModel? {
     quectelModels.first { $0.product == product }
 }
 
+// The one product the app's AT port opens (AtPort in app/AtPort.swift): the RM520N-GL. Only on it can
+// `RMNet usbmode` reach the modem, so only for it does the advice name that verb.
+let atPortProduct = 0x0801
+
+// The command the advice gives to put an RM520N-GL in QMI mode; the window shows it in a fixed-width font.
+let usbModeQmiCommand = "RMNet usbmode set qmi"
+
 // One of the modem's USB interfaces, as the I/O registry describes it (nil: the property is missing).
 struct UsbInterface {
     let number: Int?
@@ -100,6 +107,7 @@ func modemLine(_ modem: ModemState, model: QuectelModel?) -> String {
 struct DriverStatus {
     var entries: [ExtensionEntry]
     var modem: ModemState
+    var modemModel: QuectelModel? = nil  // the model `modem` is about (readModemModel); nil when none is attached
     var attached: Bool                 // a registry entry with IOUserClass RMNetDriver exists
     var properties: [String: String]   // that entry's RMNet* properties, as strings
 }
@@ -150,12 +158,20 @@ private func isSwitchedOff(_ e: ExtensionEntry) -> Bool {
 let removalUnderWayLine = "The system is removing the driver; the removal finishes when the modem is unplugged or the Mac restarts. Install is available after that."
 
 // The lines shown under the headline, most specific first; the last line is the warning, except
-// while every listed entry is uninstalling, when it is `removalUnderWayLine` (after the two AT
-// commands if the modem is not in QMI mode).
+// while every listed entry is uninstalling, when it is `removalUnderWayLine` (after the QMI-mode lines
+// if the modem is not in QMI mode). When it is not: for the RM520N-GL, the one model the app's AT port
+// opens, `RMNet usbmode set qmi` first, with the two AT commands as the fallback; for any other model
+// (or none known), the two AT commands only.
 func advice(_ s: DriverStatus, bundledVersion: String) -> [String] {
     var lines: [String] = []
     if case .notQMI = s.modem {
-        lines.append("The modem is attached but not in QMI mode. Send it these two AT commands, then wait for it to come back:")
+        if s.modemModel?.product == atPortProduct {
+            lines.append("The modem is attached but not in QMI mode. Run this command in Terminal, answer y when it asks before restarting the modem, and wait for the modem to come back (RMNet is /Applications/RMNet.app/Contents/MacOS/RMNet):")
+            lines.append(usbModeQmiCommand)
+            lines.append("Or, from any AT terminal (RMNet has no general one), send these two AT commands, then wait for the modem to come back; unplugging it and plugging it in again does the same as the second:")
+        } else {
+            lines.append("The modem is attached but not in QMI mode. Send it these two AT commands, then wait for it to come back:")
+        }
         lines.append("AT+QCFG=\"usbnet\",0")
         lines.append("AT+CFUN=1,1")
     }

@@ -9,7 +9,7 @@ In QMI mode the modem offers a USB interface that speaks Qualcomm's QMI protocol
 ## Requirements
 
 - A Mac with Apple silicon, on macOS 27.
-- Xcode 27.1 or later, signed in to a team in the **paid** Apple Developer Program. A free Personal Team cannot sign DriverKit drivers. A paid team needs no special request to Apple: for a development build, Xcode's automatic signing registers the App IDs and your Mac and makes profiles with the driver's entitlements (DriverKit, USB, networking, serial).
+- Xcode 27.1 or later, signed in to a team in the **paid** Apple Developer Program. A free Personal Team cannot sign DriverKit drivers. On the author's paid team no request to Apple was needed: for a development build, Xcode's automatic signing registered the App IDs and the Mac and made profiles with the driver's entitlements (DriverKit, USB, networking, serial).
 - The Ruby gem `xcodeproj` for macOS's own Ruby (it generates the Xcode project). Check with `/usr/bin/ruby -e 'require "xcodeproj"'`; if that fails, run `/usr/bin/gem install --user-install xcodeproj`.
 - A Quectel RM520N-GL on USB, with a SIM that has a data plan.
 
@@ -28,7 +28,7 @@ RMNET_TEAM_ID=ABCDE12345
 RMNET_BUNDLE_ID=com.example.RMNet
 ```
 
-- `RMNET_TEAM_ID` is your paid team's ID, 10 capital letters and digits (Xcode → Settings → Accounts).
+- `RMNET_TEAM_ID` is your paid team's ID, 10 capital letters and digits. The sure place to find it is developer.apple.com → Account → Membership details, "Team ID"; Xcode's Accounts pane may not show it. Do not use the code in parentheses in your "Apple Development" certificate's name: that is a different identifier.
 - `RMNET_BUNDLE_ID` is a bundle ID you own, such as your domain reversed; the driver gets it with `.driver` added. App IDs are unique across all of Apple, so the project's default, `io.rmnetdriver.RMNet`, is taken.
 - `config.local` is ignored by git and read as data, never run: it may hold only these two lines (with no comment after a value), comment lines and blank lines. Environment variables of the same names win over it.
 - Choose the bundle ID once: the install script refuses to replace an installed `/Applications/RMNet.app` with another bundle ID, whose driver could be left with no app able to remove it. To change the ID, remove the old driver (below); when `systemextensionsctl list` shows no entry for it, or only an uninstalling one, delete `/Applications/RMNet.app`, then change `config.local`.
@@ -47,7 +47,8 @@ RMNet usbmode set qmi    # asks, then restarts the modem (about 30 s)
 - `RMNet` here and below is the app's command-line side, `/Applications/RMNet.app/Contents/MacOS/RMNet`. An alias saves typing: `alias RMNet=/Applications/RMNet.app/Contents/MacOS/RMNet`.
 - These commands talk to the modem's spare AT port (USB interface 3) directly, from user space, so they work before the driver is installed or approved. They need the app, which the next section builds: on a new modem, install first, then check the mode. When the modem comes back in QMI mode, the driver attaches by itself.
 - `usbmode set` changes nothing when the modem is already in that mode. `--yes` skips the question; `--no-reboot` saves the mode for the next restart (a replug, or `AT+CFUN=1,1`).
-- **Caveat.** RMNet looks for the modem's AT port only on USB product `2c7c:0801`, the RM520N-GL's ID in QMI mode. Whether the RM520N-GL keeps that ID in ECM, MBIM or RNDIS mode is not known. If it does not, RMNet cannot find the modem (`usb mode: The RM520N-GL (USB 2c7c:0801) is not attached.`), and another AT terminal must send `AT+QCFG="usbnet",0`, then `AT+CFUN=1,1`. So do not switch to another mode without one; a modem that arrives in another mode may need one too.
+- **This project has no general AT terminal.** macOS gives the modem's AT ports no device (no `/dev/cu.*` to open with a terminal program, with or without the driver), and RMNet sends only the AT commands behind its own verbs and tabs. Setting the USB mode (`RMNet usbmode`) is the one AT task in this README that the app does for you; for any other AT command named here (`AT+QGPS=1` for `RMNet gps`, and the caveat below) you need another tool that can reach the modem's AT port.
+- **Caveat.** RMNet looks for the modem's AT port only on USB product `2c7c:0801`, the RM520N-GL's ID in QMI mode. Whether the RM520N-GL keeps that ID in ECM, MBIM or RNDIS mode is not known. If it does not, RMNet cannot find the modem (`usb mode: The RM520N-GL (USB 2c7c:0801) is not attached.`), and another AT terminal must send `AT+QCFG="usbnet",0`, then `AT+CFUN=1,1` (or, instead of the second, unplug the modem and plug it back in). So do not switch to another mode without such a terminal; a modem that arrives in another mode may need one too.
 
 ## Build and install
 
@@ -82,7 +83,7 @@ ping -c 3 -b en33 1.1.1.1       # bound to the port, whatever the service order
 |---|---|
 | `RMNet status [--json]` | Whether the driver is installed and the modem attached in QMI mode; the driver's state, addresses and counters. |
 | `RMNet sms list [--json]`<br>`RMNet sms send <number> <text>`<br>`RMNet sms delete <index>...` | List, send and delete the modem's text messages. Each message sent costs a carrier fee. |
-| `RMNet gps [seconds]` | The position from the modem's GNSS receiver, which must be on (`AT+QGPS=1` on an AT terminal). |
+| `RMNet gps [seconds]` | The position from the modem's GNSS receiver. It needs the driver attached (it reads the NMEA serial port) and GNSS already switched on with `AT+QGPS=1`, which RMNet does not send: use another AT terminal (this project has none, see "The modem's USB mode"). |
 | `RMNet network [--json]` | Registration, operator, technology, band, signal and cell. |
 | `RMNet radio [on\|off]` | Show the radio's state, or switch it. `off` is airplane mode: no connection until `radio on`. |
 | `RMNet mode [auto\|nr5g\|lte\|lte:nr5g\|…]` | Show or set the network mode. The modem keeps it; the command prints how to put it back. |
@@ -92,7 +93,7 @@ ping -c 3 -b en33 1.1.1.1       # bound to the port, whatever the service order
 | `RMNet activate` | Install or update the driver this app carries (the install script runs it). |
 | `RMNet deactivate` | Remove the driver; macOS asks for an administrator's password (below). |
 
-- The modem commands (`sms`, `network`, `radio`, `mode`, `apn`, `sim`, `usbmode`) use the modem's spare AT port, USB interface 3. They exit 0 on success, 1 on a failure (one line saying why) and 2 on wrong usage.
+- The modem commands (`sms`, `network`, `radio`, `mode`, `apn`, `sim`, `usbmode`) use the modem's spare AT port, USB interface 3. They exit 0 on success, 1 on a failure (one line saying why) and 2 on wrong usage; `usbmode set` also exits 2, changing nothing, when it has no terminal to ask on (run from a script, give it `--yes`).
 - Ctrl-C does not interrupt a command that changes the modem (except at a password or PIN prompt, before anything is sent), so a redial is never cut short with the radio off.
 - RMNet never logs or writes to disk message texts, phone numbers, passwords, PINs or your position.
 - Every option and every line each command prints is in [docs/reference.md](docs/reference.md), "Driver".
@@ -112,7 +113,7 @@ The driver also presents two of the modem's other USB interfaces as serial ports
 
 **To remove** the driver, press `Remove…` on the window's `Driver` tab, or run `RMNet deactivate`. macOS asks for an administrator's password. The driver keeps the port until the modem is unplugged or the Mac restarts.
 
-macOS removes a driver only when asked by an app that embeds that exact driver version. That is why the install script keeps a copy of every app it installs, as `build/installed/RMNet-<version>.app`, and why `make clean` leaves that folder alone. **Never delete `build/installed/`**: without the matching app, an installed driver cannot be removed until that exact version is built again. If `/Applications/RMNet.app` no longer carries the installed version, follow [docs/reference.md](docs/reference.md), "Removing the driver".
+macOS removes a driver only when asked by an app that embeds that exact driver version. That is why the install script keeps a copy of every app it installs, as `build/installed/RMNet-<version>.app`, and why `make clean` leaves that folder alone. **Never delete `build/installed/`**: without the matching app, an installed driver cannot be removed until that exact version is built again. It lives inside your clone, so deleting the clone or cloning afresh in its place deletes it too: keep the clone for as long as a driver built from it is installed, or copy `build/installed/` somewhere safe first and put it back into the new clone (the install script refuses to run while an installed version has no kept app there). If `/Applications/RMNet.app` no longer carries the installed version, follow [docs/reference.md](docs/reference.md), "Removing the driver".
 
 Do not switch the driver off in System Settings while the modem is attached: the driver cannot stop, its switched-off entry stays next to later builds, and the system refuses every activation until both entries are removed.
 

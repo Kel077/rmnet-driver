@@ -1,6 +1,8 @@
 # Copy to config.local (git-ignored) and fill in. Environment variables of the same names win.
-# Your paid Apple Developer team ID (Xcode > Settings > Accounts; 10 characters). A free Personal
-# Team cannot sign DriverKit drivers.
+# Your paid Apple Developer team ID, 10 capital letters and digits. The sure place to find it:
+# developer.apple.com > Account > Membership details, "Team ID" (Xcode's Accounts pane may not show
+# it, and the code in an "Apple Development" certificate's name is a different identifier: do not use
+# it). A free Personal Team cannot sign DriverKit drivers.
 RMNET_TEAM_ID=
 # A bundle ID you own, for the app; the driver gets <this>.driver. Example: com.example.RMNet
 RMNET_BUNDLE_ID=

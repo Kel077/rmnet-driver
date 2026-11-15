@@ -16,9 +16,9 @@
 
 ## Global Constraints
 
-- Branch `open-source`, cut from `main` at `98f4655` (after this plan is committed). Tasks 1 and 2 run in parallel in worktrees `~/personal/RM520N-GL/worktrees/os-config` (branch `os-config`) and `~/personal/RM520N-GL/worktrees/os-usbmode` (branch `os-usbmode`), both cut from `open-source`; the coordinator merges them into `open-source`. Task 3 runs after both, in `~/personal/RM520N-GL/worktrees/os-docs` (branch `os-docs`).
+- Branch `open-source`, cut from `main` at `98f4655` (after this plan is committed). Tasks 1 and 2 run in parallel in worktrees `<project>/worktrees/os-config` (branch `os-config`) and `<project>/worktrees/os-usbmode` (branch `os-usbmode`), both cut from `open-source`; the coordinator merges them into `open-source`. Task 3 runs after both, in `<project>/worktrees/os-docs` (branch `os-docs`).
 - For this Mac nothing changes: the coordinator writes `config.local` with `RMNET_TEAM_ID=ABCDE12345` and `RMNET_BUNDLE_ID=io.rmnetdriver.RMNet`, so the installed driver keeps its identity and the kept apps in `build/installed/` stay valid.
-- No hardware in any task: no install, no activation, no modem reboot, no AT command sent, never `~/personal/RM520N-GL/at.py`, no `sudo`, nothing sent on `en33`. Never write to or delete from `build/installed/`; never touch `/Applications/RMNet.app`. Never register an App ID or device: never run a signed `xcodebuild` or `gen.rb --team` followed by a build.
+- No hardware in any task: no install, no activation, no modem reboot, no AT command sent, never the owner's own AT tool, no `sudo`, nothing sent on `en33`. Never write to or delete from `build/installed/`; never touch `/Applications/RMNet.app`. Never register an App ID or device: never run a signed `xcodebuild` or `gen.rb --team` followed by a build.
 - Text messages and phone numbers stored in the modem are private: never log, print in tests' output, or commit any.
 - After every task: `make test`, `make driver-test`, `make check-driverkit`, `make app-test`, `make script-test` all pass, and `make driver` (unsigned) succeeds.
 - Commit at the end of every task with the message given; no attribution lines.

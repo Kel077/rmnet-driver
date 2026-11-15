@@ -53,8 +53,6 @@ func readModemModel() -> (state: ModemState, model: QuectelModel?) {
     return (.absent, nil)
 }
 
-func readModem() -> ModemState { readModemModel().state }
-
 // The RMNet* properties of the driver's registry entry, as strings, or nil if it is not attached.
 func readDriverProperties() -> [String: String]? {
     let entry = firstService("IOService", withProperties: ["IOUserClass": driverClass])
@@ -70,5 +68,7 @@ func readDriverProperties() -> [String: String]? {
 // The status the window and `status --json` show, with the entries a properties request listed.
 func readStatus(entries: [ExtensionEntry]) -> DriverStatus {
     let driver = readDriverProperties()
-    return DriverStatus(entries: entries, modem: readModem(), attached: driver != nil, properties: driver ?? [:])
+    let (modem, model) = readModemModel()
+    return DriverStatus(entries: entries, modem: modem, modemModel: model, attached: driver != nil,
+                        properties: driver ?? [:])
 }

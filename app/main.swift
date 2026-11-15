@@ -7,6 +7,7 @@
 //        RMNet apn [show] [--json] | apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>]
 //                  [--password | --no-password] [--auth none|pap|chap|pap-or-chap] [--no-redial]
 //        RMNet sim [--json] | sim unlock [--last-attempt]
+//        RMNet usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes]
 //        RMNet (no argument, or opened from the Finder): the status window.
 // It must run from /Applications/RMNet.app for activate and deactivate (scripts/install-driver.sh).
 // With a verb it opens no window and exits by itself. `status --json` (scripts/soak.sh reads it) keeps

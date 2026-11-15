@@ -137,8 +137,8 @@ final class ExtensionManager {
                         return
                     }
                     let entries = found.map(ExtensionEntry.init)
-                    let now = DriverStatus(entries: entries, modem: status.modem, attached: status.attached,
-                                           properties: status.properties)
+                    let now = DriverStatus(entries: entries, modem: status.modem, modemModel: status.modemModel,
+                                           attached: status.attached, properties: status.properties)
                     if canRemoveDirectly(now, bundledVersion: bundledVersion) {
                         deactivateNow()
                     } else {
