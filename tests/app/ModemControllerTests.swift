@@ -118,6 +118,10 @@ final class FakeService: ModemServing, CustomReflectable {
     func setUsbMode(_ mode: UsbNetMode, reboot: Bool) -> Result<UsbModeChange, ModemFailure> {
         .failure(ModemFailure(message: "not used"))
     }
+    // Nor does it send a command as typed (only `RMNet at` does): never called.
+    func at(_ line: String, timeout: TimeInterval) -> Result<[String], ModemFailure> {
+        .failure(ModemFailure(message: "not used"))
+    }
 
     func releaseInfo(_ r: Result<NetworkInfo, ModemFailure>) { locked { infoResults.append(r) }; gate.signal() }
     func releaseRadio(_ r: Result<RadioChange, ModemFailure>) { locked { radioResults.append(r) }; gate.signal() }

@@ -1,5 +1,6 @@
 // Tests for app/ModemService.swift: the AT sequences of the modem service (the network read, the radio, the
-// network mode, the USB network mode, the data profiles with the redial, the SIM and PIN entry), run against
+// network mode, the USB network mode, one command as typed for `RMNet at`, the data profiles with the redial,
+// the SIM and PIN entry), run against
 // a scripted port that answers from a queue and records every line sent, an opener that counts the ports it
 // hands out, and a fake clock that `sleep` moves on. The fixtures are the modem's real answers (2026-11-15,
 // firmware RM520NGLAAR03A04M4G_01.204.01.204); the AT+QCFG="usbnet" answers are in the form Quectel's AT
@@ -77,6 +78,33 @@ final class ScriptedPort: AtCommanding {
             closedItself = true
         }
         return next.answer
+    }
+
+    func close() { closed = true }
+}
+
+/// A port that answers `line` with raw bytes read by AtPort's own answer logic (AtAnswerCollector, the
+/// port echoing), mapped as AtPort.command maps it; any other line is not answered.
+final class CollectingPort: AtCommanding {
+    private let line: String
+    private let bytes: [UInt8]
+    private(set) var sent: [String] = []
+    private(set) var closed = false
+
+    init(_ line: String, _ raw: String) {
+        self.line = line
+        self.bytes = Array(raw.utf8)
+    }
+
+    func command(_ line: String, timeout: TimeInterval) -> Answer {
+        sent.append(line)
+        guard line == self.line else { return timedOut }
+        var collector = AtAnswerCollector(echo: line)
+        switch collector.feed(bytes) {
+        case .answer(let lines): return .success(lines)
+        case .modemError(let errorLine): return .failure(.modem(errorLine))
+        default: return timedOut
+        }
     }
 
     func close() { closed = true }
@@ -284,6 +312,7 @@ struct ModemServiceTests {
         radio()
         mode()
         usbMode()
+        atCommand()
         profiles()
         profileChange()
         profileRedialFailures()
@@ -727,6 +756,94 @@ struct ModemServiceTests {
                         + "If it does not restart, the new mode takes effect at the next restart (AT+CFUN=1,1 or a replug).",
                         "setUsbMode: a restart without an answer: \(words)")
             rig.finish("setUsbMode, restart: \(words)", opens: 1)
+        }
+    }
+
+    // MARK: at
+
+    static func atCommand() {
+        // The answer: the lines before OK, as AtPort gives them; the line sent once, with the timeout asked.
+        do {
+            let rig = Rig([("ATI", .success(["Quectel", "RM520N-GL", "Revision: X"]))])
+            let lines = success(rig.service.at("ATI", timeout: 10), "at ATI")
+            check(lines == ["Quectel", "RM520N-GL", "Revision: X"], "at(\"ATI\"): the three answer lines",
+                  "\(String(describing: lines))")
+            expectLines(rig.port(1).lines, ["ATI"], "at(\"ATI\"): exactly ATI sent")
+            check(rig.port(1).sent.map { $0.timeout } == [10], "at(\"ATI\", timeout: 10): sent with 10 s",
+                  "\(rig.port(1).sent.map { $0.timeout })")
+            rig.finish("at ATI", opens: 1)
+        }
+        do {
+            // Through AtPort's own answer logic: the echo and the final OK are not answer lines.
+            let port = CollectingPort("ATI", "ATI\r\r\nQuectel\r\nRM520N-GL\r\nRevision: X\r\n\r\nOK\r\n")
+            let service = ModemService(open: { .success(port) })
+            let lines = success(service.at("ATI", timeout: 10), "at ATI, raw answer")
+            check(lines == ["Quectel", "RM520N-GL", "Revision: X"], "at(\"ATI\"): echo and OK are left out",
+                  "\(String(describing: lines))")
+            check(port.sent == ["ATI"] && port.closed, "at(\"ATI\"): raw answer: one line sent, the port closed",
+                  "\(port.sent)")
+        }
+        for (line, timeout) in [("AT+QGPS=1", 10.0), ("AT+COPS=?", 60.0), ("AT+QCFG=\"usbnet\"", 1.0), ("at", 300.0),
+                                ("AT+COPS=1,0,\"CHINA MOBILE\"", 10.0)] {
+            let rig = Rig([(line, ok)])
+            let lines = success(rig.service.at(line, timeout: timeout), "at \(line)")
+            check(lines == [], "at(\(line)): an answer of OK alone has no lines", "\(String(describing: lines))")
+            check(rig.port(1).sent.map { $0.line } == [line] && rig.port(1).sent.map { $0.timeout } == [timeout],
+                  "at(\(line), timeout: \(timeout)): sent as it is, once, with that timeout",
+                  "\(rig.port(1).sent.map { "\($0.line) \($0.timeout)" })")
+            rig.finish("at \(line)", opens: 1)
+        }
+
+        // The modem's error line: a failure whose message is that line.
+        for errorLine in ["ERROR", "+CME ERROR: 10", "+CMS ERROR: 500"] {
+            let rig = Rig([("AT+CPIN?", .failure(.modem(errorLine)))])
+            let failure = failureOf(rig.service.at("AT+CPIN?", timeout: 10), "at, \(errorLine)")
+            check(failure == ModemFailure(message: errorLine, atKind: .modemError),
+                  "at: \(errorLine) is a failure with that text, kind modemError", "\(failure)")
+            expectLines(rig.port(1).lines, ["AT+CPIN?"], "at: \(errorLine): one line sent")
+            rig.finish("at, \(errorLine)", opens: 1)
+        }
+
+        // No answer in time, an I/O error: failures saying so.
+        do {
+            let rig = Rig([("AT+COPS=?", timedOut)])
+            let failure = failureOf(rig.service.at("AT+COPS=?", timeout: 60), "at, timeout")
+            check(failure == ModemFailure(message: describe(.timeout), atKind: .timeout),
+                  "at: no answer in time is a failure saying so, kind timeout", "\(failure)")
+            expectLines(rig.port(1).lines, ["AT+COPS=?"], "at: a timeout: one line sent")
+            rig.finish("at, timeout", opens: 1)
+        }
+        do {
+            let rig = Rig([("ATI", ioError)])
+            let failure = failureOf(rig.service.at("ATI", timeout: 10), "at, I/O error")
+            check(failure == ModemFailure(message: describe(.io(Int32(bitPattern: 0xE000_02ED)))),
+                  "at: an I/O error is a failure saying so, no kind", "\(failure)")
+            rig.finish("at, I/O error", opens: 1)
+        }
+
+        // A port that does not open: nothing sent; also a timeout of the open is not the command's.
+        for error in [AtError.modemNotAttached, .noAtInterface, .busy, .timeout] {
+            let rig = Rig([.failure(error)])
+            let failure = failureOf(rig.service.at("ATI", timeout: 10), "at, open \(error)")
+            check(failure == ModemFailure(message: describe(error)), "at: a failed open (\(error)) is describe(error), no kind",
+                  "\(failure)")
+            rig.finish("at, open \(error)", opens: 1)
+        }
+
+        // A line the CLI refuses is not sent here either: no port is opened.
+        let long = "AT+" + String(repeating: "A", count: 510)
+        for line in ["", "hello", "ATI\rAT+CFUN=0", "ATI\n", "AT+CMGS=\"123\"\u{1A}", "AT\tI", "AT\u{E9}", "AT\u{7F}",
+                     long, "AT+CMGS=\"123\"", "at+cmgs=\"123\"", "AT+CMGW", "At+CmGw=\"123\""] {
+            let rig = Rig([])
+            let message = failureMessage(rig.service.at(line, timeout: 10), "at, refused \(line.debugDescription)")
+            check(message.hasSuffix("; nothing was sent"), "at: \(line.debugDescription) is refused, nothing sent", message)
+            rig.finish("at, refused \(line.debugDescription)", opens: 0)
+        }
+        do {
+            let longest = "AT+" + String(repeating: "A", count: 509)
+            let rig = Rig([(longest, ok)])
+            _ = success(rig.service.at(longest, timeout: 10), "at, 512 characters")
+            rig.finish("at, 512 characters", opens: 1)
         }
     }
 

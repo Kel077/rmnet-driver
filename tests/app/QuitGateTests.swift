@@ -142,6 +142,9 @@ final class FakeModem: ModemServing {
     func setUsbMode(_ mode: UsbNetMode, reboot: Bool) -> Result<UsbModeChange, ModemFailure> {
         .failure(ModemFailure(message: "not used"))
     }
+    func at(_ line: String, timeout: TimeInterval) -> Result<[String], ModemFailure> {
+        .failure(ModemFailure(message: "not used"))
+    }
 
     func releaseInfo(_ outcome: Result<NetworkInfo, ModemFailure>) {
         calls.locked { infoOutcome = outcome }

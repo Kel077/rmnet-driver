@@ -8,6 +8,7 @@
 //                  [--password | --no-password] [--auth none|pap|chap|pap-or-chap] [--no-redial]
 //        RMNet sim [--json] | sim unlock [--last-attempt]
 //        RMNet usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes]
+//        RMNet at [--timeout <seconds>] <command>
 //        RMNet (no argument, or opened from the Finder): the status window.
 // It must run from /Applications/RMNet.app for activate and deactivate (scripts/install-driver.sh).
 // With a verb it opens no window and exits by itself. `status --json` (scripts/soak.sh reads it) keeps
@@ -292,8 +293,9 @@ if verbs.first == "gps" {
     exit(runGps(seconds: seconds))
 }
 
-// network, radio, mode, apn, sim, usbmode: over the modem's spare AT port, off the main thread, as the sms
-// verbs.
+// network, radio, mode, apn, sim, usbmode, at: over the modem's spare AT port, off the main thread, as the
+// sms verbs. `at` alone writes to standard error (its refusals and failures); it is not a changing verb, so
+// Ctrl-C stops it.
 if let verb = verbs.first, modemVerbs.contains(verb) {
     guard let modemCommand = parseModem(verbs) else {
         print(usage)
@@ -317,7 +319,8 @@ if let verb = verbs.first, modemVerbs.contains(verb) {
                             driverProfile: readDriverProperties()?["RMNetProfile"].flatMap { Int($0) },
                             readSecret: { prompt in DispatchQueue.main.sync { readSecret(prompt: prompt) } },
                             ask: { question in DispatchQueue.main.sync { askOnTerminal(question) } },
-                            output: { print($0); fflush(stdout) })
+                            output: { print($0); fflush(stdout) },
+                            errorOutput: { fputs("\($0)\n", stderr) })
         fflush(stdout)
         exit(code)
     }

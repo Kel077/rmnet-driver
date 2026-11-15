@@ -1,11 +1,11 @@
 // The modem's settings and the changes RMNet makes to them: the radio, the network mode, the USB network
 // mode, the data profiles (APN, user name, password, authentication) and the SIM's PIN. Here are the
-// reading of their AT answers, the checks of what the owner types, the AT lines that change the modem, the
-// questions asked before a change and the sentences said after it, and `ModemServing`, the interface of
-// the service that does the I/O. Foundation only: pure functions over the answer lines (AtPort's lines
-// between the echo and OK), so `make app-test` builds this file with ModemNetwork.swift alone. A missing
-// field, `-` in place of a number, or a short line reads as "not known"; nothing here crashes on an odd
-// answer.
+// reading of their AT answers, the checks of what the owner types (also the one AT command `RMNet at`
+// sends), the AT lines that change the modem, the questions asked before a change and the sentences said
+// after it, and `ModemServing`, the interface of the service that does the I/O. Foundation only: pure
+// functions over the answer lines (AtPort's lines between the echo and OK), so `make app-test` builds this
+// file with ModemNetwork.swift alone. A missing field, `-` in place of a number, or a short line reads as
+// "not known"; nothing here crashes on an odd answer.
 //
 // A profile's password is kept in memory only. No string conversion of any value here shows it (only
 // whether one is set); the one text that holds it is `profileCommand`, the line sent to the modem.
@@ -15,11 +15,19 @@ import Foundation
 
 /// A sentence for the owner. A profile change that failed after its line may have reached the modem also
 /// carries the profile's settings before it (ruling R19), so that the way back can be shown; nil otherwise.
-/// Its string conversions show no password: ProfileSettings shows only whether one is set.
+/// A command sent by `at` that ended without OK carries how it ended, when `RMNet at` prints that its own
+/// way (`atKind`); nil otherwise. Its string conversions show no password: ProfileSettings shows only
+/// whether one is set.
 struct ModemFailure: Error, Equatable {
     let message: String
     var profileBefore: ProfileSettings? = nil
+    var atKind: AtFailureKind? = nil
 }
+
+/// How a command sent by `at` ended without OK: the modem's own error line (`ERROR`, `+CME ERROR: …`,
+/// `+CMS ERROR: …`; the failure's message is that line), or no answer in the time given. Any other failure
+/// of `at` (the port not opened, an I/O error) has none.
+enum AtFailureKind: Equatable { case modemError, timeout }
 
 /// So `error.localizedDescription` is the owner's sentence, not "The operation couldn't be completed".
 extension ModemFailure: LocalizedError { var errorDescription: String? { message } }
@@ -118,6 +126,7 @@ protocol ModemServing {
     func enterPin(_ pin: String, shownAttempts: Int) -> Result<PinOutcome, ModemFailure>
     func usbMode() -> Result<UsbModeInfo, ModemFailure>
     func setUsbMode(_ mode: UsbNetMode, reboot: Bool) -> Result<UsbModeChange, ModemFailure>
+    func at(_ line: String, timeout: TimeInterval) -> Result<[String], ModemFailure>   // one atCommandProblem accepts
 }
 
 // MARK: - Answer lines
@@ -179,6 +188,31 @@ func usbModeName(_ value: Int) -> String {
 /// `RMNet usbmode --json`: `{"mode":"qmi","value":0,"driverWorks":true}`.
 func usbModeJSON(_ info: UsbModeInfo) -> [String: Any] {
     ["mode": usbModeName(info.value), "value": info.value, "driverWorks": info.mode == .qmi]
+}
+
+// MARK: - One AT command as typed (`RMNet at`)
+
+/// The longest command `RMNet at` sends, in characters.
+let atCommandLimit = 512
+
+/// nil when `line` may be sent as one AT command; else why not, as `RMNet at` says it after `at: ` (never
+/// quoting the line). Refused: an empty line; a character outside printable ASCII (0x20–0x7E), so no CR or LF
+/// (which would end the line early and send a second command) and no Ctrl-Z (which ends a message body); more
+/// than 512 characters; a line that does not start with AT (any case); AT+CMGS and AT+CMGW at the start (any
+/// case), which wait at the "> " prompt for a message body that one line cannot give.
+func atCommandProblem(_ line: String) -> String? {
+    let scalars = line.unicodeScalars
+    if scalars.isEmpty { return "no command given; usage: RMNet at [--timeout <seconds>] <command>" }
+    guard scalars.allSatisfy({ (0x20...0x7E).contains($0.value) }) else {
+        return "a command is printable ASCII only (no line end, tab or Ctrl-Z)"
+    }
+    if scalars.count > atCommandLimit { return "a command is at most \(atCommandLimit) characters" }
+    let upper = line.uppercased()              // ASCII only by now
+    guard upper.hasPrefix("AT") else { return "a command starts with AT" }
+    for withBody in ["AT+CMGS", "AT+CMGW"] where upper.hasPrefix(withBody) {
+        return "\(withBody) needs a message body; use RMNet sms send"
+    }
+    return nil
 }
 
 // MARK: - Data profiles

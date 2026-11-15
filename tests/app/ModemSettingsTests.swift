@@ -96,6 +96,7 @@ struct NoModem: ModemServing {
     func enterPin(_ pin: String, shownAttempts: Int) -> Result<PinOutcome, ModemFailure> { .failure(failure) }
     func usbMode() -> Result<UsbModeInfo, ModemFailure> { .failure(failure) }
     func setUsbMode(_ mode: UsbNetMode, reboot: Bool) -> Result<UsbModeChange, ModemFailure> { .failure(failure) }
+    func at(_ line: String, timeout: TimeInterval) -> Result<[String], ModemFailure> { .failure(failure) }
 }
 
 @main
@@ -109,6 +110,8 @@ struct ModemSettingsTests {
               "ModemServing: a service answers with a ModemFailure")
         let failure: Error = ModemFailure(message: "x")
         check((failure as? ModemFailure)?.message == "x", "ModemFailure: is an Error")
+        check(ModemFailure(message: "x").atKind == nil && ModemFailure(message: "ERROR", atKind: .modemError).atKind == .modemError,
+              "ModemFailure: atKind is nil unless given (only `at` gives it)")
         let notAttached: Error = ModemFailure(message: "The modem is not attached.")
         expectEqual(notAttached.localizedDescription, "The modem is not attached.",
                     "ModemFailure: localizedDescription is the owner's sentence")
