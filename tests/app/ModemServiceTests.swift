@@ -870,7 +870,7 @@ struct ModemServiceTests {
 
         // `RMNet bands set sa n99` names every supported band, not 41.
         expectEqual(failureMessage(service.setBands(.sa, to: [99]), "after a lock: sa 99"),
-                    "The modem does not support 5G SA band 99 (supported: \(nrWords)). Nothing was changed.",
+                    "The modem does not support 5G SA band 99 (supported: \(nrWords)). The 5G SA bands were not changed.",
                     "after a lock: an unsupported band is refused with the full supported list")
 
         // `RMNet bands reset sa`: setBands(.sa, to:) the supported list bands() gave, which writes every band.
@@ -1029,7 +1029,9 @@ struct ModemServiceTests {
         let lteRead = bandRead("lte_band")
         let rf: (String, Answer) = (supportRead, .success(rfBandLines))
         let allSA = (saRead, bandAnswer("nr5g_band", nrList))
-        let notChanged = "Nothing was changed."
+        // A failure before the write names the RAT, not "Nothing was changed." (an earlier RAT of a reset of all
+        // three may have been set).
+        let notChanged = "The 5G SA bands were not changed."
 
         // The change: the rf_band read, the RAT's read, the write, the read-back, on one port.
         do {
@@ -1087,6 +1089,21 @@ struct ModemServiceTests {
             expectEqual(message, "At least one 5G SA band is needed. \(notChanged)", "setBands(.sa, []): refused")
             rig.finish("setBands sa []", opens: 0)
         }
+        for (rat, name) in [(BandRat.lte, "LTE"), (.nsa, "5G NSA")] {
+            expectEqual(bandsNotChanged(rat), "The \(name) bands were not changed.", "bandsNotChanged(.\(rat)): names the RAT")
+            let rig = Rig([])
+            let message = failureMessage(rig.service.setBands(rat, to: []), "setBands \(rat) []")
+            expectEqual(message, "At least one \(name) band is needed. The \(name) bands were not changed.",
+                        "setBands(.\(rat), []): refused, naming the RAT")
+            rig.finish("setBands \(rat) []", opens: 0)
+        }
+        do {
+            let rig = Rig([.failure(.busy)])
+            let message = failureMessage(rig.service.setBands(.nsa, to: [41]), "setBands nsa, busy")
+            expectEqual(message, "\(describe(.busy)) The 5G NSA bands were not changed.",
+                        "setBands(.nsa): a failed open names the RAT, not \"Nothing was changed.\"")
+            rig.finish("setBands nsa, busy", opens: 1)
+        }
         for (asked, words) in [([99], "band 99"), ([41, 100, 99], "bands 99, 100"), ([4], "band 4")] {
             let rig = Rig([rf, allSA])
             let message = failureMessage(rig.service.setBands(.sa, to: asked), "setBands sa \(asked)")
@@ -1099,7 +1116,7 @@ struct ModemServiceTests {
             // A RAT with no supported bands: its reset is an empty list, refused.
             let rig = Rig([(supportRead, .success(["+QNWPREFCFG: \"lte_band\",\"0\""])), (lteRead, bandAnswer("lte_band", "3"))])
             let message = failureMessage(rig.service.setBands(.lte, to: [3]), "setBands lte, none supported")
-            expectEqual(message, "The modem does not support LTE band 3 (supported: none). \(notChanged)",
+            expectEqual(message, "The modem does not support LTE band 3 (supported: none). The LTE bands were not changed.",
                         "setBands: no band supported")
             rig.finish("setBands lte, none supported", opens: 1)
         }

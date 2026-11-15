@@ -341,31 +341,34 @@ final class ModemService: ModemServing {
     /// Reads `rat`'s supported and allowed bands first. Refused, nothing written: an empty list (before the
     /// port is opened) or a band the modem does not support (`bandsProblem`). When the bands allowed are
     /// already those asked (as a set), nothing more is sent. Otherwise the change (5 s), sorted, each band once,
-    /// and its read-back, which must be the bands asked as a set.
+    /// and its read-back, which must be the bands asked as a set. A failure before the write ends `The <RAT>
+    /// bands were not changed.` (not "Nothing was changed.": in `bands reset` of all three an earlier RAT may
+    /// have been set).
     func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure> {
         let wanted = bandSorted(bands)
+        let unchanged = bandsNotChanged(rat)
         if wanted.isEmpty, let problem = bandsProblem(rat, wanted, supported: []) {
-            return failure("\(problem) Nothing was changed.")
+            return failure("\(problem) \(unchanged)")
         }
-        return withPort({ "\(describe($0)) Nothing was changed." }) { link in
+        return withPort({ "\(describe($0)) \(unchanged)" }) { link in
             let supported: [Int]
             switch readSupportedBands(link, [rat]) {
             case .success(let lists): supported = lists[rat] ?? []
-            case .failure(let f): return failure("\(f.message) Nothing was changed.")
+            case .failure(let f): return failure("\(f.message) \(unchanged)")
             }
             let before: [Int]
             switch readAllowedBands(link, rat) {
             case .success(let allowed): before = allowed
-            case .failure(let f): return failure("\(f.message) Nothing was changed.")
+            case .failure(let f): return failure("\(f.message) \(unchanged)")
             }
-            if let problem = bandsProblem(rat, wanted, supported: supported) { return failure("\(problem) Nothing was changed.") }
+            if let problem = bandsProblem(rat, wanted, supported: supported) { return failure("\(problem) \(unchanged)") }
             if before == wanted { return .success(BandChange(before: before, after: before)) }   // both sorted, each once
             let was = "They were \(bandListWords(before))."
             switch link.command(bandsCommand(rat, wanted), timeout: ModemService.writeTimeout) {
             case .success:
                 break
             case .failure(let error) where isRefusal(error):
-                return failure("The \(rat.name) bands were not changed. \(describe(error))")
+                return failure("\(unchanged) \(describe(error))")
             case .failure(let error):
                 return failure("It is not known whether the \(rat.name) bands changed. \(describe(error)) \(was)")
             }

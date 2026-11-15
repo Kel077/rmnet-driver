@@ -279,6 +279,12 @@ func bandsProblem(_ rat: BandRat, _ bands: [Int], supported: [Int]) -> String? {
         + "\(bandListWords(unsupported)) (supported: \(bandListWords(supported)))."
 }
 
+/// The end of a sentence for a failure before `rat`'s write: `The 5G NSA bands were not changed.` (In `bands
+/// reset` of all three an earlier RAT may have been set, so not "Nothing was changed.")
+func bandsNotChanged(_ rat: BandRat) -> String {
+    "The \(rat.name) bands were not changed."
+}
+
 /// `RMNet bands --json`, one RAT: `{"rat":"lte","allowed":[3,41],"supported":[1,2,…]}`.
 func bandsJSON(_ set: BandSet) -> [String: Any] {
     ["rat": set.rat.rawValue, "allowed": set.allowed, "supported": set.supported]

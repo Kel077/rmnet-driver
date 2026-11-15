@@ -8,7 +8,8 @@
 // Each verb prints lines starting `<verb>: ` (the `network` rows and the `apn` profile lines aside; `usbmode`
 // prints `usb mode: `, `usb mode set to …`, its other-mode warning and `cancelled; nothing changed`; `bands`
 // prints `<RAT>: …` and its indented `supported: …`, and `<RAT> bands: …` and `<RAT> bands set to …`) and
-// returns 0, or 1 after a failure, printed as one line `<verb>: <sentence>`. `at` prints the modem's answer as
+// returns 0, or 1 after a failure, printed as one line `<verb>: <sentence>` (a `bands reset` of all three that
+// stops at a failure adds `bands: not reset: …`). `at` prints the modem's answer as
 // an AT terminal shows it, and its own lines (`at: …`) on standard error: see `sendAt`. A password or PIN goes
 // from readSecret to the service and nowhere else: no line printed holds one. Nothing here logs.
 import Foundation
@@ -574,9 +575,11 @@ private func showBands(_ service: ModemServing, json: Bool, _ output: (String) -
 /// Reads the bands once, then puts each of `rats`, in order, to `target` of its bands as read; stops at the
 /// first failure (exit 1). A RAT's bands are checked first (`bandsProblem`: not empty, every band supported),
 /// and a RAT that already allows exactly those (as a set) is said to and left alone; otherwise the warning,
-/// naming the bands before (`all supported` when they were), then the change. No question, as `mode`. A failure
-/// before a RAT's write ends `Nothing was changed.` (in a reset of all three, the lines before it show any RAT
-/// already set).
+/// naming the bands before (`all supported` when they were), then the change. No question, as `mode`. Only a
+/// failure of the first read ends `Nothing was changed.`; a failure before a RAT's write ends `The <RAT> bands
+/// were not changed.` (in a reset of all three the lines before it show any RAT already set). A reset of all
+/// three that stops at a failure then names the RATs from the one that failed on: `bands: not reset: 5G NSA,
+/// 5G SA (run RMNet bands reset <rat> to try again)`.
 private func changeBands(_ service: ModemServing, _ rats: [BandRat], _ output: (String) -> Void,
                          to target: (BandSet) -> [Int]) -> Int32 {
     let sets: [BandSet]
@@ -584,13 +587,22 @@ private func changeBands(_ service: ModemServing, _ rats: [BandRat], _ output: (
     case .failure(let failure): return fail("bands", "\(failure.message) Nothing was changed.", output)
     case .success(let read): sets = read
     }
-    for rat in rats {
+    for (index, rat) in rats.enumerated() {
+        // The failure's line; in a reset of all three, then the RATs not reset: this one and those after it.
+        func stop(_ sentence: String) -> Int32 {
+            output("bands: \(sentence)")
+            if rats.count > 1 {
+                output("bands: not reset: \(rats[index...].map { $0.name }.joined(separator: ", ")) "
+                       + "(run RMNet bands reset <rat> to try again)")
+            }
+            return 1
+        }
         guard let set = sets.first(where: { $0.rat == rat }) else {
-            return fail("bands", "The modem did not report its \(rat.name) bands. Nothing was changed.", output)
+            return stop("The modem did not report its \(rat.name) bands. \(bandsNotChanged(rat))")
         }
         let wanted = bandSorted(target(set))
         if let problem = bandsProblem(rat, wanted, supported: set.supported) {
-            return fail("bands", "\(problem) Nothing was changed.", output)
+            return stop("\(problem) \(bandsNotChanged(rat))")
         }
         let list = bandListWords(wanted)
         if Set(set.allowed) == Set(wanted) {
@@ -602,7 +614,7 @@ private func changeBands(_ service: ModemServing, _ rats: [BandRat], _ output: (
                + "seconds")
         switch service.setBands(rat, to: wanted) {
         case .failure(let failure):
-            return fail("bands", failure.message, output)
+            return stop(failure.message)
         case .success(let change) where change.before == change.after:
             output("\(rat.name) bands: already \(bandListWords(change.after)); nothing changed")
         case .success(let change):
