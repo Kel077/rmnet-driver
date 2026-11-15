@@ -574,17 +574,19 @@ private func showBands(_ service: ModemServing, json: Bool, _ output: (String) -
 /// Reads the bands once, then puts each of `rats`, in order, to `target` of its bands as read; stops at the
 /// first failure (exit 1). A RAT's bands are checked first (`bandsProblem`: not empty, every band supported),
 /// and a RAT that already allows exactly those (as a set) is said to and left alone; otherwise the warning,
-/// naming the bands before (`all supported` when they were), then the change. No question, as `mode`.
+/// naming the bands before (`all supported` when they were), then the change. No question, as `mode`. A failure
+/// before a RAT's write ends `Nothing was changed.` (in a reset of all three, the lines before it show any RAT
+/// already set).
 private func changeBands(_ service: ModemServing, _ rats: [BandRat], _ output: (String) -> Void,
                          to target: (BandSet) -> [Int]) -> Int32 {
     let sets: [BandSet]
     switch service.bands() {
-    case .failure(let failure): return fail("bands", failure.message, output)
+    case .failure(let failure): return fail("bands", "\(failure.message) Nothing was changed.", output)
     case .success(let read): sets = read
     }
     for rat in rats {
         guard let set = sets.first(where: { $0.rat == rat }) else {
-            return fail("bands", "The modem did not report its \(rat.name) bands.", output)
+            return fail("bands", "The modem did not report its \(rat.name) bands. Nothing was changed.", output)
         }
         let wanted = bandSorted(target(set))
         if let problem = bandsProblem(rat, wanted, supported: set.supported) {

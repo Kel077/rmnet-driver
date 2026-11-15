@@ -1374,8 +1374,8 @@ struct ModemCliTests {
         // Failures.
         fake = FakeModem()
         fake.bandsResult = .failure(ModemFailure(message: "Fake: no modem."))
-        expectLines(run(["bands", "set", "sa", "41"], fake, "bands set, read failed"), ["bands: Fake: no modem."], code: 1,
-                    "bands set: the read failed")
+        expectLines(run(["bands", "set", "sa", "41"], fake, "bands set, read failed"),
+                    ["bands: Fake: no modem. Nothing was changed."], code: 1, "bands set: the read failed")
         check(fake.bandsAsked.isEmpty, "bands set: the read failed, nothing set")
         fake = FakeModem()
         fake.setBandsResults[.sa] = .failure(refused)
@@ -1388,7 +1388,9 @@ struct ModemCliTests {
                     "bands set: the service found it already set")
         fake = with([BandSet(rat: .lte, allowed: lteSupported, supported: lteSupported)])
         expectLines(run(["bands", "set", "sa", "41"], fake, "bands set, no SA read"),
-                    ["bands: The modem did not report its 5G SA bands."], code: 1, "bands set: a RAT not read")
+                    ["bands: The modem did not report its 5G SA bands. Nothing was changed."], code: 1,
+                    "bands set: a RAT not read")
+        check(fake.bandsAsked.isEmpty, "bands set: a RAT not read, nothing set")
 
         // reset one RAT: to every supported band.
         fake = with(bandSets(sa: [41]))
@@ -1437,8 +1439,8 @@ struct ModemCliTests {
         check(fake.bandsAsked == ["lte \(joined(lteSupported))"], "bands reset: only LTE tried", "\(fake.bandsAsked)")
         fake = FakeModem()
         fake.bandsResult = .failure(ModemFailure(message: "Fake: no modem."))
-        expectLines(run(["bands", "reset"], fake, "bands reset, read failed"), ["bands: Fake: no modem."], code: 1,
-                    "bands reset: the read failed")
+        expectLines(run(["bands", "reset"], fake, "bands reset, read failed"),
+                    ["bands: Fake: no modem. Nothing was changed."], code: 1, "bands reset: the read failed")
         check(fake.bandsAsked.isEmpty, "bands reset: the read failed, nothing set")
     }
 }
