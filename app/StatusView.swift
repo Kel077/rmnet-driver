@@ -1,6 +1,7 @@
 // The RMNet app's one window: on its Driver tab the driver's status, refreshed every 2 seconds, and the
 // buttons that install, update and remove it; on its Messages tab the modem's text messages (SmsView.swift);
-// on its Network and SIM & APN tabs the modem's network, settings and SIM (ModemView.swift).
+// on its Network and SIM & APN tabs the modem's network, settings and SIM (ModemView.swift). And its menu
+// bar item (MenuBarView.swift), which stays when the window is closed.
 // Started by main.swift when the app gets no command-line verb.
 import AppKit
 import Combine
@@ -8,6 +9,9 @@ import SwiftUI
 
 struct RMNetApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    // The menu bar item's state, polled from launch for as long as the app runs. Observed here, so that the
+    // item's icon follows it.
+    @StateObject private var menuBar = MenuBarStatus.forApp(queue: AppDelegate.modemQueue)
 
     var body: some Scene {
         Window("RMNet", id: "status") {
@@ -15,6 +19,11 @@ struct RMNetApp: App {
                         modem: appDelegate.modem, modemQuitNotice: appDelegate.modem.quitNotice)
         }
         .defaultSize(width: 520, height: 480)
+        // The icon only; the title is its accessibility label.
+        MenuBarExtra(menuBar.icon.accessibilityLabel, systemImage: menuBar.icon.symbolName) {
+            MenuBarPanel(status: menuBar)
+        }
+        .menuBarExtraStyle(.window)
     }
 }
 
@@ -80,23 +89,23 @@ struct RMNetWindow: View {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    // The one serial queue to the modem's AT port, shared by both controllers, so that the window never
-    // opens the port twice at once.
-    private let modemQueue = DispatchQueue(label: "io.rmnetdriver.RMNet.modem", qos: .userInitiated)
+    // The one serial queue to the modem's AT port, shared by both controllers and the menu bar item, so that
+    // the app never opens the port twice at once.
+    static let modemQueue = DispatchQueue(label: "io.rmnetdriver.RMNet.modem", qos: .userInitiated)
 
     // The process's one SmsController (its queue to the modem is the shared one): the window shows it, and
     // quitting waits for its running call. It lives as long as the app, so a window reopened from the Dock
     // shows the same messages and result line. Its answer to a quit goes through `quitGate`.
     private(set) lazy var messages: SmsController = SmsController(
         service: SmsService(),
-        queue: modemQueue,
+        queue: AppDelegate.modemQueue,
         replyToQuit: { [unowned self] succeeded in self.quitGate.replied(AppDelegate.messagesMember, succeeded) },
         requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
 
     // The process's one ModemController, for the Network and SIM & APN tabs, kept the same way.
     private(set) lazy var modem: ModemController = ModemController(
         service: ModemService(),
-        queue: modemQueue,
+        queue: AppDelegate.modemQueue,
         driverProfile: driverProfileNumber,
         replyToQuit: { [unowned self] succeeded in self.quitGate.replied(AppDelegate.modemMember, succeeded) },
         requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
@@ -112,11 +121,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                          resume: { [unowned self] in self.messages.resumeAfterCancelledQuit() })],
         reply: { NSApp.reply(toApplicationShouldTerminate: $0) })
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    // RMNet stays in the menu bar when its window is closed; `Open RMNet` in the item's panel opens it again.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
-    // Every way of quitting (Cmd-Q, the Dock's Quit, closing the last window, logout) comes here. With a
-    // call to the modem running, the app ends only when it has finished; a send is never cut short. A send,
-    // delete or change that does not succeed cancels the quit, so that its result can be read.
+    // Every way of quitting (Cmd-Q, the Dock's Quit, `Quit RMNet` in the menu bar item's panel, logout) comes
+    // here. With a call to the modem running, the app ends only when it has finished; a send is never cut
+    // short. A send, delete or change that does not succeed cancels the quit, so that its result can be read.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         quitGate.ask() ? .terminateLater : .terminateNow
     }
