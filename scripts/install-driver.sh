@@ -9,10 +9,11 @@
 # script refuses, before anything is built, unless both are set.
 #
 # A driver can only be deactivated by an app that embeds that exact driver version, so a copy of
-# every app that asks for activation is kept in build/installed/RMNet-<version>.app (README,
-# "Removing the driver"): the new app is kept before it asks, and the app it replaces is kept
-# before it is removed if the system lists any entry with its version. Before that, the script stops,
-# changing nothing, if any other listed version (an uninstalling entry aside) has no kept app.
+# every app that asks for activation is kept in build/installed/RMNet-<version>.app
+# (docs/reference.md, "Removing the driver"): the new app is kept before it asks, and the app it
+# replaces is kept before it is removed if the system lists any entry with its version. Before that,
+# the script stops, changing nothing, if any other listed version (an uninstalling entry aside) has
+# no kept app.
 # Nothing here deactivates.
 set -eu
 
@@ -127,7 +128,7 @@ for ver in $missing; do
 done
 if [ -n "$others" ]; then
   echo "install-driver: listed driver version(s)$others have no kept app in $KEEP ($APP is ${installed:-missing})" >&2
-  echo "install-driver: without one they cannot be deactivated; see README, Removing the driver; nothing was changed" >&2
+  echo "install-driver: without one they cannot be deactivated; see docs/reference.md, Removing the driver; nothing was changed" >&2
   exit 1
 fi
 if [ -n "$old" ] && listed_versions | grep -qxF "$old"; then
