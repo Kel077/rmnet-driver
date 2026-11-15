@@ -58,6 +58,7 @@ struct WindowVisibilityTests {
         otherWindowsDoNotCount()
         closing()
         leavingAndSwitching()
+        reopening()
         print("window visibility: \(checks) checks passed")
     }
 
@@ -115,6 +116,26 @@ struct WindowVisibilityTests {
         equal(rig.reports, [true, false], "close: then occluded, nothing new")
         w.occlusionChanged(true)
         equal(rig.reports, [true, false, true], "close: the same window shown again")
+    }
+
+    // A Dock click, a second launch or `Open RMNet`: the RMNet window when it is open (deminiaturized first when
+    // minimized), whether or not an openWindow action is kept; else the action; else AppKit's own handling.
+    static func reopening() {
+        for action in [true, false] {
+            equal(windowReopen(windowFound: true, minimized: false, actionAvailable: action), .bringForward(deminiaturize: false),
+                  "reopen: an open window is brought forward (action \(action))")
+            equal(windowReopen(windowFound: true, minimized: true, actionAvailable: action), .bringForward(deminiaturize: true),
+                  "reopen: a minimized window is deminiaturized first (action \(action))")
+        }
+        for minimized in [true, false] {
+            equal(windowReopen(windowFound: false, minimized: minimized, actionAvailable: true), .openWithAction,
+                  "reopen: no window, the kept action opens it (minimized \(minimized))")
+            equal(windowReopen(windowFound: false, minimized: minimized, actionAvailable: false), .leaveToAppKit,
+                  "reopen: no window and no action, AppKit's own handling (minimized \(minimized))")
+        }
+        check(WindowReopen.leaveToAppKit.handled == false, "reopen: AppKit's handling is not handled here")
+        check(WindowReopen.openWithAction.handled && WindowReopen.bringForward(deminiaturize: false).handled,
+              "reopen: the other two are")
     }
 
     // Leaving the window (the view taken out of it) is not visible, and its later notifications are not

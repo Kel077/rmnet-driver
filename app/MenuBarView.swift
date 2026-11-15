@@ -29,6 +29,12 @@ extension MenuBarStatus {
 /// The panel, about 280 pt wide.
 struct MenuBarPanel: View {
     @ObservedObject var status: MenuBarStatus
+    /// Shows the RMNet window, given the panel's own way of opening it (for when it is not open). The app
+    /// passes AppDelegate.showStatusWindow, which brings an open window forward first.
+    var showWindow: (_ open: @escaping () -> Void) -> Void = { open in
+        open()
+        NSApp.activate()
+    }
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -68,8 +74,8 @@ struct MenuBarPanel: View {
             Divider()
             HStack {
                 Button("Open RMNet") {
-                    openWindow(id: "status")
-                    NSApp.activate()
+                    let open = openWindow
+                    showWindow { open(id: "status") }
                 }
                 Spacer()
                 // Through applicationShouldTerminate, so the quit gate still waits for a running send or change.
@@ -104,8 +110,9 @@ private struct Lines: View {
 /// Calls `shown` each time the panel's window comes on screen: when it becomes key (the menu bar panel does
 /// when it opens) or becomes visible. Several calls for one opening are harmless: the model reads the port
 /// at most once in 10 s. Nothing is called while the panel is not on screen, so the port is not read at
-/// launch. Calls `hidden` when it is no longer on screen (it resigns key and goes, its occlusion state is
-/// no longer visible, or the view leaves it), so that the model stops asking for the listing.
+/// launch, and resigning key never calls it (menuBarPanelSignal), so no read starts as the panel closes.
+/// Calls `hidden` when it is no longer on screen or the view leaves it, so that the model stops asking for
+/// the listing.
 private struct PanelShownObserver: NSViewRepresentable {
     let shown: () -> Void
     let hidden: () -> Void
@@ -135,21 +142,30 @@ private struct PanelShownObserver: NSViewRepresentable {
             super.viewDidMoveToWindow()
             stopObserving()
             guard let window else {
-                onHidden()
+                signal(.detached)
                 return
             }
             let center = NotificationCenter.default
-            for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
-                         NSWindow.didChangeOcclusionStateNotification] {
+            let events: [(Notification.Name, MenuBarPanelEvent)] = [
+                (NSWindow.didBecomeKeyNotification, .becameKey),
+                (NSWindow.didResignKeyNotification, .resignedKey),
+                (NSWindow.didChangeOcclusionStateNotification, .occlusionChanged),
+            ]
+            for (name, event) in events {
                 tokens.append(center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
-                    self?.check()
+                    self?.signal(event)
                 })
             }
-            check()
+            signal(.attached)
         }
 
-        private func check() {
-            if let window, window.isVisible, window.occlusionState.contains(.visible) { onShown() } else { onHidden() }
+        private func signal(_ event: MenuBarPanelEvent) {
+            let onScreen = window.map { $0.isVisible && $0.occlusionState.contains(.visible) } ?? false
+            switch menuBarPanelSignal(event, onScreen: onScreen) {
+            case .shown: onShown()
+            case .hidden: onHidden()
+            case nil: break
+            }
         }
 
         private func stopObserving() {

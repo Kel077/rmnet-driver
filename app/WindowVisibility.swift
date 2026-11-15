@@ -60,3 +60,21 @@ final class WindowVisibility {
         report(visible)
     }
 }
+
+/// How the RMNet window is shown on a Dock click, a second launch (`open /Applications/RMNet.app`) or `Open RMNet`
+/// in the menu bar item's panel. The window itself first, when it is open (found among the app's windows by the
+/// mark its view sets, until it closes): deminiaturized when minimized, made key and ordered front. Else the
+/// openWindow action kept from SwiftUI. Else, with neither, AppKit's and SwiftUI's own handling of a reopen.
+enum WindowReopen: Equatable {
+    case bringForward(deminiaturize: Bool)
+    case openWithAction
+    case leaveToAppKit
+
+    /// Whether the app showed the window itself (applicationShouldHandleReopen then returns false).
+    var handled: Bool { self != .leaveToAppKit }
+}
+
+func windowReopen(windowFound: Bool, minimized: Bool, actionAvailable: Bool) -> WindowReopen {
+    if windowFound { return .bringForward(deminiaturize: minimized) }
+    return actionAvailable ? .openWithAction : .leaveToAppKit
+}

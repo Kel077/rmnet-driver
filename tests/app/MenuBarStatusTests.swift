@@ -159,6 +159,8 @@ struct MenuBarStatusTests {
         addresses()
         polling()
         listingWhenNeeded()
+        staleListing()
+        panelSignals()
         throttle()
         oneReadAtATime()
         notes()
@@ -344,8 +346,7 @@ struct MenuBarStatusTests {
         rig.properties = upProperties
         s.poll()
         equal(rig.listing.asked, 2, "listing: not asked once the driver is attached")
-        equal(s.headline, "Waiting for approval in System Settings",
-              "listing: the headline keeps the last answer while it is not asked")
+        equal(s.headline, "Asking the system…", "listing: an answer not asked again is stale, not shown")
 
         rig.open()
         equal(rig.listing.asked, 3, "listing: asked when the panel opens")
@@ -363,6 +364,57 @@ struct MenuBarStatusTests {
         equal(rig.listing.asked, 6, "listing: not asked once the panel is closed")
         s.panelClosed()
         equal(rig.listing.asked, 6, "listing: closing twice is harmless")
+    }
+
+    // A listing that was not asked again (the driver attached, the panel closed) is stale: when the driver goes
+    // away the icon is `.noDriver` until a fresh listing says that the system waits for approval, never the old
+    // answer's `.waitingForApproval`. Its headline asks the system again too.
+    static func staleListing() {
+        let rig = Rig()
+        let s = rig.status!
+        rig.listing.answer = [awaiting]
+        s.poll()
+        equal(s.icon, .waitingForApproval, "stale: waiting for approval, no driver")
+        rig.listing.answer = [enabled]
+        rig.properties = ["RMNetState": "up"]
+        s.poll()
+        equal(s.icon, .up, "stale: the driver attached and up")
+        equal(rig.listing.asked, 1, "stale: not asked with the driver attached")
+
+        rig.listing.holding = true
+        rig.properties = nil
+        s.poll()
+        equal(rig.listing.asked, 2, "stale: asked once the driver is gone")
+        equal(s.icon, .noDriver, "stale: no driver until the fresh answer, not the old waiting for approval")
+        equal(s.headline, "Asking the system…", "stale: the headline asks again")
+        rig.listing.answerWaiting([awaiting])
+        equal(s.icon, .waitingForApproval, "stale: the fresh answer says waiting")
+        equal(s.headline, "Waiting for approval in System Settings", "stale: and its headline")
+
+        // A question asked while no driver was attached, answered after it attached: still the latest answer.
+        rig.properties = nil
+        s.poll()
+        rig.properties = ["RMNetState": "up"]
+        s.poll()
+        rig.listing.answerWaiting([enabled])
+        equal(s.headline, "Connected", "stale: an answer to a question already asked is used")
+        rig.listing.holding = false
+    }
+
+    // The panel's window events: shown only while on screen, and never on resigning key (the panel resigns key
+    // as it closes, while it may still be on screen, and no read may start then); hidden when it is off screen
+    // or the view left it.
+    static func panelSignals() {
+        let cases: [(MenuBarPanelEvent, Bool, MenuBarPanelSignal?)] = [
+            (.attached, true, .shown), (.attached, false, .hidden),
+            (.detached, true, .hidden), (.detached, false, .hidden),
+            (.becameKey, true, .shown), (.becameKey, false, nil),
+            (.resignedKey, true, nil), (.resignedKey, false, .hidden),
+            (.occlusionChanged, true, .shown), (.occlusionChanged, false, .hidden),
+        ]
+        for (event, onScreen, want) in cases {
+            equal(menuBarPanelSignal(event, onScreen: onScreen), want, "panel signal: \(event), on screen \(onScreen)")
+        }
     }
 
     // Opening the panel reads the network once, on the model's queue; opening it again less than 10 s after

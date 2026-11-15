@@ -21,7 +21,7 @@ struct RMNetApp: App {
         .defaultSize(width: 520, height: 480)
         // The icon only; the title is its accessibility label.
         MenuBarExtra(menuBar.icon.accessibilityLabel, systemImage: menuBar.icon.symbolName) {
-            MenuBarPanel(status: menuBar)
+            MenuBarPanel(status: menuBar, showWindow: { open in _ = AppDelegate.showStatusWindow(using: open) })
                 .background(OpenWindowKeeper())
         }
         .menuBarExtraStyle(.window)
@@ -92,7 +92,8 @@ struct RMNetWindow: View {
 }
 
 /// Reports whether the window this view is in can be seen: its own occlusion state, and not visible once it
-/// closes or the view leaves it (WindowVisibility.swift). The app's other windows do not count.
+/// closes or the view leaves it (WindowVisibility.swift). The app's other windows do not count. Also marks the
+/// window as the RMNet window (AppDelegate.statusWindow) while it is open, so a reopen can find it.
 private struct WindowVisibilityObserver: NSViewRepresentable {
     let report: (Bool) -> Void
 
@@ -101,6 +102,7 @@ private struct WindowVisibilityObserver: NSViewRepresentable {
 
     final class ObserverView: NSView {
         private let visibility: WindowVisibility
+        private var closeToken: NSObjectProtocol?
 
         init(report: @escaping (Bool) -> Void) {
             visibility = WindowVisibility(occlusionChanged: NSWindow.didChangeOcclusionStateNotification,
@@ -110,19 +112,33 @@ private struct WindowVisibilityObserver: NSViewRepresentable {
 
         required init?(coder: NSCoder) { nil }
 
+        deinit { stopMarking() }
+
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             visibility.follow(window, visible: { [weak window] in
                 guard let window else { return false }
                 return window.isVisible && window.occlusionState.contains(.visible)
             })
+            stopMarking()
+            guard let window else { return }
+            AppDelegate.statusWindow = window
+            closeToken = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window,
+                                                                queue: .main) { [weak window] _ in
+                if AppDelegate.statusWindow === window { AppDelegate.statusWindow = nil }
+            }
+        }
+
+        private func stopMarking() {
+            if let closeToken { NotificationCenter.default.removeObserver(closeToken) }
+            closeToken = nil
         }
     }
 }
 
-/// Keeps the app's way of opening the window (`openWindow(id: "status")`, then activating the app, as `Open
-/// RMNet` does) in AppDelegate.openStatusWindow, for a Dock click or a second launch while the window is
-/// closed. In the window and in the menu bar item's panel; it reads nothing.
+/// Keeps SwiftUI's way of opening the window (`openWindow(id: "status")`) in AppDelegate.openStatusWindow, for
+/// a Dock click or a second launch while the window is closed. In the window and in the menu bar item's panel;
+/// it reads nothing.
 private struct OpenWindowKeeper: View {
     @Environment(\.openWindow) private var openWindow
 
@@ -131,10 +147,7 @@ private struct OpenWindowKeeper: View {
             .frame(width: 0, height: 0)
             .onAppear {
                 let open = openWindow
-                AppDelegate.openStatusWindow = {
-                    open(id: "status")
-                    NSApp.activate()
-                }
+                AppDelegate.openStatusWindow = { open(id: "status") }
             }
     }
 }
@@ -175,18 +188,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // RMNet stays in the menu bar when its window is closed; `Open RMNet` in the item's panel opens it again.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
-    // How `Open RMNet` opens the window, kept by the window and the panel when they appear (OpenWindowKeeper);
+    // SwiftUI's way of opening the window, kept by the window and the panel when they appear (OpenWindowKeeper);
     // nil until one of them has. On the main thread only.
     static var openStatusWindow: (() -> Void)?
 
-    // A click on the Dock icon, or `open /Applications/RMNet.app` while RMNet runs: opens the window, or brings
-    // it forward, as `Open RMNet` does. `hasVisibleWindows` is not trusted: the menu bar item's own windows can
-    // count as visible while the RMNet window is closed. False: handled here. True (no way kept yet, which
-    // should not happen, since the window opens at launch): AppKit's own handling.
+    // The RMNet window while it is open: marked by its view when the view moves into it, cleared when it closes
+    // (WindowVisibilityObserver). On the main thread only.
+    static weak var statusWindow: NSWindow?
+
+    // Shows the RMNet window (windowReopen in WindowVisibility.swift): the window itself when it is open, found
+    // among the app's windows, deminiaturized if minimized, made key and ordered front; else `open`, SwiftUI's
+    // openWindow; then the app is made active. False when there is neither, and nothing was done.
+    static func showStatusWindow(using open: (() -> Void)?) -> Bool {
+        let window = statusWindow.flatMap { marked in NSApp.windows.first(where: { $0 === marked }) }
+        let way = windowReopen(windowFound: window != nil, minimized: window?.isMiniaturized == true,
+                               actionAvailable: open != nil)
+        switch way {
+        case .bringForward(let deminiaturize):
+            if deminiaturize { window?.deminiaturize(nil) }
+            window?.makeKeyAndOrderFront(nil)
+        case .openWithAction:
+            open?()
+        case .leaveToAppKit:
+            return false
+        }
+        NSApp.activate()
+        return way.handled
+    }
+
+    // A click on the Dock icon, or `open /Applications/RMNet.app` while RMNet runs: shows the window as `Open
+    // RMNet` does. `hasVisibleWindows` is not trusted: the menu bar item's own windows can count as visible while
+    // the RMNet window is closed. False: shown here. True (no open window and no openWindow kept, which should
+    // not happen, since the window opens at launch): AppKit's and SwiftUI's own handling.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        guard let open = AppDelegate.openStatusWindow else { return true }
-        open()
-        return false
+        !AppDelegate.showStatusWindow(using: AppDelegate.openStatusWindow)
     }
 
     // Every way of quitting (Cmd-Q, the Dock's Quit, `Quit RMNet` in the menu bar item's panel, logout) comes

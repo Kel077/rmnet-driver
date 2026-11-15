@@ -94,6 +94,26 @@ private func menuBarSignal(_ leg: CellLeg) -> String {
     return parts.joined(separator: ", ")
 }
 
+/// What the panel's window just did, as its observer (MenuBarView.swift) sees it: the observer's view moved
+/// into it or out of it, it became or resigned key, or its occlusion state changed.
+enum MenuBarPanelEvent { case attached, detached, becameKey, resignedKey, occlusionChanged }
+
+/// What the observer then tells the model: the panel is shown (panelOpened) or hidden (panelClosed).
+enum MenuBarPanelSignal: Equatable { case shown, hidden }
+
+/// Shown only while the window is on screen (visible, with its occlusion state visible), and never on
+/// resigning key: the panel resigns key as it closes (a click outside it, `Open RMNet` making the RMNet window
+/// key) while it may still be on screen, and no read may start then; its order-out changes the occlusion state,
+/// which says hidden. Hidden when it is off screen or the view left it; nil: nothing to tell.
+func menuBarPanelSignal(_ event: MenuBarPanelEvent, onScreen: Bool) -> MenuBarPanelSignal? {
+    switch event {
+    case .detached: return .hidden
+    case .resignedKey: return onScreen ? nil : .hidden
+    case .becameKey: return onScreen ? .shown : nil
+    case .attached, .occlusionChanged: return onScreen ? .shown : .hidden
+    }
+}
+
 let menuBarReadingLine = "Reading the modem…"
 let menuBarBusyNote = "The modem's AT port is busy; open the panel again in a moment."
 
@@ -151,8 +171,8 @@ final class MenuBarStatus: ObservableObject {
     private var timer: Timer?
     private var asking = false              // a listing question is pending
     private var panelOpen = false           // between panelOpened() and panelClosed()
-    private var listingAnswered = false     // the system has answered at least once
-    private var entries: [ExtensionEntry]? = nil   // its last answer; nil: it gave no listing
+    private var listingAnswered = false     // the system has answered since the listing was last dropped as stale
+    private var entries: [ExtensionEntry]? = nil   // that answer; nil: none, or it gave no listing
     private var driver: DriverProperties? = nil
     private var usb: (state: ModemState, model: QuectelModel?) = (.absent, nil)
     private var lastReadFinished: Date? = nil
@@ -187,14 +207,20 @@ final class MenuBarStatus: ObservableObject {
     }
 
     /// Reads the registry; asks the system for its listing too (its answer updates the icon and headline when
-    /// it comes) when no driver is attached or the panel is open, unless a question is pending. Never the AT
-    /// port. On the main thread only.
+    /// it comes) when no driver is attached or the panel is open, unless a question is pending. When it is not
+    /// asked, the last answer is stale and is dropped: a driver that goes away later shows no driver until a
+    /// fresh answer says the system waits for approval. Never the AT port. On the main thread only.
     func poll() {
         dispatchPrecondition(condition: .onQueue(.main))
         driver = properties()
         usb = modem()
+        let wanted = driver == nil || panelOpen
+        if !wanted && !asking {
+            listingAnswered = false
+            entries = nil
+        }
         update()
-        guard driver == nil || panelOpen, !asking else { return }
+        guard wanted, !asking else { return }
         asking = true
         listing { [weak self] answer in
             guard let self else { return }
