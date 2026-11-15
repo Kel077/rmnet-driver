@@ -69,15 +69,25 @@ check-driverkit:
 	./scripts/check-personalities.sh
 
 # The app's status model, SMS model, AT answer logic, the Messages tab's controller, the gps verb's
-# NMEA logic and its port reader, tested without Xcode or hardware (neither the AT port nor the NMEA
-# port is opened: the reader reads a pseudo-terminal the test makes, and no window is made).
-app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/nmea-tests build/gpsread-tests
+# NMEA logic and its port reader, the network model, the settings model, the modem service (against a
+# scripted port), the modem verbs (against a fake service), the modem tabs' controller and the quit gate
+# (with both controllers), tested without Xcode or hardware (neither the AT port nor the NMEA port is
+# opened: the reader reads a pseudo-terminal the test makes, and no window is made).
+app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/nmea-tests build/gpsread-tests \
+		build/modemnet-tests build/modemset-tests build/modemsvc-tests build/modemcli-tests build/modemui-tests \
+		build/quit-tests
 	./build/app-tests
 	./build/sms-tests
 	./build/at-tests
 	./build/smsui-tests
 	./build/nmea-tests
 	./build/gpsread-tests
+	./build/modemnet-tests
+	./build/modemset-tests
+	./build/modemsvc-tests
+	./build/modemcli-tests
+	./build/modemui-tests
+	./build/quit-tests
 
 build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
 	@mkdir -p build
@@ -100,6 +110,33 @@ build/nmea-tests: app/Nmea.swift tests/app/NmeaTests.swift
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 build/gpsread-tests: app/Nmea.swift app/GpsCommand.swift tests/app/GpsReadTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+build/modemnet-tests: app/ModemNetwork.swift tests/app/ModemNetworkTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+build/modemset-tests: app/ModemNetwork.swift app/ModemSettings.swift tests/app/ModemSettingsTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+# SmsService.swift brings describe(_: AtError).
+build/modemsvc-tests: app/AtPort.swift app/SmsModel.swift app/SmsService.swift app/ModemNetwork.swift \
+		app/ModemSettings.swift app/ModemService.swift tests/app/ModemServiceTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+build/modemcli-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ModemCli.swift tests/app/ModemCliTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+build/modemui-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ModemController.swift tests/app/ModemControllerTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+build/quit-tests: app/SmsModel.swift app/SmsController.swift app/ModemNetwork.swift app/ModemSettings.swift \
+		app/ModemController.swift app/QuitGate.swift tests/app/QuitGateTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 

@@ -150,6 +150,7 @@ struct SmsControllerTests {
         twoLines()
         deleting()
         quitting()
+        resuming()
         composingAndStore()
         print("smsui-test: \(checks) checks passed")
     }
@@ -395,6 +396,57 @@ struct SmsControllerTests {
             }
             c.setTabShown(false)
         }
+    }
+
+    // resumeAfterCancelledQuit (the modem tabs' controller cancelled the quit, ruling R18): working again,
+    // listing at once with the timer back if the tab is shown; a quit still waiting is cancelled too, its
+    // line goes at once, and it is never answered (the running call is not cut short).
+    static func resuming() {
+        let rig = Rig()
+        let c = rig.controller
+        func timer() -> Timer? {
+            Mirror(reflecting: c).children.first(where: { $0.label == "timer" }).flatMap { $0.value as? Timer }
+        }
+        c.setTabShown(true)
+        pump(until: { rig.fake.calls.count == 1 && rig.fake.blocked == 1 }, "resume: the first listing")
+        rig.fake.releaseList(listing([]))
+        pump(until: { c.running == nil }, "resume: the first listing comes back")
+        rig.ready()
+        check(c.quitWhenFinished() == false, "resume: the quit answered at once")
+        check(timer() == nil && !c.refreshEnabled && !c.sendEnabled, "resume: stopped while the app ends")
+        c.resumeAfterCancelledQuit()
+        pump(until: { rig.fake.calls.count == 2 && rig.fake.blocked == 1 }, "resume: the shown tab lists at once")
+        rig.fake.releaseList(listing([]))
+        pump(until: { c.running == nil }, "resume: that listing comes back")
+        check(timer()?.isValid == true && c.refreshEnabled && c.sendEnabled && c.quitNotice.line == "",
+              "resume: the timer runs again and the controller works")
+
+        // A quit that waits for a send, cancelled elsewhere: the line goes at once; the send runs to its end
+        // and its result stays, with no answer to the quit and no request for attention.
+        rig.startSend()
+        check(c.quitWhenFinished() == true, "resume: a quit waits for the send")
+        check(c.quitNotice.line == "RMNet quits when the message being sent has finished.", "resume: the quit line",
+              c.quitNotice.line)
+        c.resumeAfterCancelledQuit()
+        check(c.quitNotice.line == "", "resume: the quit line goes at once", c.quitNotice.line)
+        check(c.running == .sending && rig.fake.calls.count == 3, "resume: the send is not cut short and nothing else starts",
+              "\(rig.fake.calls)")
+        rig.fake.releaseSend(.failure(notKnown))
+        pump(until: { rig.fake.calls.count == 4 && rig.fake.blocked == 1 }, "resume: the tab lists after the send")
+        check(c.result == notKnown.message && c.resultIsFailure, "resume: the send's sentence stays", c.result)
+        rig.fake.releaseList(listing([]))
+        pump(until: { c.running == nil }, "resume: that listing comes back")
+        settle()
+        check(rig.replies.isEmpty && rig.attention == 0, "resume: a cancelled quit that was waiting is never answered",
+              "\(rig.replies) \(rig.attention)")
+
+        // With the tab not shown: working again, but nothing is listed and no timer runs.
+        c.setTabShown(false)
+        _ = c.quitWhenFinished()
+        c.resumeAfterCancelledQuit()
+        settle()
+        check(rig.fake.calls.count == 4 && timer() == nil && c.refreshEnabled,
+              "resume: with the tab not shown, nothing is listed and no timer runs", "\(rig.fake.calls)")
     }
 
     // Send waits while an input method composes; the store's warning reaches the list line.
