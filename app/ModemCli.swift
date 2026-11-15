@@ -1,14 +1,15 @@
-// The command-line verbs for the modem's network and settings: `network`, `radio`, `mode`, `apn`, `sim`
-// and `usbmode`. The parser (wrong usage is nil: main.swift prints the usage line and exits 2 without
-// opening the port) and what each verb prints, over a `ModemServing`, the readSecret that reads a password
-// or a PIN without echo, the question asked on the terminal before a restart, and the output. Foundation
-// only, with ModemNetwork.swift and ModemSettings.swift: `make app-test` builds it with them and a fake
-// service.
+// The command-line verbs for the modem's network and settings: `network`, `radio`, `mode`, `apn`, `sim`,
+// `usbmode`, and `at`, which sends one AT command as typed. The parser (wrong usage is nil: main.swift prints
+// the usage line and exits 2 without opening the port; `at` is never nil, see `parseAt`) and what each verb
+// prints, over a `ModemServing`, the readSecret that reads a password or a PIN without echo, the question
+// asked on the terminal before a restart, and the output. Foundation only, with ModemNetwork.swift and
+// ModemSettings.swift: `make app-test` builds it with them and a fake service.
 //
 // Each verb prints lines starting `<verb>: ` (the `network` rows and the `apn` profile lines aside; `usbmode`
 // prints `usb mode: `, `usb mode set to …`, its other-mode warning and `cancelled; nothing changed`) and
-// returns 0, or 1 after a failure, printed as one line `<verb>: <sentence>`. A password or PIN goes from
-// readSecret to the service and nowhere else: no line printed holds one.
+// returns 0, or 1 after a failure, printed as one line `<verb>: <sentence>`. `at` prints the modem's answer as
+// an AT terminal shows it, and its own lines (`at: …`) on standard error: see `sendAt`. A password or PIN goes
+// from readSecret to the service and nowhere else: no line printed holds one. Nothing here logs.
 import Foundation
 
 enum ModemCommand: Equatable {
@@ -24,12 +25,15 @@ enum ModemCommand: Equatable {
     case simUnlock(lastAttempt: Bool)
     case usbMode(json: Bool)
     case usbModeSet(UsbNetMode, reboot: Bool, yes: Bool)    // reboot: no --no-reboot; yes: --yes
+    case at(String, timeout: Int)               // one line atCommandProblem accepts; seconds, 1 to 300
+    case atRefused(String)                      // `at` with a command or option it does not take: why
 
     /// Radio on or off, a mode set, apn set, sim unlock and usbmode set: main.swift ignores the stopping
-    /// signals for these.
+    /// signals for these. Not `at`: it sends what the owner typed, as an AT terminal would, and Ctrl-C stops
+    /// it (the modem may still carry out a command already sent).
     var changesModem: Bool {
         switch self {
-        case .network, .apnShow, .sim, .usbMode: return false
+        case .network, .apnShow, .sim, .usbMode, .at, .atRefused: return false
         case .radio(let on): return on != nil
         case .mode(let mode): return mode != nil
         case .apnSet, .simUnlock, .usbModeSet: return true
@@ -37,13 +41,14 @@ enum ModemCommand: Equatable {
     }
 }
 
-let modemVerbs: Set<String> = ["network", "radio", "mode", "apn", "sim", "usbmode"]
+let modemVerbs: Set<String> = ["network", "radio", "mode", "apn", "sim", "usbmode", "at"]
 
 /// Appended to main.swift's usage line.
 let modemUsage = "network [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | apn [show] [--json] | "
     + "apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] [--password | --no-password] "
     + "[--auth none|pap|chap|pap-or-chap] [--no-redial] | sim [--json] | sim unlock [--last-attempt] | "
-    + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes]"
+    + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes] | "
+    + "at [--timeout <seconds>] <command>"
 
 // MARK: - Parsing
 
@@ -78,9 +83,36 @@ func parseModem(_ words: [String]) -> ModemCommand? {
     case "usbmode":
         guard rest.first == "set" else { return jsonOption(rest).map { .usbMode(json: $0) } }
         return parseUsbModeSet(Array(rest.dropFirst()))
+    case "at":
+        return parseAt(rest)
     default:
         return nil
     }
+}
+
+/// `at --timeout`'s range, and the wait without it, in seconds.
+private let atTimeouts = 1...300
+private let atDefaultTimeout = 10
+
+/// The words after `at`: `--timeout <seconds>` first, if given, then the command's words, joined with single
+/// spaces, with spaces at the ends dropped (the port knows its answer by the echo of the line, and an echo
+/// loses those spaces). Never nil: a command or timeout `at` does not take is `.atRefused` with the reason,
+/// printed as `at: <reason>` in place of the usage line.
+private func parseAt(_ words: [String]) -> ModemCommand {
+    var rest = words[...]
+    var timeout = atDefaultTimeout
+    if rest.first == "--timeout" {
+        rest = rest.dropFirst()
+        guard let seconds = rest.first.flatMap({ Int($0) }), atTimeouts.contains(seconds) else {
+            return .atRefused("--timeout takes a whole number of seconds from \(atTimeouts.lowerBound) to "
+                              + "\(atTimeouts.upperBound)")
+        }
+        timeout = seconds
+        rest = rest.dropFirst()
+    }
+    let line = rest.joined(separator: " ").trimmingCharacters(in: CharacterSet(charactersIn: " "))
+    if let problem = atCommandProblem(line) { return .atRefused(problem) }
+    return .at(line, timeout: timeout)
 }
 
 private let usbModeOptions: [String: UsbNetMode] =
@@ -165,12 +197,14 @@ private func parseApnSet(_ words: [String]) -> ModemCommand? {
 // MARK: - Running
 
 /// Runs `command` (blocking: off the main thread) and returns the exit code: 0, 1, or 2 when `usbmode set`
-/// would restart the modem without a terminal to ask on. `driverProfile` is the driver's `RMNetProfile` (nil
-/// when the driver is not attached); `readSecret` reads a password or PIN without echo after showing its
-/// prompt (nil without a terminal); `ask` shows a question on the terminal and reads one line (nil without a
-/// terminal, see `askOnTerminal`); `output` prints one line.
+/// would restart the modem without a terminal to ask on or `at` refuses its command. `driverProfile` is the
+/// driver's `RMNetProfile` (nil when the driver is not attached); `readSecret` reads a password or PIN without
+/// echo after showing its prompt (nil without a terminal); `ask` shows a question on the terminal and reads
+/// one line (nil without a terminal, see `askOnTerminal`); `output` prints one line on standard output,
+/// `errorOutput` one on standard error (only `at` uses it).
 func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int?,
-              readSecret: (String) -> String?, ask: (String) -> String?, output: (String) -> Void) -> Int32 {
+              readSecret: (String) -> String?, ask: (String) -> String?, output: (String) -> Void,
+              errorOutput: (String) -> Void) -> Int32 {
     switch command {
     case .network(let json):
         return showNetwork(service, json: json, output)
@@ -208,6 +242,12 @@ func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int
         return showUsbMode(service, json: json, output)
     case let .usbModeSet(mode, reboot, yes):
         return setUsbMode(service, mode, reboot: reboot, yes: yes, ask: ask, output)
+    case let .at(line, timeout):
+        return sendAt(service, line, timeout: timeout, output, errorOutput)
+    case .atRefused(let reason):
+        // Nothing is sent: the port is not even opened.
+        errorOutput("at: \(reason)")
+        return 2
     }
 }
 
@@ -468,6 +508,31 @@ private func setUsbMode(_ service: ModemServing, _ mode: UsbNetMode, reboot: Boo
         output("usb mode set to \(mode.name); it takes effect at the next restart (AT+CFUN=1,1 or a replug)")
     }
     return 0
+}
+
+/// One AT command, its answer printed as an AT terminal shows it: each answer line on standard output, then
+/// `OK`, exit 0; the modem's error line (`ERROR`, `+CME ERROR: …`, `+CMS ERROR: …`) on standard output, exit 1.
+/// On standard error, exit 1: `at: no answer in <n> s` (the timeout given), or `at: <sentence>` for any
+/// other failure. What the modem sends is printed display-safe, as all text from it (`modemTextSafe`); the
+/// line sent and its answer go to the terminal only, never to a log.
+private func sendAt(_ service: ModemServing, _ line: String, timeout: Int, _ output: (String) -> Void,
+                    _ errorOutput: (String) -> Void) -> Int32 {
+    switch service.at(line, timeout: TimeInterval(timeout)) {
+    case .success(let lines):
+        for answer in lines { output(modemTextSafe(answer)) }
+        output("OK")
+        return 0
+    case .failure(let failure):
+        switch failure.atKind {
+        case .modemError:
+            output(modemTextSafe(failure.message))
+            return 1
+        case .timeout:
+            return fail("at", "no answer in \(timeout) s", errorOutput)
+        case nil:
+            return fail("at", failure.message, errorOutput)
+        }
+    }
 }
 
 /// Shows `question` on the terminal (no line end after it) and reads one line. nil, asking nothing, when

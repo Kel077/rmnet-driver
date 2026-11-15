@@ -1,5 +1,6 @@
-// Tests for app/ModemCli.swift: the command-line verbs `network`, `radio`, `mode`, `apn` and `sim`. The
-// parser for every form and each wrong usage, and what each verb prints and returns, against a fake
+// Tests for app/ModemCli.swift: the command-line verbs `network`, `radio`, `mode`, `apn`, `sim`, `usbmode`
+// and `at`. The parser for every form and each wrong usage or refusal, and what each verb prints (on standard
+// output and standard error) and returns, against a fake
 // ModemServing that records its calls and returns set results (no port is opened). The fixtures are the
 // modem's real answers (2026-11-15, firmware RM520NGLAAR03A04M4G_01.204.01.204). A password or PIN that
 // the fake `readSecret` gives must reach the service and appear in no output line. Built with swiftc by
@@ -101,12 +102,14 @@ final class FakeModem: ModemServing {
         .success(PinOutcome(accepted: true, sim: SimInfo(state: .ready, pinLock: true, pinAttempts: 3, pukAttempts: 10)))
     var usbModeResult: Result<UsbModeInfo, ModemFailure> = .success(UsbModeInfo(value: 0))
     var setUsbModeResult: Result<UsbModeChange, ModemFailure>? = nil  // nil: rebooting, or set for the next restart
+    var atResult: Result<[String], ModemFailure> = .success([])
 
     var radioAsked: [Bool] = []
     var modesAsked: [String] = []
     var profilesSet: [(id: Int, settings: ProfileSettings, redial: Bool)] = []
     var pinsEntered: [(pin: String, shownAttempts: Int)] = []
     var usbModesSet: [String] = []                                    // "<mode> reboot" or "<mode> no reboot"
+    var atSent: [String] = []                                         // "<line> <timeout>"
 
     func networkInfo() -> Result<NetworkInfo, ModemFailure> {
         events.append("networkInfo")
@@ -151,15 +154,21 @@ final class FakeModem: ModemServing {
         usbModesSet.append("\(mode.name) \(reboot ? "reboot" : "no reboot")")
         return setUsbModeResult ?? .success(reboot ? .rebooting : .setTakesEffectAfterRestart)
     }
+    func at(_ line: String, timeout: TimeInterval) -> Result<[String], ModemFailure> {
+        events.append("at")
+        atSent.append("\(line) \(timeout)")
+        return atResult
+    }
 }
 
-/// One run of a verb: what it printed, its exit code, the prompts the fake readSecret was asked, the
-/// questions the fake terminal was asked.
+/// One run of a verb: what it printed on standard output (`lines`) and on standard error (`errors`), its
+/// exit code, the prompts the fake readSecret was asked, the questions the fake terminal was asked.
 struct Run {
     let lines: [String]
     let code: Int32
     let prompts: [String]
     var questions: [String] = []
+    var errors: [String] = []
 }
 
 /// Parses `words` (which must be right usage) and runs it against `fake`; readSecret answers `secretAnswer`,
@@ -174,6 +183,7 @@ func run(_ words: [String], _ fake: FakeModem, driverProfile: Int? = 1, secretAn
     var lines: [String] = []
     var prompts: [String] = []
     var questions: [String] = []
+    var errors: [String] = []
     let code = runModem(command, service: fake, driverProfile: driverProfile,
                         readSecret: { prompt in
                             fake.events.append("readSecret")
@@ -188,16 +198,29 @@ func run(_ words: [String], _ fake: FakeModem, driverProfile: Int? = 1, secretAn
                         output: { line in
                             fake.events.append("output")
                             lines.append(line)
+                        },
+                        errorOutput: { line in
+                            fake.events.append("error")
+                            errors.append(line)
                         })
-    return Run(lines: lines, code: code, prompts: prompts, questions: questions)
+    return Run(lines: lines, code: code, prompts: prompts, questions: questions, errors: errors)
 }
 
 func linesText(_ lines: [String]) -> String {
     lines.map { "    \($0)" }.joined(separator: "\n")
 }
 
+/// The lines on standard output and the exit code; nothing on standard error.
 func expectLines(_ got: Run, _ want: [String], code: Int32, _ name: String) {
     check(got.lines == want, "\(name): the lines", "want\n\(linesText(want))\n  got\n\(linesText(got.lines))")
+    check(got.errors.isEmpty, "\(name): nothing on standard error", linesText(got.errors))
+    check(got.code == code, "\(name): exit \(code)", "got \(got.code)")
+}
+
+/// The lines on standard output and on standard error, and the exit code.
+func expectOutput(_ got: Run, out: [String], err: [String], code: Int32, _ name: String) {
+    check(got.lines == out, "\(name): standard output", "want\n\(linesText(out))\n  got\n\(linesText(got.lines))")
+    check(got.errors == err, "\(name): standard error", "want\n\(linesText(err))\n  got\n\(linesText(got.errors))")
     check(got.code == code, "\(name): exit \(code)", "got \(got.code)")
 }
 
@@ -252,11 +275,12 @@ let restoreProfile1 = "apn: to put it back: RMNet apn set --apn '' --type ipv4v6
 struct ModemCliTests {
     static func main() {
         // --- the verbs and the usage -------------------------------------------------------------
-        check(modemVerbs == ["network", "radio", "mode", "apn", "sim", "usbmode"], "modemVerbs", "\(modemVerbs.sorted())")
+        check(modemVerbs == ["network", "radio", "mode", "apn", "sim", "usbmode", "at"], "modemVerbs", "\(modemVerbs.sorted())")
         check(modemUsage == "network [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | apn [show] [--json] | "
               + "apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] [--password | --no-password] "
               + "[--auth none|pap|chap|pap-or-chap] [--no-redial] | sim [--json] | sim unlock [--last-attempt] | "
-              + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes]",
+              + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes] | "
+              + "at [--timeout <seconds>] <command>",
               "modemUsage: the brief's usage without the leading RMNet", modemUsage)
 
         // --- parseModem: every form --------------------------------------------------------------
@@ -343,6 +367,7 @@ struct ModemCliTests {
             ["usbmode", "set", "qmi", "--json"], ["usbmode", "set", "qmi", "--reboot"], ["usbmode", "set", "qmi", "ecm"],
             ["usbmode", "--json", "--json"], ["usbmode", "show"], ["usbmode", "qmi"], ["usbmode", "--yes"],
             ["usbmode", "--json", "set", "qmi"], ["usbmode", "set", "rmnet"], ["usbmode", "set", ""], ["usbMode"],
+            ["AT", "ATI"], ["At", "ATI"],
         ] {
             expectWrongUsage(words)
         }
@@ -356,6 +381,10 @@ struct ModemCliTests {
                                        .usbMode(json: false), .usbMode(json: true)]
         for c in changing { check(c.changesModem, "changesModem: \(c) changes the modem") }
         for c in reading { check(!c.changesModem, "changesModem: \(c) only reads") }
+        // `at` sends what the owner typed, also a change such as AT+CFUN=1,1, and Ctrl-C stops it all the same.
+        for c in [ModemCommand.at("AT+CFUN=1,1", timeout: 10), .at("ATI", timeout: 300), .atRefused("x")] {
+            check(!c.changesModem, "changesModem: \(c) is not a changing verb (Ctrl-C works)")
+        }
 
         // --- network -----------------------------------------------------------------------------
         let saLines = [
@@ -871,8 +900,146 @@ struct ModemCliTests {
         check(fake.pinsEntered.isEmpty, "sim unlock: the read failed, nothing sent")
 
         usbModeVerb()
+        atVerb()
 
         print("modem cli: \(checks) checks passed")
+    }
+
+    // --- at --------------------------------------------------------------------------------------
+    static func atVerb() {
+        let noCommand = "at: no command given; usage: RMNet at [--timeout <seconds>] <command>"
+        let badTimeout = "at: --timeout takes a whole number of seconds from 1 to 300"
+        let notAT = "at: a command starts with AT"
+        let notPrintable = "at: a command is printable ASCII only (no line end, tab or Ctrl-Z)"
+        let tooLong = "at: a command is at most 512 characters"
+        let cmgs = "at: AT+CMGS needs a message body; use RMNet sms send"
+        let cmgw = "at: AT+CMGW needs a message body; use RMNet sms send"
+        let cmgc = "at: AT+CMGC needs a second stage after a > prompt; RMNet at sends one line only"
+        let qcmgs = "at: AT+QCMGS needs a second stage after a > prompt; RMNet at sends one line only"
+        func lockout(_ what: String) -> String {
+            "at: RMNet at does not send \(what) (it would switch the AT port to data mode or change how the modem answers, "
+                + "and RMNet's own AT features would stop working)"
+        }
+        let longest = "AT+" + String(repeating: "A", count: 509)       // 512 characters
+        let tooLongLine = longest + "A"                                // 513
+
+        // Parsing: the words after the options joined with single spaces, sent as typed.
+        expectParse(["at", "ATI"], .at("ATI", timeout: 10))
+        expectParse(["at", "AT+CSQ"], .at("AT+CSQ", timeout: 10))
+        expectParse(["at", "--timeout", "60", "AT+COPS=?"], .at("AT+COPS=?", timeout: 60))
+        expectParse(["at", "--timeout", "1", "ATI"], .at("ATI", timeout: 1))
+        expectParse(["at", "--timeout", "300", "ATI"], .at("ATI", timeout: 300))
+        // `RMNet at AT+QCFG=\"usbnet\"` and `RMNet at 'AT+QCFG="usbnet"'` both give the shell's one word.
+        expectParse(["at", "AT+QCFG=\"usbnet\""], .at("AT+QCFG=\"usbnet\"", timeout: 10))
+        // `RMNet at AT+COPS=1,0,\"CHINA MOBILE\"`: two words, joined with one space.
+        expectParse(["at", "AT+COPS=1,0,\"CHINA", "MOBILE\""], .at("AT+COPS=1,0,\"CHINA MOBILE\"", timeout: 10))
+        expectParse(["at", "AT+QCFG=\"usbnet\",0"], .at("AT+QCFG=\"usbnet\",0", timeout: 10))
+        expectParse(["at", "ati"], .at("ati", timeout: 10))
+        expectParse(["at", "AT"], .at("AT", timeout: 10))
+        expectParse(["at", "AT+CMGL=4"], .at("AT+CMGL=4", timeout: 10))
+        // The other SMS commands, and settings that leave the port working, are sent.
+        for line in ["AT+CMGR=1", "AT+QCMGR=1", "AT+CMGD=1", "AT+CMGF=0", "AT+CPMS?", "ATS3?", "ATS4?", "ATS0=0", "AT&F",
+                     "AT&V", "ATZ", "ATE0", "ATE1", "ATI", "AT+QCFG=\"usbnet\"", "AT+CGDCONT?"] {
+            expectParse(["at", line], .at(line, timeout: 10))
+        }
+        expectParse(["at", longest], .at(longest, timeout: 10))
+        // Spaces at the ends are dropped (the port's echo check would never match them); inside, kept.
+        expectParse(["at", "ATI "], .at("ATI", timeout: 10))
+        expectParse(["at", "ATI", ""], .at("ATI", timeout: 10))
+        expectParse(["at", "", "ATI"], .at("ATI", timeout: 10))
+        expectParse(["at", "AT+COPS=1,0,\"A  B\""], .at("AT+COPS=1,0,\"A  B\"", timeout: 10))
+
+        // Refused: one line on standard error, exit 2, nothing sent (the fake records no call).
+        let refusals: [([String], String)] = [
+            (["at"], noCommand), (["at", ""], noCommand), (["at", " "], noCommand), (["at", "--timeout", "10"], noCommand),
+            (["at", "--timeout", "0", "ATI"], badTimeout), (["at", "--timeout", "301", "ATI"], badTimeout),
+            (["at", "--timeout"], badTimeout), (["at", "--timeout", "abc", "ATI"], badTimeout),
+            (["at", "--timeout", "-5", "ATI"], badTimeout), (["at", "--timeout", "1.5", "ATI"], badTimeout),
+            (["at", "--timeout", "", "ATI"], badTimeout), (["at", "--timeout", "ATI"], badTimeout),
+            (["at", "hello"], notAT), (["at", "A"], notAT), (["at", "+CSQ"], notAT), (["at", "--json", "ATI"], notAT),
+            (["at", "--timeout", "5", "--timeout", "6", "ATI"], notAT),
+            (["at", "ATI\rAT+CFUN=0"], notPrintable), (["at", "ATI\r"], notPrintable), (["at", "ATI\n"], notPrintable),
+            (["at", "ATI\u{1A}"], notPrintable), (["at", "AT+CMGS=\"123\"\u{1A}"], notPrintable),
+            (["at", "AT\tI"], notPrintable), (["at", "AT\u{E9}"], notPrintable), (["at", "AT\u{7F}"], notPrintable),
+            (["at", "AT\u{1B}"], notPrintable), (["at", "AT\u{202E}I"], notPrintable),
+            (["at", tooLongLine], tooLong),
+            (["at", "at+cmgs=\"123\""], cmgs), (["at", "AT+CMGS=\"123\""], cmgs), (["at", "At+CmGs"], cmgs),
+            (["at", "AT+CMGS=23"], cmgs), (["at", "AT+CMGW"], cmgw), (["at", "at+cmgw=\"123\""], cmgw),
+            // A prompt command anywhere in the line, spaces removed; also inside a quoted string.
+            (["at", "AT+CSQ;+CMGS=\"1\""], cmgs), (["at", "ATE1+CMGS=1"], cmgs), (["at", "AT", "+CMGS=1"], cmgs),
+            (["at", "AT+C", "MGS=1"], cmgs), (["at", "AT+QCFG=\"x+cmgs\""], cmgs), (["at", "AT+CSQ;+cmgw=1"], cmgw),
+            (["at", "AT+CMGC=1"], cmgc), (["at", "at+cmgc"], cmgc), (["at", "AT+CSQ;+CMGC=2"], cmgc), (["at", "AT +CMGC"], cmgc),
+            (["at", "AT+QCMGS=\"1\",1,1,1"], qcmgs), (["at", "at+qcmgs"], qcmgs), (["at", "AT+CSQ;+QCMGS"], qcmgs),
+            (["at", "AT", "+QCMGS"], qcmgs),
+            // Data mode, and how the modem answers: the first basic command after AT, spaces removed.
+            (["at", "ATD*99#"], lockout("ATD")), (["at", "ATDT123;"], lockout("ATD")), (["at", "atd123"], lockout("ATD")),
+            (["at", "AT", "D123"], lockout("ATD")), (["at", "ATD"], lockout("ATD")),
+            (["at", "ATO"], lockout("ATO")), (["at", "ATO0"], lockout("ATO")), (["at", "ato"], lockout("ATO")),
+            (["at", "ATV0"], lockout("ATV")), (["at", "ATV1"], lockout("ATV")), (["at", "atv"], lockout("ATV")),
+            (["at", "AT V0"], lockout("ATV")),
+            (["at", "ATQ1"], lockout("ATQ")), (["at", "ATQ0"], lockout("ATQ")), (["at", "atq"], lockout("ATQ")),
+            // The line-end characters (S3, S4) anywhere, and &W, which would keep such settings.
+            (["at", "ATS3=10"], lockout("ATS3=")), (["at", "ATE1S3=13"], lockout("ATS3=")),
+            (["at", "AT", "S3", "=", "13"], lockout("ATS3=")), (["at", "ats3=13"], lockout("ATS3=")),
+            (["at", "ATS4=10"], lockout("ATS4=")), (["at", "AT+CSQ;S4=10"], lockout("ATS4=")),
+            (["at", "AT&W"], lockout("AT&W")), (["at", "AT&W0"], lockout("AT&W")), (["at", "ATE0&W"], lockout("AT&W")),
+            (["at", "AT&F&W"], lockout("AT&W")), (["at", "at&w"], lockout("AT&W")), (["at", "AT+CSQ;& W"], lockout("AT&W")),
+        ]
+        for (words, line) in refusals {
+            let fake = FakeModem()
+            let refused = run(words, fake, "\(words.debugDescription)")
+            expectOutput(refused, out: [], err: [line], code: 2, "\(words.debugDescription): refused")
+            check(fake.atSent.isEmpty && fake.events == ["error"], "\(words.debugDescription): refused, nothing sent",
+                  "\(fake.events) \(fake.atSent)")
+        }
+
+        // The answer: each line, then OK.
+        var fake = FakeModem()
+        fake.atResult = .success(["Quectel", "RM520N-GL", "Revision: X"])
+        expectOutput(run(["at", "ATI"], fake, "at ATI"), out: ["Quectel", "RM520N-GL", "Revision: X", "OK"], err: [],
+                     code: 0, "at ATI: the answer lines, then OK")
+        check(fake.atSent == ["ATI 10.0"] && fake.events.filter({ $0 != "output" }) == ["at"],
+              "at ATI: one call, ATI with 10 s", "\(fake.atSent) \(fake.events)")
+        fake = FakeModem()
+        expectOutput(run(["at", "--timeout", "60", "AT+COPS=?"], fake, "at --timeout 60"), out: ["OK"], err: [], code: 0,
+                     "at AT+COPS=?: OK alone")
+        check(fake.atSent == ["AT+COPS=? 60.0"], "at --timeout 60: the service gets 60 s", "\(fake.atSent)")
+        fake = FakeModem()
+        fake.atResult = .success(["+CSQ: 20,99"])
+        expectOutput(run(["at", "AT+COPS=1,0,\"CHINA", "MOBILE\""], fake, "at, two words"), out: ["+CSQ: 20,99", "OK"],
+                     err: [], code: 0, "at, two words: the answer")
+        check(fake.atSent == ["AT+COPS=1,0,\"CHINA MOBILE\" 10.0"], "at, two words: one line, one space", "\(fake.atSent)")
+        // An answer line is printed display-safe, as all text from the modem.
+        fake = FakeModem()
+        fake.atResult = .success(["a\u{202E}b\u{85}c"])
+        expectOutput(run(["at", "AT+CMGL=4"], fake, "at, unsafe text"), out: ["a\u{FFFD}b\u{FFFD}c", "OK"], err: [], code: 0,
+                     "at: an answer line is made display-safe")
+
+        // The modem's error line: on standard output, as an AT terminal shows it; exit 1.
+        for errorLine in ["ERROR", "+CME ERROR: 10", "+CMS ERROR: 500"] {
+            fake = FakeModem()
+            fake.atResult = .failure(ModemFailure(message: errorLine, atKind: .modemError))
+            expectOutput(run(["at", "AT+QGPS=1"], fake, "at, \(errorLine)"), out: [errorLine], err: [], code: 1,
+                         "at: \(errorLine) on standard output, exit 1")
+        }
+
+        // No answer in time: `at: no answer in <n> s` with the timeout given; exit 1.
+        for (words, seconds) in [(["at", "ATI"], 10), (["at", "--timeout", "60", "AT+COPS=?"], 60),
+                                 (["at", "--timeout", "1", "ATI"], 1)] {
+            fake = FakeModem()
+            fake.atResult = .failure(ModemFailure(message: "The modem did not answer in time.", atKind: .timeout))
+            expectOutput(run(words, fake, "\(words), timeout"), out: [], err: ["at: no answer in \(seconds) s"], code: 1,
+                         "\(words): a timeout")
+        }
+
+        // Any other failure: its text on standard error, exit 1.
+        for message in ["The RM520N-GL (USB 2c7c:0801) is not attached.", "The modem did not answer in time.",
+                        "Another program is using the modem's spare AT port."] {
+            fake = FakeModem()
+            fake.atResult = .failure(ModemFailure(message: message))
+            expectOutput(run(["at", "ATI"], fake, "at, \(message)"), out: [], err: ["at: \(message)"], code: 1,
+                         "at: a failure (\(message))")
+        }
     }
 
     // --- usbmode ---------------------------------------------------------------------------------

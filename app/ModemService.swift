@@ -1,8 +1,8 @@
 // The modem over its spare AT port (USB interface 3): the network read, the radio, the network mode, the
-// USB network mode (with the restart that puts it in effect), the data profiles (with the redial that
-// makes the driver dial with new settings) and the SIM's PIN. The models in ModemNetwork.swift and
-// ModemSettings.swift read the answers and write the lines that change the modem; this file only puts them
-// in order. Each call opens a port, works and closes it, also on failure.
+// USB network mode (with the restart that puts it in effect), one command as the owner typed it (`RMNet at`),
+// the data profiles (with the redial that makes the driver dial with new settings) and the SIM's PIN. The
+// models in ModemNetwork.swift and ModemSettings.swift read the answers and write the lines that change the
+// modem; this file only puts them in order. Each call opens a port, works and closes it, also on failure.
 // After a timeout or an I/O error nothing more is sent on that port (AtPort closes itself after a timeout),
 // so the call ends there; only a redial then opens a second port, to switch the radio back on. Calls block
 // (a redial usually up to about 40 s, longer when the port fails) and must not be made on the main thread.
@@ -275,6 +275,29 @@ final class ModemService: ModemServing {
             case .failure(let error):
                 return failure("The USB mode is now \(mode.name). It is not known whether the modem is restarting. "
                                + "\(describe(error)) If it does not restart, the new mode \(nextRestart)")
+            }
+        }
+    }
+
+    // MARK: One command as typed (`RMNet at`)
+
+    /// Sends `line` as it is, once, and gives the modem `timeout` to answer: on its final OK, the answer's lines
+    /// (AtPort's, without the echo and the OK). The modem's error line is a failure whose message is that line
+    /// (`atKind` .modemError); no answer in time is a failure saying so (.timeout); a port that does not open,
+    /// or an I/O error, a failure saying so (no `atKind`). A line `atCommandProblem` refuses is not sent: no
+    /// port is opened.
+    func at(_ line: String, timeout: TimeInterval) -> Result<[String], ModemFailure> {
+        if let problem = atCommandProblem(line) { return failure("\(problem); nothing was sent") }
+        return withPort({ describe($0) }) { link in
+            switch link.command(line, timeout: timeout) {
+            case .success(let lines):
+                return .success(lines)
+            case .failure(.modem(let errorLine)):
+                return .failure(ModemFailure(message: errorLine, atKind: .modemError))
+            case .failure(.timeout):
+                return .failure(ModemFailure(message: describe(.timeout), atKind: .timeout))
+            case .failure(let error):
+                return failure(describe(error))
             }
         }
     }

@@ -311,7 +311,8 @@ struct StatusView: View {
             if controller.known {
                 ForEach(advice(status, bundledVersion: controller.bundledVersion), id: \.self) { line in
                     Text(line)
-                        .font(line.hasPrefix("AT+") || line == usbModeQmiCommand ? .body.monospaced() : .body)
+                        .font(line.hasPrefix("AT+") || line == usbModeQmiCommand || atFallbackCommands.contains(line)
+                              ? .body.monospaced() : .body)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 }

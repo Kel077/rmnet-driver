@@ -46,9 +46,9 @@ RMNet usbmode set qmi    # asks, then restarts the modem (about 30 s)
 
 - `RMNet` here and below is the app's command-line side, `/Applications/RMNet.app/Contents/MacOS/RMNet`. An alias saves typing: `alias RMNet=/Applications/RMNet.app/Contents/MacOS/RMNet`.
 - These commands talk to the modem's spare AT port (USB interface 3) directly, from user space, so they work before the driver is installed or approved. They need the app, which the next section builds: on a new modem, install first, then check the mode. When the modem comes back in QMI mode, the driver attaches by itself.
-- `usbmode set` changes nothing when the modem is already in that mode. `--yes` skips the question; `--no-reboot` saves the mode for the next restart (a replug, or `AT+CFUN=1,1`).
-- **This project has no general AT terminal.** macOS gives the modem's AT ports no device (no `/dev/cu.*` to open with a terminal program, with or without the driver), and RMNet sends only the AT commands behind its own verbs and tabs. Setting the USB mode (`RMNet usbmode`) is the one AT task in this README that the app does for you; for any other AT command named here (`AT+QGPS=1` for `RMNet gps`, and the caveat below) you need another tool that can reach the modem's AT port.
-- **Caveat.** RMNet looks for the modem's AT port only on USB product `2c7c:0801`, the RM520N-GL's ID in QMI mode. Whether the RM520N-GL keeps that ID in ECM, MBIM or RNDIS mode is not known. If it does not, RMNet cannot find the modem (`usb mode: The RM520N-GL (USB 2c7c:0801) is not attached.`), and another AT terminal must send `AT+QCFG="usbnet",0`, then `AT+CFUN=1,1` (or, instead of the second, unplug the modem and plug it back in). So do not switch to another mode without such a terminal; a modem that arrives in another mode may need one too.
+- `usbmode set` changes nothing when the modem is already in that mode. `--yes` skips the question; `--no-reboot` saves the mode for the next restart (a replug, or `RMNet at AT+CFUN=1,1`).
+- **`RMNet at` sends any other AT command.** macOS gives the modem's AT ports no device (no `/dev/cu.*` to open with a terminal program, with or without the driver), so the app sends them itself: `RMNet at <command>` sends one command and prints the modem's answer, for example `RMNet at AT+QGPS=1` to switch GNSS on for `RMNet gps`, or `RMNet at AT+CFUN=1,1` to restart the modem. Put a command with quotes in single quotes for the shell: `RMNet at 'AT+QCFG="usbnet"'`. Like `usbmode`, it finds the modem only on USB product `2c7c:0801` (the caveat below).
+- **Caveat.** RMNet looks for the modem's AT port only on USB product `2c7c:0801`, the RM520N-GL's ID in QMI mode, for `usbmode` and `at` alike. Whether the RM520N-GL keeps that ID in ECM, MBIM or RNDIS mode is not known. If it does, `RMNet usbmode set qmi` switches it back (or, by hand, `RMNet at 'AT+QCFG="usbnet",0'`, then `RMNet at AT+CFUN=1,1`). If it does not, RMNet cannot find the modem (`usb mode: The RM520N-GL (USB 2c7c:0801) is not attached.`), `RMNet at` included, and an AT terminal outside this project must send `AT+QCFG="usbnet",0`, then `AT+CFUN=1,1` (or, instead of the second, unplug the modem and plug it back in). So do not switch to another mode without such a terminal; a modem that arrives in another mode may need one too.
 
 ## Build and install
 
@@ -60,7 +60,7 @@ The script builds the app and its driver signed, under your team and bundle ID, 
 
 - **The first time**, macOS asks for your approval: open System Settings → General → Login Items & Extensions → Driver Extensions, and turn the RMNet driver on. The script waits (`waiting for approval in System Settings`) until you do. Later builds need no new approval.
 - The script refuses, changing nothing, when `config.local` is missing or invalid, when `/Applications/RMNet.app` has another bundle ID, when an installed driver version has no kept app in `build/installed/`, or when a build was already installed in the same minute (wait a minute).
-- **A newer build does not replace a running one at once.** If the script's last step prints `an older build is still running`, unplug the modem and plug it back in (or send it `AT+CFUN=1,1`), and the new build loads.
+- **A newer build does not replace a running one at once.** If the script's last step prints `an older build is still running`, unplug the modem and plug it back in (or run `RMNet at AT+CFUN=1,1`), and the new build loads.
 
 Check that it works:
 
@@ -83,19 +83,20 @@ ping -c 3 -b en33 1.1.1.1       # bound to the port, whatever the service order
 |---|---|
 | `RMNet status [--json]` | Whether the driver is installed and the modem attached in QMI mode; the driver's state, addresses and counters. |
 | `RMNet sms list [--json]`<br>`RMNet sms send <number> <text>`<br>`RMNet sms delete <index>...` | List, send and delete the modem's text messages. Each message sent costs a carrier fee. |
-| `RMNet gps [seconds]` | The position from the modem's GNSS receiver. It needs the driver attached (it reads the NMEA serial port) and GNSS already switched on with `AT+QGPS=1`, which RMNet does not send: use another AT terminal (this project has none, see "The modem's USB mode"). |
+| `RMNet gps [seconds]` | The position from the modem's GNSS receiver. It needs the driver attached (it reads the NMEA serial port) and GNSS already switched on, which `gps` does not do: `RMNet at AT+QGPS=1`. |
 | `RMNet network [--json]` | Registration, operator, technology, band, signal and cell. |
 | `RMNet radio [on\|off]` | Show the radio's state, or switch it. `off` is airplane mode: no connection until `radio on`. |
 | `RMNet mode [auto\|nr5g\|lte\|lte:nr5g\|…]` | Show or set the network mode. The modem keeps it; the command prints how to put it back. |
 | `RMNet apn [show] [--json]`<br>`RMNet apn set [--apn <name>] [--type ipv4\|ipv6\|ipv4v6] [--user <name>] [--password \| --no-password] [--auth none\|pap\|chap\|pap-or-chap] [--no-redial]` | Show the data profiles, or change the one the driver dials. A change redials: the connection drops for about 10 to 30 s. |
 | `RMNet sim [--json]`<br>`RMNet sim unlock [--last-attempt]` | The SIM's state and the attempts left; enter its PIN (asked without echo; the last attempt only with `--last-attempt`). |
 | `RMNet usbmode [--json]`<br>`RMNet usbmode set qmi\|ecm\|mbim\|rndis [--no-reboot] [--yes]` | Show or set the modem's USB mode (above). |
+| `RMNet at [--timeout <s>] <command>` | Send one AT command and print the answer (above). It waits 10 s for the answer, or `--timeout` seconds (1 to 300). It refuses the SMS commands that wait at a `>` prompt (use `sms send`) and the commands that would stop RMNet's own AT features from working (dialling, `ATO`, `ATV`, `ATQ`, `S3=`, `S4=`, `&W`). |
 | `RMNet activate` | Install or update the driver this app carries (the install script runs it). |
 | `RMNet deactivate` | Remove the driver; macOS asks for an administrator's password (below). |
 
-- The modem commands (`sms`, `network`, `radio`, `mode`, `apn`, `sim`, `usbmode`) use the modem's spare AT port, USB interface 3. They exit 0 on success, 1 on a failure (one line saying why) and 2 on wrong usage; `usbmode set` also exits 2, changing nothing, when it has no terminal to ask on (run from a script, give it `--yes`).
-- Ctrl-C does not interrupt a command that changes the modem (except at a password or PIN prompt, before anything is sent), so a redial is never cut short with the radio off.
-- RMNet never logs or writes to disk message texts, phone numbers, passwords, PINs or your position.
+- The modem commands (`sms`, `network`, `radio`, `mode`, `apn`, `sim`, `usbmode`, `at`) use the modem's spare AT port, USB interface 3. They exit 0 on success, 1 on a failure (one line saying why) and 2 on wrong usage; `usbmode set` also exits 2, changing nothing, when it has no terminal to ask on (run from a script, give it `--yes`). `at` prints the modem's error line as its answer (exit 1), and its own refusals (exit 2, nothing sent) and failures on standard error.
+- Ctrl-C does not interrupt a command that changes the modem (except at a password or PIN prompt, before anything is sent), so a redial is never cut short with the radio off. `RMNet at` is not one of them: Ctrl-C stops it, though a command already sent may still be carried out.
+- RMNet never logs or writes to disk message texts, phone numbers, passwords, PINs, your position, or what `RMNet at` sends and prints.
 - Every option and every line each command prints is in [docs/reference.md](docs/reference.md), "Driver".
 
 Opened with no argument (from the Finder, or `open /Applications/RMNet.app`), the app shows one window with four tabs:
@@ -124,7 +125,7 @@ Do not switch the driver off in System Settings while the modem is attached: the
 - **`Installed, modem not attached`.** No matching modem is on USB; the `modem:` line of `RMNet status` lists the products looked for.
 - **The port has no address.** `RMNet status` shows `RMNetState`. `RMNet network` says whether the modem is registered and the radio on, `RMNet sim` whether the SIM waits for its PIN, and `RMNet apn` which profile the driver dials and its APN. A wrong APN breaks the connection: set your carrier's with `RMNet apn set --apn <name>`.
 - **The driver's log.** `scripts/driver-log.sh` follows the driver's lines (they start with `RMNet:`) and saves them in `build/logs/`. macOS does not keep them for later, so start it before you replug, reinstall or reproduce the problem.
-- **`an older build is still running`.** Unplug the modem and plug it back in, or send it `AT+CFUN=1,1`.
+- **`an older build is still running`.** Unplug the modem and plug it back in, or run `RMNet at AT+CFUN=1,1`.
 - **After a macOS update.** Not tried yet. If the driver stops loading, check `RMNet status` and `systemextensionsctl list`, update Xcode if the new macOS needs it, and run `scripts/install-driver.sh` again.
 - **Connected, but nothing goes over the modem.** See the service order below.
 
