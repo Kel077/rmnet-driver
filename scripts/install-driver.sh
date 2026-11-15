@@ -17,7 +17,7 @@
 set -eu
 
 cd "$(dirname "$0")/.." || exit 1
-. ./scripts/install-checks.sh # missing_kept_apps, running_line
+. ./scripts/install-checks.sh # installed_id_line, missing_kept_apps, running_line
 . ./scripts/config.sh         # rmnet_config_require: TEAM_ID, BUNDLE_ID, DRIVER_ID
 rmnet_config_require || exit 2
 
@@ -25,6 +25,19 @@ BUILD="$PWD/build/xcode-signed"
 NEW="$BUILD/Release/RMNet.app"
 APP=/Applications/RMNet.app
 KEEP="$PWD/build/installed"
+
+# The app to be replaced must have the configured bundle ID, before anything is built or changed:
+# every check below goes by $DRIVER_ID, so an app under another ID (config.local changed, or a typo)
+# would be removed without a kept copy.
+installed_id=
+if [ -e "$APP" ]; then
+  installed_id=$(/usr/bin/defaults read "$APP/Contents/Info" CFBundleIdentifier 2>/dev/null) &&
+    [ -n "$installed_id" ] || installed_id='(none readable)'
+fi
+if ! id_line=$(installed_id_line "$installed_id" "$BUNDLE_ID"); then
+  echo "install-driver: $APP: $id_line" >&2
+  exit 2
+fi
 
 now=$(date -u +%s)
 epoch=$(date -u -j -f '%Y-%m-%d %H:%M:%S' '2026-01-01 00:00:00' +%s)

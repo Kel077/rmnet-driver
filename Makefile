@@ -140,10 +140,11 @@ build/quit-tests: app/SmsModel.swift app/SmsController.swift app/ModemNetwork.sw
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
-# The scripts' decisions that need neither the network nor an install: the install script's kept-app
-# and running-driver checks (scripts/install-checks.sh), soak.sh's status classes (--classify), and the
-# driver's personalities against the model list (scripts/check-personalities.sh), and the build's
-# team and bundle IDs from config.local or the environment (scripts/config.sh, gen.rb's options).
+# The scripts' decisions that need neither the network nor an install: the install script's
+# installed-app ID, kept-app and running-driver checks (scripts/install-checks.sh), soak.sh's status
+# classes (--classify), the driver's personalities against the model list
+# (scripts/check-personalities.sh), and the build's team and bundle IDs from config.local or the
+# environment (scripts/config.sh, gen.rb's options).
 script-test:
 	sh tests/scripts/test-install-checks.sh
 	sh tests/scripts/test-soak-classify.sh
