@@ -1,5 +1,6 @@
 // Tests for app/ModemService.swift: the AT sequences of the modem service (the network read, the radio, the
-// network mode, the USB network mode, one command as typed for `RMNet at`, the data profiles with the redial,
+// network mode, the USB network mode, the LTE and 5G bands, one command as typed for `RMNet at`, the data
+// profiles with the redial,
 // the SIM and PIN entry), run against
 // a scripted port that answers from a queue and records every line sent, an opener that counts the ports it
 // hands out, and a fake clock that `sleep` moves on. The fixtures are the modem's real answers (2026-11-15,
@@ -301,6 +302,25 @@ let simLines = ["AT+CPIN?", "AT+QPINC?", "AT+CLCK=\"SC\",2"]
 let pin = "73519"
 let pinLine = "AT+CPIN=\"73519\""
 
+// The bands, as the modem answered on 2026-11-15: AT+QNWPREFCFG="ue_capability_band" gives five lines (the
+// gw_band and nrdc_nr5g_band lines are not used), and each RAT's own setting allows every supported band.
+let lteList = "1:2:3:4:5:7:8:12:13:14:17:18:19:20:25:26:28:29:30:32:34:38:39:40:41:42:43:46:48:66:71"
+let nrList = "1:2:3:5:7:8:12:13:14:18:20:25:26:28:29:30:38:40:41:48:66:70:71:75:76:77:78:79"
+let lteSupported = [1, 2, 3, 4, 5, 7, 8, 12, 13, 14, 17, 18, 19, 20, 25, 26, 28, 29, 30, 32, 34, 38, 39, 40, 41, 42, 43,
+                    46, 48, 66, 71]
+let nrSupported = [1, 2, 3, 5, 7, 8, 12, 13, 14, 18, 20, 25, 26, 28, 29, 30, 38, 40, 41, 48, 66, 70, 71, 75, 76, 77, 78, 79]
+let nrWords = "1, 2, 3, 5, 7, 8, 12, 13, 14, 18, 20, 25, 26, 28, 29, 30, 38, 40, 41, 48, 66, 70, 71, 75, 76, 77, 78, 79"
+let capabilityLines = [
+    "+QNWPREFCFG: \"gw_band\",1:2:4:5:8:19",
+    "+QNWPREFCFG: \"lte_band\",\(lteList)",
+    "+QNWPREFCFG: \"nsa_nr5g_band\",\(nrList)",
+    "+QNWPREFCFG: \"nr5g_band\",\(nrList)",
+    "+QNWPREFCFG: \"nrdc_nr5g_band\",0",
+]
+let capabilityRead = "AT+QNWPREFCFG=\"ue_capability_band\""
+func bandRead(_ key: String) -> String { "AT+QNWPREFCFG=\"\(key)\"" }
+func bandAnswer(_ key: String, _ list: String) -> Answer { .success(["+QNWPREFCFG: \"\(key)\",\(list)"]) }
+
 /// The redial's lines before the change: the settings now, the radio's state, the radio off.
 let redialStart: [(String, Answer)] = [("AT+QICSGP=1", qicsgp1), ("AT+CFUN?", cfunOn), ("AT+CFUN=4", ok)]
 
@@ -312,6 +332,8 @@ struct ModemServiceTests {
         radio()
         mode()
         usbMode()
+        bandsRead()
+        bandsChange()
         atCommand()
         profiles()
         profileChange()
@@ -756,6 +778,283 @@ struct ModemServiceTests {
                         + "If it does not restart, the new mode takes effect at the next restart (AT+CFUN=1,1 or a replug).",
                         "setUsbMode: a restart without an answer: \(words)")
             rig.finish("setUsbMode, restart: \(words)", opens: 1)
+        }
+    }
+
+    // MARK: bands
+
+    static func bandsRead() {
+        let reads = [capabilityRead, bandRead("lte_band"), bandRead("nsa_nr5g_band"), bandRead("nr5g_band")]
+        func script(lte: Answer = bandAnswer("lte_band", lteList), nsa: Answer = bandAnswer("nsa_nr5g_band", nrList),
+                    sa: Answer = bandAnswer("nr5g_band", nrList),
+                    capability: Answer = .success(capabilityLines)) -> [(String, Answer)] {
+            [(capabilityRead, capability), (bandRead("lte_band"), lte), (bandRead("nsa_nr5g_band"), nsa),
+             (bandRead("nr5g_band"), sa)]
+        }
+
+        // The values.
+        check(BandRat.allCases == [.lte, .nsa, .sa], "BandRat: lte, nsa, sa in that order")
+        check(BandRat.allCases.map { $0.rawValue } == ["lte", "nsa", "sa"], "BandRat: raw values lte, nsa, sa")
+        check(BandRat.allCases.map { $0.key } == ["lte_band", "nsa_nr5g_band", "nr5g_band"],
+              "BandRat: the modem's keys", "\(BandRat.allCases.map { $0.key })")
+        check(BandRat.allCases.map { $0.name } == ["LTE", "5G NSA", "5G SA"], "BandRat: the display names",
+              "\(BandRat.allCases.map { $0.name })")
+
+        // The modem's answers as they are: every supported band allowed.
+        do {
+            let rig = Rig(script())
+            let sets = success(rig.service.bands(), "bands")
+            check(sets == [BandSet(rat: .lte, allowed: lteSupported, supported: lteSupported),
+                           BandSet(rat: .nsa, allowed: nrSupported, supported: nrSupported),
+                           BandSet(rat: .sa, allowed: nrSupported, supported: nrSupported)],
+                  "bands: the three RATs, each allowing every supported band", "\(String(describing: sets))")
+            check(sets?.map { $0.supported.count } == [31, 28, 28], "bands: 31 LTE, 28 NSA, 28 SA bands supported")
+            expectLines(rig.port(1).lines, reads, "bands: the capability read, then lte, nsa, sa")
+            check(rig.port(1).sent.map { $0.timeout } == [3, 3, 3, 3], "bands: each read has 3 s",
+                  "\(rig.port(1).sent.map { $0.timeout })")
+            rig.finish("bands", opens: 1)
+        }
+        do {
+            // Locked: the allowed lists sorted, each band once; 0 alone is none.
+            let rig = Rig(script(lte: bandAnswer("lte_band", "41:3:3"), nsa: bandAnswer("nsa_nr5g_band", "0"),
+                                 sa: bandAnswer("nr5g_band", "78:41")))
+            let sets = success(rig.service.bands(), "bands, locked")
+            check(sets == [BandSet(rat: .lte, allowed: [3, 41], supported: lteSupported),
+                           BandSet(rat: .nsa, allowed: [], supported: nrSupported),
+                           BandSet(rat: .sa, allowed: [41, 78], supported: nrSupported)],
+                  "bands: allowed lists sorted and unique; 0 alone is none", "\(String(describing: sets))")
+            rig.finish("bands, locked", opens: 1)
+        }
+        do {
+            // The capability lines in another order, with other lines among them.
+            let shuffled: Answer = .success(["+QNWPREFCFG: \"nr5g_band\",\(nrList)", "+QNWPREFCFG: \"nrdc_nr5g_band\",0",
+                                             "+QNWPREFCFG: \"lte_band\",\(lteList)", "+QNWPREFCFG: \"gw_band\",1:2:4:5:8:19",
+                                             "+QNWPREFCFG: \"nsa_nr5g_band\",\(nrList)"])
+            let rig = Rig(script(capability: shuffled))
+            let sets = success(rig.service.bands(), "bands, shuffled capability")
+            check(sets?.map { $0.rat } == [.lte, .nsa, .sa] && sets?.map { $0.supported.count } == [31, 28, 28],
+                  "bands: the capability lines found by key, in any order", "\(String(describing: sets))")
+            rig.finish("bands, shuffled capability", opens: 1)
+        }
+
+        // The parsing itself.
+        check(parseBandList(capabilityLines, key: "lte_band") == lteSupported, "parseBandList: lte_band")
+        check(parseBandList(capabilityLines, key: "nr5g_band") == nrSupported, "parseBandList: nr5g_band")
+        check(parseBandList(capabilityLines, key: "nrdc_nr5g_band") == [], "parseBandList: 0 alone is none")
+        check(parseBandList(capabilityLines, key: "gw_band") == [1, 2, 4, 5, 8, 19], "parseBandList: gw_band")
+        check(parseBandList(["+QNWPREFCFG: \"lte_band\",41"], key: "lte_band") == [41], "parseBandList: one band")
+        check(parseBandList(["+QNWPREFCFG: \"lte_band\",41:3:41"], key: "lte_band") == [3, 41],
+              "parseBandList: sorted, each band once")
+        check(parseBandList([" +QNWPREFCFG: \"lte_band\",3:41 "], key: "lte_band") == [3, 41],
+              "parseBandList: spaces around the line are ignored")
+        check(parseBandList(capabilityLines, key: "nr5g") == nil, "parseBandList: a key is matched whole")
+        check(parseBandList([], key: "lte_band") == nil, "parseBandList: no lines, nil")
+        check(parseBandList(["+QNWPREFCFG: \"mode_pref\",AUTO"], key: "lte_band") == nil, "parseBandList: another key, nil")
+        for bad in ["", "1::3", "1:3:", ":1", "1:x:3", "x", "0:3", "3:0", "1;3", "1,3", "+3", "-3", "3 :41", "1.5",
+                    "\u{0663}", "99999999999999999999"] {
+            check(parseBandList(["+QNWPREFCFG: \"lte_band\",\(bad)"], key: "lte_band") == nil,
+                  "parseBandList: \(bad.debugDescription) is unparsable, nil")
+        }
+        check(parseBandList(["+QNWPREFCFG: \"lte_band\""], key: "lte_band") == nil, "parseBandList: no list, nil")
+        check(parseBandList(["+QNWPREFCFG: \"lte_band\",3,41"], key: "lte_band") == nil,
+              "parseBandList: a third field is unparsable, nil")
+        check(bandsCommand(.lte, [3, 41]) == "AT+QNWPREFCFG=\"lte_band\",3:41", "bandsCommand: lte 3:41")
+        check(bandsCommand(.nsa, [78]) == "AT+QNWPREFCFG=\"nsa_nr5g_band\",78", "bandsCommand: nsa 78")
+        check(bandsCommand(.sa, [41, 1]) == "AT+QNWPREFCFG=\"nr5g_band\",1:41", "bandsCommand: sorted")
+        check(bandsCommand(.sa, [41, 41, 78]) == "AT+QNWPREFCFG=\"nr5g_band\",41:78", "bandsCommand: each band once")
+        expectEqual(bandListWords([3, 41]), "3, 41", "bandListWords: comma and space")
+        expectEqual(bandListWords([41, 3, 3]), "3, 41", "bandListWords: ascending, each once")
+        expectEqual(bandListWords([]), "none", "bandListWords: none")
+
+        // A key the modem did not report, or a list that cannot be read: a failure saying so.
+        for (rat, name) in [(BandRat.lte, "LTE"), (.nsa, "5G NSA"), (.sa, "5G SA")] {
+            let missing: Answer = .success(capabilityLines.filter { !$0.hasPrefix("+QNWPREFCFG: \"\(rat.key)\",") })
+            let rig = Rig([(capabilityRead, missing)])
+            let message = failureMessage(rig.service.bands(), "bands, no supported \(name)")
+            expectEqual(message, "The modem did not report its supported \(name) bands.",
+                        "bands: no supported \(name) line is a failure")
+            rig.finish("bands, no supported \(name)", opens: 1)
+        }
+        do {
+            let rig = Rig([(capabilityRead, .success(capabilityLines.map { $0.replacingOccurrences(of: ":78:", with: ":x:") }))])
+            let message = failureMessage(rig.service.bands(), "bands, unparsable supported")
+            expectEqual(message, "The modem did not report its supported 5G NSA bands.",
+                        "bands: an unparsable supported list is a failure")
+            rig.finish("bands, unparsable supported", opens: 1)
+        }
+        for (answer, what) in [(ok, "a bare OK"), (bandAnswer("nr5g_band", "1::3"), "an unparsable list"),
+                               (bandAnswer("nsa_nr5g_band", nrList), "another key")] {
+            let rig = Rig(script(sa: answer))
+            let message = failureMessage(rig.service.bands(), "bands, allowed SA \(what)")
+            expectEqual(message, "The modem did not report its allowed 5G SA bands.", "bands: allowed SA \(what) is a failure")
+            rig.finish("bands, allowed SA \(what)", opens: 1)
+        }
+        for (answer, words) in [(cme(3), "The modem refused the command (+CME ERROR: 3)."),
+                                (timedOut, "The modem did not answer in time.")] {
+            let rig = Rig([(capabilityRead, answer)])
+            let message = failureMessage(rig.service.bands(), "bands, capability \(words)")
+            expectEqual(message, "The supported bands could not be read. \(words)", "bands: a capability read that fails")
+            rig.finish("bands, capability \(words)", opens: 1)
+        }
+        for (answer, words) in [(cme(3), "The modem refused the command (+CME ERROR: 3)."),
+                                (timedOut, "The modem did not answer in time.")] {
+            let rig = Rig([(capabilityRead, .success(capabilityLines)), (bandRead("lte_band"), answer)])
+            let message = failureMessage(rig.service.bands(), "bands, allowed LTE \(words)")
+            expectEqual(message, "The allowed LTE bands could not be read. \(words)", "bands: an allowed read that fails")
+            expectLines(rig.port(1).lines, [capabilityRead, bandRead("lte_band")], "bands: nothing read after a failed read")
+            rig.finish("bands, allowed LTE \(words)", opens: 1)
+        }
+        do {
+            let rig = Rig([.failure(.modemNotAttached)])
+            let message = failureMessage(rig.service.bands(), "bands, no modem")
+            expectEqual(message, describe(.modemNotAttached), "bands: a failed open fails with describe(error)")
+            rig.finish("bands, no modem", opens: 1)
+        }
+    }
+
+    static func bandsChange() {
+        let saRead = bandRead("nr5g_band")
+        let lteRead = bandRead("lte_band")
+        let capability: (String, Answer) = (capabilityRead, .success(capabilityLines))
+        let allSA = (saRead, bandAnswer("nr5g_band", nrList))
+        let notChanged = "Nothing was changed."
+
+        // The change: the capability read, the RAT's read, the write, the read-back, on one port.
+        do {
+            let rig = Rig([capability, allSA, ("AT+QNWPREFCFG=\"nr5g_band\",41", ok), (saRead, bandAnswer("nr5g_band", "41"))])
+            let change = success(rig.service.setBands(.sa, to: [41]), "setBands sa 41")
+            check(change == BandChange(before: nrSupported, after: [41]), "setBands(.sa, [41]): from every band to 41",
+                  "\(String(describing: change))")
+            expectLines(rig.port(1).lines, [capabilityRead, saRead, "AT+QNWPREFCFG=\"nr5g_band\",41", saRead],
+                        "setBands(.sa, [41]): capability, nr5g_band, the write, the read-back")
+            check(rig.port(1).sent.map { $0.timeout } == [3, 3, 5, 3], "setBands: the write has 5 s, the reads 3 s",
+                  "\(rig.port(1).sent.map { $0.timeout })")
+            rig.finish("setBands sa 41", opens: 1)
+        }
+        do {
+            // Sorted and each band once; the read-back compared as a set.
+            let rig = Rig([capability, (lteRead, bandAnswer("lte_band", lteList)), ("AT+QNWPREFCFG=\"lte_band\",3:41", ok),
+                           (lteRead, bandAnswer("lte_band", "41:3"))])
+            let change = success(rig.service.setBands(.lte, to: [41, 3, 3]), "setBands lte 41,3,3")
+            check(change == BandChange(before: lteSupported, after: [3, 41]), "setBands(.lte, [41, 3, 3]): sends 3:41",
+                  "\(String(describing: change))")
+            rig.finish("setBands lte 41,3,3", opens: 1)
+        }
+        do {
+            let rig = Rig([capability, (bandRead("nsa_nr5g_band"), bandAnswer("nsa_nr5g_band", "41")),
+                           ("AT+QNWPREFCFG=\"nsa_nr5g_band\",\(nrList)", ok),
+                           (bandRead("nsa_nr5g_band"), bandAnswer("nsa_nr5g_band", nrList))])
+            let change = success(rig.service.setBands(.nsa, to: nrSupported), "setBands nsa, reset")
+            check(change == BandChange(before: [41], after: nrSupported), "setBands(.nsa, supported): the reset",
+                  "\(String(describing: change))")
+            rig.finish("setBands nsa, reset", opens: 1)
+        }
+        do {
+            // Only the RAT changed needs its supported line.
+            let rig = Rig([(capabilityRead, .success(capabilityLines.filter { !$0.contains("\"lte_band\"") })), allSA,
+                           ("AT+QNWPREFCFG=\"nr5g_band\",78", ok), (saRead, bandAnswer("nr5g_band", "78"))])
+            _ = success(rig.service.setBands(.sa, to: [78]), "setBands sa, no lte line")
+            rig.finish("setBands sa, no lte line", opens: 1)
+        }
+
+        // Already allowed: no write.
+        for (allowed, asked) in [(nrList, nrSupported), ("41", [41]), ("41:78", [78, 41, 41])] {
+            let rig = Rig([capability, (saRead, bandAnswer("nr5g_band", allowed))])
+            let change = success(rig.service.setBands(.sa, to: asked), "setBands sa \(asked), unchanged")
+            let before = parseBandList(["+QNWPREFCFG: \"nr5g_band\",\(allowed)"], key: "nr5g_band") ?? [-1]
+            check(change == BandChange(before: before, after: before), "setBands(.sa, \(asked)): already allowed, unchanged",
+                  "\(String(describing: change))")
+            expectLines(rig.port(1).lines, [capabilityRead, saRead], "setBands(.sa, \(asked)): already allowed, only the reads")
+            rig.finish("setBands sa \(asked), unchanged", opens: 1)
+        }
+
+        // Refused: an empty list (no port opened), or a band not supported (nothing written).
+        do {
+            let rig = Rig([])
+            let message = failureMessage(rig.service.setBands(.sa, to: []), "setBands sa []")
+            expectEqual(message, "At least one 5G SA band is needed. \(notChanged)", "setBands(.sa, []): refused")
+            rig.finish("setBands sa []", opens: 0)
+        }
+        for (asked, words) in [([99], "band 99"), ([41, 100, 99], "bands 99, 100"), ([4], "band 4")] {
+            let rig = Rig([capability, allSA])
+            let message = failureMessage(rig.service.setBands(.sa, to: asked), "setBands sa \(asked)")
+            expectEqual(message, "The modem does not support 5G SA \(words) (supported: \(nrWords)). \(notChanged)",
+                        "setBands(.sa, \(asked)): refused, naming the bands")
+            expectLines(rig.port(1).lines, [capabilityRead, saRead], "setBands(.sa, \(asked)): no write")
+            rig.finish("setBands sa \(asked)", opens: 1)
+        }
+        do {
+            // A RAT with no supported bands: its reset is an empty list, refused.
+            let rig = Rig([(capabilityRead, .success(["+QNWPREFCFG: \"lte_band\",0"])), (lteRead, bandAnswer("lte_band", "3"))])
+            let message = failureMessage(rig.service.setBands(.lte, to: [3]), "setBands lte, none supported")
+            expectEqual(message, "The modem does not support LTE band 3 (supported: none). \(notChanged)",
+                        "setBands: no band supported")
+            rig.finish("setBands lte, none supported", opens: 1)
+        }
+
+        // The read-back.
+        do {
+            let rig = Rig([capability, allSA, ("AT+QNWPREFCFG=\"nr5g_band\",41", ok), (saRead, bandAnswer("nr5g_band", "41:78"))])
+            let message = failureMessage(rig.service.setBands(.sa, to: [41]), "setBands, read-back differs")
+            expectEqual(message, "The modem answered OK but now reports 5G SA bands 41, 78. They were \(nrWords).",
+                        "setBands: a read-back that differs names both lists")
+            rig.finish("setBands, read-back differs", opens: 1)
+        }
+        for (answer, what) in [(ok, "a bare OK"), (bandAnswer("nr5g_band", "4x"), "an unparsable list")] {
+            let rig = Rig([capability, allSA, ("AT+QNWPREFCFG=\"nr5g_band\",41", ok), (saRead, answer)])
+            let message = failureMessage(rig.service.setBands(.sa, to: [41]), "setBands, read-back \(what)")
+            expectEqual(message, "The modem answered OK but did not report its 5G SA bands. They were \(nrWords).",
+                        "setBands: a read-back with \(what)")
+            rig.finish("setBands, read-back \(what)", opens: 1)
+        }
+        do {
+            let rig = Rig([capability, allSA, ("AT+QNWPREFCFG=\"nr5g_band\",41", ok), (saRead, timedOut)])
+            let message = failureMessage(rig.service.setBands(.sa, to: [41]), "setBands, read-back times out")
+            expectEqual(message, "The modem answered OK, but the 5G SA bands could not be read back. The modem did not answer "
+                        + "in time. They were \(nrWords).", "setBands: a read-back that times out")
+            rig.finish("setBands, read-back times out", opens: 1)
+        }
+
+        // The write.
+        do {
+            let rig = Rig([capability, allSA, ("AT+QNWPREFCFG=\"nr5g_band\",41", cme(3))])
+            let message = failureMessage(rig.service.setBands(.sa, to: [41]), "setBands, refused")
+            expectEqual(message, "The 5G SA bands were not changed. The modem refused the command (+CME ERROR: 3).",
+                        "setBands: a refused write")
+            rig.finish("setBands, refused", opens: 1)
+        }
+        do {
+            let rig = Rig([capability, allSA, ("AT+QNWPREFCFG=\"nr5g_band\",41", timedOut)])
+            let message = failureMessage(rig.service.setBands(.sa, to: [41]), "setBands, write times out")
+            expectEqual(message, "It is not known whether the 5G SA bands changed. The modem did not answer in time. "
+                        + "They were \(nrWords).", "setBands: a write that times out")
+            rig.finish("setBands, write times out", opens: 1)
+        }
+
+        // The lists before not read: nothing is written.
+        for (answer, words) in [(cme(3), "The supported bands could not be read. The modem refused the command (+CME ERROR: 3)."),
+                                (timedOut, "The supported bands could not be read. The modem did not answer in time."),
+                                (ok, "The modem did not report its supported 5G SA bands.")] {
+            let rig = Rig([(capabilityRead, answer)])
+            let message = failureMessage(rig.service.setBands(.sa, to: [41]), "setBands, capability: \(words)")
+            expectEqual(message, "\(words) \(notChanged)", "setBands: capability not read: nothing written")
+            expectLines(rig.port(1).lines, [capabilityRead], "setBands: capability not read: only that read")
+            rig.finish("setBands, capability: \(words)", opens: 1)
+        }
+        for (answer, words) in [(cme(3), "The allowed 5G SA bands could not be read. The modem refused the command (+CME ERROR: 3)."),
+                                (timedOut, "The allowed 5G SA bands could not be read. The modem did not answer in time."),
+                                (ok, "The modem did not report its allowed 5G SA bands.")] {
+            let rig = Rig([capability, (saRead, answer)])
+            let message = failureMessage(rig.service.setBands(.sa, to: [41]), "setBands, allowed: \(words)")
+            expectEqual(message, "\(words) \(notChanged)", "setBands: allowed not read: nothing written")
+            expectLines(rig.port(1).lines, [capabilityRead, saRead], "setBands: allowed not read: only the reads")
+            rig.finish("setBands, allowed: \(words)", opens: 1)
+        }
+        do {
+            let rig = Rig([.failure(.busy)])
+            let message = failureMessage(rig.service.setBands(.sa, to: [41]), "setBands, busy")
+            expectEqual(message, "\(describe(.busy)) \(notChanged)", "setBands: a failed open changes nothing")
+            rig.finish("setBands, busy", opens: 1)
         }
     }
 
