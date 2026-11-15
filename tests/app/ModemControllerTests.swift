@@ -31,6 +31,8 @@ enum Call: Equatable {
     case setProfile(Int, ProfileSettings, redial: Bool)
     case sim
     case enterPin(String, shownAttempts: Int)
+    case bands                       // in `allCalls` only (it does not block: see bands())
+    case setBands(BandRat, [Int])
 }
 
 let queueKey = DispatchSpecificKey<String>()
@@ -39,10 +41,18 @@ let queueName = "io.rmnetdriver.RMNet.modem.test"
 /// Records each call, then blocks it (on the controller's queue) until the test releases it with a result.
 /// Its mirror is empty: its log holds the test PINs, and the checks that the controller keeps no copy of a
 /// PIN reflect over the controller, which holds the service.
+/// The bands read is the exception: it follows every network read in the same block, so it does not block
+/// and is not in `calls` (whose counts are those of the calls a test releases); it answers at once with the
+/// next result queued by `queueBands`, else `bandsAnswer`, and is in `allCalls`, which holds every call in
+/// order.
 final class FakeService: ModemServing, CustomReflectable {
     private let lock = NSLock()
     private let gate = DispatchSemaphore(value: 0)
     private var log: [Call] = []
+    private var everything: [Call] = []
+    private var bandsQueued: [Result<[BandSet], ModemFailure>] = []
+    private var bandsDefault: Result<[BandSet], ModemFailure> = .success(bandSets())
+    private var setBandsResults: [Result<BandChange, ModemFailure>] = []
     private var infoResults: [Result<NetworkInfo, ModemFailure>] = []
     private var radioResults: [Result<RadioChange, ModemFailure>] = []
     private var modeResults: [Result<ModeChange, ModemFailure>] = []
@@ -56,6 +66,13 @@ final class FakeService: ModemServing, CustomReflectable {
 
     var customMirror: Mirror { Mirror(self, children: [:]) }
     var calls: [Call] { locked { log } }
+    var allCalls: [Call] { locked { everything } }
+    var bandsReads: Int { locked { everything.filter { $0 == .bands }.count } }
+    /// What a bands read answers when nothing is queued.
+    var bandsAnswer: Result<[BandSet], ModemFailure> {
+        get { locked { bandsDefault } }
+        set { locked { bandsDefault = newValue } }
+    }
     var blocked: Int { locked { inside } }
     var mostAtOnce: Int { locked { mostInside } }
     var callsOffQueue: Int { locked { misplaced } }
@@ -70,6 +87,7 @@ final class FakeService: ModemServing, CustomReflectable {
         let placed = !Thread.isMainThread && DispatchQueue.getSpecific(key: queueKey) == queueName
         locked {
             log.append(call)
+            everything.append(call)
             if !placed { misplaced += 1 }
             inside += 1
             mostInside = max(mostInside, inside)
@@ -122,11 +140,26 @@ final class FakeService: ModemServing, CustomReflectable {
     func at(_ line: String, timeout: TimeInterval) -> Result<[String], ModemFailure> {
         .failure(ModemFailure(message: "not used"))
     }
-    // Nor does it show or lock the bands (only `RMNet bands` does): never called.
-    func bands() -> Result<[BandSet], ModemFailure> { .failure(ModemFailure(message: "not used")) }
-    func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure> {
-        .failure(ModemFailure(message: "not used"))
+    // Answers at once (see the class's comment), on the controller's queue like every call.
+    func bands() -> Result<[BandSet], ModemFailure> {
+        let placed = !Thread.isMainThread && DispatchQueue.getSpecific(key: queueKey) == queueName
+        return locked {
+            everything.append(.bands)
+            if !placed { misplaced += 1 }
+            inside += 1
+            mostInside = max(mostInside, inside)
+            inside -= 1
+            return bandsQueued.isEmpty ? bandsDefault : bandsQueued.removeFirst()
+        }
     }
+
+    func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure> {
+        enter(.setBands(rat, bands))
+        return locked { setBandsResults.removeFirst() }
+    }
+
+    /// The answer of the next bands read (then `bandsAnswer` again).
+    func queueBands(_ r: Result<[BandSet], ModemFailure>) { locked { bandsQueued.append(r) } }
 
     func releaseInfo(_ r: Result<NetworkInfo, ModemFailure>) { locked { infoResults.append(r) }; gate.signal() }
     func releaseRadio(_ r: Result<RadioChange, ModemFailure>) { locked { radioResults.append(r) }; gate.signal() }
@@ -135,6 +168,7 @@ final class FakeService: ModemServing, CustomReflectable {
     func releaseProfile(_ r: Result<ProfileChange, ModemFailure>) { locked { profileResults.append(r) }; gate.signal() }
     func releaseSim(_ r: Result<SimInfo, ModemFailure>) { locked { simResults.append(r) }; gate.signal() }
     func releasePin(_ r: Result<PinOutcome, ModemFailure>) { locked { pinResults.append(r) }; gate.signal() }
+    func releaseSetBands(_ r: Result<BandChange, ModemFailure>) { locked { setBandsResults.append(r) }; gate.signal() }
 }
 
 // MARK: - Helpers
@@ -292,6 +326,19 @@ let portBusy = ModemFailure(message: "Another program is using the modem's spare
 let notAnswered = ModemFailure(message: "The modem did not answer in time.")
 let refused = ModemFailure(message: "The modem refused the command (+CME ERROR: 3). Nothing was changed.")
 
+// The bands, as the modem answered on 2026-11-15 (tests/app/ModemCliTests.swift): every supported band allowed.
+let lteSupported = [1, 2, 3, 4, 5, 7, 8, 12, 13, 14, 17, 18, 19, 20, 25, 26, 28, 29, 30, 32, 34, 38, 39, 40, 41, 42, 43,
+                    46, 48, 66, 71]
+let nrSupported = [1, 2, 3, 5, 7, 8, 12, 13, 14, 18, 20, 25, 26, 28, 29, 30, 38, 40, 41, 48, 66, 70, 71, 75, 76, 77, 78, 79]
+
+func bandSets(lte: [Int] = lteSupported, nsa: [Int] = nrSupported, sa: [Int] = nrSupported) -> [BandSet] {
+    [BandSet(rat: .lte, allowed: lte, supported: lteSupported), BandSet(rat: .nsa, allowed: nsa, supported: nrSupported),
+     BandSet(rat: .sa, allowed: sa, supported: nrSupported)]
+}
+
+let bandsRefused = ModemFailure(message: "The modem refused the command (+CME ERROR: 3). The 5G NSA bands were not changed.")
+let bandsQuitLine = "RMNet quits when the bands have been changed."
+
 let waitingLine = "Waiting for the current read to finish…"
 let anotherChange = "Another change to the modem has not finished yet. Nothing was changed; try again when it has."
 let anotherChangePin = "Another change to the modem has not finished yet. The PIN was not sent; enter it again when it has."
@@ -315,6 +362,11 @@ struct ModemControllerTests {
         refreshing()
         nothingDone()
         pinEntry()
+        bandsReading()
+        bandsEnabled()
+        bandsChanges()
+        bandsResets()
+        bandsNothingDone()
         quitting()
         resuming()
         check(changesSeen > 0, "main thread: the controllers' changes were watched")
@@ -1283,6 +1335,380 @@ struct ModemControllerTests {
         p.setTabShown(nil)
     }
 
+    // The bands are read with the Network tab's read, in its block after networkInfo(), and only then: not
+    // with the SIM & APN tab's read, nor while no modem tab is shown, the window is hidden or a confirmation
+    // (or the bands sheet) is open. A failed bands read keeps the last bands and says why, a good one clears
+    // that; the network read's failure is its own, and does not stop the bands read.
+    static func bandsReading() {
+        let rig = Rig()
+        let c = rig.controller
+        check(c.bands == nil && c.bandsFailure == nil, "bands: nothing is known at first")
+        c.setTabShown(.network)
+        rig.waitForCall(1, "the Network tab is read")
+        check(rig.fake.bandsReads == 0 && c.bands == nil, "bands: read after networkInfo() has returned", "\(rig.fake.allCalls)")
+        rig.fake.releaseInfo(.success(network("AUTO")))
+        pump(until: { c.running == nil }, "the first read comes back")
+        check(rig.fake.allCalls == [.networkInfo, .bands], "bands: the Network tab's read is networkInfo() then bands()",
+              "\(rig.fake.allCalls)")
+        check(c.bands == bandSets() && c.bandsFailure == nil, "bands: a good read sets the bands")
+        check(c.result == "", "bands: a read never writes the result line", c.result)
+
+        c.tick()
+        rig.answerInfo(2, .success(network("AUTO")), "a tick")
+        timer(of: c)?.fire()
+        rig.answerInfo(3, .success(network("AUTO")), "a timer turn")
+        check(rig.fake.bandsReads == 3, "bands: read again with each network read", "\(rig.fake.allCalls)")
+
+        rig.fake.queueBands(.failure(portBusy))
+        c.tick()
+        rig.answerInfo(4, .success(network("LTE")), "a turn whose bands read fails")
+        check(c.bands == bandSets() && c.bandsFailure == portBusy.message, "bands: a failed read keeps the bands and says why",
+              "\(String(describing: c.bandsFailure))")
+        check(c.info == network("LTE") && c.infoFailure == nil, "bands: their failure is not the network read's")
+
+        rig.fake.bandsAnswer = .success(bandSets(sa: [41]))
+        c.tick()
+        rig.answerInfo(5, .failure(notAnswered), "a turn whose network read fails")
+        check(rig.fake.bandsReads == 5 && c.bands == bandSets(sa: [41]) && c.bandsFailure == nil,
+              "bands: read also when the network read failed; a good read clears the failure", "\(rig.fake.allCalls)")
+        check(c.infoFailure == notAnswered.message && c.info == network("LTE"), "bands: the network read's failure is its own")
+
+        c.setTabShown(.simAndApn)
+        rig.answerSettings(6, .success(listing()), .success(ready), "the SIM & APN tab")
+        c.tick()
+        rig.answerSettings(8, .success(listing()), .success(ready), "a turn of the SIM & APN tab")
+        check(rig.fake.bandsReads == 5, "bands: not read with the SIM & APN tab's read", "\(rig.fake.allCalls)")
+        check(c.bands == bandSets(sa: [41]), "bands: kept while the other tab is shown")
+        c.setTabShown(.network)
+        rig.answerInfo(10, .success(network("LTE")), "back on the Network tab")
+        check(rig.fake.bandsReads == 6, "bands: read again when the Network tab is shown", "\(rig.fake.allCalls)")
+
+        c.setWindowVisible(false)
+        c.tick()
+        c.refresh()
+        settle()
+        check(rig.fake.bandsReads == 6 && rig.fake.calls.count == 10, "bands: nothing is read while the window is hidden")
+        c.setWindowVisible(true)
+        rig.answerInfo(11, .success(network("LTE")), "the window shows again")
+        check(rig.fake.bandsReads == 7, "bands: read when the window shows again")
+        c.setConfirming(true)
+        c.tick()
+        timer(of: c)?.fire()
+        settle()
+        check(rig.fake.bandsReads == 7 && rig.fake.calls.count == 11, "bands: nothing is read while a confirmation is open")
+        c.setConfirming(false)
+        c.setTabShown(nil)
+        c.tick()
+        c.refresh()
+        settle()
+        check(rig.fake.bandsReads == 7 && rig.fake.calls.count == 11, "bands: nothing is read with no modem tab shown")
+        check(rig.fake.mostAtOnce == 1 && rig.fake.callsOffQueue == 0, "bands: one call at a time, on the queue")
+
+        // A first bands read that fails: the bands stay unknown, and the failure is said.
+        let rig2 = Rig()
+        let d = rig2.controller
+        rig2.fake.bandsAnswer = .failure(notAnswered)
+        d.setTabShown(.network)
+        rig2.answerInfo(1, .success(network("AUTO")), "a first read whose bands fail")
+        check(d.bands == nil && d.bandsFailure == notAnswered.message && d.info == network("AUTO"),
+              "bands: a failed first read leaves them unknown and says why")
+        check(!d.bandsChangeEnabled && !d.resetAllBandsEnabled, "bands: no Change… or Reset all while they are unknown")
+        d.setTabShown(nil)
+    }
+
+    // The bands' words as the tab shows them (as `RMNet bands` prints them), and when its buttons are on:
+    // Change… once the bands are read; Reset for a RAT that does not allow every supported band; Reset all
+    // when any does not. All off while a change runs or waits, a confirmation (or the sheet) is open, or the
+    // app quits; a read leaves them on (R12). The sheet's Apply: on for a selection that is a change the
+    // modem can take (bandsProblem: not empty, every band supported), also while the sheet is open.
+    static func bandsEnabled() {
+        check(bandsSummary(BandSet(rat: .lte, allowed: lteSupported, supported: lteSupported)) == "all 31 supported bands allowed",
+              "words: every supported band allowed", bandsSummary(BandSet(rat: .lte, allowed: lteSupported, supported: lteSupported)))
+        check(bandsSummary(BandSet(rat: .lte, allowed: [41, 3], supported: lteSupported)) == "2 of 31 supported bands allowed: 3, 41",
+              "words: some bands allowed", bandsSummary(BandSet(rat: .lte, allowed: [41, 3], supported: lteSupported)))
+        check(bandsSummary(BandSet(rat: .nsa, allowed: [], supported: nrSupported)) == "0 of 28 supported bands allowed: none",
+              "words: no band allowed")
+        check(bandLabel(.lte, 3) == "B3" && bandLabel(.nsa, 78) == "n78" && bandLabel(.sa, 41) == "n41",
+              "words: the sheet's labels, B for LTE and n for 5G")
+
+        let rig = Rig()
+        let c = rig.controller
+        check(!c.bandsChangeEnabled && !c.resetAllBandsEnabled && !c.bandsResetEnabled(.lte) && !c.bandsApplyEnabled(.sa, [41]),
+              "enabled: all off before the bands are read")
+        c.setTabShown(.network)
+        rig.answerInfo(1, .success(network("AUTO")), "the first read")
+        check(c.bandsChangeEnabled, "enabled: Change… on once the bands are read")
+        check(BandRat.allCases.allSatisfy { !c.bandsResetEnabled($0) } && !c.resetAllBandsEnabled,
+              "enabled: no Reset and no Reset all while every RAT allows every supported band")
+
+        rig.fake.bandsAnswer = .success(bandSets(sa: [41]))
+        c.tick()
+        rig.answerInfo(2, .success(network("AUTO")), "5G SA locked to 41")
+        check(c.bandsResetEnabled(.sa) && !c.bandsResetEnabled(.lte) && !c.bandsResetEnabled(.nsa) && c.resetAllBandsEnabled,
+              "enabled: Reset for the RAT locked, and Reset all")
+        check(!c.bandsApplyEnabled(.sa, []), "apply: off with nothing checked")
+        check(!c.bandsApplyEnabled(.sa, [41]) && !c.bandsApplyEnabled(.sa, [41, 41]), "apply: off for the bands allowed now")
+        check(c.bandsApplyEnabled(.sa, [78, 41]) && c.bandsApplyEnabled(.sa, nrSupported), "apply: on for another selection")
+        check(!c.bandsApplyEnabled(.sa, [41, 4]), "apply: off with a band the modem does not support")
+        check(c.bandsApplyEnabled(.lte, [3]) && !c.bandsApplyEnabled(.lte, lteSupported), "apply: per RAT")
+
+        c.tick()
+        rig.waitForCall(3, "a turn starts")
+        check(c.bandsChangeEnabled && c.bandsResetEnabled(.sa) && c.resetAllBandsEnabled && c.bandsApplyEnabled(.sa, [78]),
+              "enabled: a read leaves them on (R12)")
+        rig.fake.releaseInfo(.success(network("AUTO")))
+        pump(until: { c.running == nil }, "the turn comes back")
+
+        c.setConfirming(true)
+        check(!c.bandsChangeEnabled && !c.bandsResetEnabled(.sa) && !c.resetAllBandsEnabled,
+              "enabled: Change…, Reset and Reset all off while a confirmation or the sheet is open")
+        check(c.bandsApplyEnabled(.sa, [78]), "apply: on in the open sheet")
+        c.setConfirming(false)
+
+        c.setRadio(on: false)
+        rig.waitForCall(4, "a change runs")
+        check(!c.bandsChangeEnabled && !c.bandsResetEnabled(.sa) && !c.resetAllBandsEnabled && !c.bandsApplyEnabled(.sa, [78]),
+              "enabled: all off while a change runs")
+        rig.fake.releaseRadio(.success(radioOff))
+        rig.answerInfo(5, .success(network("AUTO")), "the read after the change")
+        check(c.bandsChangeEnabled && c.bandsResetEnabled(.sa) && c.resetAllBandsEnabled && c.bandsApplyEnabled(.sa, [78]),
+              "enabled: on again afterwards")
+        check(c.quitWhenFinished() == false, "enabled: a quit with nothing running answers at once")
+        check(!c.bandsChangeEnabled && !c.bandsResetEnabled(.sa) && !c.resetAllBandsEnabled && !c.bandsApplyEnabled(.sa, [78]),
+              "enabled: all off once the app quits")
+        c.setTabShown(nil)
+    }
+
+    // changeBands: the bands asked go to setBands once, sorted, each once; `.bands` runs and nothing else can
+    // start; the result line; the RAT shows the bands read back at once, then the tab (the bands with it) is
+    // read again, after a failure too. A change asked for while a read runs waits for it (R12).
+    static func bandsChanges() {
+        let rig = Rig()
+        let c = rig.controller
+        c.setTabShown(.network)
+        rig.answerInfo(1, .success(network("AUTO")), "the first read")
+        c.changeBands(.sa, to: [41])
+        rig.waitForCall(2, "the bands change reaches the service")
+        check(rig.fake.calls.last == .setBands(.sa, [41]) && c.running == .bands, "change: setBands(.sa, [41]); .bands runs",
+              "\(rig.fake.calls)")
+        check(c.result == "Changing the 5G SA bands to 41…" && !c.resultIsFailure, "change: the running sentence", c.result)
+        check(!c.bandsChangeEnabled && !c.resetAllBandsEnabled && !c.refreshEnabled && !c.modeChangeEnabled,
+              "change: the buttons are off while it runs")
+        c.tick()
+        c.refresh()
+        timer(of: c)?.fire()
+        c.changeBands(.lte, to: [3])
+        c.resetBands(.sa)
+        c.resetAllBands()
+        c.setRadio(on: false)
+        settle()
+        check(rig.fake.calls.count == 2 && rig.fake.bandsReads == 1, "change: nothing else starts while .bands runs",
+              "\(rig.fake.allCalls)")
+        check(c.result == anotherChange && c.resultIsFailure, "change: another change while it runs is refused with a sentence",
+              c.result)
+        rig.fake.bandsAnswer = .success(bandSets(sa: [41]))
+        rig.fake.releaseSetBands(.success(BandChange(before: nrSupported, after: [41])))
+        rig.waitForCall(3, "the tab is read again after the change")
+        check(rig.fake.calls.last == .networkInfo, "change: the Network tab is read again")
+        check(c.result == "5G SA bands set to 41" && !c.resultIsFailure, "change: the result line", c.result)
+        check(c.bands == bandSets(sa: [41]), "change: the RAT shows the bands read back at once")
+        rig.fake.releaseInfo(.success(network("AUTO")))
+        pump(until: { c.running == nil }, "the read after the change comes back")
+        check(Array(rig.fake.allCalls.suffix(3)) == [.setBands(.sa, [41]), .networkInfo, .bands],
+              "change: then the bands are read again", "\(rig.fake.allCalls)")
+        check(rig.fake.calls.filter({ $0 == .setBands(.sa, [41]) }).count == 1, "change: setBands is called once")
+        check(c.bands == bandSets(sa: [41]) && c.result == "5G SA bands set to 41", "change: the read after it leaves the result line")
+
+        // Unsorted, a band twice: sorted, each once. A failure: its sentence, and the bands read again all the same.
+        c.changeBands(.sa, to: [78, 41, 78])
+        rig.waitForCall(4, "a change that will fail")
+        check(rig.fake.calls.last == .setBands(.sa, [41, 78]), "change: the bands sorted, each once", "\(rig.fake.calls)")
+        check(c.result == "Changing the 5G SA bands to 41, 78…", "change: the running sentence names them", c.result)
+        let saRefused = ModemFailure(message: "The modem refused the command (+CME ERROR: 3). The 5G SA bands were not changed.")
+        rig.fake.releaseSetBands(.failure(saRefused))
+        rig.waitForCall(5, "the tab is read again after the failed change")
+        check(c.result == saRefused.message && c.resultIsFailure, "change: a failure's sentence", c.result)
+        check(c.bands == bandSets(sa: [41]), "change: a failure leaves the bands as last read")
+        rig.fake.releaseInfo(.success(network("AUTO")))
+        pump(until: { c.running == nil }, "the read after the failure comes back")
+        check(rig.fake.bandsReads == 3 && rig.fake.allCalls.last == .bands, "change: the bands are read again after a failure",
+              "\(rig.fake.allCalls)")
+        check(c.result == saRefused.message && c.resultIsFailure, "change: the read after it leaves the failure's sentence")
+
+        // Every supported band: said so.
+        c.changeBands(.sa, to: nrSupported)
+        rig.waitForCall(6, "a change to every supported band")
+        check(c.result == "Changing the 5G SA bands to all 28 supported bands…", "change: the running sentence for all", c.result)
+        rig.fake.bandsAnswer = .success(bandSets())
+        rig.fake.releaseSetBands(.success(BandChange(before: [41], after: nrSupported)))
+        rig.answerInfo(7, .success(network("AUTO")), "the read after it")
+        check(c.result == "5G SA bands set to all 28 supported bands" && !c.resultIsFailure, "change: the sentence for all", c.result)
+        check(c.bands == bandSets(), "change: the bands as read")
+
+        // The modem had them already (changed elsewhere since the last read): nothing written, and said.
+        c.changeBands(.lte, to: [3])
+        rig.waitForCall(8, "a change the modem has already")
+        rig.fake.bandsAnswer = .success(bandSets(lte: [3]))
+        rig.fake.releaseSetBands(.success(BandChange(before: [3], after: [3])))
+        rig.answerInfo(9, .success(network("AUTO")), "the read after it")
+        check(c.result == "The LTE bands are already 3. Nothing was changed." && !c.resultIsFailure,
+              "change: bands the modem already had", c.result)
+        check(c.bands == bandSets(lte: [3]), "change: the bands as read")
+
+        // Asked for while a read runs: it waits for the read, then starts.
+        c.tick()
+        rig.waitForCall(10, "a turn starts")
+        c.changeBands(.lte, to: [41, 3])
+        check(c.result == waitingLine && c.running == .reading && !c.bandsChangeEnabled, "change: it waits for the read", c.result)
+        rig.fake.releaseInfo(.success(network("AUTO")))
+        rig.waitForCall(11, "the change after the read")
+        check(rig.fake.calls.last == .setBands(.lte, [3, 41]) && c.running == .bands, "change: then it starts", "\(rig.fake.calls)")
+        check(c.result == "Changing the LTE bands to 3, 41…", "change: then its running line", c.result)
+        rig.fake.bandsAnswer = .success(bandSets(lte: [3, 41]))
+        rig.fake.releaseSetBands(.success(BandChange(before: [3], after: [3, 41])))
+        rig.answerInfo(12, .success(network("AUTO")), "the read after it")
+        check(c.result == "LTE bands set to 3, 41" && !c.resultIsFailure && c.bands == bandSets(lte: [3, 41]),
+              "change: made after the read", c.result)
+        check(rig.fake.mostAtOnce == 1 && rig.fake.callsOffQueue == 0, "change: one call at a time, on the queue")
+        c.setTabShown(nil)
+    }
+
+    // resetBands: setBands(rat, its supported bands). resetAllBands: each RAT that does not allow every
+    // supported band, in the order LTE, 5G NSA, 5G SA, in one change (`.bands` throughout, no read between),
+    // then one read; it stops at the first failure and says which RATs were not reset.
+    static func bandsResets() {
+        let rig = Rig()
+        let c = rig.controller
+        rig.fake.bandsAnswer = .success(bandSets(lte: [3, 41], sa: [41]))
+        c.setTabShown(.network)
+        rig.answerInfo(1, .success(network("AUTO")), "the first read")
+        c.resetBands(.lte)
+        rig.waitForCall(2, "the reset reaches the service")
+        check(rig.fake.calls.last == .setBands(.lte, lteSupported) && c.running == .bands,
+              "reset: setBands(.lte, its supported bands)", "\(rig.fake.calls)")
+        check(c.result == "Resetting the LTE bands to all 31 supported bands…" && !c.resultIsFailure, "reset: the running sentence",
+              c.result)
+        rig.fake.bandsAnswer = .success(bandSets(sa: [41]))
+        rig.fake.releaseSetBands(.success(BandChange(before: [3, 41], after: lteSupported)))
+        rig.waitForCall(3, "the tab is read again after the reset")
+        check(c.result == "LTE bands set to all 31 supported bands" && !c.resultIsFailure, "reset: the result line", c.result)
+        check(c.bands == bandSets(sa: [41]), "reset: the RAT shows the bands read back at once")
+        rig.fake.releaseInfo(.success(network("AUTO")))
+        pump(until: { c.running == nil }, "the read comes back")
+        check(rig.fake.allCalls.last == .bands && rig.fake.bandsReads == 2, "reset: the bands are read again", "\(rig.fake.allCalls)")
+
+        // Reset all: the three in order in one change, then one read.
+        rig.fake.bandsAnswer = .success(bandSets(lte: [3], nsa: [78], sa: [41]))
+        c.tick()
+        rig.answerInfo(4, .success(network("AUTO")), "all three locked")
+        c.resetAllBands()
+        rig.waitForCall(5, "Reset all starts with LTE")
+        check(rig.fake.calls.last == .setBands(.lte, lteSupported) && c.running == .bands, "reset all: LTE first", "\(rig.fake.calls)")
+        check(c.result == "Resetting the LTE, 5G NSA and 5G SA bands to all supported bands…", "reset all: the running sentence",
+              c.result)
+        rig.fake.releaseSetBands(.success(BandChange(before: [3], after: lteSupported)))
+        rig.waitForCall(6, "then 5G NSA")
+        check(rig.fake.calls.last == .setBands(.nsa, nrSupported) && c.running == .bands, "reset all: 5G NSA second, no read between",
+              "\(rig.fake.calls)")
+        rig.fake.releaseSetBands(.success(BandChange(before: [78], after: nrSupported)))
+        rig.waitForCall(7, "then 5G SA")
+        check(rig.fake.calls.last == .setBands(.sa, nrSupported) && c.running == .bands, "reset all: 5G SA third", "\(rig.fake.calls)")
+        check(rig.fake.bandsReads == 3, "reset all: no read between the RATs", "\(rig.fake.allCalls)")
+        rig.fake.bandsAnswer = .success(bandSets())
+        rig.fake.releaseSetBands(.success(BandChange(before: [41], after: nrSupported)))
+        rig.waitForCall(8, "one read after")
+        check(rig.fake.calls.last == .networkInfo, "reset all: the tab is read again once")
+        check(c.result == "LTE, 5G NSA and 5G SA bands set to all supported bands" && !c.resultIsFailure, "reset all: the result line",
+              c.result)
+        check(c.bands == bandSets(), "reset all: the bands read back, at once")
+        rig.fake.releaseInfo(.success(network("AUTO")))
+        pump(until: { c.running == nil }, "the read comes back")
+
+        // It stops at the first failure: the RATs from that one on are not reset, and the bands are read again.
+        rig.fake.bandsAnswer = .success(bandSets(lte: [3], nsa: [78], sa: [41]))
+        c.tick()
+        rig.answerInfo(9, .success(network("AUTO")), "all three locked again")
+        c.resetAllBands()
+        rig.waitForCall(10, "LTE")
+        rig.fake.releaseSetBands(.success(BandChange(before: [3], after: lteSupported)))
+        rig.waitForCall(11, "5G NSA, which will fail")
+        check(rig.fake.calls.last == .setBands(.nsa, nrSupported), "reset all: 5G NSA after LTE", "\(rig.fake.calls)")
+        rig.fake.bandsAnswer = .success(bandSets(nsa: [78], sa: [41]))
+        rig.fake.releaseSetBands(.failure(bandsRefused))
+        rig.waitForCall(12, "the read after the failure")
+        check(rig.fake.calls.last == .networkInfo, "reset all: stops at the first failure: 5G SA is not tried", "\(rig.fake.calls)")
+        check(c.result == "LTE bands set to all supported bands. " + bandsRefused.message + " Not reset: 5G NSA and 5G SA."
+              && c.resultIsFailure, "reset all: the RATs reset, the failure, and the RATs not reset", c.result)
+        check(c.bands == bandSets(nsa: [78], sa: [41]), "reset all: the RAT reset shows its bands read back")
+        rig.fake.releaseInfo(.success(network("AUTO")))
+        pump(until: { c.running == nil }, "the read comes back")
+        check(rig.fake.allCalls.last == .bands, "reset all: the bands are read again after a failure", "\(rig.fake.allCalls)")
+
+        // A RAT that allows every supported band is left alone; a failure on the first RAT: none reset.
+        c.resetAllBands()
+        rig.waitForCall(13, "Reset all with LTE not locked")
+        check(rig.fake.calls.last == .setBands(.nsa, nrSupported), "reset all: LTE, not locked, is left alone", "\(rig.fake.calls)")
+        check(c.result == "Resetting the 5G NSA and 5G SA bands to all supported bands…", "reset all: the RATs it resets", c.result)
+        rig.fake.releaseSetBands(.failure(notAnswered))
+        rig.answerInfo(14, .success(network("AUTO")), "the read after the failure")
+        check(c.result == notAnswered.message + " Not reset: 5G NSA and 5G SA." && c.resultIsFailure,
+              "reset all: a failure on the first RAT", c.result)
+        check(rig.fake.mostAtOnce == 1 && rig.fake.callsOffQueue == 0, "reset: one call at a time, on the queue")
+        c.setTabShown(nil)
+    }
+
+    // A bands change that would do nothing, or that the modem cannot take, says why on the result line and
+    // nothing reaches the service: never an empty list or a band not supported. Nothing starts once the
+    // app quits.
+    static func bandsNothingDone() {
+        let rig = Rig()
+        let c = rig.controller
+        c.changeBands(.sa, to: [41])
+        check(c.result == "The 5G SA bands have not been read. Nothing was changed." && c.resultIsFailure,
+              "nothing: Change before the bands are read", c.result)
+        c.resetBands(.lte)
+        check(c.result == "The LTE bands have not been read. Nothing was changed." && c.resultIsFailure,
+              "nothing: Reset before the bands are read", c.result)
+        c.resetAllBands()
+        check(c.result == "The bands have not been read. Nothing was changed." && c.resultIsFailure,
+              "nothing: Reset all before the bands are read", c.result)
+
+        c.setTabShown(.network)
+        rig.answerInfo(1, .success(network("AUTO")), "the first read")
+        c.changeBands(.sa, to: [])
+        check(c.result == "At least one 5G SA band is needed. Nothing was changed." && c.resultIsFailure,
+              "nothing: no band", c.result)
+        c.changeBands(.sa, to: [41, 4])
+        check(c.result == "The modem does not support 5G SA band 4 (supported: \(bandListWords(nrSupported))). Nothing was changed."
+              && c.resultIsFailure, "nothing: a band the modem does not support", c.result)
+        c.changeBands(.sa, to: nrSupported.reversed())
+        check(c.result == "The 5G SA bands are already all 28 supported bands. Nothing was changed." && c.resultIsFailure,
+              "nothing: Change to the bands allowed now", c.result)
+        c.resetBands(.lte)
+        check(c.result == "The LTE bands are already all 31 supported bands. Nothing was changed." && c.resultIsFailure,
+              "nothing: Reset of a RAT that allows every supported band", c.result)
+        c.resetAllBands()
+        check(c.result == "LTE, 5G NSA and 5G SA already allow all their supported bands. Nothing was changed."
+              && c.resultIsFailure, "nothing: Reset all when every RAT allows every supported band", c.result)
+        rig.fake.bandsAnswer = .success(bandSets(sa: [41]))
+        c.tick()
+        rig.answerInfo(2, .success(network("AUTO")), "5G SA locked")
+        c.changeBands(.sa, to: [41])
+        check(c.result == "The 5G SA bands are already 41. Nothing was changed." && c.resultIsFailure,
+              "nothing: Change to the band allowed now", c.result)
+        settle()
+        check(rig.fake.calls == [.networkInfo, .networkInfo], "nothing: none of them reached the service", "\(rig.fake.calls)")
+
+        check(c.quitWhenFinished() == false, "nothing: the quit answers at once")
+        c.changeBands(.sa, to: [41, 78])
+        c.resetBands(.sa)
+        c.resetAllBands()
+        settle()
+        check(rig.fake.calls.count == 2 && c.running == nil, "nothing: no bands change starts once the app quits",
+              "\(rig.fake.calls)")
+        c.setTabShown(nil)
+    }
+
     // Quitting: at once with nothing running; otherwise the line for what runs, then true after a read or
     // a change that succeeded, false (and attention, and working again) after one that failed.
     static func quitting() {
@@ -1298,13 +1724,15 @@ struct ModemControllerTests {
             c.setRadio(on: false)
             c.pickedMode = "LTE"
             c.changeMode()
+            c.changeBands(.sa, to: [41])
+            c.resetAllBands()
             c.setWindowVisible(false)
             c.setWindowVisible(true)
             c.setTabShown(.simAndApn)
             settle()
             check(rig.fake.calls.count == 1 && rig.replies.isEmpty && rig.attention == 0 && timer(of: c) == nil,
                   "quit: nothing starts and no later reply", "\(rig.fake.calls)")
-            check(!c.refreshEnabled && !c.modeChangeEnabled, "quit: nothing is enabled while the app ends")
+            check(!c.refreshEnabled && !c.modeChangeEnabled && !c.bandsChangeEnabled, "quit: nothing is enabled while the app ends")
         }
 
         struct Case {
@@ -1316,6 +1744,7 @@ struct ModemControllerTests {
             let start: (ModemController) -> Void
             let end: (FakeService) -> Void
             let result: String?  // the result line after a failure
+            var bands = bandSets()  // what the bands reads answer
         }
         let reading = "RMNet quits when the current request to the modem has finished."
         let radioBack = "RMNet quits when the radio has been switched back on."
@@ -1361,11 +1790,29 @@ struct ModemControllerTests {
                  end: { $0.releasePin(.success(refusedPin)) }, result: pinSentence(refusedPin)),
             Case(name: "a PIN that fails", tab: .simAndApn, notice: pinLine, goesAhead: false, calls: 1, start: unlock,
                  end: { $0.releasePin(.failure(notAnswered)) }, result: notAnswered.message),
+            Case(name: "a bands change", tab: .network, notice: bandsQuitLine, goesAhead: true, calls: 1,
+                 start: { $0.changeBands(.sa, to: [41]) },
+                 end: { $0.releaseSetBands(.success(BandChange(before: nrSupported, after: [41]))) }, result: nil),
+            Case(name: "a bands change that fails", tab: .network, notice: bandsQuitLine, goesAhead: false, calls: 1,
+                 start: { $0.changeBands(.sa, to: [41]) }, end: { $0.releaseSetBands(.failure(bandsRefused)) },
+                 result: bandsRefused.message),
+            Case(name: "a bands reset", tab: .network, notice: bandsQuitLine, goesAhead: true, calls: 1,
+                 start: { $0.resetBands(.sa) },
+                 end: { $0.releaseSetBands(.success(BandChange(before: [41], after: nrSupported))) }, result: nil,
+                 bands: bandSets(sa: [41])),
+            Case(name: "a reset of all the bands", tab: .network, notice: bandsQuitLine, goesAhead: true, calls: 3,
+                 start: { $0.resetAllBands() },
+                 end: { fake in
+                     fake.releaseSetBands(.success(BandChange(before: [3], after: lteSupported)))
+                     fake.releaseSetBands(.success(BandChange(before: [78], after: nrSupported)))
+                     fake.releaseSetBands(.success(BandChange(before: [41], after: nrSupported)))
+                 }, result: nil, bands: bandSets(lte: [3], nsa: [78], sa: [41])),
         ]
         for k in cases {
             let name = "quit during \(k.name)"
             let rig = Rig()
             let c = rig.controller
+            rig.fake.bandsAnswer = .success(k.bands)
             c.setTabShown(k.tab)
             if k.tab == .network {
                 rig.answerInfo(1, .success(network("AUTO")), "\(name): the first read")

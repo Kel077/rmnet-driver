@@ -104,7 +104,7 @@ Opened with no argument (from the Finder, or `open /Applications/RMNet.app`), th
 
 - **Driver**: a headline such as `Connected`, advice on what to do, the addresses, versions and counters; `Install` (or `Update`) and `Remove…`.
 - **Messages**: the modem's text messages; `Delete…`, and a form to send one.
-- **Network**: registration, signal and cell; `Radio Off…` or `Radio On`; the network mode, with `Change…`.
+- **Network**: registration, signal and cell; `Radio Off…` or `Radio On`; the network mode, with `Change…`; the bands LTE, 5G NSA and 5G SA may use, each with `Change…` (a checkbox for each supported band) and `Reset`, and `Reset all`.
 - **SIM & APN**: the SIM's state and PIN entry; the data profiles, and an editor for the one the driver dials.
 
 The driver also presents two of the modem's other USB interfaces as serial ports: `/dev/cu.RM520N-GL-NMEA` (GNSS sentences, while GNSS is on) and `/dev/cu.RM520N-GL-DIAG` (Qualcomm's DIAG protocol, for tools such as QCSuper). Like every serial port on macOS, any local user can read and write them while the driver is attached.

@@ -1,5 +1,6 @@
 // The window's Network and SIM & APN tabs. Network: what the modem says about the network, the radio
-// (Radio Off…, Radio On) and the network mode (Change…, Put Back). SIM & APN: the SIM (Unlock… while it
+// (Radio Off…, Radio On), the network mode (Change…, Put Back) and the bands each RAT may use (Change…, a
+// sheet of checkboxes; Reset; Reset all). SIM & APN: the SIM (Unlock… while it
 // asks for its PIN), the data profiles, and an editor for the profile the driver dials (Apply…, Put
 // Back…). ModemController (ModemController.swift) holds the state, reads the shown tab and runs one call
 // at a time; the rows, questions and sentences come from ModemNetwork.swift and ModemSettings.swift. Each
@@ -181,10 +182,17 @@ private func radioStateWords(_ radio: RadioState) -> String {
     }
 }
 
+/// The bands sheet open for one RAT, with its bands as read when it opened.
+private struct BandsEdit: Identifiable {
+    let opened: BandSet
+    var id: BandRat { opened.rat }
+}
+
 struct NetworkTab: View {
     // The process's one controller, owned by the app delegate.
     @ObservedObject var controller: ModemController
     @State private var question: Question<NetworkAction>? = nil
+    @State private var editing: BandsEdit? = nil
 
     /// The picker's modes: the window's choices, then the modem's mode (or the pick) if it is another mode;
     /// the same RATs in another order (the modem's `NR5G:LTE`) are the choice already there (sameMode).
@@ -217,6 +225,8 @@ struct NetworkTab: View {
                     }
                     radioControl
                     modeControl
+                    Divider()
+                    bandsControl
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.trailing, 14)  // room for the scroll bar
@@ -226,6 +236,77 @@ struct NetworkTab: View {
         .padding()
         .frame(minWidth: 480, minHeight: 420)
         .modifier(Confirmation(question: $question, controller: controller, perform: perform, closed: {}))
+        // Reads pause while the sheet is open, as for a confirmation; however it closes, they go on.
+        .sheet(item: $editing, onDismiss: { controller.setConfirming(false) }) { edit in
+            BandsSheet(controller: controller, opened: edit.opened,
+                       apply: { chosen in
+                           controller.changeBands(edit.opened.rat, to: chosen)
+                           editing = nil
+                           controller.setConfirming(false)
+                       },
+                       cancel: {
+                           editing = nil
+                           controller.setConfirming(false)
+                       })
+        }
+    }
+
+    /// One row per RAT (its summary as `RMNet bands` prints it, Change… and Reset), then Reset all; while the
+    /// bands are unknown, `Bands: not read yet` or why the read failed.
+    @ViewBuilder private var bandsControl: some View {
+        if let sets = controller.bands {
+            Text("Bands")
+                .font(.headline)
+            if let failure = controller.bandsFailure {
+                Text(verbatim: "\(failure) The bands below may be out of date.")
+                    .foregroundStyle(Color.orange)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 6) {
+                ForEach(sets, id: \.rat) { set in
+                    GridRow {
+                        Text(verbatim: set.rat.name)
+                            .foregroundStyle(.secondary)
+                        Text(verbatim: bandsSummary(set))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Button("Change…") { openBands(set) }
+                            .disabled(!controller.bandsChangeEnabled)
+                            .accessibilityLabel(Text(verbatim: "Change the \(set.rat.name) bands…"))
+                        Button("Reset") { controller.resetBands(set.rat) }
+                            .disabled(!controller.bandsResetEnabled(set.rat))
+                            .accessibilityLabel(Text(verbatim: "Reset the \(set.rat.name) bands"))
+                    }
+                }
+            }
+            HStack(alignment: .firstTextBaseline) {
+                Text("Reset allows every supported band again, at once; the modem may re-select a cell and drop "
+                     + "the connection for a few seconds.")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                Button("Reset all") { controller.resetAllBands() }
+                    .disabled(!controller.resetAllBandsEnabled)
+            }
+        } else {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Bands:")
+                    .font(.headline)
+                Text(verbatim: controller.bandsFailure ?? "not read yet")
+                    .foregroundStyle(controller.bandsFailure == nil ? Color.secondary : Color.orange)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+            }
+        }
+    }
+
+    private func openBands(_ set: BandSet) {
+        guard controller.bandsChangeEnabled else { return }
+        editing = BandsEdit(opened: set)
+        controller.setConfirming(true)
     }
 
     @ViewBuilder private var radioControl: some View {
@@ -308,6 +389,81 @@ struct NetworkTab: View {
         case .changeMode: controller.changeMode()
         case .putBack: controller.putBack()
         }
+    }
+}
+
+/// The sheet Change… opens for one RAT: a checkbox for each band it supports (`B3` for LTE, `n41` for 5G),
+/// ticked for those it may use as read when the sheet opened; Select all and Clear; the warning; Apply (the
+/// default button), off with nothing ticked or with the bands allowed now (the controller's
+/// bandsApplyEnabled), and Cancel. Apply calls `apply` with the bands ticked, sorted; the tab then closes the
+/// sheet.
+struct BandsSheet: View {
+    @ObservedObject var controller: ModemController
+    let opened: BandSet
+    let apply: ([Int]) -> Void
+    let cancel: () -> Void
+    @State private var ticked: Set<Int>
+
+    private static let columns = 7
+
+    init(controller: ModemController, opened: BandSet, apply: @escaping ([Int]) -> Void, cancel: @escaping () -> Void) {
+        self.controller = controller
+        self.opened = opened
+        self.apply = apply
+        self.cancel = cancel
+        _ticked = State(initialValue: Set(opened.allowed).intersection(opened.supported))
+    }
+
+    /// The supported bands, ascending, in rows of `columns`.
+    private var rows: [[Int]] {
+        let all = bandSorted(opened.supported)
+        return stride(from: 0, to: all.count, by: BandsSheet.columns).map {
+            Array(all[$0..<min($0 + BandsSheet.columns, all.count)])
+        }
+    }
+
+    private func tick(_ band: Int) -> Binding<Bool> {
+        Binding(get: { ticked.contains(band) },
+                set: { on in if on { ticked.insert(band) } else { ticked.remove(band) } })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(verbatim: "\(opened.rat.name) bands")
+                .font(.headline)
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
+                ForEach(rows, id: \.self) { row in
+                    GridRow {
+                        ForEach(row, id: \.self) { band in
+                            Toggle(isOn: tick(band)) {
+                                Text(verbatim: bandLabel(opened.rat, band))
+                                    .monospacedDigit()
+                            }
+                            .toggleStyle(.checkbox)
+                        }
+                    }
+                }
+            }
+            HStack {
+                Button("Select all") { ticked = Set(opened.supported) }
+                    .disabled(ticked == Set(opened.supported))
+                Button("Clear") { ticked = [] }
+                    .disabled(ticked.isEmpty)
+            }
+            Text("The modem may re-select a cell and drop the connection for a few seconds.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Cancel", action: cancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Apply") { apply(ticked.sorted()) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!controller.bandsApplyEnabled(opened.rat, Array(ticked)))
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
     }
 }
 
