@@ -1,5 +1,5 @@
 // The menu bar item (a MenuBarExtra in RMNetApp, StatusView.swift): its icon (MenuBarLabel), and the panel it
-// opens, the connection at a glance as the Overview shows it: the state's pill from the Driver tab's headline, the
+// opens, the connection at a glance as the Overview shows it: the state's pill from the Driver screen's headline, the
 // technology's badge, the bars with their word, the operator and the band from the network read over the AT port
 // when the panel opens (with its time, or why it failed), the IPv4 address while the link is up, the window's quit
 // lines while a quit waits, `Open RMNet` and `Quit RMNet`. MenuBarStatus (MenuBarStatus.swift) holds the state and
@@ -9,7 +9,7 @@ import SwiftUI
 
 extension MenuBarStatus {
     /// The app's one, on the registry, the system's listing (asked with a 10 s limit) and the network read with
-    /// ModemService on `queue`, the queue the window's tabs share for the AT port. The app delegate starts its
+    /// ModemService on `queue`, the queue the window's screens share for the AT port. The app delegate starts its
     /// polls at launch (`start`).
     static func forApp(queue: DispatchQueue) -> MenuBarStatus {
         let manager = ExtensionManager()

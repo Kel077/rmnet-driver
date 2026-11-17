@@ -1,8 +1,8 @@
-// Whether the RMNet window can be seen, for its Messages and modem tabs, which read the AT port only while
+// Whether the RMNet window can be seen, for its Messages and modem screens, which read the AT port only while
 // it can (their controllers' setWindowVisible). It follows that one window's own notifications: its occlusion
 // state changing, and its closing. The app's other windows (the menu bar item's panel, the status item's own
 // window) post the same notifications for themselves and are not followed: NSApp.occlusionState, which counts
-// every window of the app, would keep the tabs reading the port while the RMNet window is covered, hidden
+// every window of the app, would keep the screens reading the port while the RMNet window is covered, hidden
 // (Cmd-H), minimized or closed but the panel is open or the status item counts as visible. Also how the window
 // is shown again (windowReopen) and when a quit shows it (quitShowsWindow).
 //
@@ -83,7 +83,7 @@ func windowReopen(windowFound: Bool, minimized: Bool, actionAvailable: Bool) -> 
 
 /// Whether a quit shows the RMNet window first (applicationShouldTerminate, then as windowReopen above): only
 /// when the quit waits for a call to the modem (`terminateLater`) and the window cannot be seen (closed,
-/// minimized, hidden or covered), since the line above its tabs says what RMNet waits for; otherwise `Quit
+/// minimized, hidden or covered), since the line above its screen says what RMNet waits for; otherwise `Quit
 /// RMNet` with the window closed would seem to do nothing. A quit that ends at once, or a window already in
 /// view, is left alone.
 func quitShowsWindow(waits: Bool, windowSeen: Bool) -> Bool {

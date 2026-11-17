@@ -514,8 +514,10 @@ struct ModemSettingsTests {
         let radioOff = radioOffQuestion()
         check(radioOff.title == "Switch the radio off?", "radioOffQuestion: title", radioOff.title)
         check(radioOff.message.contains("connection is down until the radio is switched on again")
-                && radioOff.message.contains("Radio On") && radioOff.message.contains("`RMNet radio on`"),
-              "radioOffQuestion: says the connection is down until Radio On or `RMNet radio on`", radioOff.message)
+                && radioOff.message.contains("the Radio switch on the Network screen")
+                && radioOff.message.contains("`RMNet radio on`") && !radioOff.message.contains("Radio On"),
+              "radioOffQuestion: says the connection is down until the Radio switch on the Network screen or "
+                + "`RMNet radio on`", radioOff.message)
 
         let toLTE = modeQuestion(from: "AUTO", to: "LTE")
         check(toLTE.title == "Change the network mode to LTE only?", "modeQuestion: title", toLTE.title)
@@ -664,26 +666,26 @@ struct ModemSettingsTests {
                     "The radio is on; registered, home network (5GS) after 12 s.", "profileSentence: redialled")
         let leftOff = profileSentence(toCmnet(.radioLeftOff("The modem did not answer in time.")))
         check(leftOff.hasPrefix("The profile was changed, but the radio is still off: ")
-                && leftOff.hasSuffix("Run `RMNet radio on`, or press Radio On in the window."),
+                && leftOff.hasSuffix("Run `RMNet radio on`, or use the Radio switch on the window's Network screen."),
               "profileSentence: the radio left off begins and ends as the brief says", leftOff)
         expectEqual(leftOff, "The profile was changed, but the radio is still off: the modem did not answer in time. " +
-                             "Profile 1 is now \(cmnetPapWords). Run `RMNet radio on`, or press Radio On in the window.",
+                             "Profile 1 is now \(cmnetPapWords). Run `RMNet radio on`, or use the Radio switch on the window's Network screen.",
                     "profileSentence: the radio left off")
         expectEqual(profileSentence(toCmnet(.radioLeftOff("AT+CFUN=1 was refused"))),
                     "The profile was changed, but the radio is still off: AT+CFUN=1 was refused. " +
-                    "Profile 1 is now \(cmnetPapWords). Run `RMNet radio on`, or press Radio On in the window.",
+                    "Profile 1 is now \(cmnetPapWords). Run `RMNet radio on`, or use the Radio switch on the window's Network screen.",
                     "profileSentence: a reason without a full stop")
         for (why, name) in [("", "empty"), ("  \n", "only spaces")] {
             expectEqual(profileSentence(toCmnet(.radioLeftOff(why))),
                         "The profile was changed, but the radio is still off: the radio could not be switched on. " +
-                        "Profile 1 is now \(cmnetPapWords). Run `RMNet radio on`, or press Radio On in the window.",
+                        "Profile 1 is now \(cmnetPapWords). Run `RMNet radio on`, or use the Radio switch on the window's Network screen.",
                         "profileSentence: a reason that is \(name)")
         }
         for (why, shownWhy) in [("Is the modem attached?", "is the modem attached?"), ("AT+CFUN=1 failed!", "AT+CFUN=1 failed!"),
                                 ("The modem did not answer in time. ", "the modem did not answer in time.")] {
             expectEqual(profileSentence(toCmnet(.radioLeftOff(why))),
                         "The profile was changed, but the radio is still off: \(shownWhy) " +
-                        "Profile 1 is now \(cmnetPapWords). Run `RMNet radio on`, or press Radio On in the window.",
+                        "Profile 1 is now \(cmnetPapWords). Run `RMNet radio on`, or use the Radio switch on the window's Network screen.",
                         "profileSentence: a reason ending \"\(why.last.map { String($0) } ?? "")\" gets no second stop")
         }
 

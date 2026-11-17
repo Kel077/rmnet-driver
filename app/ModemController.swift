@@ -1,5 +1,5 @@
-// The Overview's, Network and SIM & APN tabs' state and the calls they make to the modem: reads only while a
-// tab is shown in a visible window, one call at a time, the result line of the last change, a way back (Put
+// The Overview, Network and SIM & Data screens' state and the calls they make to the modem: reads only while one
+// of them is shown in a visible window, one call at a time, the result line of the last change, a way back (Put
 // Back) for a mode or profile change, the bands each RAT may use (changed or reset to every supported band),
 // the serving cell's signal over the last 120 network reads, and quitting that waits for a running call. It
 // takes any ModemServing, and the two AppKit calls it needs (the answer to the terminate question, the request
@@ -13,7 +13,8 @@
 import Combine
 import Foundation
 
-/// The modem tab shown in the window. The Overview reads the network as the Network tab does, without the bands.
+/// The modem screen shown in the window (`simAndApn`: SIM & Data). The Overview reads the network as the Network
+/// screen does, without the bands.
 enum ModemTab: Equatable { case overview, network, simAndApn }
 
 /// One serving leg's signal in one network read that succeeded, for the signal history's charts: the read's
@@ -40,7 +41,7 @@ enum ModemUndo: Equatable {
     case profile(id: Int, ProfileSettings)
 }
 
-/// The line the window shows above its tabs while a quit waits for a call to the modem; "" otherwise.
+/// The line the window shows above its screen while a quit waits for a call to the modem; "" otherwise.
 /// Its own object, so the window can show it without observing the whole controller.
 final class ModemQuitNotice: ObservableObject {
     @Published fileprivate(set) var line = ""
@@ -84,7 +85,7 @@ private final class ModemChange {
 
 /// The app has exactly one, owned by the app delegate, so that quitting can wait for a running call. Its
 /// methods are called on the main thread; every service call runs on `queue` (shared with the Messages
-/// tab, so the AT port is never opened twice at once), one at a time, with the result handed back to the
+/// screen, so the AT port is never opened twice at once), one at a time, with the result handed back to the
 /// main thread.
 final class ModemController: ObservableObject {
     @Published private(set) var info: NetworkInfo? = nil         // the last network read that succeeded
@@ -105,11 +106,11 @@ final class ModemController: ObservableObject {
     @Published private(set) var resultIsFailure = false
     @Published private(set) var undo: ModemUndo? = nil
     @Published var form: ProfileSettings? = nil   // the editor's values for the driver's profile
-    @Published var pickedMode: String? = nil      // the Network tab's picker
+    @Published var pickedMode: String? = nil      // the Network screen's picker
     /// One sample a serving leg from each of the last `signalHistoryReads` network reads that succeeded (the
-    /// Overview's and the Network tab's), oldest first; a read with no leg adds none but counts.
+    /// Overview's and the Network screen's), oldest first; a read with no leg adds none but counts.
     @Published private(set) var signalHistory: [SignalSample] = []
-    /// The next Network read also reads the bands: set when the Network tab comes into view (shown, or its
+    /// The next Network read also reads the bands: set when the Network screen comes into view (shown, or its
     /// window seen again), on Refresh there and after every bands change; cleared only by a bands read that
     /// succeeded, so a turn whose network read failed (the bands are then not read) or whose bands read failed
     /// leaves them due for the next turn. Not on every 5 s turn: the bands take a port open and four reads of
@@ -140,8 +141,8 @@ final class ModemController: ObservableObject {
     private var confirming = false               // a confirmation is open: nothing new is read
     private var stopping = false                 // the app is quitting: nothing new starts
     private var quitWaits = false                // a quit waits for the running call to finish
-    private var readingTab: ModemTab?            // the tab the running read is for
-    private var readWanted = false               // the shown tab is to be read as soon as nothing runs
+    private var readingTab: ModemTab?            // the screen the running read is for
+    private var readWanted = false               // the shown screen is to be read as soon as nothing runs
     private var change: ModemChange? = nil       // the change running, or waiting on the queue behind a read
     private var driverProfileRead: Int? = nil    // driverProfile() at the last settings refresh
     private var formSource: ProfileSettings? = nil  // the values `form` was last filled from
@@ -224,7 +225,7 @@ final class ModemController: ObservableObject {
 
     // MARK: When the modem is read
 
-    /// The modem tab shown (nil: none, also when the window closes).
+    /// The modem screen shown (nil: none, also when the window closes).
     func setTabShown(_ tab: ModemTab?) {
         self.tab = tab
         updateTimer()
@@ -248,10 +249,10 @@ final class ModemController: ObservableObject {
 
     private var active: Bool { tab != nil && windowVisible && !stopping }
 
-    // Reads the shown tab at once when it becomes active (or another tab is shown), then on each turn of
-    // its timer (5 s Overview and Network, 30 s SIM & APN); stops when it is not active. The Network tab coming
-    // into view makes the bands due. A Network read that runs serves the Overview shown meanwhile (the same
-    // read, less the bands); an Overview read does not serve the Network tab, whose bands are due.
+    // Reads the shown screen at once when it becomes active (or another screen is shown), then on each turn of
+    // its timer (5 s Overview and Network, 30 s SIM & Data); stops when it is not active. The Network screen
+    // coming into view makes the bands due. A Network read that runs serves the Overview shown meanwhile (the same
+    // read, less the bands); an Overview read does not serve the Network screen, whose bands are due.
     private func updateTimer() {
         guard active, let tab else {
             timer?.invalidate()
@@ -271,7 +272,7 @@ final class ModemController: ObservableObject {
         timer = t
         timerTab = tab
         if running == .reading, readingTab == tab || (tab == .overview && readingTab == .network) {
-            readWanted = false  // the read running now is this tab's, or serves it
+            readWanted = false  // the read running now is this screen's, or serves it
         } else {
             readWanted = true
             readIfDue()
@@ -289,16 +290,16 @@ final class ModemController: ObservableObject {
         read(refreshing: false)
     }
 
-    /// Refresh: reads the shown tab at once, on the Network tab the bands too (on the Overview the network
+    /// Refresh: reads the shown screen at once, on the Network screen the bands too (on the Overview the network
     /// only). Nothing (and the bands not made due) when `read` would start nothing.
     func refresh() {
         read(refreshing: true)
     }
 
-    /// Reads what the shown tab needs: the Network tab networkInfo(), then bands() when they are due and
+    /// Reads what the shown screen needs: the Network screen networkInfo(), then bands() when they are due and
     /// networkInfo() succeeded (after a failure the port is likely busy or the modem gone, and the bands stay
-    /// due); the Overview networkInfo() only; the SIM & APN tab profiles() then sim(); each in one block on the
-    /// queue. Nothing while a call runs, no tab is shown, the window is hidden, a confirmation is open or the
+    /// due); the Overview networkInfo() only; SIM & Data profiles() then sim(); each in one block on the
+    /// queue. Nothing while a call runs, no screen is shown, the window is hidden, a confirmation is open or the
     /// app quits.
     private func read(refreshing: Bool) {
         guard running == nil, active, !confirming, let tab else { return }
@@ -444,7 +445,7 @@ final class ModemController: ObservableObject {
     }
 
     /// The quit was cancelled elsewhere (the Messages controller's call failed; QuitGate.swift): working
-    /// again, the shown tab read at once. A quit of this controller that still waited is cancelled too and
+    /// again, the shown screen read at once. A quit of this controller that still waited is cancelled too and
     /// never answered.
     func resumeAfterCancelledQuit() {
         stopping = false
@@ -465,11 +466,11 @@ final class ModemController: ObservableObject {
         stopping = false
         replyToQuit(false)
         requestAttention()
-        updateTimer()  // the app goes on: the shown tab is read again
+        updateTimer()  // the app goes on: the shown screen is read again
         return true
     }
 
-    // After every call: the quit's answer, else the shown tab read again after a change, or a read that
+    // After every call: the quit's answer, else the shown screen read again after a change, or a read that
     // became due while the call ran.
     private func finished(succeeded: Bool, changed: Bool) {
         if answeredQuit(succeeded: succeeded) { return }
@@ -722,7 +723,7 @@ final class ModemController: ObservableObject {
     }
 
     /// `steps` in order on the queue, one setBands each, as one change (`.bands`), stopping at the first
-    /// failure; then the result line (`all`: Reset all's), and the tab read again with the bands (after a
+    /// failure; then the result line (`all`: Reset all's), and the screen read again with the bands (after a
     /// failure too).
     private func runBands(_ steps: [BandsStep], all: Bool = false, line: String) {
         submit(.bands, line: line, quitLine: ModemController.bandsQuitLine, {
@@ -756,7 +757,7 @@ final class ModemController: ObservableObject {
             }
             bands = sets
         }
-        bandsDue = true  // read again with the tab, after a failure too
+        bandsDue = true  // read again with the screen, after a failure too
         let line: String
         if !all, let step = steps.first {
             if let failure = outcome.failed {
@@ -804,7 +805,7 @@ private struct BandsOutcome {
 
 // MARK: - The bands' words
 
-/// A RAT's bands as the Network tab shows them, the words `RMNet bands` prints: `all 31 supported bands
+/// A RAT's bands as the Network screen shows them, the words `RMNet bands` prints: `all 31 supported bands
 /// allowed`, or `2 of 31 supported bands allowed: 3, 41` (compared as sets).
 func bandsSummary(_ set: BandSet) -> String {
     let allowed = Set(set.allowed)

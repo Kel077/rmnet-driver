@@ -160,8 +160,9 @@ struct NetworkTab: View {
 
     // MARK: Signal
 
-    /// The connection's bars and word in the title row; a gauge for each metric of each serving leg (EN-DC: a column
-    /// for LTE and one for NR); then RSRP and SINR over the last ten minutes.
+    /// The connection's bars and their word (signalCaption, as the Overview and the menu bar panel say it) in the
+    /// title row; a gauge for each metric of each serving leg (EN-DC: a column for LTE and one for NR); then RSRP and
+    /// SINR over the last ten minutes.
     private var signalCard: some View {
         let info = controller.info
         let legs = NetworkCards.shownLegs(info)
@@ -170,7 +171,7 @@ struct NetworkTab: View {
             if info != nil {
                 HStack(spacing: Spacing.s) {
                     SignalBars(level: level)
-                    Text(verbatim: level.map(signalWord) ?? "Not known")
+                    Text(verbatim: signalCaption(info))
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -295,8 +296,8 @@ struct NetworkTab: View {
         }
     }
 
-    /// On while the modem says the radio is on. Switching it off asks first (the confirmation of Radio Off…);
-    /// switching it on runs Radio On. Either way it shows the modem's state, not the click (radioClicks), and it is
+    /// On while the modem says the radio is on. Switching it off asks first (radioOffQuestion); switching it on
+    /// switches the radio on at once. Either way it shows the modem's state, not the click (radioClicks), and it is
     /// off while a change runs or waits, or a confirmation or the sheet is open. Shown only once the radio is read.
     private var radioSwitch: some View {
         Toggle("Radio", isOn: Binding(get: { NetworkCards.radioSwitchOn(controller.info?.radio) == true }, set: { on in
@@ -414,8 +415,9 @@ struct NetworkTab: View {
 
 // MARK: - The cards' parts
 
-/// The throughput card: the current rates in large type over the last two minutes as a chart. It observes the sampler
-/// (every second) so that only it redraws.
+/// The throughput card: the current rates in large type over the last two minutes as a chart; without the driver's
+/// counters (it is not attached) the chart's place says so, as the Overview's does. It observes the sampler (every
+/// second) so that only it redraws.
 private struct ThroughputCard: View {
     @ObservedObject var throughput: ThroughputSampler
 
@@ -423,7 +425,11 @@ private struct ThroughputCard: View {
         Card("Throughput", symbol: "arrow.up.arrow.down") {
             VStack(alignment: .leading, spacing: Spacing.m) {
                 ThroughputRates(current: throughput.current)
-                ThroughputChart(points: throughput.points, height: 180)
+                if throughput.sessionRx == nil {
+                    ChartPlaceholder(text: "No data from the driver", height: 180)
+                } else {
+                    ThroughputChart(points: throughput.points, height: 180)
+                }
             }
         }
     }

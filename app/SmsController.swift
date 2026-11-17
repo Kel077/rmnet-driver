@@ -1,4 +1,4 @@
-// The Messages tab's state and the calls it makes to the modem: one call at a time, the list's line and
+// The Messages screen's state and the calls it makes to the modem: one call at a time, the list's line and
 // the result line kept apart, and quitting that waits for a running call. It takes any SmsServing, and
 // the two AppKit calls it needs (the answer to the terminate question, the request for attention) are
 // closures given by the app delegate, so it uses no AppKit or SwiftUI and is tested with a fake service
@@ -13,9 +13,9 @@ enum SmsActivity: Equatable {
     case sending
 }
 
-/// The line the window shows above its tabs while a quit waits for a call to the modem; "" otherwise.
+/// The line the window shows above its screen while a quit waits for a call to the modem; "" otherwise.
 /// Its own object, so the window can show it without observing the whole controller (typing a message
-/// must not redraw the Driver tab).
+/// must not redraw the rest of the window).
 final class SmsQuitNotice: ObservableObject {
     @Published fileprivate(set) var line = ""
 }
@@ -90,7 +90,7 @@ final class SmsController: ObservableObject {
 
     // MARK: When the modem is asked
 
-    /// The Messages tab is the one shown (true) or not (false, also when the window closes).
+    /// The Messages screen is the one shown (true) or not (false, also when the window closes).
     func setTabShown(_ shown: Bool) {
         tabShown = shown
         updateTimer()
@@ -109,7 +109,7 @@ final class SmsController: ObservableObject {
 
     private var active: Bool { tabShown && windowVisible && !stopping }
 
-    // Lists at once when the tab becomes active, then every 15 s; stops when it is not.
+    // Lists at once when the screen becomes active, then every 15 s; stops when it is not.
     private func updateTimer() {
         if active {
             guard timer == nil else { return }
@@ -147,7 +147,7 @@ final class SmsController: ObservableObject {
         return true
     }
 
-    /// The quit was cancelled elsewhere (the modem tabs' call failed): working again, the tab listed at once
+    /// The quit was cancelled elsewhere (the modem screens' call failed): working again, the screen listed at once
     /// if it is shown. A quit of this controller that still waited is cancelled too and never answered.
     func resumeAfterCancelledQuit() {
         stopping = false
@@ -168,7 +168,7 @@ final class SmsController: ObservableObject {
         stopping = false
         replyToQuit(false)
         requestAttention()
-        updateTimer()  // the app goes on: the tab lists again if it is shown
+        updateTimer()  // the app goes on: the screen lists again if it is shown
         return true
     }
 

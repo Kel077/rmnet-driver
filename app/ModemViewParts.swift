@@ -1,6 +1,5 @@
 // What the Network and SIM & Data screens share (NetworkView.swift, SimDataView.swift): the profile the driver
-// dials, the read line with Refresh, the result line, label and value rows, the Put Back command, and the
-// confirmations' words and their modifier.
+// dials, the words of the read line, the Put Back command, and the confirmations' words and their modifier.
 import SwiftUI
 
 /// The profile the driver dials: its RMNetProfile registry property; nil when it is not attached.
@@ -17,7 +16,7 @@ private let readTimeFormat: DateFormatter = {
     return f
 }()
 
-/// The tab's first line: "Updated HH:mm:ss." after a read that succeeded; after one that failed, its
+/// The screen's read line: "Updated HH:mm:ss." after a read that succeeded; after one that failed, its
 /// sentence, and when values from an earlier read are on screen, that they may be out of date; before
 /// the first read, `reading`.
 func readStatusLine(at: Date?, failure: String?, valuesShown: Bool, reading: String) -> String {
@@ -27,59 +26,6 @@ func readStatusLine(at: Date?, failure: String?, valuesShown: Bool, reading: Str
     case (nil, let t?): return "Updated \(t)."
     case (let f?, let t?) where valuesShown: return "\(f) The values below may be out of date; they were read at \(t)."
     case (let f?, _): return valuesShown ? "\(f) The values below may be out of date." : f
-    }
-}
-
-/// The read line (orange after a failed read) and Refresh.
-struct ReadStatus: View {
-    let text: String
-    let failed: Bool
-    @ObservedObject var controller: ModemController
-
-    var body: some View {
-        HStack(alignment: .top) {
-            Text(verbatim: text)
-                .foregroundStyle(failed ? Color.orange : Color.secondary)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            Button("Refresh") { controller.refresh() }
-                .disabled(!controller.refreshEnabled)
-        }
-    }
-}
-
-/// The result of the last change (or what runs or waits now), red on failure. A read never changes it.
-struct ResultLine: View {
-    @ObservedObject var controller: ModemController
-
-    var body: some View {
-        if !controller.result.isEmpty {
-            Text(verbatim: controller.result)
-                .foregroundStyle(controller.resultIsFailure ? Color.red : Color.primary)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-}
-
-/// Label and value in two columns; the values can be selected.
-struct RowsGrid: View {
-    let rows: [(label: String, value: String)]
-
-    var body: some View {
-        Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 4) {
-            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                GridRow {
-                    Text(verbatim: row.label)
-                        .foregroundStyle(.secondary)
-                    Text(verbatim: row.value)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-        }
     }
 }
 
@@ -111,10 +57,10 @@ struct Question<Action> {
     var cancelIsDefault = false   // Return cancels: the confirm button is never the default (the PIN, ruling R20)
 }
 
-/// Shows `question` as a confirmation. The tab calls `setConfirming(true)` when it opens one. Confirming
+/// Shows `question` as a confirmation. The screen calls `setConfirming(true)` when it opens one. Confirming
 /// calls `perform` first and then `setConfirming(false)`, so the change starts at once rather than after
 /// the read that may be due (ruling R12); the confirm button is never turned off. Confirmed, cancelled or
-/// dismissed, `closed` runs (the SIM & APN tab clears the PIN and the last-attempt checkbox there).
+/// dismissed, `closed` runs (the SIM & Data screen clears the PIN and the last-attempt checkbox there).
 struct Confirmation<Action>: ViewModifier {
     @Binding var question: Question<Action>?
     let controller: ModemController

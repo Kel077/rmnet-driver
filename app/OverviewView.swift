@@ -135,7 +135,8 @@ private struct CardRow<Content: View>: View {
 // MARK: - Hero
 
 /// The hero: the state in large type (Connected only while the driver's link is up); under it the technology badge,
-/// the bars with their word, the operator and the bands as chips (primary first, then the aggregated carriers); the
+/// the bars with their word (signalCaption, as the menu bar panel says it: the radio off, searching or limited service
+/// when the modem says so), the operator and the bands as chips (primary first, then the aggregated carriers); the
 /// addresses while connected, beside them or below. An operator or bands not known are left out; an unknown signal
 /// (nothing read, or no RSRP) is outlined bars and "Signal not known", never "No signal". Washed with the state's
 /// colour.
@@ -147,7 +148,7 @@ private struct OverviewHero: View {
     var body: some View {
         let pill = connectionPill(driverStatus.connectionHeadline)
         let info = modem.info
-        let level = info.flatMap(signalLevel)   // nil: not known (outlined bars, "Signal not known")
+        let level = info.flatMap(signalLevel)   // nil: not known (outlined bars)
         let operatorName = info.flatMap { $0.networkName ?? $0.operatorName }
         let bands = info.flatMap(bandText)
         let addresses = pill.state == .connected ? addressRows(driverStatus.status.properties) : []
@@ -163,7 +164,7 @@ private struct OverviewHero: View {
                         TechBadge(text: tech)
                     }
                     SignalBars(level: level, height: 14)
-                    Text(verbatim: level.map(signalWord) ?? "Signal not known")
+                    Text(verbatim: signalCaption(info))
                         .foregroundStyle(.secondary)
                 }
                 .fixedSize()
@@ -366,7 +367,7 @@ private struct SignalCard: View {
                     if let quality {
                         Text(verbatim: signalWord(quality))
                             .font(.callout.weight(.medium))
-                            .foregroundStyle(signalTint(quality))
+                            .foregroundStyle(signalTextTint(quality))
                     }
                 }
                 .accessibilityElement(children: .ignore)

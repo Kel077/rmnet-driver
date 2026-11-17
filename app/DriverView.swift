@@ -1,4 +1,4 @@
-// The window's Driver screen, a settings-style form: the driver's status (the headline as a pill, the version
+// The window's Driver screen, a settings-style form: the driver's status (the headline's pill, the version
 // installed and the one this app carries, whether it is enabled, the modem and its USB mode), what to do (the advice,
 // Install or Update and Remove…, and System Settings while the driver waits for approval), and, on request, the
 // details: the system's entries for the extension and the driver's own properties. Refreshed every 2 seconds while it
@@ -51,7 +51,7 @@ struct StatusView: View {
         let guidance = warning == nil ? lines : Array(lines.dropLast())
         Form {
             Section {
-                DriverHeadline(state: pill.state, headline: headlineText)
+                DriverHeadline(state: pill.state, text: pill.text)
                 if case .unknown(let why) = controller.listing {
                     Text(verbatim: why)
                         .foregroundStyle(.red)
@@ -165,10 +165,13 @@ struct StatusView: View {
     }
 }
 
-/// The status section's first row: the driver's tile and name, and the headline as a pill.
+/// The status section's first row: the driver's tile and name, and the headline's pill in connectionPill's words, as
+/// the sidebar, the Overview and the menu bar show it ("Not connected", not the headline's "Link down"). The longer
+/// headlines add nothing the screen does not say: "Waiting for approval in System Settings" has the advice right under
+/// it, which names the pane, and Open System Settings.
 private struct DriverHeadline: View {
     let state: ConnectionState
-    let headline: String
+    let text: String
 
     var body: some View {
         HStack(spacing: Spacing.m) {
@@ -181,7 +184,7 @@ private struct DriverHeadline: View {
             VStack(alignment: .leading, spacing: Spacing.xs) {
                 Text("RMNet driver")
                     .font(.headline)
-                StatusPill(state: state, text: headline)
+                StatusPill(state: state, text: text)
             }
             Spacer(minLength: 0)
         }

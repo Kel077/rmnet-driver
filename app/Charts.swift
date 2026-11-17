@@ -114,8 +114,8 @@ struct ThroughputRates: View {
 
 /// One metric of the signal history over the last `window` seconds: a line per leg (NR blue, LTE teal, WCDMA
 /// gray), its quality zones (SignalQuality.swift) shaded behind, and a dashed rule where the technology or the
-/// band changed, labelled with the new one. "Collecting…" before two reads, "No signal data" when every value is
-/// unknown.
+/// band changed, labelled with the new one. "Collecting…" before two reads in the window, "No signal data" when every
+/// value is unknown.
 struct SignalHistoryChart: View {
     let samples: [SignalSample]
     let metric: SignalMetric
@@ -132,9 +132,9 @@ struct SignalHistoryChart: View {
     }
 
     var body: some View {
-        let reads = Set(samples.map { $0.at }).count
         let latest = samples.last?.at ?? Date()
         let shown = samples.filter { $0.at >= latest.addingTimeInterval(-window) }
+        let reads = Set(shown.map { $0.at }).count   // the reads in the window, not every one kept
         let points = signalPoints(shown, metric)
         if reads < 2 {
             ChartPlaceholder(text: "Collecting…", height: height)

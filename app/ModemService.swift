@@ -59,7 +59,7 @@ private func failure<T>(_ message: String) -> Result<T, ModemFailure> {
     .failure(ModemFailure(message: message))
 }
 
-private let stillOffAdvice = "Run `RMNet radio on`, or press Radio On in the window."
+private let stillOffAdvice = "Run `RMNet radio on`, or use the Radio switch on the window's Network screen."
 
 final class ModemService: ModemServing {
     fileprivate static let readTimeout: TimeInterval = 3

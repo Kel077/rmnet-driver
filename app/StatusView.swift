@@ -264,7 +264,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         replyToQuit: { [unowned self] succeeded in self.quitGate.replied(AppDelegate.messagesMember, succeeded) },
         requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
 
-    // The process's one ModemController, for the Network and SIM & APN tabs, kept the same way.
+    // The process's one ModemController, for the Overview, Network and SIM & Data screens, kept the same way.
     private(set) lazy var modem: ModemController = ModemController(
         service: ModemService(),
         queue: AppDelegate.modemQueue,
@@ -343,7 +343,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Every way of quitting (Cmd-Q, the Dock's Quit, `Quit RMNet` in the menu bar item's panel, logout) comes
     // here. With a call to the modem running, the app ends only when it has finished; a send is never cut
     // short. A send, delete or change that does not succeed cancels the quit, so that its result can be read.
-    // While it waits, the window shows why above its tabs (and the panel above its buttons); so a quit that
+    // While it waits, the window shows why above its screen (and the panel above its buttons); so a quit that
     // waits opens the window, or brings it forward, when it cannot be seen (quitShowsWindow).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let waits = quitGate.ask()

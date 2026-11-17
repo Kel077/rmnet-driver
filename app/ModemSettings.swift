@@ -683,7 +683,7 @@ private func attemptsLeft(_ n: Int) -> String {
 func radioOffQuestion() -> (title: String, message: String) {
     (title: "Switch the radio off?",
      message: "The modem leaves the network (airplane mode), and the driver's connection is down until the radio is "
-        + "switched on again: press Radio On, or run `RMNet radio on`.")
+        + "switched on again: use the Radio switch on the Network screen, or run `RMNet radio on`.")
 }
 
 /// The way back from a mode change: for any mode `canonicalMode` accepts, which the service sends in the
@@ -789,7 +789,7 @@ func profileSentence(_ c: ProfileChange) -> String {
         return "\(now) The radio was switched off and on again. \(radioSentence(radio))"
     case .radioLeftOff(let why):
         return "The profile was changed, but the radio is still off: \(clause(why)) \(now) "
-            + "Run `RMNet radio on`, or press Radio On in the window."
+            + "Run `RMNet radio on`, or use the Radio switch on the window's Network screen."
     }
 }
 

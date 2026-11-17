@@ -39,6 +39,19 @@ func signalTint(_ level: Int) -> Color {
     }
 }
 
+/// A quality word's colour by level (the gauge's word, the Overview's Signal card word): signalTint's, except Fair (2),
+/// whose yellow is about 1.4:1 as text on a light card. There it is a dark amber, #7A5C00, about 5.9:1 on the light
+/// card (#F8F8F8); in dark appearance the system yellow (about 11:1 on the dark card, #242424). The bars and the zone
+/// fills keep signalTint's and zoneFill's yellow.
+func signalTextTint(_ level: Int) -> Color {
+    level == 2 ? fairTextTint : signalTint(level)
+}
+
+private let fairTextTint = Color(nsColor: NSColor(name: nil) { appearance in
+    appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        ? .systemYellow : NSColor(srgbRed: 0x7A / 255.0, green: 0x5C / 255.0, blue: 0, alpha: 1)
+})
+
 /// A quality zone's fill behind a chart or a gauge (1 poor … 4 excellent): excellent and good green (good fainter),
 /// fair yellow, poor orange.
 func zoneFill(_ level: Int) -> Color {
@@ -253,7 +266,7 @@ struct MetricGauge: View {
                 .frame(height: 8)
             Text(verbatim: quality.map { signalWord($0) } ?? (value == nil ? "Not known" : " "))
                 .font(.caption)
-                .foregroundStyle(quality.map { signalTint($0) } ?? .secondary)
+                .foregroundStyle(quality.map { signalTextTint($0) } ?? .secondary)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text(verbatim: title))

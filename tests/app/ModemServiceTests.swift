@@ -1464,7 +1464,7 @@ struct ModemServiceTests {
     // A redial whose change, read-back or own port fails in the middle still switches the radio back on, on
     // a new port when the first closed itself, and says plainly when it could not.
     static func profileRedialFailures() {
-        let stillOff = "Run `RMNet radio on`, or press Radio On in the window."
+        let stillOff = "Run `RMNet radio on`, or use the Radio switch on the window's Network screen."
         do {
             // The change refused: AT+CFUN=1 is still sent; nothing changed.
             let rig = Rig(redialStart + [(setCmnet, cme(3)), ("AT+CFUN=1", ok)] + registered)

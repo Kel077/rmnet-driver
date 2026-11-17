@@ -1,5 +1,5 @@
 // The menu bar item's state: an icon saying whether the modem's connection is up and, for its panel, the
-// Driver tab's headline, the driver's addresses and a few lines about the network. Foundation only, so
+// Driver screen's headline, the driver's addresses and a few lines about the network. Foundation only, so
 // `make app-test` builds it without AppKit or SwiftUI (tests/app/MenuBarStatusTests.swift); the item and
 // its panel are in MenuBarView.swift.
 //
@@ -9,7 +9,7 @@
 // driver from waiting for approval) at once and then every 12th poll, about once a minute. With the driver
 // attached the headline comes from the registry until the listing answers. Never from the AT port. The
 // network lines come from the modem's spare AT port, read once when the panel opens (`panelOpened`) and not
-// again until 10 s after the last read finished, on the queue the window's tabs use, so that the app never
+// again until 10 s after the last read finished, on the queue the window's screens use, so that the app never
 // opens the port twice at once. Nothing read is logged or stored.
 import Foundation
 
@@ -141,7 +141,7 @@ func asOfText(_ date: Date) -> String {
     "as of \(asOfFormat.string(from: date))"
 }
 
-/// The Driver tab's words before the system first answers (DriverView.swift).
+/// The Driver screen's headline before the system first answers (DriverView.swift).
 private let askingHeadline = "Asking the system…"
 
 /// headline() of StatusModel.swift, by another name: inside MenuBarStatus `headline` is the property.
@@ -150,7 +150,7 @@ private func driverHeadline(_ status: DriverStatus) -> String {
 }
 
 /// The panel's headline: with the system's last fresh answer (`entries`, nil: none yet, or no listing), the
-/// Driver tab's; with the driver attached and no such answer, the Driver tab's headline for an attached driver
+/// Driver screen's; with the driver attached and no such answer, the Driver screen's headline for an attached driver
 /// whose one listed entry is enabled (`Connected`, `Connecting` or `Link down`, from RMNetState), so that the
 /// panel never says `Asking the system…` while the driver runs; with no driver, `Asking the system…` until the
 /// system answers, `Unknown` while it gives no listing.
