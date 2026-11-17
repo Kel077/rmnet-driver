@@ -68,7 +68,7 @@ Check that it works:
 RMNet status
 ```
 
-It prints the driver extension and whether it is enabled, a `modem:` line saying whether the modem is attached and in QMI mode, and, once the driver is attached, its properties: `RMNetState = up` when connected, and the addresses (`RMNetIPv4`, `RMNetIPv6`). The window's `Driver` tab then shows `Connected`.
+It prints the driver extension and whether it is enabled, a `modem:` line saying whether the modem is attached and in QMI mode, and, once the driver is attached, its properties: `RMNetState = up` when connected, and the addresses (`RMNetIPv4`, `RMNetIPv6`). The window's `Driver` screen then shows `Connected`.
 
 macOS names the port `en` and a number, which varies from Mac to Mac (`en33` on the author's). Find yours with `networksetup -listallhardwareports`, under the hardware port `RM520N-GL`. Then:
 
@@ -100,14 +100,15 @@ ping -c 3 -b en33 1.1.1.1       # bound to the port, whatever the service order
 - RMNet never logs or writes to disk message texts, phone numbers, passwords, PINs, your position, or what `RMNet at` sends and prints.
 - Every option and every line each command prints is in [docs/reference.md](docs/reference.md), "Driver".
 
-Opened with no argument (from the Finder, or `open /Applications/RMNet.app`), the app shows one window with four tabs:
+Opened with no argument (from the Finder, or `open /Applications/RMNet.app`), the app shows one window: a sidebar with five screens, and at its foot the connection (`Connected`, `Not connected` and the like, with the technology, band and signal while it is up). Each screen has its actions in the toolbar, and the result of a change appears as a banner at the bottom.
 
-- **Driver**: a headline such as `Connected`, advice on what to do, the addresses, versions and counters; `Install` (or `Update`) and `Remove…`.
-- **Messages**: the modem's text messages; `Delete…`, and a form to send one.
-- **Network**: registration, signal and cell; `Radio Off…` or `Radio On`; the network mode, with `Change…`; the bands LTE, 5G NSA and 5G SA may use, each with `Change…` (a checkbox for each supported band) and `Reset`, and `Reset all`.
-- **SIM & APN**: the SIM's state and PIN entry; the data profiles, and an editor for the one the driver dials.
+- **Overview**: the connection at a glance: its state, technology, signal, operator, bands and addresses, the throughput of the last two minutes and the signal of the last ten, and cards for the SIM, the unread messages and the driver. `Refresh` reads again; the driver card has `Install`, `Update` or `Open System Settings` when one is due.
+- **Messages**: the modem's text messages, newest first, with the one selected beside them; `Refresh`, `Delete…` and `New Message`, which opens a sheet to write and send one.
+- **Network**: cards for the connection, signal, throughput and cell; the radio, a switch (switching it off asks first); the network mode, with `Change…` and, after a change, `Put Back…`; and the bands LTE, 5G NSA and 5G SA may use, each with `Change…` (a sheet with a chip for each supported band) and `Reset`, and `Reset all`.
+- **SIM & Data**: the SIM's state and attempts left, with `Unlock…` (a sheet for the PIN) while it asks for one; the data profile the driver dials, with an editor (`Revert`, `Apply…`, and after a change `Put Back…`) and a list of all profiles.
+- **Driver**: a headline such as `Connected`, advice on what to do, the versions and, under `Details`, the system's entries and the driver's properties; `Install` (or `Update`), `Remove…`, and `Open System Settings` while the driver waits for approval.
 
-**Menu bar.** While it runs, the app also has an item in the menu bar: an antenna, struck through unless the connection is up. Its panel shows the `Driver` tab's headline, the addresses while connected, and the technology and band, operator and signal, read from the modem when the panel opens (not again within 10 s; the icon itself never asks the modem), with `Open RMNet` and `Quit RMNet`. Closing the window leaves RMNet running in the menu bar; `Open RMNet` or a click on its Dock icon opens it again, and `Quit RMNet` or Cmd-Q ends it, once a running send or change has finished (the panel and the window say so meanwhile; a quit that waits opens the window when it cannot be seen).
+**Menu bar.** While it runs, the app also has an item in the menu bar: an antenna, struck through unless the connection is up. Its panel shows a status pill, then the technology, the signal bars with a word, the operator and band, read from the modem when the panel opens (not again within 10 s; the icon itself never asks the modem), and the IPv4 address while connected, with `Open RMNet` and `Quit RMNet`. Closing the window leaves RMNet running in the menu bar; `Open RMNet` or a click on its Dock icon opens it again, and `Quit RMNet` or Cmd-Q ends it, once a running send or change has finished (the panel and the window say so meanwhile; a quit that waits opens the window when it cannot be seen).
 
 The driver also presents two of the modem's other USB interfaces as serial ports: `/dev/cu.RM520N-GL-NMEA` (GNSS sentences, while GNSS is on) and `/dev/cu.RM520N-GL-DIAG` (Qualcomm's DIAG protocol, for tools such as QCSuper). Like every serial port on macOS, any local user can read and write them while the driver is attached.
 
@@ -115,7 +116,7 @@ The driver also presents two of the modem's other USB interfaces as serial ports
 
 **To update**, pull the new code and run `scripts/install-driver.sh` again. No new approval is needed; unplug and replug the modem if the script says an older build is still running.
 
-**To remove** the driver, press `Remove…` on the window's `Driver` tab, or run `RMNet deactivate`. macOS asks for an administrator's password. The driver keeps the port until the modem is unplugged or the Mac restarts.
+**To remove** the driver, press `Remove…` on the window's `Driver` screen, or run `RMNet deactivate`. macOS asks for an administrator's password. The driver keeps the port until the modem is unplugged or the Mac restarts.
 
 macOS removes a driver only when asked by an app that embeds that exact driver version. That is why the install script keeps a copy of every app it installs, as `build/installed/RMNet-<version>.app`, and why `make clean` leaves that folder alone. **Never delete `build/installed/`**: without the matching app, an installed driver cannot be removed until that exact version is built again. It lives inside your clone, so deleting the clone or cloning afresh in its place deletes it too: keep the clone for as long as a driver built from it is installed, or copy `build/installed/` somewhere safe first and put it back into the new clone (the install script refuses to run while an installed version has no kept app there). If `/Applications/RMNet.app` no longer carries the installed version, follow [docs/reference.md](docs/reference.md), "Removing the driver".
 
@@ -123,7 +124,7 @@ Do not switch the driver off in System Settings while the modem is attached: the
 
 ## Troubleshooting
 
-- **The driver does not appear.** Run `RMNet status`, or `systemextensionsctl list` (look for `<your bundle ID>.driver`). `Waiting for approval in System Settings` means the approval above is still to be given; `Not installed` means no activation got through: run the install script again and read what it printed. For more than one entry, or a switched-off one, the window's `Driver` tab says what to do.
+- **The driver does not appear.** Run `RMNet status`, or `systemextensionsctl list` (look for `<your bundle ID>.driver`). `Waiting for approval in System Settings` means the approval above is still to be given; `Not installed` means no activation got through: run the install script again and read what it printed. For more than one entry, or a switched-off one, the window's `Driver` screen says what to do.
 - **`Modem is not in QMI mode`.** Run `RMNet usbmode set qmi` (above).
 - **`Installed, modem not attached`.** No matching modem is on USB; the `modem:` line of `RMNet status` lists the products looked for.
 - **The port has no address.** `RMNet status` shows `RMNetState`. `RMNet network` says whether the modem is registered and the radio on, `RMNet sim` whether the SIM waits for its PIN, and `RMNet apn` which profile the driver dials and its APN. A wrong APN breaks the connection: set your carrier's with `RMNet apn set --apn <name>`.
@@ -165,7 +166,7 @@ The make targets (none needs the modem, an install or signing; details in [docs/
 
 The documents:
 
-- [docs/reference.md](docs/reference.md): every make target, script, command and window tab in detail; removing a driver by hand; the serial ports; the supported models; the harness.
+- [docs/reference.md](docs/reference.md): every make target, script, command and window screen in detail; removing a driver by hand; the serial ports; the supported models; the harness.
 - [docs/status.md](docs/status.md): where each line of the design's "Done means" stands, with the evidence.
 - [docs/driverkit-notes.md](docs/driverkit-notes.md): what was learned about DriverKit, from compiling and on hardware.
 - [docs/superpowers/](docs/superpowers/): the [design](docs/superpowers/specs/2026-11-13-rmnet-driver-design.md) and the plans the code was built from.
