@@ -1,8 +1,9 @@
 // Tests for what the Network screen's cards show (app/NetworkView.swift's NetworkCards): the Connection card's rows
 // ("—" for what was not read, the operator and network names, the PLMN's fallback, the mode with a 5G kind disabled),
 // the technology's words without a badge, the legs' order and names, the metrics a RAT reports, why there is no leg
-// to show, the Cell card's rows (one or two legs, WCDMA, none), the carrier chips (bandwidth, primary) and their
-// widths, and the bands' chips, count and collapse. Built with swiftc by `make app-test` from NetworkView.swift and
+// to show, the Cell card's rows (one or two legs, WCDMA, none), the carrier chips (bandwidth, once a serving leg;
+// primary) and their widths, the radio switch (none while the radio is not known), and the bands' chips, count and
+// collapse. Built with swiftc by `make app-test` from NetworkView.swift and
 // the files it needs; its views are compiled, not drawn (no window is made, no modem opened).
 // Stops at the first failure, prints which check failed and exits 1.
 import Foundation
@@ -64,6 +65,7 @@ struct NetworkViewTests {
         noLeg()
         cell()
         carriers()
+        radioSwitch()
         chipWidths()
         bands()
         print("network view: \(checks) checks passed")
@@ -224,6 +226,24 @@ struct NetworkViewTests {
               "carriers: a carrier text kept as given")
         equal(NetworkCards.carrierChips(info([])), [], "carriers: none")
         equal(NetworkCards.carrierChips(info([leg("WCDMA")])), [], "carriers: a leg with no band")
+        // Intra-band aggregation: the serving leg's bandwidth goes to one chip only, the first on its band.
+        equal(NetworkCards.carrierChips(info([sa], carriers: ["n41", "n41"])), [
+            NetworkCards.CarrierChip(band: "n41", bandwidthMHz: 100, primary: true),
+            NetworkCards.CarrierChip(band: "n41", bandwidthMHz: nil, primary: false),
+        ], "carriers: n41 + n41, the leg's 100 MHz on the primary only")
+        equal(NetworkCards.carrierChips(info([lte], carriers: ["B3", "B7", "B3"])).map { $0.bandwidthMHz }, [20, nil, nil],
+              "carriers: B3 + B7 + B3, the leg's 20 MHz on the first B3 only")
+        equal(NetworkCards.carrierChips(info([lte, nsaNr], carriers: ["B3", "B3", "n78"])).map { $0.bandwidthMHz },
+              [20, nil, 100], "carriers: each serving leg's bandwidth once, on its own band")
+    }
+
+    // The radio switch: shown only once the radio has been read, on only while the modem says it is on.
+    static func radioSwitch() {
+        equal(NetworkCards.radioSwitchOn(nil), nil, "radio switch: not read, no switch")
+        equal(NetworkCards.radioSwitchOn(.on), true, "radio switch: on")
+        equal(NetworkCards.radioSwitchOn(.airplane), false, "radio switch: airplane mode, off")
+        equal(NetworkCards.radioSwitchOn(.minimum), false, "radio switch: minimum functionality, off")
+        equal(NetworkCards.radioSwitchOn(.other(5)), false, "radio switch: another AT+CFUN value, off")
     }
 
     // Wider with more bandwidth, between 56 and 220 pt; 56 when not known.

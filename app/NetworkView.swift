@@ -247,7 +247,10 @@ struct NetworkTab: View {
                         .foregroundStyle(.secondary)
                     Spacer(minLength: Spacing.s)
                     Text(verbatim: controller.info?.radio.map(radioStateWords) ?? "—")
-                    radioSwitch
+                    // No switch while the radio is not known (nothing read, or reads failing): "—" only.
+                    if NetworkCards.radioSwitchOn(controller.info?.radio) != nil {
+                        radioSwitch
+                    }
                 }
                 HStack(alignment: .center, spacing: Spacing.m) {
                     Text("Network mode")
@@ -294,9 +297,9 @@ struct NetworkTab: View {
 
     /// On while the modem says the radio is on. Switching it off asks first (the confirmation of Radio Off…);
     /// switching it on runs Radio On. Either way it shows the modem's state, not the click (radioClicks), and it is
-    /// off while a change runs or waits, a confirmation or the sheet is open, or the radio has not been read.
+    /// off while a change runs or waits, or a confirmation or the sheet is open. Shown only once the radio is read.
     private var radioSwitch: some View {
-        Toggle("Radio", isOn: Binding(get: { controller.info?.radio == .on }, set: { on in
+        Toggle("Radio", isOn: Binding(get: { NetworkCards.radioSwitchOn(controller.info?.radio) == true }, set: { on in
             radioClicks += 1
             if on {
                 controller.setRadio(on: true)
@@ -309,7 +312,7 @@ struct NetworkTab: View {
         .toggleStyle(.switch)
         .labelsHidden()
         .id(radioClicks)
-        .disabled(!controller.refreshEnabled || controller.info?.radio == nil)
+        .disabled(!controller.refreshEnabled)
     }
 
     // MARK: Bands
@@ -831,18 +834,27 @@ enum NetworkCards {
     }
 
     /// The carriers in use: AT+QCAINFO's (primary first), then any serving leg's band they do not list (as
-    /// bandText). Each has the bandwidth of the serving leg on its band, when there is one (the modem reports none
-    /// for another carrier); the first is the primary when AT+QCAINFO listed it.
+    /// bandText); the first is the primary when AT+QCAINFO listed it. A serving leg's bandwidth goes to one chip
+    /// only, the first on its band (the primary when listed): with intra-band aggregation (n41 + n41) the other
+    /// carrier's bandwidth is not known (the modem reports a bandwidth for the serving legs only).
     static func carrierChips(_ info: NetworkInfo) -> [CarrierChip] {
         let legs = info.serving?.cells ?? []
         var bands = info.carriers
         for leg in legs {
             if let band = leg.band, !bands.contains(band) { bands.append(band) }
         }
+        var unassigned = legs.filter { $0.band != nil && $0.bandwidthMHz != nil }
         return bands.enumerated().map { i, band in
-            CarrierChip(band: band, bandwidthMHz: legs.first(where: { $0.band == band && $0.bandwidthMHz != nil })?.bandwidthMHz,
-                        primary: i == 0 && !info.carriers.isEmpty)
+            let leg = unassigned.firstIndex(where: { $0.band == band }).map { unassigned.remove(at: $0) }
+            return CarrierChip(band: band, bandwidthMHz: leg?.bandwidthMHz, primary: i == 0 && !info.carriers.isEmpty)
         }
+    }
+
+    /// The radio switch's position: on while the modem says the radio is on, off for airplane mode, minimum
+    /// functionality or another AT+CFUN value; nil while the radio is not known (nothing read, or reads failing),
+    /// when the screen shows "—" and no switch.
+    static func radioSwitchOn(_ radio: RadioState?) -> Bool? {
+        radio.map { $0 == .on }
     }
 
     /// A carrier chip's width in points, by its bandwidth: 40 pt and 1.2 pt a MHz, at least 56 (room for the band and
