@@ -41,9 +41,10 @@ struct MenuBarLabel: View {
 
 /// The panel, 290 pt wide: a compact version of the Overview's hero. The pill says Connected only while the
 /// driver's link is up (connectionPill of the model's headline). The badge, the bars, the operator and the band come
-/// from the last network read that succeeded (`info`), with its time; a value not known is "—", and a signal not
-/// known is outlined bars and "Signal not known", never "No signal". Without that read, its lines if there are any.
-/// The IPv4 address (copyable) only while the link is up.
+/// from the last network read that succeeded (`info`), with its time; a value not known is "—". The word beside the
+/// bars is signalCaption's: the radio off, searching or limited service when the modem says so, "Signal not known"
+/// (outlined bars) when the signal is not known, never "No signal", else the bars' word. Without that read, its lines
+/// if there are any. The IPv4 address (copyable) only while the link is up.
 struct MenuBarPanel: View {
     @ObservedObject var status: MenuBarStatus
     // The controllers' quit lines (quitNoticeLines), shown above the buttons while a quit waits: `Quit RMNet`
@@ -103,15 +104,19 @@ struct MenuBarPanel: View {
     /// NetworkInfo, the read's lines and time.
     @ViewBuilder private var network: some View {
         if let info = status.info {
-            let level = signalLevel(info)   // nil: not known
             VStack(alignment: .leading, spacing: Spacing.s) {
-                HStack(alignment: .center, spacing: Spacing.s) {
-                    SignalBars(level: level, height: 16)
-                    Text(verbatim: level.map(signalWord) ?? "Signal not known")
-                        .font(.title3.weight(.semibold))
-                        .lineLimit(1)
-                    Spacer(minLength: Spacing.s)
-                    asOf
+                // The read's time beside the bars and their word, or under them when a long word leaves no room
+                // ("Radio off (airplane mode)").
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .center, spacing: Spacing.s) {
+                        signal(info)
+                        Spacer(minLength: Spacing.s)
+                        asOf
+                    }
+                    VStack(alignment: .leading, spacing: Spacing.xs) {
+                        signal(info)
+                        asOf
+                    }
                 }
                 VStack(alignment: .leading, spacing: Spacing.xs) {
                     KeyValueRow(label: "Operator", value: info.networkName ?? info.operatorName ?? "—")
@@ -123,6 +128,16 @@ struct MenuBarPanel: View {
                 Lines(status.networkLines)
                 asOf
             }
+        }
+    }
+
+    /// The bars (outlined when the level is not known) and the word beside them (signalCaption).
+    private func signal(_ info: NetworkInfo) -> some View {
+        HStack(alignment: .center, spacing: Spacing.s) {
+            SignalBars(level: signalLevel(info), height: 16)
+            Text(verbatim: signalCaption(info))
+                .font(.title3.weight(.semibold))
+                .lineLimit(1)
         }
     }
 

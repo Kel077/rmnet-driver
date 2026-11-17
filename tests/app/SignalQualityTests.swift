@@ -42,6 +42,7 @@ struct SignalQualityTests {
         words()
         servingLegs()
         connectionLevel()
+        captions()
         badges()
         bands()
         metrics()
@@ -154,6 +155,52 @@ struct SignalQualityTests {
         check(signalLevel(info([leg("GSM", rsrp: nil)])) == nil, "connection: a RAT not known here is unknown")
         check(signalLevel(NetworkInfo(serving: ServingCell(state: "NOCONN", cells: [leg("NR5G-SA", rsrp: -86)]))) == 3,
               "connection: the radio not read does not hide a serving cell read")
+    }
+
+    // The word beside the bars. The radio off says so, whatever else was read: "Radio off (airplane mode)" (the menu
+    // bar panel's old first line; the Network screen's Radio row), "Minimum functionality" (that row's words). The
+    // serving cell searching or in limited service says so, with a leg or without (its Connection row's words, as the
+    // old first line had them). "Signal not known" with nothing read or no level. Otherwise the bars' word: "No
+    // signal" also for a serving cell read with no leg in another state (no service), which has no word of its own.
+    static func captions() {
+        let sa = leg("NR5G-SA", rsrp: -86, sinr: 10)
+        // The radio off.
+        equal(signalCaption(info([sa], radio: .airplane)), "Radio off (airplane mode)", "caption: airplane mode, a leg read")
+        equal(signalCaption(NetworkInfo(radio: .airplane)), "Radio off (airplane mode)",
+              "caption: airplane mode, nothing else read")
+        equal(signalCaption(info([], radio: .airplane, state: "SEARCH")), "Radio off (airplane mode)",
+              "caption: airplane mode before searching")
+        equal(signalCaption(info([sa], radio: .minimum)), "Minimum functionality", "caption: minimum functionality, a leg read")
+        equal(signalCaption(NetworkInfo(radio: .minimum)), "Minimum functionality",
+              "caption: minimum functionality, nothing else read")
+        equal(signalCaption(info([], radio: .minimum, state: "LIMSRV")), "Minimum functionality",
+              "caption: minimum functionality before limited service")
+        // Searching, limited service, no service.
+        equal(signalCaption(info([], state: "SEARCH")), "Searching", "caption: searching")
+        equal(signalCaption(info([], state: "LIMSRV")), "Limited service", "caption: limited service")
+        equal(signalCaption(info([leg("LTE", rsrp: -86, sinr: 20)], state: "LIMSRV")), "Limited service",
+              "caption: limited service on a cell with a good signal")
+        equal(signalCaption(info([], state: "NOCONN")), "No signal", "caption: no service (a serving cell with no leg)")
+        equal(signalCaption(info([], state: "")), "No signal", "caption: no service, no state given")
+        // Not known.
+        equal(signalCaption(nil), "Signal not known", "caption: nothing read")
+        equal(signalCaption(NetworkInfo(radio: .on)), "Signal not known", "caption: the serving cell not read")
+        equal(signalCaption(NetworkInfo()), "Signal not known", "caption: neither the radio nor the serving cell read")
+        equal(signalCaption(info([leg("LTE", rsrp: nil, sinr: 20)])), "Signal not known", "caption: a leg without RSRP")
+        // Otherwise the bars' five words, idle or connected, and with another AT+CFUN value.
+        let levels: [(CellLeg, String)] = [
+            (leg("LTE", rsrp: -125, sinr: 2), "No signal"),
+            (leg("LTE", rsrp: -105, sinr: 20), "Poor"),
+            (leg("NR5G-SA", rsrp: -95, sinr: 20), "Fair"),
+            (sa, "Good"),
+            (leg("NR5G-SA", rsrp: -75, sinr: 20), "Excellent"),
+        ]
+        for (l, word) in levels {
+            equal(signalCaption(info([l])), word, "caption: \(word)")
+            equal(signalCaption(info([l], state: "CONNECT")), word, "caption: \(word), connected")
+            equal(signalCaption(info([l])), signalWord(signalLevel(info([l])) ?? -1), "caption: \(word) is the bars' word")
+        }
+        equal(signalCaption(info([sa], radio: .other(5))), "Good", "caption: another AT+CFUN value reads as the bars")
     }
 
     static func badges() {

@@ -60,6 +60,28 @@ func signalLevel(_ info: NetworkInfo) -> Int? {
     return signalLevel(rat: leg.rat, rsrp: leg.rsrp, sinr: leg.sinr)
 }
 
+/// The word beside the bars, in the app's existing words (networkRows' Radio and Connection rows, the Network
+/// screen's and `RMNet network`'s):
+/// - the radio off, whatever else was read: "Radio off (airplane mode)" (AT+CFUN 4, as the menu bar panel's first
+///   line said it), "Minimum functionality" (AT+CFUN 0);
+/// - the serving cell searching or in limited service, with a leg or without: "Searching", "Limited service";
+/// - "Signal not known" with nothing read (nil) or no level (signalLevel nil);
+/// - otherwise the bars' word (signalWord): "No signal" also for a serving cell read with no leg in another state
+///   (no service), which has no word of its own.
+func signalCaption(_ info: NetworkInfo?) -> String {
+    let unknown = "Signal not known"
+    guard let info else { return unknown }
+    let rows = networkRows(info)
+    func row(_ label: String) -> String? { rows.first(where: { $0.label == label })?.value }
+    func capitalized(_ words: String) -> String { words.prefix(1).uppercased() + words.dropFirst() }
+    if info.radio == .airplane, let radio = row("Radio") { return "Radio " + radio }   // "off (airplane mode)"
+    if info.radio == .minimum, let radio = row("Radio") { return capitalized(radio) }  // "minimum functionality"
+    if let state = info.serving?.state, state == "SEARCH" || state == "LIMSRV", let connection = row("Connection") {
+        return capitalized(connection)   // "searching", "limited service"
+    }
+    return signalLevel(info).map(signalWord) ?? unknown
+}
+
 /// The technology as the badge shows it: "5G SA", "5G NSA", "LTE" (also with a 5G core), "3G" for WCDMA; nil
 /// when there is none to show (radio off, searching, limited service, unknown, a RAT not named here).
 func techBadgeText(_ info: NetworkInfo) -> String? {
