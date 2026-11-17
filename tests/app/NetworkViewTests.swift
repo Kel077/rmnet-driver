@@ -1,0 +1,281 @@
+// Tests for what the Network screen's cards show (app/NetworkView.swift's NetworkCards): the Connection card's rows
+// ("—" for what was not read, the operator and network names, the PLMN's fallback, the mode with a 5G kind disabled),
+// the technology's words without a badge, the legs' order and names, the metrics a RAT reports, why there is no leg
+// to show, the Cell card's rows (one or two legs, WCDMA, none), the carrier chips (bandwidth, primary) and their
+// widths, and the bands' chips, count and collapse. Built with swiftc by `make app-test` from NetworkView.swift and
+// the files it needs; its views are compiled, not drawn (no window is made, no modem opened).
+// Stops at the first failure, prints which check failed and exits 1.
+import Foundation
+
+var checks = 0
+
+func check(_ ok: Bool, _ name: String, _ detail: @autoclosure () -> String = "") {
+    checks += 1
+    if !ok {
+        print("FAIL: \(name)")
+        let d = detail()
+        if !d.isEmpty { print("  \(d)") }
+        exit(1)
+    }
+}
+
+func equal<T: Equatable>(_ got: T, _ want: T, _ name: String) {
+    check(got == want, name, "got \(got)\nwant \(want)")
+}
+
+func rows(_ r: [(label: String, value: String)]) -> [String] {
+    r.map { "\($0.label): \($0.value)" }
+}
+
+func leg(_ rat: String, duplex: String? = nil, mcc: String? = "001", mnc: String? = "01", cellID: String? = nil,
+         pci: Int? = nil, tac: String? = nil, channel: Int? = nil, band: String? = nil, bandwidth: Double? = nil,
+         rsrp: Int? = nil, rsrq: Int? = nil, sinr: Double? = nil) -> CellLeg {
+    CellLeg(rat: rat, duplex: duplex, mcc: mcc, mnc: mnc, cellID: cellID, pci: pci, tac: tac, channel: channel,
+            band: band, bandwidthMHz: bandwidth, rsrp: rsrp, rsrq: rsrq, sinr: sinr)
+}
+
+let sa = leg("NR5G-SA", duplex: "TDD", cellID: "1A2B3C4D5", pci: 245, tac: "3F2A", channel: 520110, band: "n41",
+             bandwidth: 100, rsrp: -86, rsrq: -11, sinr: 14.5)
+let lte = leg("LTE", duplex: "FDD", cellID: "2C4E01", pci: 101, tac: "2B1E", channel: 1300, band: "B3", bandwidth: 20,
+              rsrp: -97, rsrq: -12, sinr: 9)
+let nsaNr = leg("NR5G-NSA", pci: 388, channel: 627264, band: "n78", bandwidth: 100, rsrp: -89, rsrq: -11, sinr: 16)
+let wcdma = leg("WCDMA", cellID: "0A1B2C", pci: 77, tac: "1F00", channel: 10700, rsrp: -80)
+
+func info(_ legs: [CellLeg]?, carriers: [String] = [], radio: RadioState? = .on, state: String = "NOCONN",
+          registration: Registration? = Registration(status: .home, domain: "5GS"), operatorName: String? = "Example Mobile",
+          networkName: String? = "Example Mobile", plmn: String? = "00101", act: Int? = nil, mode: String? = "AUTO",
+          nr5gDisable: Int? = 0) -> NetworkInfo {
+    NetworkInfo(radio: radio, registration: registration, operatorName: operatorName, networkName: networkName,
+                plmn: plmn, accessTechnology: act, serving: legs.map { ServingCell(state: state, cells: $0) },
+                carriers: carriers, mode: mode, nr5gDisable: nr5gDisable)
+}
+
+func set(_ rat: BandRat, allowed: [Int], supported: [Int]) -> BandSet {
+    BandSet(rat: rat, allowed: allowed, supported: supported)
+}
+
+@main
+struct NetworkViewTests {
+    static func main() {
+        words()
+        connection()
+        technology()
+        legs()
+        noLeg()
+        cell()
+        carriers()
+        chipWidths()
+        bands()
+        print("network view: \(checks) checks passed")
+    }
+
+    static func words() {
+        equal(NetworkCards.capitalizedFirst("registered, home network (5GS)"), "Registered, home network (5GS)",
+              "capitalized: first letter")
+        equal(NetworkCards.capitalizedFirst("5G only"), "5G only", "capitalized: a digit first")
+        equal(NetworkCards.capitalizedFirst(""), "", "capitalized: empty")
+        equal(NetworkCards.bandwidthText(100), "100 MHz", "bandwidth: whole")
+        equal(NetworkCards.bandwidthText(1.4), "1.4 MHz", "bandwidth: decimal")
+        equal(NetworkCards.notReported, "—", "not reported: a dash")
+    }
+
+    // The operator, registration, PLMN and network mode, each "—" when not read.
+    static func connection() {
+        equal(rows(NetworkCards.connectionRows(nil)),
+              ["Operator: —", "Registration: —", "PLMN: —", "Network mode: —"], "connection: nothing read")
+        equal(rows(NetworkCards.connectionRows(info([sa]))),
+              ["Operator: Example Mobile", "Registration: Registered, home network (5GS)", "PLMN: 00101",
+               "Network mode: Automatic (5G, LTE and WCDMA)"], "connection: 5G SA")
+        equal(rows(NetworkCards.connectionRows(NetworkInfo())),
+              ["Operator: —", "Registration: —", "PLMN: —", "Network mode: —"], "connection: a read with nothing in it")
+        // The operator's name and the network's, as the network rows give them.
+        equal(NetworkCards.operatorText(info(nil, operatorName: "EXAMPLE MOBILE", networkName: "Example Mobile")),
+              "EXAMPLE MOBILE", "operator: the same name in other case")
+        equal(NetworkCards.operatorText(info(nil, operatorName: "Example", networkName: "Example Mobile")),
+              "Example (Example Mobile)", "operator: two names")
+        equal(NetworkCards.operatorText(info(nil, operatorName: nil, networkName: "Example Mobile")), "Example Mobile",
+              "operator: the network's name only")
+        equal(NetworkCards.operatorText(info(nil, operatorName: "Example", networkName: nil)), "Example",
+              "operator: AT+COPS? only")
+        equal(NetworkCards.operatorText(info(nil, operatorName: nil, networkName: nil)), nil, "operator: none")
+        // The PLMN: AT+QSPN's, else the first leg's MCC and MNC, else none.
+        equal(NetworkCards.plmnText(info([sa], plmn: "310260")), "310260", "PLMN: AT+QSPN's")
+        equal(NetworkCards.plmnText(info([leg("LTE", mcc: "460", mnc: "00")], plmn: nil)), "46000",
+              "PLMN: the first leg's MCC and MNC")
+        equal(NetworkCards.plmnText(info([leg("LTE", mcc: "460", mnc: nil)], plmn: nil)), nil, "PLMN: no MNC")
+        equal(NetworkCards.plmnText(info(nil, plmn: nil)), nil, "PLMN: no leg")
+        // The mode, in modeWords' words, with a 5G kind disabled; the registration's words.
+        let disabled = NetworkCards.connectionRows(info([sa], mode: "LTE:NR5G", nr5gDisable: 1))
+        equal(disabled[3].value, "5G and LTE; 5G SA is disabled", "connection: mode with 5G SA disabled")
+        equal(NetworkCards.connectionRows(info([sa], mode: nil, nr5gDisable: 2))[3].value, "5G NSA is disabled",
+              "connection: mode not read, 5G NSA disabled")
+        equal(NetworkCards.connectionRows(info([sa], mode: nil, nr5gDisable: nil))[3].value, "—",
+              "connection: mode not read")
+        equal(NetworkCards.connectionRows(info([sa], registration: Registration(status: .roaming, domain: "EPS")))[1].value,
+              "Registered, roaming (EPS)", "connection: roaming")
+        equal(NetworkCards.connectionRows(info([], registration: Registration(status: .searching, domain: "5GS")))[1].value,
+              "Searching", "connection: searching")
+    }
+
+    // The technology in words where the badge shows none.
+    static func technology() {
+        equal(NetworkCards.technologyWithoutBadge(info([sa])), nil, "technology: the badge shows 5G SA")
+        equal(NetworkCards.technologyWithoutBadge(info([lte, nsaNr])), nil, "technology: the badge shows 5G NSA")
+        equal(NetworkCards.technologyWithoutBadge(info([], state: "SEARCH")), "Searching", "technology: searching")
+        equal(NetworkCards.technologyWithoutBadge(info([], state: "LIMSRV")), "Limited service",
+              "technology: limited service")
+        equal(NetworkCards.technologyWithoutBadge(info([], radio: .airplane)), "None (radio off)",
+              "technology: radio off")
+        equal(NetworkCards.technologyWithoutBadge(info(nil)), nil, "technology: unknown")
+        equal(NetworkCards.technologyWithoutBadge(info([leg("GSM")])), "GSM", "technology: a RAT the badge does not name")
+    }
+
+    // LTE first (EN-DC's columns), names and the metrics a RAT reports.
+    static func legs() {
+        equal(NetworkCards.shownLegs(nil), [], "legs: nothing read")
+        equal(NetworkCards.shownLegs(info(nil)), [], "legs: serving cell not read")
+        equal(NetworkCards.shownLegs(info([sa])), [sa], "legs: 5G SA")
+        equal(NetworkCards.shownLegs(info([lte, nsaNr])), [lte, nsaNr], "legs: EN-DC in the modem's order")
+        equal(NetworkCards.shownLegs(info([nsaNr, lte])), [lte, nsaNr], "legs: EN-DC with NR first, LTE shown first")
+        equal(NetworkCards.legTitle(sa), "NR", "leg title: 5G SA")
+        equal(NetworkCards.legTitle(nsaNr), "NR", "leg title: 5G NSA")
+        equal(NetworkCards.legTitle(lte), "LTE", "leg title: LTE")
+        equal(NetworkCards.legTitle(wcdma), "WCDMA", "leg title: WCDMA")
+        equal(NetworkCards.legMetrics("NR5G-SA"), [.rsrp, .rsrq, .sinr], "metrics: NR")
+        equal(NetworkCards.legMetrics("LTE"), [.rsrp, .rsrq, .sinr], "metrics: LTE")
+        equal(NetworkCards.legMetrics("WCDMA"), [.rsrp], "metrics: WCDMA (RSCP only)")
+        equal(NetworkCards.legValue(sa, .rsrp), -86, "value: RSRP")
+        equal(NetworkCards.legValue(sa, .rsrq), -11, "value: RSRQ")
+        equal(NetworkCards.legValue(sa, .sinr), 14.5, "value: SINR")
+        equal(NetworkCards.legValue(leg("LTE"), .rsrp), nil, "value: RSRP not reported")
+        equal(NetworkCards.legValue(leg("LTE"), .sinr), nil, "value: SINR not reported")
+    }
+
+    // Why the Signal and Cell cards show no leg; nil when they show one, or "—".
+    static func noLeg() {
+        equal(NetworkCards.noLegReason(nil), nil, "no leg: nothing read")
+        equal(NetworkCards.noLegReason(info([sa])), nil, "no leg: a leg")
+        equal(NetworkCards.noLegReason(info(nil)), nil, "no leg: serving cell not read")
+        equal(NetworkCards.noLegReason(info([], state: "SEARCH")), "No serving cell.", "no leg: searching")
+        equal(NetworkCards.noLegReason(info([], state: "LIMSRV")), "No serving cell.", "no leg: limited service")
+        equal(NetworkCards.noLegReason(info([], radio: .airplane, state: "SEARCH")), "The radio is off.",
+              "no leg: airplane mode")
+        equal(NetworkCards.noLegReason(info(nil, radio: .minimum)), "The radio is off.", "no leg: minimum functionality")
+        equal(NetworkCards.noLegReason(info([sa], radio: .airplane)), "The radio is off.",
+              "no leg: radio off with a leg still read")
+        equal(NetworkCards.noLegReason(info([], radio: nil, state: "SEARCH")), "No serving cell.",
+              "no leg: radio not read, searching")
+    }
+
+    // The Cell card's rows: a value a leg, "—" for what a leg did not report.
+    static func cell() {
+        equal(NetworkCards.cellRows([sa]), [
+            NetworkCards.CellRow(label: "Band", values: ["n41 (TDD)"]),
+            NetworkCards.CellRow(label: "Bandwidth", values: ["100 MHz"]),
+            NetworkCards.CellRow(label: "Channel", values: ["520110"]),
+            NetworkCards.CellRow(label: "PCI", values: ["245"]),
+            NetworkCards.CellRow(label: "Cell ID", values: ["1A2B3C4D5"]),
+            NetworkCards.CellRow(label: "TAC", values: ["3F2A"]),
+        ], "cell: 5G SA")
+        equal(NetworkCards.cellRows([lte, nsaNr]), [
+            NetworkCards.CellRow(label: "Band", values: ["B3 (FDD)", "n78"]),
+            NetworkCards.CellRow(label: "Bandwidth", values: ["20 MHz", "100 MHz"]),
+            NetworkCards.CellRow(label: "Channel", values: ["1300", "627264"]),
+            NetworkCards.CellRow(label: "PCI", values: ["101", "388"]),
+            NetworkCards.CellRow(label: "Cell ID", values: ["2C4E01", "—"]),
+            NetworkCards.CellRow(label: "TAC", values: ["2B1E", "—"]),
+        ], "cell: EN-DC, NR without cell ID and TAC")
+        equal(NetworkCards.cellRows([wcdma]), [
+            NetworkCards.CellRow(label: "Band", values: ["—"]),
+            NetworkCards.CellRow(label: "Bandwidth", values: ["—"]),
+            NetworkCards.CellRow(label: "Channel", values: ["10700"]),
+            NetworkCards.CellRow(label: "PSC", values: ["77"]),
+            NetworkCards.CellRow(label: "Cell ID", values: ["0A1B2C"]),
+            NetworkCards.CellRow(label: "LAC", values: ["1F00"]),
+        ], "cell: WCDMA, its own labels")
+        equal(NetworkCards.cellRows([]).map { $0.label }, ["Band", "Bandwidth", "Channel", "PCI", "Cell ID", "TAC"],
+              "cell: no leg, labels")
+        equal(NetworkCards.cellRows([]).map { $0.values }, Array(repeating: ["—"], count: 6), "cell: no leg, one dash each")
+        equal(NetworkCards.cellRows([leg("LTE", band: "B7")])[0].values, ["B7"], "cell: band without duplex")
+        equal(NetworkCards.cellRows([leg("LTE", duplex: "FDD")])[0].values, ["—"], "cell: duplex without band")
+        equal(NetworkCards.cellRows([leg("LTE", bandwidth: 1.4)])[1].values, ["1.4 MHz"], "cell: 1.4 MHz")
+    }
+
+    // The carriers: AT+QCAINFO's first, then legs' bands not listed; bandwidth from the leg on that band.
+    static func carriers() {
+        equal(NetworkCards.carrierChips(info([sa], carriers: ["n41", "n25"])), [
+            NetworkCards.CarrierChip(band: "n41", bandwidthMHz: 100, primary: true),
+            NetworkCards.CarrierChip(band: "n25", bandwidthMHz: nil, primary: false),
+        ], "carriers: primary with its leg's bandwidth, a secondary without")
+        equal(NetworkCards.carrierChips(info([lte, nsaNr], carriers: ["B3"])), [
+            NetworkCards.CarrierChip(band: "B3", bandwidthMHz: 20, primary: true),
+            NetworkCards.CarrierChip(band: "n78", bandwidthMHz: 100, primary: false),
+        ], "carriers: EN-DC's NR leg added after the listed carrier")
+        equal(NetworkCards.carrierChips(info([lte, nsaNr])), [
+            NetworkCards.CarrierChip(band: "B3", bandwidthMHz: 20, primary: false),
+            NetworkCards.CarrierChip(band: "n78", bandwidthMHz: 100, primary: false),
+        ], "carriers: none listed, the legs' bands, none marked primary")
+        equal(NetworkCards.carrierChips(info([lte], carriers: ["B3", "B7", "B20"])).map { $0.bandwidthMHz },
+              [20, nil, nil], "carriers: aggregation, only the serving leg's bandwidth known")
+        equal(NetworkCards.carrierChips(info([leg("LTE", band: "B3")], carriers: ["B3"])),
+              [NetworkCards.CarrierChip(band: "B3", bandwidthMHz: nil, primary: true)], "carriers: leg without bandwidth")
+        equal(NetworkCards.carrierChips(info(nil, carriers: ["LTE BAND X"])),
+              [NetworkCards.CarrierChip(band: "LTE BAND X", bandwidthMHz: nil, primary: true)],
+              "carriers: a carrier text kept as given")
+        equal(NetworkCards.carrierChips(info([])), [], "carriers: none")
+        equal(NetworkCards.carrierChips(info([leg("WCDMA")])), [], "carriers: a leg with no band")
+    }
+
+    // Wider with more bandwidth, between 56 and 220 pt; 56 when not known.
+    static func chipWidths() {
+        equal(NetworkCards.carrierChipWidth(nil), 56, "chip width: not known")
+        equal(NetworkCards.carrierChipWidth(0), 56, "chip width: zero")
+        equal(NetworkCards.carrierChipWidth(1.4), 56, "chip width: 1.4 MHz at the minimum")
+        equal(NetworkCards.carrierChipWidth(20), 64, "chip width: 20 MHz")
+        equal(NetworkCards.carrierChipWidth(100), 160, "chip width: 100 MHz")
+        equal(NetworkCards.carrierChipWidth(400), 220, "chip width: 400 MHz at the maximum")
+        let widths = [5.0, 10, 15, 20, 40, 60, 80, 100, 150].map { NetworkCards.carrierChipWidth($0) }
+        check(zip(widths, widths.dropFirst()).allSatisfy { $0 <= $1 }, "chip width: never narrower with more bandwidth",
+              "\(widths)")
+        check(NetworkCards.carrierChipWidth(100) > NetworkCards.carrierChipWidth(20) * 2,
+              "chip width: 100 MHz well over twice 20 MHz")
+    }
+
+    // A RAT's chips (allowed or not), its count and when its row collapses.
+    static func bands() {
+        let all = [1, 3, 41, 78]
+        let open = set(.sa, allowed: [78, 41, 3, 1], supported: all)
+        equal(NetworkCards.bandsAllAllowed(open), true, "bands: every band allowed (another order)")
+        equal(NetworkCards.bandsCount(open), "All 4 allowed", "bands: count, all allowed")
+        let locked = set(.sa, allowed: [41], supported: all)
+        equal(NetworkCards.bandsAllAllowed(locked), false, "bands: locked")
+        equal(NetworkCards.bandsCount(locked), "1 of 4 allowed", "bands: count, locked")
+        equal(NetworkCards.bandChips(locked), [
+            NetworkCards.BandChip(band: 1, label: "n1", allowed: false),
+            NetworkCards.BandChip(band: 3, label: "n3", allowed: false),
+            NetworkCards.BandChip(band: 41, label: "n41", allowed: true),
+            NetworkCards.BandChip(band: 78, label: "n78", allowed: false),
+        ], "bands: chips, ascending, n41 allowed")
+        equal(NetworkCards.bandChips(set(.lte, allowed: [3, 7], supported: [7, 3, 1])).map { $0.label }, ["B1", "B3", "B7"],
+              "bands: LTE labels")
+        equal(NetworkCards.bandChips(set(.nsa, allowed: [78], supported: [41, 78])).map { $0.label }, ["n41", "n78"],
+              "bands: 5G NSA labels")
+        // A band allowed that the modem does not list as supported is still shown, allowed.
+        let odd = set(.lte, allowed: [3, 99], supported: [1, 3])
+        equal(NetworkCards.bandChips(odd).map { "\($0.label) \($0.allowed)" }, ["B1 false", "B3 true", "B99 true"],
+              "bands: an allowed band not listed as supported")
+        equal(NetworkCards.bandsAllAllowed(odd), false, "bands: not collapsed with an unsupported band allowed")
+        equal(NetworkCards.bandsCount(odd), "2 of 2 allowed", "bands: count as bandsSummary counts it")
+        // Nothing allowed, or nothing at all.
+        let none = set(.sa, allowed: [], supported: all)
+        equal(NetworkCards.bandsAllAllowed(none), false, "bands: none allowed")
+        equal(NetworkCards.bandsCount(none), "0 of 4 allowed", "bands: count, none allowed")
+        let empty = set(.sa, allowed: [], supported: [])
+        equal(NetworkCards.bandsAllAllowed(empty), false, "bands: nothing supported is not all allowed")
+        equal(NetworkCards.bandsCount(empty), "0 of 0 allowed", "bands: count, nothing supported")
+        equal(NetworkCards.bandChips(empty), [], "bands: no chips")
+        // Duplicates count once.
+        equal(NetworkCards.bandsCount(set(.lte, allowed: [3, 3], supported: [3, 7, 7])), "1 of 2 allowed",
+              "bands: count as sets")
+    }
+}
