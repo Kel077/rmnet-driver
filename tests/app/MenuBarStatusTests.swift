@@ -168,6 +168,7 @@ struct MenuBarStatusTests {
         realServiceWording()
         networkLines()
         asOf()
+        readInfo()
         print("menu bar status: \(checks) checks passed")
     }
 
@@ -687,5 +688,84 @@ struct MenuBarStatusTests {
         (c.year, c.month, c.day, c.hour, c.minute, c.second) = (2026, 11, 16, 9, 5, 7)
         let date = Calendar.current.date(from: c)!
         equal(asOfText(date), "as of 09:05:07", "as of")
+    }
+
+    // The last read's NetworkInfo (the panel's badge, bars and band), from the same read as the lines and kept and
+    // cleared exactly as they are: nil before any read and on polls; set by a read that succeeded; unchanged when
+    // the panel opens again within 10 s (no read) and while a read runs; kept by a busy port and by another
+    // failure; replaced by the next read that succeeds; cleared with the lines when the modem is not attached.
+    static func readInfo() {
+        let rig = Rig()
+        let s = rig.status!
+        rig.listing.answer = [enabled]
+        rig.properties = upProperties
+        check(s.info == nil, "info: nil before any read")
+        s.poll()
+        check(s.info == nil, "info: a poll reads no network")
+
+        rig.network.answer(.success(saInfo))
+        rig.open()
+        equal(s.info, saInfo, "info: set by a read that succeeded")
+        equal(s.networkLines, menuBarNetworkLines(saInfo), "info: from the read that set the lines")
+        let first = rig.clock
+
+        // Opened again within 10 s: no read, nothing changes.
+        rig.clock = first.addingTimeInterval(5)
+        rig.open()
+        settle()
+        equal(rig.network.calls, 1, "info: no read 5 s after the last")
+        equal(s.info, saInfo, "info: unchanged without a read")
+
+        // A busy port and another failure keep it, with the lines.
+        rig.clock = first.addingTimeInterval(10)
+        rig.network.answer(.failure(ModemFailure(message: describe(AtError.busy))))
+        rig.open()
+        equal(s.networkNote, menuBarBusyNote, "info: the busy read was made")
+        equal(s.info, saInfo, "info: kept by a busy port")
+        equal(s.networkLines, menuBarNetworkLines(saInfo), "info: the lines kept with it")
+        rig.clock = first.addingTimeInterval(20)
+        rig.network.answer(.failure(ModemFailure(message: describe(AtError.timeout))))
+        rig.open()
+        equal(s.networkNote, "The network could not be read. The modem did not answer in time.",
+              "info: the failed read was made")
+        equal(s.info, saInfo, "info: kept by a read that failed")
+        equal(s.networkLines, menuBarNetworkLines(saInfo), "info: the lines kept with it after a failure")
+
+        // The next read that succeeds replaces it; while that read runs, the last one stays.
+        var nsa = NetworkInfo(radio: .on, operatorName: "CMCC", networkName: "CHINA MOBILE", plmn: "46000")
+        nsa.serving = ServingCell(state: "CONNECT", cells: [leg("LTE", band: "B3", rsrp: -95, sinr: 8.5),
+                                                            leg("NR5G-NSA", band: "n78", rsrp: -88, sinr: 12)])
+        nsa.carriers = ["B3"]
+        rig.clock = first.addingTimeInterval(30)
+        rig.network.holding = true
+        s.panelOpened()
+        pump(until: { rig.network.calls == 4 }, "the read to start")
+        check(s.reading, "info: a read runs")
+        equal(s.info, saInfo, "info: the last one while a read runs")
+        rig.network.release(.success(nsa))
+        pump(until: { !s.reading }, "the read to finish")
+        rig.network.holding = false
+        equal(s.info, nsa, "info: replaced by the next read that succeeded")
+        equal(s.networkLines, menuBarNetworkLines(nsa), "info: with its lines")
+        check(s.networkNote == nil, "info: and no note")
+
+        // The modem not attached: cleared with the lines and their time.
+        rig.clock = first.addingTimeInterval(40)
+        rig.network.answer(.failure(ModemFailure(message: describe(AtError.modemNotAttached))))
+        rig.open()
+        check(s.info == nil, "info: cleared when the modem is not attached")
+        equal(s.networkLines, [], "info: as the lines are")
+        check(s.networkAt == nil, "info: and their time")
+        rig.clock = first.addingTimeInterval(50)
+        rig.network.answer(.failure(ModemFailure(message: describe(AtError.busy))))
+        rig.open()
+        check(s.info == nil, "info: a busy read keeps none when there was none")
+
+        // It comes back with the next read that succeeds; one read per opening throughout.
+        rig.clock = first.addingTimeInterval(60)
+        rig.network.answer(.success(saInfo))
+        rig.open()
+        equal(s.info, saInfo, "info: set again by a read that succeeded")
+        equal(rig.network.calls, 7, "info: one read per opening, not within 10 s")
     }
 }
