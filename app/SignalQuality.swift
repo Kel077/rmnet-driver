@@ -46,9 +46,17 @@ func servingLeg(_ legs: [CellLeg]) -> CellLeg? {
     return legs.first
 }
 
-/// The connection's bars: the serving leg's; 0 with no leg (searching, nothing read) or with the radio off.
-func signalLevel(_ info: NetworkInfo) -> Int {
-    guard info.radio != .airplane, let leg = servingLeg(info.serving?.cells ?? []) else { return 0 }
+/// The connection's bars: the serving leg's (servingLeg, signalLevel(rat:rsrp:sinr:)).
+/// - 0 when the modem says there is no signal: the radio is off (airplane mode, AT+CFUN 4, or minimum
+///   functionality, AT+CFUN 0), or the serving cell was read and has no leg (searching, limited or no service).
+/// - nil when it is not known: the serving cell was not read (`serving` nil: no +QENG line came back), or the leg
+///   that stands for the connection has no RSRP (RSCP), as with a RAT whose fields are not read here.
+/// The views show nil as unknown (outlined bars, "—"), never as "No signal".
+func signalLevel(_ info: NetworkInfo) -> Int? {
+    if info.radio == .airplane || info.radio == .minimum { return 0 }
+    guard let serving = info.serving else { return nil }
+    guard let leg = servingLeg(serving.cells) else { return 0 }
+    guard leg.rsrp != nil else { return nil }
     return signalLevel(rat: leg.rat, rsrp: leg.rsrp, sinr: leg.sinr)
 }
 

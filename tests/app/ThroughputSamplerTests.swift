@@ -1,5 +1,5 @@
-// Tests for app/ThroughputSampler.swift: download and upload rates from two reads of the driver's byte counters,
-// a counter that goes down (a driver restart) or a gap starting a new series, a missing counter adding nothing,
+// Tests for app/ThroughputSampler.swift: download and upload rates over the last two intervals between reads of the
+// driver's byte counters, smoothing a once-a-second counter read once a second; a counter that goes down (a driver restart) or a gap starting a new series, a missing counter adding nothing,
 // the 120-point cap, the current rates and the session totals, the counters read from the driver's registry
 // properties, and a rate in words. Driven by a fake counter reader and a fake clock. Built with swiftc by `make app-test`
 // from app/ThroughputSampler.swift and this file; no AppKit, no registry.
@@ -44,6 +44,7 @@ final class Rig {
 struct ThroughputSamplerTests {
     static func main() {
         rates()
+        drift()
         resets()
         missing()
         gaps()
@@ -53,11 +54,12 @@ struct ThroughputSamplerTests {
         print("throughput sampler: \(checks) checks passed")
     }
 
-    // The first read is the baseline (no point, no rate); each read after it adds a point: the bytes moved since
-    // the read before, in bits per second over the time between them.
+    // The first read is the baseline (no point, no rate); each read after it adds a point: the bytes moved over the
+    // last two read intervals of the series (one for the series' first point), in bits per second over that time.
     static func rates() {
         let rig = Rig()
         let s = rig.sampler
+        equal(ThroughputSampler.window, 2, "rates: a rate covers the last two read intervals")
         check(s.points.isEmpty && s.current == nil && s.sessionRx == nil && s.sessionTx == nil && rig.reads == 0,
               "rates: nothing is known, and nothing read, before the first sample")
         rig.sample(at: 0, (rx: 5_000_000, tx: 1_000_000))
@@ -66,16 +68,63 @@ struct ThroughputSamplerTests {
 
         rig.sample(at: 1, (rx: 6_000_000, tx: 1_125_000))
         equal(s.points, [ThroughputPoint(at: start.addingTimeInterval(1), downBitsPerSecond: 8_000_000,
-                                         upBitsPerSecond: 1_000_000, series: 0)], "rates: 1 MB down and 125 kB up in 1 s")
+                                         upBitsPerSecond: 1_000_000, series: 0)],
+              "rates: the series' first point is over its one interval: 1 MB down and 125 kB up in 1 s")
         equal(s.current, s.points.last, "rates: the current rates are the newest point")
         check(s.sessionRx == 6_000_000 && s.sessionTx == 1_125_000, "rates: the totals follow the counters")
 
-        rig.sample(at: 1.5, (rx: 6_500_000, tx: 1_125_000))
-        equal(s.points.last, ThroughputPoint(at: start.addingTimeInterval(1.5), downBitsPerSecond: 8_000_000,
-                                             upBitsPerSecond: 0, series: 0), "rates: over half a second; nothing up is 0")
-        rig.sample(at: 3.5, (rx: 6_500_000, tx: 1_125_000))
-        equal(s.points.last?.downBitsPerSecond, 0, "rates: no traffic is a rate of 0, not a missing point")
-        equal(s.points.count, 3, "rates: one point a read after the first")
+        rig.sample(at: 2, (rx: 7_000_000, tx: 1_250_000))
+        equal(s.points.last, ThroughputPoint(at: start.addingTimeInterval(2), downBitsPerSecond: 8_000_000,
+                                             upBitsPerSecond: 1_000_000, series: 0), "rates: over the last two intervals")
+        rig.sample(at: 3, (rx: 7_000_000, tx: 1_250_000))
+        equal(s.points.last, ThroughputPoint(at: start.addingTimeInterval(3), downBitsPerSecond: 4_000_000,
+                                             upBitsPerSecond: 500_000, series: 0),
+              "rates: one interval with nothing moved halves the rate over two")
+        equal(s.current, s.points.last, "rates: current follows the smoothed rate")
+        rig.sample(at: 4, (rx: 7_000_000, tx: 1_250_000))
+        check(s.points.last?.downBitsPerSecond == 0 && s.points.last?.upBitsPerSecond == 0,
+              "rates: nothing moved over two intervals is a rate of 0, not a missing point")
+        rig.sample(at: 4.5, (rx: 7_600_000, tx: 1_250_000))
+        equal(s.points.last?.downBitsPerSecond, 3_200_000, "rates: over 1.5 s when the intervals are 1 s and 0.5 s")
+        equal(s.points.count, 5, "rates: one point a read after the first")
+    }
+
+    // Steady traffic as the driver publishes it: its counters step once a second, at each whole second here. Read
+    // once a second with the reads drifting 0.01 s either side of the step, the bytes between two reads go 0, 2x,
+    // x, x, 0, 2x … (x the true rate). A window of two read intervals holds one, two or three steps: one only when
+    // it starts just after a step and ends just before one (1.98 s), three only when it starts just before and ends
+    // just after (2.02 s). The bound asserted: every point after the series' first is within [0.5x, 1.5x] (here
+    // 0.505x to 1.485x), never 0 or 2x; most are x; and current is always the newest point.
+    static func drift() {
+        let rig = Rig()
+        let s = rig.sampler
+        let downStep: UInt64 = 2_500_000   // bytes a second: 20 Mbit/s
+        let upStep: UInt64 = 250_000       // 2 Mbit/s
+        let x = Double(downStep * 8)
+        let xUp = Double(upStep * 8)
+        let signs = Array("+-+++-+--++---+-+-++-+---+++-+-+--+-++-+")   // each read 0.01 s after (+) or before (-)
+        var raw: [Double] = []
+        var lastSteps: UInt64? = nil
+        for (i, sign) in signs.enumerated() {
+            let at = 100 + Double(i) + (sign == "+" ? 0.01 : -0.01)
+            let steps = UInt64(at.rounded(.down))   // the counters published by then
+            rig.sample(at: at, (rx: steps * downStep, tx: steps * upStep))
+            if let l = lastSteps { raw.append(Double((steps - l) * downStep * 8)) }
+            lastSteps = steps
+            if !s.points.isEmpty { equal(s.current, s.points.last, "drift: current is the newest point after read \(i)") }
+        }
+        check(raw.contains(0) && raw.contains(2 * x) && raw.contains(x),
+              "drift: the reads see 0, x and 2x between them (the case smoothed)", "\(raw)")
+        check(Set(s.points.map { $0.series }) == [0] && s.points.count == signs.count - 1, "drift: one series, a point a read")
+        for (i, p) in s.points.enumerated().dropFirst() {
+            check(p.downBitsPerSecond >= 0.5 * x && p.downBitsPerSecond <= 1.5 * x,
+                  "drift: download point \(i) within [0.5x, 1.5x]", "\(p.downBitsPerSecond / x)x")
+            check(p.upBitsPerSecond >= 0.5 * xUp && p.upBitsPerSecond <= 1.5 * xUp,
+                  "drift: upload point \(i) within [0.5x, 1.5x]", "\(p.upBitsPerSecond / xUp)x")
+            check(p.downBitsPerSecond != 0 && p.downBitsPerSecond != 2 * x, "drift: point \(i) is neither 0 nor 2x")
+        }
+        let exact = s.points.dropFirst().filter { abs($0.downBitsPerSecond - x) < 1 }.count
+        check(exact * 2 > s.points.count, "drift: most points are the true rate", "\(exact) of \(s.points.count)")
     }
 
     // A counter that goes down (download or upload), as after a driver restart, gives no negative rate: the read

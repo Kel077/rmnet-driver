@@ -122,7 +122,9 @@ struct SignalQualityTests {
         check(servingLeg([]) == nil, "serving leg: none without a leg")
     }
 
-    // The connection's bars: the serving leg's; 0 with no leg or with the radio off.
+    // The connection's bars: the serving leg's. 0 when the modem says there is no signal: the radio off (airplane
+    // mode or minimum functionality), or a serving cell read with no leg (searching, limited or no service). nil
+    // when it is not known: the serving cell not read, or the leg that stands for the connection without an RSRP.
     static func connectionLevel() {
         equal(signalLevel(info([leg("NR5G-SA", rsrp: -86, sinr: 10)])), 3, "connection: 5G SA -86 dBm, SINR 10")
         equal(signalLevel(info([leg("LTE", rsrp: -95, sinr: 20), leg("NR5G-NSA", rsrp: -78, sinr: 15)])), 4,
@@ -130,9 +132,28 @@ struct SignalQualityTests {
         equal(signalLevel(info([leg("LTE", rsrp: -95, sinr: 20), leg("NR5G-NSA", rsrp: nil, sinr: 15)])), 2,
               "connection: EN-DC takes LTE when NR has no RSRP")
         equal(signalLevel(info([leg("WCDMA", rsrp: -80)])), 3, "connection: WCDMA RSCP -80")
-        equal(signalLevel(info([], state: "SEARCH")), 0, "connection: searching has no signal")
-        equal(signalLevel(NetworkInfo(radio: .on)), 0, "connection: no serving cell read has no signal")
+        equal(signalLevel(info([leg("LTE", rsrp: -125, sinr: 2)])), 0, "connection: a leg too weak for a bar is 0")
+
+        // 0: the modem says there is no signal.
+        equal(signalLevel(info([], state: "SEARCH")), 0, "connection: searching (a serving cell with no leg) is 0")
+        equal(signalLevel(info([], state: "LIMSRV")), 0, "connection: limited service with no leg is 0")
+        equal(signalLevel(info([], state: "NOCONN")), 0, "connection: a serving cell read with no leg is 0")
         equal(signalLevel(info([leg("LTE", rsrp: -70, sinr: 20)], radio: .airplane)), 0, "connection: radio off")
+        equal(signalLevel(NetworkInfo(radio: .airplane)), 0, "connection: radio off, serving cell not read")
+        equal(signalLevel(info([leg("LTE", rsrp: -70, sinr: 20)], radio: .minimum)), 0,
+              "connection: minimum functionality (radio off)")
+
+        // nil: not known.
+        check(signalLevel(NetworkInfo(radio: .on)) == nil, "connection: serving cell not read is unknown")
+        check(signalLevel(NetworkInfo()) == nil, "connection: nothing read is unknown")
+        check(signalLevel(NetworkInfo(radio: .on, accessTechnology: 12)) == nil,
+              "connection: an AcT without a serving cell read is unknown")
+        check(signalLevel(info([leg("LTE", rsrp: nil, sinr: 20)])) == nil, "connection: a leg without RSRP is unknown")
+        check(signalLevel(info([leg("LTE", rsrp: nil, sinr: 20), leg("NR5G-NSA", rsrp: nil, sinr: 15)])) == nil,
+              "connection: EN-DC with no RSRP on either leg is unknown")
+        check(signalLevel(info([leg("GSM", rsrp: nil)])) == nil, "connection: a RAT not known here is unknown")
+        check(signalLevel(NetworkInfo(serving: ServingCell(state: "NOCONN", cells: [leg("NR5G-SA", rsrp: -86)]))) == 3,
+              "connection: the radio not read does not hide a serving cell read")
     }
 
     static func badges() {

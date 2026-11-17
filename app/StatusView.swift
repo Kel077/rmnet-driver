@@ -175,7 +175,7 @@ private struct SidebarConnection: View {
                 }
                 Spacer(minLength: Spacing.xs)
                 if let info {
-                    SignalBars(level: signalLevel(info), height: 12)
+                    SignalBars(level: signalLevel(info), height: 12)   // nil: outlined, unknown
                 }
             }
             .padding(.horizontal, Spacing.m)

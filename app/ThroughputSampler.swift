@@ -1,14 +1,18 @@
 // The connection's throughput as the window draws it: the driver's byte counters (its RMNetRxBytes and
 // RMNetTxBytes registry properties, published once a second; never the AT port) read once a second while the
 // Overview or the Network screen is shown and the window can be seen (WindowPolls, ShellModel.swift), turned into
-// download and upload rates over the last 120 reads. Foundation only, with the counters and the clock given as
-// closures, so `make app-test` tests it (tests/app/ThroughputSamplerTests.swift).
+// download and upload rates, the last 120 of them. Each rate covers the last two intervals between reads: the
+// driver's once-a-second counters, read once a second on another clock, step 0, 1 or 2 times between two reads
+// (0 then 2x when the reads drift across the step), and over two intervals that is bounded to 0.5x…1.5x and is
+// mostly x. Foundation only, with the counters and the clock given as closures, so `make app-test` tests it
+// (tests/app/ThroughputSamplerTests.swift).
 import Combine
 import Foundation
 
-/// One rate: the bits a second moved between two reads, at the later one's time. Points of one series are drawn
-/// joined; a new series begins after a counter that went down (a driver restart), a read with no counters, a gap
-/// of more than `maxGap` or a clock that went back.
+/// One rate: the bits a second moved over the last `ThroughputSampler.window` intervals between reads of one series
+/// (over the one interval there is for a series' first point), at the newest read's time. Points of one series are
+/// drawn joined; a new series begins after a counter that went down (a driver restart), a read with no counters, a
+/// gap of more than `maxGap` or a clock that went back.
 struct ThroughputPoint: Equatable {
     let at: Date
     let downBitsPerSecond: Double
@@ -50,10 +54,13 @@ func bitRateText(_ bitsPerSecond: Double) -> String {
 /// The app has one, kept by the app delegate; its `sample` is called on the main thread.
 final class ThroughputSampler: ObservableObject {
     static let capacity = 120
+    /// The read intervals a rate covers (fewer at the start of a series).
+    static let window = 2
 
     /// The last 120 rates, oldest first.
     @Published private(set) var points: [ThroughputPoint] = []
-    /// The newest rate; nil before the second read, and after a read that started a new series until the next.
+    /// The newest rate (smoothed as the points are); nil before the second read, and after a read that started a new
+    /// series until the next.
     @Published private(set) var current: ThroughputPoint? = nil
     /// The bytes the driver has counted since it started (its counters at the last read); nil when that read
     /// found none.
@@ -63,7 +70,9 @@ final class ThroughputSampler: ObservableObject {
     private let read: () -> (rx: UInt64, tx: UInt64)?
     private let now: () -> Date
     private let maxGap: TimeInterval
-    private var baseline: (at: Date, rx: UInt64, tx: UInt64)? = nil   // the read the next rate is counted from
+    // The series' last reads, oldest first: at most `window + 1`, the first being the one the next rate is counted
+    // from. Empty after a read with no counters.
+    private var recent: [(at: Date, rx: UInt64, tx: UInt64)] = []
     private var series = 0
     private var seriesHasPoints = false
 
@@ -76,28 +85,39 @@ final class ThroughputSampler: ObservableObject {
         self.maxGap = maxGap
     }
 
-    /// Reads the counters once: a rate from the read before when both are in one series, else this read becomes
-    /// the baseline of a new one.
+    /// Reads the counters once. In the series of the read before (later, by at most `maxGap`, and neither counter
+    /// lower): a point over the last `window` read intervals (counters never go down within a series, so the
+    /// differences are not negative). Otherwise this read is the baseline of a new series, with no point.
     func sample() {
         let at = now()
         guard let counters = read() else {
             endSeries()
-            baseline = nil
+            recent = []
             sessionRx = nil
             sessionTx = nil
             return
         }
         sessionRx = counters.rx
         sessionTx = counters.tx
-        defer { baseline = (at, counters.rx, counters.tx) }
-        guard let base = baseline else { return }
-        let seconds = at.timeIntervalSince(base.at)
-        guard seconds > 0, seconds <= maxGap, counters.rx >= base.rx, counters.tx >= base.tx else {
-            endSeries()
+        let reading = (at: at, rx: counters.rx, tx: counters.tx)
+        guard let previous = recent.last else {
+            recent = [reading]
             return
         }
-        let point = ThroughputPoint(at: at, downBitsPerSecond: Double(counters.rx - base.rx) * 8 / seconds,
-                                    upBitsPerSecond: Double(counters.tx - base.tx) * 8 / seconds, series: series)
+        let interval = at.timeIntervalSince(previous.at)
+        guard interval > 0, interval <= maxGap, counters.rx >= previous.rx, counters.tx >= previous.tx else {
+            endSeries()
+            recent = [reading]
+            return
+        }
+        recent.append(reading)
+        if recent.count > ThroughputSampler.window + 1 {
+            recent.removeFirst(recent.count - (ThroughputSampler.window + 1))
+        }
+        let from = recent[0]
+        let seconds = at.timeIntervalSince(from.at)
+        let point = ThroughputPoint(at: at, downBitsPerSecond: Double(counters.rx - from.rx) * 8 / seconds,
+                                    upBitsPerSecond: Double(counters.tx - from.tx) * 8 / seconds, series: series)
         seriesHasPoints = true
         var kept = points
         kept.append(point)

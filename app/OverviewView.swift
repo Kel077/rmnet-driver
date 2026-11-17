@@ -39,7 +39,8 @@ struct OverviewView: View {
 }
 
 /// The hero card: the state in large type (Connected only while the driver's link is up), the technology badge, the
-/// bars with their word, the operator and the bands; the addresses while connected. A value not known is "—".
+/// bars with their word, the operator and the bands; the addresses while connected. A value not known is "—"; an
+/// unknown signal (nothing read, or no RSRP) is outlined bars and "Signal not known", never "No signal".
 struct OverviewHero: View {
     @ObservedObject var driverStatus: StatusController
     @ObservedObject var modem: ModemController
@@ -47,7 +48,7 @@ struct OverviewHero: View {
     var body: some View {
         let pill = connectionPill(driverStatus.connectionHeadline)
         let info = modem.info
-        let level = info.map(signalLevel)
+        let level = info.flatMap(signalLevel)   // nil: not known (outlined bars, "Signal not known")
         Card {
             VStack(alignment: .leading, spacing: Spacing.m) {
                 StatusPill(state: pill.state, text: pill.text, prominent: true)
