@@ -5,11 +5,12 @@
 // the unread messages, and the driver, with a call to action when it needs one. With the driver not installed,
 // the whole Overview is an empty state whose action installs it.
 //
-// It reads nothing itself: the shell's polls refresh the driver's status every 2 s and sample the throughput every
-// second while it is shown (WindowPolls, ShellModel.swift), ModemController reads the network every 5 s (never the
-// bands or the SIM), and the messages are listed only on the Messages screen. Each card observes the object it draws
-// and the layout follows the driver's status; only the throughput card observes the sampler, so its turn every
-// second redraws that card alone.
+// What each card says comes from OverviewModel.swift (tested there); this file draws it. It reads nothing itself:
+// the shell's polls refresh the driver's status every 2 s and sample the throughput every second while it is shown
+// (WindowPolls, ShellModel.swift), ModemController reads the network every 5 s (never the bands or the SIM), and
+// the messages are listed only on the Messages screen. Each card observes the object it draws and the layout
+// follows the driver's status; only the throughput card observes the sampler, so its turn every second redraws that
+// card alone.
 import AppKit
 import SwiftUI
 
@@ -83,7 +84,8 @@ private struct OverviewCards: View {
 
     var body: some View {
         let wide = width >= 600
-        let summary = driverSummary(driverStatus)
+        let summary = driverSummary(headline: driverStatus.connectionHeadline, status: driverStatus.status,
+                                    known: driverStatus.known, bundledVersion: driverStatus.bundledVersion)
         let driver = DriverCard(summary: summary, controller: driverStatus, navigate: navigate,
                                 driverRequested: $driverRequested)
         let driverFirst = !summary.lines.isEmpty
@@ -333,11 +335,6 @@ private struct SessionTotals: View {
     }
 }
 
-/// A byte count in words ("1.83 GB", ByteCountFormatter's file style); "—" when not known.
-private func byteText(_ bytes: UInt64?) -> String {
-    bytes.map { ByteCountFormatter.string(fromByteCount: Int64(clamping: $0), countStyle: .file) } ?? "—"
-}
-
 /// The serving leg's RSRP (RSCP for 3G) now, its quality word, and a sparkline of it over the last ten minutes of
 /// network reads, shaded by quality, with a key to the shading; in the sparkline's place, signalPlaceholder's words
 /// while it has under two values.
@@ -345,12 +342,11 @@ private struct SignalCard: View {
     @ObservedObject var modem: ModemController
 
     var body: some View {
-        let leg = modem.info?.serving.flatMap { servingLeg($0.cells) }
         let history = servingSignalHistory(modem.signalHistory, until: modem.infoAt)
-        let rat = leg?.rat ?? history.rat
-        let title = SignalMetric.rsrp.title(rat: rat)
-        let value = leg?.rsrp
-        let quality = metricQuality(.rsrp, value.map(Double.init), rat: rat)
+        let readout = signalReadout(modem.info, history)
+        let title = readout.title
+        let value = readout.value
+        let quality = readout.quality
         Card("Signal", symbol: "waveform.path.ecg", accessory: { CardNote(text: "Last 10 minutes") }) {
             VStack(alignment: .leading, spacing: Spacing.m) {
                 HStack(alignment: .firstTextBaseline, spacing: Spacing.xs) {
@@ -415,41 +411,6 @@ private struct ZoneKey: View {
     }
 }
 
-/// The sparkline's place while it has under two values: "No signal" when the last read says there is none (the
-/// radio off, or no serving leg: a read with no leg adds nothing to the history), "No signal data" after two reads
-/// without a value, else "Collecting…".
-private func signalPlaceholder(_ info: NetworkInfo?, _ history: (values: [Double], rat: String, reads: Int))
-    -> String {
-    if let info, info.serving.flatMap({ servingLeg($0.cells) }) == nil, signalLevel(info) == 0 { return "No signal" }
-    if history.values.isEmpty && history.reads >= 2 { return "No signal data" }
-    return "Collecting…"
-}
-
-/// The signal history's reads of the last `window` seconds back from `until` (the last network read that succeeded;
-/// the newest sample's time when nil), with a leg: one value a read, the RSRP (RSCP) of the leg that stands for the
-/// connection (as servingLeg: the NR leg when it has an RSRP, else the LTE leg, else the read's first), oldest
-/// first, only on the newest read's scale (RSCP for 3G, else RSRP); the newest read's leg ("NR", "LTE", "WCDMA";
-/// "LTE" with none); and how many reads there were.
-private func servingSignalHistory(_ samples: [SignalSample], until: Date? = nil, window: TimeInterval = 600)
-    -> (values: [Double], rat: String, reads: Int) {
-    guard let latest = samples.last?.at else { return ([], "LTE", 0) }
-    let from = max(until ?? latest, latest).addingTimeInterval(-window)
-    var reads: [[SignalSample]] = []
-    for sample in samples where sample.at >= from {
-        if let last = reads.last?.last, last.at == sample.at {
-            reads[reads.count - 1].append(sample)
-        } else {
-            reads.append([sample])
-        }
-    }
-    let serving = reads.compactMap { read in
-        read.first(where: { $0.leg == "NR" && $0.rsrp != nil }) ?? read.first(where: { $0.leg == "LTE" }) ?? read.first
-    }
-    let rat = serving.last?.leg ?? "LTE"
-    let values = serving.filter { ($0.leg == "WCDMA") == (rat == "WCDMA") }.compactMap { $0.rsrp.map(Double.init) }
-    return (values, rat, reads.count)
-}
-
 // MARK: - Small cards
 
 /// The SIM as the SIM & Data screen last read it (the Overview never reads it): ready; PIN required (orange, Unlock…
@@ -460,28 +421,12 @@ private struct SimCard: View {
 
     var body: some View {
         let summary = simSummary(modem.sim)
-        SmallCard(title: "SIM", symbol: "simcard", state: summary.state, stateSymbol: summary.symbol,
-                  tint: summary.tint, attention: summary.attention,
+        SmallCard(title: "SIM", symbol: "simcard", state: summary.state,
                   note: modem.sim == nil ? nil : modem.settingsAt.map(sentenceAsOf)) {
             if let action = summary.action {
-                CardButton(title: action, prominent: summary.attention) { navigate(.simData) }
+                CardButton(title: action, prominent: summary.state.tone == .attention) { navigate(.simData) }
             }
         }
-    }
-}
-
-/// The SIM card's state, its symbol and colour (nil: secondary), whether it needs attention, and its button.
-private func simSummary(_ sim: SimInfo?) -> (state: String, symbol: String, tint: Color?, attention: Bool,
-                                             action: String?) {
-    guard let sim else { return ("Not checked yet", "questionmark.circle", nil, false, "Open SIM & Data") }
-    switch sim.state {
-    case .ready: return ("Ready", "checkmark.circle.fill", .green, false, nil)
-    case .pin: return ("PIN required", "lock.fill", .orange, true, "Unlock…")
-    case .puk, .notInserted, .failure:
-        return (capitalized(simStateWords(sim.state)), "exclamationmark.triangle.fill", .orange, true,
-                "Open SIM & Data")
-    case .pin2, .puk2, .busy, .other:
-        return (capitalized(simStateWords(sim.state)), "info.circle", nil, false, "Open SIM & Data")
     }
 }
 
@@ -491,14 +436,9 @@ private struct MessagesCard: View {
     let navigate: (Screen) -> Void
 
     var body: some View {
-        let unread = messages.unread.count
-        let state: (text: String, symbol: String, tint: Color?) =
-            !messages.listed ? ("Not checked yet", "questionmark.circle", nil)
-            : unread > 0 ? ("\(unread) unread", "envelope.badge.fill", .blue)
-            : messages.messages.isEmpty ? ("No messages", "tray", nil)
-            : ("All read", "checkmark.circle", nil)
-        SmallCard(title: "Messages", symbol: "message", state: state.text, stateSymbol: state.symbol, tint: state.tint,
-                  attention: false, note: messages.listedAt.map(sentenceAsOf)) {
+        let state = messagesState(listed: messages.listed, unread: messages.unread.count,
+                                  messageCount: messages.messages.count)
+        SmallCard(title: "Messages", symbol: "message", state: state, note: messages.listedAt.map(sentenceAsOf)) {
             CardButton(title: "Open", prominent: false) { navigate(.messages) }
         }
     }
@@ -514,12 +454,11 @@ private struct DriverCard: View {
     @Binding var driverRequested: Bool
 
     var body: some View {
-        SmallCard(title: "Driver", symbol: "puzzlepiece.extension", state: summary.state,
-                  stateSymbol: summary.symbol, tint: summary.tint, attention: summary.attention, note: summary.version,
+        SmallCard(title: "Driver", symbol: "puzzlepiece.extension", state: summary.state, note: summary.version,
                   lines: summary.lines) {
             VStack(alignment: .leading, spacing: Spacing.s) {
-                if let action = summary.action {
-                    CardButton(title: title(action), prominent: summary.attention) { perform(action) }
+                if let action = summary.action, let title = summary.actionTitle {
+                    CardButton(title: title, prominent: summary.state.tone == .attention) { perform(action) }
                         .disabled(isInstall(action) && !controller.installEnabled)
                 }
                 if controller.busy || (driverRequested && !controller.progress.isEmpty) {
@@ -529,20 +468,11 @@ private struct DriverCard: View {
         }
     }
 
-    private func title(_ action: DriverSummary.Action) -> String {
-        switch action {
-        case .install: return controller.installButtonTitle
-        case .update: return "Update"
-        case .openSystemSettings: return "Open System Settings"
-        case .details: return "Details"
-        }
-    }
-
-    private func isInstall(_ action: DriverSummary.Action) -> Bool {
+    private func isInstall(_ action: DriverAction) -> Bool {
         action == .install || action == .update
     }
 
-    private func perform(_ action: DriverSummary.Action) {
+    private func perform(_ action: DriverAction) {
         switch action {
         case .install, .update:
             driverRequested = true
@@ -555,72 +485,6 @@ private struct DriverCard: View {
     }
 }
 
-/// What the driver card shows: the driver's state in words, its symbol and colour, whether it needs attention, the
-/// version line, the advice lines shown with it (StatusModel.swift's, unchanged), and its call to action.
-private struct DriverSummary {
-    enum Action { case install, update, openSystemSettings, details }
-
-    var state: String
-    var symbol: String
-    var tint: Color?
-    var attention = false
-    var version: String
-    var lines: [String] = []
-    var action: Action? = nil
-}
-
-/// The driver card for the status (its headline is the hero's, connectionHeadline): checking; status unknown
-/// (Details); not installed (Install; the Overview shows its empty state then, so the card only for completeness);
-/// waiting for approval (Open System Settings); not in QMI mode (the advice's first sentence and its commands,
-/// Details); needs attention (Details); an update bundled (Update); else running (attached) or enabled.
-private func driverSummary(_ c: StatusController) -> DriverSummary {
-    let status = c.status
-    let listed = c.known ? status.entries.first(where: { !$0.uninstalling }) ?? status.entries.first : nil
-    let version = "Version " + (listed?.version ?? "—")
-    let attention = "exclamationmark.triangle.fill"
-    switch c.connectionHeadline {
-    case "Asking the system…":
-        return DriverSummary(state: "Checking…", symbol: "circle.dotted", tint: nil, version: version)
-    case unknownHeadline:
-        return DriverSummary(state: "Status unknown", symbol: "questionmark.circle", tint: .red, version: version,
-                             action: .details)
-    case "Not installed":
-        return DriverSummary(state: "Not installed", symbol: attention, tint: .orange, attention: true,
-                             version: version, action: .install)
-    case "Waiting for approval in System Settings":
-        return DriverSummary(state: "Waiting for approval", symbol: "hand.raised.fill", tint: .orange, attention: true,
-                             version: version, action: .openSystemSettings)
-    case "Modem is not in QMI mode":
-        return DriverSummary(state: "Not in QMI mode", symbol: attention, tint: .orange, attention: true,
-                             version: version, lines: qmiModeAdvice(advice(status, bundledVersion: c.bundledVersion)),
-                             action: .details)
-    case "Needs attention":
-        return DriverSummary(state: "Needs attention", symbol: attention, tint: .orange, attention: true,
-                             version: version, action: .details)
-    default:
-        if let listed, c.known, !c.bundledVersion.isEmpty, canActivate(status), c.installButtonTitle == "Update" {
-            return DriverSummary(state: "Update available", symbol: "arrow.down.circle.fill", tint: .orange,
-                                 attention: true, version: "Version \(listed.version) → \(c.bundledVersion)",
-                                 action: .update)
-        }
-        return DriverSummary(state: status.attached ? "Running" : "Enabled", symbol: "checkmark.circle.fill",
-                             tint: .green, version: version)
-    }
-}
-
-/// The advice's not-in-QMI-mode sentence and the commands right after it: for the RM520N-GL `RMNet usbmode set
-/// qmi` (its fallback is on the Driver screen), for another model its two AT commands. Lines as the Driver screen
-/// shows them; a command is in a fixed-width font (isCommandLine).
-private func qmiModeAdvice(_ lines: [String]) -> [String] {
-    guard let first = lines.first else { return [] }
-    return [first] + lines.dropFirst().prefix(while: isCommandLine)
-}
-
-/// The Driver screen's rule for the advice lines it shows in a fixed-width font.
-private func isCommandLine(_ line: String) -> Bool {
-    line.hasPrefix("AT+") || line == usbModeQmiCommand || atFallbackCommands.contains(line)
-}
-
 /// System Settings, General, Login Items & Extensions, at its extensions.
 private func openDriverExtensionsSettings() {
     if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
@@ -630,16 +494,13 @@ private func openDriverExtensionsSettings() {
 
 // MARK: - Small card pieces
 
-/// A small card: its title, its state in large type with a symbol in the state's colour, a note under it (the time
-/// of the read, the version), lines of advice, and its buttons at the bottom. Orange-washed when it needs
-/// attention.
+/// A small card: its title, its state in large type with its symbol in the state's colour, a note under it (the
+/// time of the read, the version), lines of advice (commands in a fixed-width font), and its buttons at the bottom.
+/// Orange-washed and edged when its state needs attention.
 private struct SmallCard<Actions: View>: View {
     let title: String
     let symbol: String
-    let state: String
-    let stateSymbol: String
-    let tint: Color?
-    let attention: Bool
+    let state: CardState
     var note: String? = nil
     var lines: [String] = []
     @ViewBuilder var actions: Actions
@@ -649,11 +510,11 @@ private struct SmallCard<Actions: View>: View {
             VStack(alignment: .leading, spacing: Spacing.s) {
                 VStack(alignment: .leading, spacing: Spacing.xs) {
                     Label {
-                        Text(verbatim: state)
-                            .foregroundStyle(tint ?? .secondary)
+                        Text(verbatim: state.text)
+                            .foregroundStyle(toneColor(state.tone))
                     } icon: {
-                        Image(systemName: stateSymbol)
-                            .foregroundStyle(tint ?? .secondary)
+                        Image(systemName: state.symbol)
+                            .foregroundStyle(toneColor(state.tone))
                     }
                     .font(.title2.weight(.semibold))
                     if let note {
@@ -666,7 +527,7 @@ private struct SmallCard<Actions: View>: View {
                 .accessibilityElement(children: .combine)
                 ForEach(lines, id: \.self) { line in
                     Text(verbatim: line)
-                        .font(isCommandLine(line) ? .callout.monospaced() : .callout)
+                        .font(isAdviceCommand(line) ? .callout.monospaced() : .callout)
                         .textSelection(.enabled)
                 }
                 Spacer(minLength: 0)
@@ -675,7 +536,7 @@ private struct SmallCard<Actions: View>: View {
             .frame(maxHeight: .infinity, alignment: .topLeading)
         }
         .overlay {
-            if attention {
+            if state.tone == .attention {
                 let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
                 ZStack {
                     shape.fill(Color.orange.opacity(0.06))
@@ -684,6 +545,17 @@ private struct SmallCard<Actions: View>: View {
                 .allowsHitTesting(false)
             }
         }
+    }
+}
+
+/// A card tone's colour: green, secondary, blue, orange, red.
+private func toneColor(_ tone: CardTone) -> Color {
+    switch tone {
+    case .good: return .green
+    case .neutral: return .secondary
+    case .highlight: return .blue
+    case .attention: return .orange
+    case .error: return .red
     }
 }
 
@@ -737,12 +609,7 @@ private struct CardNote: View {
 
 /// "As of 14:02:11": asOfText as a line of its own.
 private func sentenceAsOf(_ date: Date) -> String {
-    capitalized(asOfText(date))
-}
-
-/// The text with its first letter upper case ("not inserted" is "Not inserted").
-private func capitalized(_ text: String) -> String {
-    text.prefix(1).uppercased() + text.dropFirst()
+    firstLetterUppercased(asOfText(date))
 }
 
 // MARK: - Not installed

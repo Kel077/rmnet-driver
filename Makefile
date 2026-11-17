@@ -74,12 +74,13 @@ check-driverkit:
 # a fake service), the modem tabs' controller, the quit gate (with both controllers), the menu bar item's
 # model (against fake sources), the window's own visibility for the modem tabs (against posted
 # notifications), the signal's bars and quality zones, the throughput sampler (against fake counters and a
-# fake clock) and the window's screens with the polls they run, tested without Xcode or hardware (neither the
-# AT port nor the NMEA port is opened: the reader reads a pseudo-terminal the test makes, and no window is made).
+# fake clock), the window's screens with the polls they run and the Overview's cards, tested without Xcode or
+# hardware (neither the AT port nor the NMEA port is opened: the reader reads a pseudo-terminal the test makes, and
+# no window is made).
 app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/nmea-tests build/gpsread-tests \
 		build/modemnet-tests build/modemset-tests build/modemsvc-tests build/modemcli-tests build/modemui-tests \
 		build/quit-tests build/menubar-tests build/window-tests build/signal-tests build/throughput-tests \
-		build/shell-tests
+		build/shell-tests build/overview-tests
 	./build/app-tests
 	./build/sms-tests
 	./build/at-tests
@@ -97,6 +98,7 @@ app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build
 	./build/signal-tests
 	./build/throughput-tests
 	./build/shell-tests
+	./build/overview-tests
 
 build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
 	@mkdir -p build
@@ -175,6 +177,13 @@ build/throughput-tests: app/ThroughputSampler.swift tests/app/ThroughputSamplerT
 # The screens map to the modem's reads (ModemTab), and every headline of StatusModel.swift has a pill.
 build/shell-tests: app/StatusModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/ModemController.swift \
 		app/ShellModel.swift tests/app/ShellModelTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+# What the Overview's cards say: the signal history and the SIM read (ModemController, ModemSettings), the
+# driver's status and advice (StatusModel), the pill the driver card agrees with (ShellModel), the quality zones.
+build/overview-tests: app/StatusModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/ModemController.swift \
+		app/ShellModel.swift app/SignalQuality.swift app/OverviewModel.swift tests/app/OverviewModelTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
