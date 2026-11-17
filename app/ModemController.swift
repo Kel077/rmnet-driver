@@ -1,10 +1,11 @@
-// The Network and SIM & APN tabs' state and the calls they make to the modem: reads only while a tab is
-// shown in a visible window, one call at a time, the result line of the last change, a way back (Put Back)
-// for a mode or profile change, the bands each RAT may use (changed or reset to every supported band), and
-// quitting that waits for a running call. It takes any ModemServing, and the two AppKit calls it needs (the
-// answer to the terminate question, the request for attention) and the driver's profile number are closures
-// given by the app delegate, so it uses no AppKit or SwiftUI and is tested with a fake service
-// (tests/app/ModemControllerTests.swift), as SmsController is.
+// The Overview's, Network and SIM & APN tabs' state and the calls they make to the modem: reads only while a
+// tab is shown in a visible window, one call at a time, the result line of the last change, a way back (Put
+// Back) for a mode or profile change, the bands each RAT may use (changed or reset to every supported band),
+// the serving cell's signal over the last 120 network reads, and quitting that waits for a running call. It
+// takes any ModemServing, and the two AppKit calls it needs (the answer to the terminate question, the request
+// for attention), the driver's profile number and the clock are closures given by the app delegate, so it uses
+// no AppKit or SwiftUI and is tested with a fake service (tests/app/ModemControllerTests.swift), as
+// SmsController is.
 //
 // A PIN is passed to the service and never kept: no stored property holds it (only the block on the queue
 // does, until the call returns). A profile's old password is kept in memory only, in `undo`
@@ -12,8 +13,22 @@
 import Combine
 import Foundation
 
-/// The modem tab shown in the window.
-enum ModemTab: Equatable { case network, simAndApn }
+/// The modem tab shown in the window. The Overview reads the network as the Network tab does, without the bands.
+enum ModemTab: Equatable { case overview, network, simAndApn }
+
+/// One serving leg's signal in one network read that succeeded, for the signal history's charts: the read's
+/// time, the leg ("NR" for either 5G leg, "LTE", "WCDMA", or another RAT as the modem named it), its RSRP (RSCP
+/// for WCDMA), RSRQ and SINR, the read's technology (technologyLabel: "5G SA", "5G NSA", "LTE", "WCDMA") and the
+/// leg's band.
+struct SignalSample: Equatable {
+    let at: Date
+    let leg: String
+    let rsrp: Int?
+    let rsrq: Int?
+    let sinr: Double?
+    let technology: String?
+    let band: String?
+}
 
 /// What is running on the service's queue; at most one call at a time.
 enum ModemActivity: Equatable { case reading, radio, mode, profile, pin, bands }
@@ -91,6 +106,9 @@ final class ModemController: ObservableObject {
     @Published private(set) var undo: ModemUndo? = nil
     @Published var form: ProfileSettings? = nil   // the editor's values for the driver's profile
     @Published var pickedMode: String? = nil      // the Network tab's picker
+    /// One sample a serving leg from each of the last `signalHistoryReads` network reads that succeeded (the
+    /// Overview's and the Network tab's), oldest first; a read with no leg adds none but counts.
+    @Published private(set) var signalHistory: [SignalSample] = []
     /// The next Network read also reads the bands: set when the Network tab comes into view (shown, or its
     /// window seen again), on Refresh there and after every bands change; cleared only by a bands read that
     /// succeeded, so a turn whose network read failed (the bands are then not read) or whose bands read failed
@@ -102,6 +120,7 @@ final class ModemController: ObservableObject {
 
     static let networkInterval: TimeInterval = 5
     static let settingsInterval: TimeInterval = 30
+    static let signalHistoryReads = 120   // about 10 minutes at the 5 s turns
 
     private static let readingQuitLine = "RMNet quits when the current request to the modem has finished."
     private static let radioOnQuitLine = "RMNet quits when the radio has been switched back on."
@@ -113,6 +132,7 @@ final class ModemController: ObservableObject {
     private let driverProfile: () -> Int?        // the driver's RMNetProfile; nil when it is not attached
     private let replyToQuit: (Bool) -> Void      // NSApp.reply(toApplicationShouldTerminate:)
     private let requestAttention: () -> Void     // NSApp.requestUserAttention(.criticalRequest)
+    private let now: () -> Date                  // the time of a network read (infoAt, the signal history)
     private var timer: Timer?
     private var timerTab: ModemTab?              // the tab the timer reads
     private var tab: ModemTab?                   // the modem tab shown; nil: neither
@@ -126,14 +146,17 @@ final class ModemController: ObservableObject {
     private var driverProfileRead: Int? = nil    // driverProfile() at the last settings refresh
     private var formSource: ProfileSettings? = nil  // the values `form` was last filled from
     private var pickedFrom: String? = nil        // the mode `pickedMode` was last set from
+    private var historyReads: [Int] = []         // the samples each read in `signalHistory` added, oldest first
 
     init(service: ModemServing, queue: DispatchQueue, driverProfile: @escaping () -> Int?,
-         replyToQuit: @escaping (Bool) -> Void, requestAttention: @escaping () -> Void) {
+         replyToQuit: @escaping (Bool) -> Void, requestAttention: @escaping () -> Void,
+         now: @escaping () -> Date = { Date() }) {
         self.service = service
         self.queue = queue
         self.driverProfile = driverProfile
         self.replyToQuit = replyToQuit
         self.requestAttention = requestAttention
+        self.now = now
     }
 
     deinit { timer?.invalidate() }
@@ -201,7 +224,7 @@ final class ModemController: ObservableObject {
 
     // MARK: When the modem is read
 
-    /// The modem tab shown (nil: neither, also when the window closes).
+    /// The modem tab shown (nil: none, also when the window closes).
     func setTabShown(_ tab: ModemTab?) {
         self.tab = tab
         updateTimer()
@@ -226,8 +249,9 @@ final class ModemController: ObservableObject {
     private var active: Bool { tab != nil && windowVisible && !stopping }
 
     // Reads the shown tab at once when it becomes active (or another tab is shown), then on each turn of
-    // its timer (5 s Network, 30 s SIM & APN); stops when it is not active. The Network tab coming into view
-    // makes the bands due.
+    // its timer (5 s Overview and Network, 30 s SIM & APN); stops when it is not active. The Network tab coming
+    // into view makes the bands due. A Network read that runs serves the Overview shown meanwhile (the same
+    // read, less the bands); an Overview read does not serve the Network tab, whose bands are due.
     private func updateTimer() {
         guard active, let tab else {
             timer?.invalidate()
@@ -239,15 +263,15 @@ final class ModemController: ObservableObject {
         if timer != nil, timerTab == tab { return }
         if tab == .network { bandsDue = true }
         timer?.invalidate()
-        let interval = tab == .network ? ModemController.networkInterval : ModemController.settingsInterval
+        let interval = tab == .simAndApn ? ModemController.settingsInterval : ModemController.networkInterval
         let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             self?.tick()
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
         timerTab = tab
-        if running == .reading, readingTab == tab {
-            readWanted = false  // the read running now is this tab's
+        if running == .reading, readingTab == tab || (tab == .overview && readingTab == .network) {
+            readWanted = false  // the read running now is this tab's, or serves it
         } else {
             readWanted = true
             readIfDue()
@@ -265,16 +289,17 @@ final class ModemController: ObservableObject {
         read(refreshing: false)
     }
 
-    /// Refresh: reads the shown tab at once, on the Network tab the bands too. Nothing (and the bands not made
-    /// due) when `read` would start nothing.
+    /// Refresh: reads the shown tab at once, on the Network tab the bands too (on the Overview the network
+    /// only). Nothing (and the bands not made due) when `read` would start nothing.
     func refresh() {
         read(refreshing: true)
     }
 
     /// Reads what the shown tab needs: the Network tab networkInfo(), then bands() when they are due and
     /// networkInfo() succeeded (after a failure the port is likely busy or the modem gone, and the bands stay
-    /// due); the SIM & APN tab profiles() then sim(); each in one block on the queue. Nothing while a call
-    /// runs, no tab is shown, the window is hidden, a confirmation is open or the app quits.
+    /// due); the Overview networkInfo() only; the SIM & APN tab profiles() then sim(); each in one block on the
+    /// queue. Nothing while a call runs, no tab is shown, the window is hidden, a confirmation is open or the
+    /// app quits.
     private func read(refreshing: Bool) {
         guard running == nil, active, !confirming, let tab else { return }
         readWanted = false
@@ -282,9 +307,9 @@ final class ModemController: ObservableObject {
         readingTab = tab
         let service = self.service
         switch tab {
-        case .network:
-            if refreshing { bandsDue = true }
-            let withBands = bandsDue
+        case .network, .overview:
+            if refreshing, tab == .network { bandsDue = true }
+            let withBands = tab == .network && bandsDue
             queue.async {
                 let info = service.networkInfo()
                 let sets = withBands && (try? info.get()) != nil ? service.bands() : nil
@@ -315,9 +340,11 @@ final class ModemController: ObservableObject {
         }
         switch outcome {
         case .success(let read):
+            let at = now()
             info = read
-            infoAt = Date()
+            infoAt = at
             infoFailure = nil
+            recordSignal(read, at: at)
             // The pick follows the modem unless the owner picked another mode (the same mode in another
             // order, as the window's menu names it, is not another).
             if pickedMode == nil || pickedMode == pickedFrom
@@ -328,6 +355,21 @@ final class ModemController: ObservableObject {
             infoFailure = failure.message
         }
         readFinished()
+    }
+
+    /// One sample a serving leg of `read` at `at`; then only the last `signalHistoryReads` reads are kept.
+    private func recordSignal(_ read: NetworkInfo, at: Date) {
+        let technology = technologyLabel(read)
+        let samples = (read.serving?.cells ?? []).map { leg in
+            SignalSample(at: at, leg: leg.rat.hasPrefix("NR5G") ? "NR" : leg.rat, rsrp: leg.rsrp, rsrq: leg.rsrq,
+                         sinr: leg.sinr, technology: technology, band: leg.band)
+        }
+        var history = signalHistory + samples
+        historyReads.append(samples.count)
+        while historyReads.count > ModemController.signalHistoryReads {
+            history.removeFirst(historyReads.removeFirst())
+        }
+        signalHistory = history
     }
 
     private func finishSettings(_ listed: Result<[DataProfile], ModemFailure>, _ read: Result<SimInfo, ModemFailure>) {

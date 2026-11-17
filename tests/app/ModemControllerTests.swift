@@ -238,6 +238,7 @@ final class Rig {
     let fake = FakeService()
     let queue = DispatchQueue(label: queueName)
     var driver: Int? = 1
+    var clock: Date? = nil   // the controller's clock when set; the real time otherwise
     var replies: [Bool] = []
     var attention = 0
     private var watchers: [AnyCancellable] = []
@@ -249,7 +250,8 @@ final class Rig {
         let c = ModemController(service: fake, queue: queue,
                                 driverProfile: { [unowned self] in self.driver },
                                 replyToQuit: { [unowned self] in self.replies.append($0) },
-                                requestAttention: { [unowned self] in self.attention += 1 })
+                                requestAttention: { [unowned self] in self.attention += 1 },
+                                now: { [unowned self] in self.clock ?? Date() })
         watchers.append(c.objectWillChange.sink { _ in onMainOnly("a published value of the controller") })
         watchers.append(c.quitNotice.objectWillChange.sink { _ in onMainOnly("the quit notice") })
         liveControllers.append { [weak c] in c }
@@ -339,6 +341,22 @@ func bandSets(lte: [Int] = lteSupported, nsa: [Int] = nrSupported, sa: [Int] = n
 let bandsRefused = ModemFailure(message: "The modem refused the command (+CME ERROR: 3). The 5G NSA bands were not changed.")
 let bandsQuitLine = "RMNet quits when the bands have been changed."
 
+// Serving cells for the signal history: 5G SA, EN-DC (LTE + NR) and WCDMA legs, as ModemNetwork.swift parses them.
+func cell(_ rat: String, rsrp: Int?, rsrq: Int?, sinr: Double?, band: String?) -> CellLeg {
+    CellLeg(rat: rat, duplex: "TDD", mcc: "001", mnc: "01", cellID: "1A2B3C", pci: 101, tac: "1F", channel: 520110,
+            band: band, bandwidthMHz: 100, rsrp: rsrp, rsrq: rsrq, sinr: sinr)
+}
+
+func served(_ legs: [CellLeg], state: String = "NOCONN") -> NetworkInfo {
+    NetworkInfo(radio: .on, registration: home, operatorName: "TEST NETWORK",
+                serving: ServingCell(state: state, cells: legs), mode: "AUTO")
+}
+
+let saLeg = cell("NR5G-SA", rsrp: -86, rsrq: -11, sinr: 10.5, band: "n41")
+let lteLeg = cell("LTE", rsrp: -95, rsrq: -12, sinr: 8, band: "B3")
+let nsaLeg = cell("NR5G-NSA", rsrp: -90, rsrq: -10, sinr: 14, band: "n78")
+let umtsLeg = cell("WCDMA", rsrp: -80, rsrq: nil, sinr: nil, band: nil)
+
 let waitingLine = "Waiting for the current read to finish…"
 let anotherChange = "Another change to the modem has not finished yet. Nothing was changed; try again when it has."
 let anotherChangePin = "Another change to the modem has not finished yet. The PIN was not sent; enter it again when it has."
@@ -369,6 +387,8 @@ struct ModemControllerTests {
         bandsNothingDone()
         quitting()
         resuming()
+        overviewReading()
+        signalHistory()
         check(changesSeen > 0, "main thread: the controllers' changes were watched")
         print("modem controller: \(checks) checks passed")
     }
@@ -2046,6 +2066,186 @@ struct ModemControllerTests {
               "\(rig.replies)")
         check(rig.fake.calls.count == 5 && c.refreshEnabled && timer(of: c) != nil,
               "resume: the read is not doubled and the controller works", "\(rig.fake.calls)")
+        c.setTabShown(nil)
+    }
+
+    // The Overview reads the network as the Network tab does (at once, then every 5 s, only while it is shown in a
+    // window that can be seen, nothing while a confirmation is open, nothing once the app quits), and nothing
+    // else: never the bands, and its Refresh makes none due. A Network read that runs when the Overview is shown
+    // serves it; an Overview read that runs when the Network tab is shown does not (the bands are due).
+    static func overviewReading() {
+        let rig = Rig()
+        let c = rig.controller
+        c.setTabShown(.overview)
+        check(!c.bandsDue, "overview: the bands are not due")
+        rig.waitForCall(1, "the Overview is read at once")
+        check(rig.fake.calls == [.networkInfo] && c.running == .reading, "overview: networkInfo() at once",
+              "\(rig.fake.calls)")
+        check(timer(of: c)?.timeInterval == 5 && scheduled(timer(of: c)), "overview: its timer turns every 5 s")
+        rig.fake.releaseInfo(.success(network("AUTO")))
+        pump(until: { c.running == nil }, "the Overview's first read comes back")
+        settle()
+        check(c.info == network("AUTO") && c.infoFailure == nil && c.infoAt != nil, "overview: the read sets info")
+        check(rig.fake.bandsReads == 0 && c.bands == nil && !c.bandsDue, "overview: the bands are not read",
+              "\(rig.fake.allCalls)")
+
+        c.tick()
+        rig.answerInfo(2, .success(network("AUTO")), "an Overview tick")
+        timer(of: c)?.fire()
+        rig.answerInfo(3, .success(network("AUTO")), "an Overview timer turn")
+        c.refresh()
+        check(!c.bandsDue, "overview: Refresh makes no bands due")
+        rig.answerInfo(4, .success(network("LTE")), "an Overview Refresh")
+        check(rig.fake.allCalls == Array(repeating: Call.networkInfo, count: 4),
+              "overview: ticks, turns and Refresh read the network only", "\(rig.fake.allCalls)")
+        check(c.info == network("LTE"), "overview: each read is applied")
+
+        // The window hidden: nothing, and no timer; seen again: read at once.
+        c.setWindowVisible(false)
+        c.tick()
+        c.refresh()
+        settle()
+        check(rig.fake.calls.count == 4 && timer(of: c) == nil, "overview: nothing is read while the window is hidden")
+        c.setWindowVisible(true)
+        rig.answerInfo(5, .success(network("AUTO")), "the Overview when the window is seen again")
+        check(rig.fake.bandsReads == 0 && !c.bandsDue, "overview: no bands when the window is seen again")
+
+        // A confirmation open: nothing.
+        c.setConfirming(true)
+        c.tick()
+        c.refresh()
+        timer(of: c)?.fire()
+        settle()
+        check(rig.fake.calls.count == 5, "overview: nothing is read while a confirmation is open", "\(rig.fake.calls)")
+        c.setConfirming(false)
+        settle()
+        check(rig.fake.calls.count == 5, "overview: closing it reads nothing that was not due")
+
+        // To the Network tab: the bands are due and read with its first read.
+        c.setTabShown(.network)
+        check(c.bandsDue, "overview: the Network tab after it makes the bands due")
+        rig.answerInfo(6, .success(network("AUTO")), "the Network tab after the Overview")
+        check(rig.fake.bandsReads == 1 && c.bands == bandSets() && !c.bandsDue, "overview: the Network tab reads the bands")
+
+        // Back to the Overview while a Network read runs: that read serves it.
+        c.tick()
+        rig.waitForCall(7, "a Network turn starts")
+        c.setTabShown(.overview)
+        rig.fake.releaseInfo(.success(network("AUTO")))
+        pump(until: { c.running == nil }, "the Network turn comes back")
+        settle()
+        check(rig.fake.calls.count == 7 && timer(of: c)?.timeInterval == 5,
+              "overview: a running Network read serves the Overview (no second read)", "\(rig.fake.calls)")
+
+        // To the Network tab while an Overview read runs: the Network tab reads again, with the bands.
+        c.tick()
+        rig.waitForCall(8, "an Overview turn starts")
+        c.setTabShown(.network)
+        rig.fake.releaseInfo(.success(network("AUTO")))
+        rig.waitForCall(9, "the Network tab's own read follows")
+        check(rig.fake.bandsReads == 1, "overview: its read did not read the bands", "\(rig.fake.allCalls)")
+        rig.fake.releaseInfo(.success(network("AUTO")))
+        pump(until: { c.running == nil }, "the Network tab's read comes back")
+        check(rig.fake.bandsReads == 2 && !c.bandsDue, "overview: the Network tab's read after it reads the bands")
+
+        // To the Overview with nothing running: read at once; then the SIM & APN tab reads the settings.
+        c.setTabShown(.overview)
+        rig.answerInfo(10, .success(network("AUTO")), "the Overview again")
+        c.setTabShown(.simAndApn)
+        rig.answerSettings(11, .success(listing()), .success(ready), "the SIM & APN tab after the Overview")
+        check(timer(of: c)?.timeInterval == 30 && rig.fake.bandsReads == 2, "overview: the SIM & APN tab as before")
+        c.setTabShown(nil)
+        check(timer(of: c) == nil, "overview: no timer with no modem screen shown")
+
+        // Quitting stops it.
+        c.setTabShown(.overview)
+        rig.answerInfo(13, .success(network("AUTO")), "the Overview before a quit")
+        check(c.quitWhenFinished() == false && timer(of: c) == nil, "overview: a quit stops its timer")
+        c.tick()
+        c.refresh()
+        settle()
+        check(rig.fake.calls.count == 13, "overview: nothing is read once the app quits", "\(rig.fake.calls)")
+        check(rig.fake.mostAtOnce == 1 && rig.fake.callsOffQueue == 0, "overview: one call at a time, on the queue")
+    }
+
+    // Every network read that succeeds (the Overview's or the Network tab's) adds one sample a serving leg, at the
+    // read's time: the leg ("NR", "LTE", "WCDMA"), RSRP, RSRQ, SINR, the technology and the band. A failed read
+    // adds none; a read with no leg adds none but counts as a read. The last 120 reads are kept.
+    static func signalHistory() {
+        let rig = Rig()
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        rig.clock = t0
+        let c = rig.controller
+        var published = 0
+        let watch = c.$signalHistory.dropFirst().sink { _ in published += 1 }
+        defer { watch.cancel() }
+        check(c.signalHistory.isEmpty && ModemController.signalHistoryReads == 120, "history: empty at first; 120 reads kept")
+
+        c.setTabShown(.overview)
+        rig.answerInfo(1, .success(served([saLeg])), "a 5G SA read")
+        check(c.signalHistory == [SignalSample(at: t0, leg: "NR", rsrp: -86, rsrq: -11, sinr: 10.5, technology: "5G SA",
+                                               band: "n41")],
+              "history: one sample for the 5G SA leg", "\(c.signalHistory)")
+        check(c.infoAt == t0 && published == 1, "history: at the read's time; published")
+
+        rig.clock = t0.addingTimeInterval(5)
+        c.tick()
+        rig.answerInfo(2, .success(served([lteLeg, nsaLeg])), "an EN-DC read")
+        check(Array(c.signalHistory.dropFirst()) == [
+            SignalSample(at: t0.addingTimeInterval(5), leg: "LTE", rsrp: -95, rsrq: -12, sinr: 8, technology: "5G NSA", band: "B3"),
+            SignalSample(at: t0.addingTimeInterval(5), leg: "NR", rsrp: -90, rsrq: -10, sinr: 14, technology: "5G NSA", band: "n78"),
+        ], "history: one sample a leg for EN-DC", "\(c.signalHistory)")
+
+        rig.clock = t0.addingTimeInterval(10)
+        c.tick()
+        rig.answerInfo(3, .failure(portBusy), "a failed read")
+        check(c.signalHistory.count == 3, "history: a failed read adds nothing")
+
+        rig.clock = t0.addingTimeInterval(15)
+        c.tick()
+        rig.answerInfo(4, .success(served([], state: "SEARCH")), "a read while searching")
+        check(c.signalHistory.count == 3, "history: a read with no leg adds nothing")
+
+        rig.clock = t0.addingTimeInterval(20)
+        c.tick()
+        rig.answerInfo(5, .success(served([umtsLeg])), "a WCDMA read")
+        check(c.signalHistory.last == SignalSample(at: t0.addingTimeInterval(20), leg: "WCDMA", rsrp: -80, rsrq: nil, sinr: nil,
+                                                   technology: "WCDMA", band: nil),
+              "history: the WCDMA leg", "\(String(describing: c.signalHistory.last))")
+
+        // Kept across the screens; the Network tab's reads add too; the settings read adds none.
+        c.setTabShown(.simAndApn)
+        rig.answerSettings(6, .success(listing()), .success(ready), "the SIM & APN tab")
+        check(c.signalHistory.count == 4, "history: kept, and not added to, on the SIM & APN tab")
+        rig.clock = t0.addingTimeInterval(25)
+        c.setTabShown(.network)
+        rig.answerInfo(8, .success(served([saLeg])), "a Network tab read")
+        check(c.signalHistory.count == 5 && c.signalHistory.last?.at == t0.addingTimeInterval(25),
+              "history: the Network tab's read adds its sample")
+
+        // 5 reads so far count (the failed one does not). 115 more fill the 120.
+        var count = 8
+        for i in 1...115 {
+            rig.clock = t0.addingTimeInterval(25 + Double(i) * 5)
+            c.tick()
+            count += 1
+            rig.answerInfo(count, .success(served([saLeg])), "read \(i) of the 115")
+        }
+        check(c.signalHistory.count == 120 && c.signalHistory.first?.at == t0,
+              "history: 120 reads are all kept", "\(c.signalHistory.count)")
+        // The 121st drops the oldest read (one sample); the next drops the EN-DC read (two samples); the next the
+        // read with no leg (none).
+        let more: [(samples: Int, first: String)] = [(120, "LTE"), (119, "WCDMA"), (120, "WCDMA"), (120, "NR")]
+        for (n, want) in more.enumerated() {
+            rig.clock = t0.addingTimeInterval(1_000 + Double(n) * 5)
+            c.tick()
+            count += 1
+            rig.answerInfo(count, .success(served([saLeg])), "read \(121 + n)")
+            check(c.signalHistory.count == want.samples && c.signalHistory.first?.leg == want.first,
+                  "history: read \(121 + n) keeps the last 120 reads",
+                  "\(c.signalHistory.count) samples, first \(String(describing: c.signalHistory.first?.leg))")
+        }
+        check(c.signalHistory.last?.at == t0.addingTimeInterval(1_015), "history: the newest sample is last")
         c.setTabShown(nil)
     }
 }

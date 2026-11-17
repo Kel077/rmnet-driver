@@ -1,8 +1,8 @@
-// The RMNet app's one window: on its Driver tab the driver's status, refreshed every 2 seconds, and the
-// buttons that install, update and remove it (DriverView.swift); on its Messages tab the modem's text messages
-// (SmsView.swift); on its Network and SIM & APN tabs the modem's network, settings and SIM (NetworkView.swift,
-// SimDataView.swift). And its menu bar item (MenuBarView.swift), which stays when the window is closed.
-// Started by main.swift when the app gets no command-line verb.
+// The RMNet app's one window: a sidebar of screens (ShellModel.swift's Screen) with the connection at its foot,
+// and the screen chosen: the Overview (OverviewView.swift), the modem's text messages (SmsView.swift), its network
+// and its SIM and data profile (NetworkView.swift, SimDataView.swift), and the driver, which this app installs,
+// updates and removes (DriverView.swift). And its menu bar item (MenuBarView.swift), which stays when the window
+// is closed. Started by main.swift when the app gets no command-line verb.
 import AppKit
 import Combine
 import SwiftUI
@@ -13,9 +13,12 @@ struct RMNetApp: App {
     var body: some Scene {
         Window("RMNet", id: "status") {
             RMNetWindow(messages: appDelegate.messages, quitNotice: appDelegate.messages.quitNotice,
-                        modem: appDelegate.modem, modemQuitNotice: appDelegate.modem.quitNotice)
+                        modem: appDelegate.modem, modemQuitNotice: appDelegate.modem.quitNotice,
+                        driverStatus: appDelegate.driverStatus, throughput: appDelegate.throughput,
+                        menuBar: appDelegate.menuBar, polls: appDelegate.windowPolls)
         }
-        .defaultSize(width: 520, height: 480)
+        .defaultSize(width: 920, height: 640)
+        .windowResizability(.contentMinSize)
         // The App observes nothing: the item's label and its panel observe the menu bar model (kept by the app
         // delegate), so a change of the icon redraws only the label.
         MenuBarExtra {
@@ -30,65 +33,156 @@ struct RMNetApp: App {
     }
 }
 
-enum WindowTab: Hashable {
-    case driver
-    case messages
-    case network
-    case simAndApn
-}
-
-// The window's tabs: Driver (DriverView.swift), Messages (SmsView.swift), Network (NetworkView.swift) and SIM &
-// APN (SimDataView.swift). The tab shown is tracked by the selection; the Messages tab and the modem tabs ask the
-// modem only while one of theirs is shown and this window itself can be seen (WindowVisibility.swift: not
-// NSApp.occlusionState, which the menu bar item's windows would keep visible). The controllers are not observed
-// here, so typing a message does not redraw the Driver tab; only their small quit notices are: while a
-// quit waits for a call to the modem, a line above the tabs says so (quitNoticeLines, as the menu bar's panel).
+// The window: a NavigationSplitView whose sidebar lists the screens (the Messages row with the unread count) above
+// the connection pill, and whose detail is the screen chosen, under the quit notices. The screen chosen is kept
+// across launches (@SceneStorage). What the modem, the messages and the two polls read follows the screen shown
+// (Screen's modemTab, listsMessages, readsDriverStatus, samplesThroughput) and only while this window itself can be
+// seen (WindowVisibility.swift: not NSApp.occlusionState, which the menu bar item's windows would keep visible).
+// The controllers are not observed here, so typing a message does not redraw the window; only their small quit
+// notices are: while a quit waits for a call to the modem, a line above the screen says so (quitNoticeLines, as
+// the menu bar's panel). Each screen puts its own actions in the toolbar (ToolbarItem placement .primaryAction)
+// and its result line in the banner slot at its bottom (DesignKit's resultBanner); the window sets the title.
 struct RMNetWindow: View {
     let messages: SmsController
     @ObservedObject var quitNotice: SmsQuitNotice
     let modem: ModemController
     @ObservedObject var modemQuitNotice: ModemQuitNotice
-    @State private var tab = WindowTab.driver
+    let driverStatus: StatusController
+    let throughput: ThroughputSampler
+    let menuBar: MenuBarStatus
+    let polls: WindowPolls
+    @SceneStorage("screen") private var screen = Screen.overview
 
     var body: some View {
-        VStack(spacing: 0) {
-            ForEach(quitNoticeLines(messages: quitNotice.line, modem: modemQuitNotice.line), id: \.self) { line in
-                Text(verbatim: line)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding([.horizontal, .top])
+        NavigationSplitView {
+            List(selection: Binding(get: { screen }, set: { if let chosen = $0 { screen = chosen } })) {
+                ForEach(Screen.allCases) { item in
+                    SidebarRow(screen: item, messages: messages)
+                        .tag(item)
+                }
             }
-            TabView(selection: $tab) {
-                StatusView()
-                    .tabItem { Text("Driver") }
-                    .tag(WindowTab.driver)
-                SmsView(controller: messages)
-                    .tabItem { Text("Messages") }
-                    .tag(WindowTab.messages)
-                NetworkTab(controller: modem)
-                    .tabItem { Text("Network") }
-                    .tag(WindowTab.network)
-                SimApnTab(controller: modem)
-                    .tabItem { Text("SIM & APN") }
-                    .tag(WindowTab.simAndApn)
+            .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 280)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                SidebarConnection(menuBar: menuBar, modem: modem)
+                    .padding(Spacing.m)
             }
+        } detail: {
+            VStack(spacing: 0) {
+                QuitNotice(lines: quitNoticeLines(messages: quitNotice.line, modem: modemQuitNotice.line))
+                detail(screen)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .navigationTitle(screen.title)
         }
-        .onAppear { messages.setTabShown(tab == .messages) }
-        .onChange(of: tab) { _, shown in messages.setTabShown(shown == .messages) }
-        .onDisappear { messages.setTabShown(false) }
-        .onAppear { modem.setTabShown(modemTab(tab)) }
-        .onChange(of: tab) { _, shown in modem.setTabShown(modemTab(shown)) }
+        // The window's minimum is 760 × 520 with its toolbar (about 52 pt): this frame is below the toolbar.
+        .frame(minWidth: 760, minHeight: 468)
+        .onAppear { show(screen) }
+        .onChange(of: screen) { _, shown in show(shown) }
         .onDisappear {
+            messages.setTabShown(false)
             modem.setTabShown(nil)
             // The controller outlives the window: a confirmation or the bands sheet that closed with it must not
             // keep its reads paused when the window opens again.
             modem.setConfirming(false)
+            polls.setScreen(nil)
         }
         .background(WindowVisibilityObserver { visible in
             messages.setWindowVisible(visible)
             modem.setWindowVisible(visible)
+            polls.setWindowVisible(visible)
         })
         .background(OpenWindowKeeper())
+    }
+
+    /// Tells the controllers and the polls what the screen shown reads.
+    private func show(_ shown: Screen) {
+        messages.setTabShown(shown.listsMessages)
+        modem.setTabShown(shown.modemTab)
+        polls.setScreen(shown)
+    }
+
+    @ViewBuilder private func detail(_ shown: Screen) -> some View {
+        switch shown {
+        case .overview:
+            OverviewView(driverStatus: driverStatus, modem: modem, messages: messages, throughput: throughput,
+                         navigate: { screen = $0 })
+        case .messages:
+            SmsView(controller: messages)
+        case .network:
+            NetworkTab(controller: modem, throughput: throughput)
+        case .simData:
+            SimApnTab(controller: modem)
+        case .driver:
+            StatusView(controller: driverStatus)
+        }
+    }
+}
+
+/// A screen in the sidebar: its symbol and title; the Messages row with the unread messages' count as a badge
+/// (only that row observes the messages' controller).
+private struct SidebarRow: View {
+    let screen: Screen
+    let messages: SmsController
+
+    var body: some View {
+        if screen == .messages {
+            MessagesRow(screen: screen, messages: messages)
+        } else {
+            Label(screen.title, systemImage: screen.symbol)
+        }
+    }
+}
+
+private struct MessagesRow: View {
+    let screen: Screen
+    @ObservedObject var messages: SmsController
+
+    var body: some View {
+        Label(screen.title, systemImage: screen.symbol)
+            .badge(messages.unread.count)
+    }
+}
+
+/// The connection at the sidebar's foot: the state's dot and words, from the menu bar item's model (read from the
+/// registry every 5 s whatever the screen); while the link is up, the technology, the band and the bars from the
+/// modem's last network read, if it is less than a minute old (the Overview and the Network screen read it).
+private struct SidebarConnection: View {
+    @ObservedObject var menuBar: MenuBarStatus
+    @ObservedObject var modem: ModemController
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 15)) { context in
+            let pill = connectionPill(menuBar.headline)
+            let fresh = modem.infoAt.map { context.date.timeIntervalSince($0) < 60 } ?? false
+            let info = menuBar.icon == .up && fresh ? modem.info : nil
+            let tech = info.flatMap(techBadgeText)
+            HStack(spacing: Spacing.s) {
+                Image(systemName: "circle.fill")
+                    .imageScale(.small)
+                    .font(.caption)
+                    .foregroundStyle(pill.state.tint)
+                    .symbolEffect(.pulse, options: .repeating, isActive: pill.state == .connecting)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(verbatim: pill.text)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                    if let tech {
+                        Text(verbatim: [tech, info.flatMap(bandText)].compactMap { $0 }.joined(separator: " · "))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer(minLength: Spacing.xs)
+                if let info {
+                    SignalBars(level: signalLevel(info), height: 12)
+                }
+            }
+            .padding(.horizontal, Spacing.m)
+            .padding(.vertical, Spacing.s)
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.quaternary.opacity(0.6)))
+            .accessibilityElement(children: .combine)
+        }
     }
 }
 
@@ -182,6 +276,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Kept here rather than in the App, so that only the item's label and panel observe it.
     private(set) lazy var menuBar: MenuBarStatus = MenuBarStatus.forApp(queue: AppDelegate.modemQueue)
 
+    // The driver's status, shared by the Overview and the Driver screen, and the throughput, shared by the Overview
+    // and the Network screen; each polled by `windowPolls` only while one of its screens is shown and the window
+    // can be seen: the status every 2 s (the registry and the system's listing), the driver's byte counters every
+    // second (the registry only). Neither reads the AT port.
+    private(set) lazy var driverStatus = StatusController()
+    private(set) lazy var throughput = ThroughputSampler(read: { driverByteCounters(readDriverProperties()) })
+    private(set) lazy var windowPolls = WindowPolls(
+        driverStatus: RepeatingPoll(every: 2) { [unowned self] in self.driverStatus.refresh() },
+        throughput: RepeatingPoll(every: 1) { [unowned self] in self.throughput.sample() })
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         menuBar.start()
     }
@@ -266,7 +370,9 @@ enum ListingState {
 }
 
 // Keeps the status and runs the requests. Every message about an install or a removal comes from
-// the request's own answer, and says "installed" only when the listing, read again, agrees.
+// the request's own answer, and says "installed" only when the listing, read again, agrees. The app has one
+// (AppDelegate.driverStatus), refreshed by the window's poll (WindowPolls) every 2 s while the Overview or the
+// Driver screen is shown and the window can be seen.
 final class StatusController: ObservableObject {
     @Published private(set) var status = DriverStatus(entries: [], modem: .absent, attached: false, properties: [:])
     @Published private(set) var listing = ListingState.asking
@@ -404,5 +510,18 @@ final class StatusController: ObservableObject {
         case .other(let raw): return "The system answered the \(request) with result \(raw)."
         case .failed(let error): return "The system refused the \(request): \(describe(error))"
         }
+    }
+}
+
+extension StatusController {
+    /// The connection's headline for the Overview, as the menu bar's panel decides it (menuBarHeadline): with the
+    /// system's listing, the Driver screen's headline; with the driver attached and no listing (not answered yet,
+    /// or none given), the headline for its state (Connected only while its link is up); with neither, `Asking the
+    /// system…` until the system answers, `Unknown` while it gives no listing.
+    var connectionHeadline: String {
+        let answered: Bool
+        if case .asking = listing { answered = false } else { answered = true }
+        return menuBarHeadline(driver: status.attached ? status.properties : nil, modem: status.modem,
+                               model: status.modemModel, answered: answered, entries: known ? status.entries : nil)
     }
 }

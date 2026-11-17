@@ -8,15 +8,6 @@ func driverProfileNumber() -> Int? {
     readDriverProperties()?["RMNetProfile"].flatMap { Int($0) }
 }
 
-/// The modem tab a window tab is; nil for the Driver and Messages tabs.
-func modemTab(_ tab: WindowTab) -> ModemTab? {
-    switch tab {
-    case .network: return .network
-    case .simAndApn: return .simAndApn
-    case .driver, .messages: return nil
-    }
-}
-
 // MARK: - Shared pieces
 
 private let readTimeFormat: DateFormatter = {

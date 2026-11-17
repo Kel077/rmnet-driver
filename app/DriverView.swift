@@ -1,7 +1,7 @@
-// The window's Driver tab: the driver's status, refreshed every 2 seconds, and the buttons that install, update
-// and remove it. StatusController (StatusView.swift) holds the status and runs the requests; the headline, the
-// advice and the table come from StatusModel.swift.
-import Combine
+// The window's Driver screen: the driver's status, refreshed every 2 seconds while it is shown and the window can
+// be seen (the window's poll, WindowPolls in ShellModel.swift), and the buttons that install, update and remove it.
+// StatusController (StatusView.swift; the app delegate's driverStatus) holds the status and runs the requests; the
+// headline, the advice and the table come from StatusModel.swift.
 import SwiftUI
 
 extension TableRow: Identifiable {
@@ -9,9 +9,9 @@ extension TableRow: Identifiable {
 }
 
 struct StatusView: View {
-    @StateObject private var controller = StatusController()
+    // The process's one controller, owned by the app delegate and shared with the Overview.
+    @ObservedObject var controller: StatusController
     @State private var confirmingRemove = false
-    private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     private var headlineText: String {
         switch controller.listing {
@@ -73,8 +73,6 @@ struct StatusView: View {
         }
         .padding()
         .frame(minWidth: 480, minHeight: 420)
-        .onAppear { controller.refresh() }
-        .onReceive(timer) { _ in controller.refresh() }
         .confirmationDialog("Remove the RMNet driver?", isPresented: $confirmingRemove) {
             Button("Remove", role: .destructive) { controller.remove() }
             Button("Cancel", role: .cancel) {}

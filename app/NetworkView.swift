@@ -28,6 +28,9 @@ private struct BandsEdit: Identifiable {
 struct NetworkTab: View {
     // The process's one controller, owned by the app delegate.
     @ObservedObject var controller: ModemController
+    // The throughput, sampled every second while this screen is shown; not observed here (a view that draws it
+    // observes it, so that the rest of the screen does not redraw every second).
+    let throughput: ThroughputSampler
     @State private var question: Question<NetworkAction>? = nil
     @State private var editing: BandsEdit? = nil
 
