@@ -1,8 +1,9 @@
 // The menu bar item (a MenuBarExtra in RMNetApp, StatusView.swift): its icon (MenuBarLabel), and the panel it
-// opens with the Driver tab's headline, the addresses while the link is up, a few lines about the network read
-// over the AT port when the panel opens, the window's quit lines while a quit waits, `Open RMNet` and `Quit
-// RMNet`. MenuBarStatus (MenuBarStatus.swift) holds the state and decides when the port is read; this file only
-// shows it.
+// opens, the connection at a glance as the Overview shows it: the state's pill from the Driver tab's headline, the
+// technology's badge, the bars with their word, the operator and the band from the network read over the AT port
+// when the panel opens (with its time, or why it failed), the IPv4 address while the link is up, the window's quit
+// lines while a quit waits, `Open RMNet` and `Quit RMNet`. MenuBarStatus (MenuBarStatus.swift) holds the state and
+// decides when the port is read; this file only shows it, with DesignKit's pieces.
 import AppKit
 import SwiftUI
 
@@ -38,7 +39,11 @@ struct MenuBarLabel: View {
     }
 }
 
-/// The panel, about 280 pt wide.
+/// The panel, 290 pt wide: a compact version of the Overview's hero. The pill says Connected only while the
+/// driver's link is up (connectionPill of the model's headline). The badge, the bars, the operator and the band come
+/// from the last network read that succeeded (`info`), with its time; a value not known is "—", and a signal not
+/// known is outlined bars and "Signal not known", never "No signal". Without that read, its lines if there are any.
+/// The IPv4 address (copyable) only while the link is up.
 struct MenuBarPanel: View {
     @ObservedObject var status: MenuBarStatus
     // The controllers' quit lines (quitNoticeLines), shown above the buttons while a quit waits: `Quit RMNet`
@@ -53,44 +58,31 @@ struct MenuBarPanel: View {
     }
     @Environment(\.openWindow) private var openWindow
 
+    private static let width: CGFloat = 290
+    private static let inset: CGFloat = 14
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: status.icon.symbolName)
-                    .foregroundStyle(status.icon == .up ? Color.green : Color.secondary)
-                    .accessibilityHidden(true)
-                Text(verbatim: status.headline)
-                    .font(.headline)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if !status.addressLines.isEmpty {
-                Lines(status.addressLines)
-                    .textSelection(.enabled)
-            }
-            if showsNetwork {
-                Divider()
-                VStack(alignment: .leading, spacing: 3) {
-                    Lines(status.networkLines)
-                    if let at = status.networkAt {
-                        Text(verbatim: asOfText(at))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    if status.reading {
-                        Text(verbatim: menuBarReadingLine)
-                            .foregroundStyle(.secondary)
-                    } else if let note = status.networkNote {
-                        // A busy port is not a failure: the connection may well be up.
-                        Text(verbatim: note)
-                            .foregroundStyle(note == menuBarBusyNote ? Color.secondary : Color.orange)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+        let pill = connectionPill(status.headline)
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            HStack(alignment: .center, spacing: Spacing.s) {
+                StatusPill(state: pill.state, text: pill.text)
+                Spacer(minLength: Spacing.s)
+                if let tech = status.info.flatMap(techBadgeText) {
+                    TechBadge(text: tech)
                 }
             }
-            Divider()
+            network
+            readLine
+            if let ipv4 {
+                KeyValueRow(label: "IPv4", value: ipv4, copyable: true)
+            }
             let quitLines = quitNoticeLines(messages: quitNotice.line, modem: modemQuitNotice.line)
-            if !quitLines.isEmpty {
-                Lines(quitLines)
+            if quitLines.isEmpty {
+                Divider()
+            } else {
+                // The window's notice, from edge to edge of the panel, in place of the divider above the buttons.
+                QuitNotice(lines: quitLines)
+                    .padding(.horizontal, -MenuBarPanel.inset)
             }
             HStack {
                 Button("Open RMNet") {
@@ -102,13 +94,76 @@ struct MenuBarPanel: View {
                 Button("Quit RMNet") { NSApp.terminate(nil) }
             }
         }
-        .padding(14)
-        .frame(width: 280, alignment: .leading)
+        .padding(MenuBarPanel.inset)
+        .frame(width: MenuBarPanel.width, alignment: .leading)
         .background(PanelShownObserver(shown: { status.panelOpened() }, hidden: { status.panelClosed() }))
     }
 
-    private var showsNetwork: Bool {
-        !status.networkLines.isEmpty || status.reading || status.networkNote != nil
+    /// The last network read: the bars and their word with the read's time, the operator and the band; or, with no
+    /// NetworkInfo, the read's lines and time.
+    @ViewBuilder private var network: some View {
+        if let info = status.info {
+            let level = signalLevel(info)   // nil: not known
+            VStack(alignment: .leading, spacing: Spacing.s) {
+                HStack(alignment: .center, spacing: Spacing.s) {
+                    SignalBars(level: level, height: 16)
+                    Text(verbatim: level.map(signalWord) ?? "Signal not known")
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(1)
+                    Spacer(minLength: Spacing.s)
+                    asOf
+                }
+                VStack(alignment: .leading, spacing: Spacing.xs) {
+                    KeyValueRow(label: "Operator", value: info.networkName ?? info.operatorName ?? "—")
+                    KeyValueRow(label: "Band", value: bandText(info) ?? "—")
+                }
+            }
+        } else if !status.networkLines.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                Lines(status.networkLines)
+                asOf
+            }
+        }
+    }
+
+    /// "as of HH:mm:ss": when the read shown finished.
+    @ViewBuilder private var asOf: some View {
+        if let at = status.networkAt {
+            Text(verbatim: asOfText(at))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+    }
+
+    /// "Reading the modem…" while a read runs; else why the last one failed: a busy port in secondary colour (not a
+    /// failure: the connection may well be up), any other failure in orange.
+    @ViewBuilder private var readLine: some View {
+        if status.reading {
+            HStack(spacing: Spacing.s) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(verbatim: menuBarReadingLine)
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+        } else if let note = status.networkNote {
+            let busy = note == menuBarBusyNote
+            Label {
+                Text(verbatim: note)
+                    .fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: busy ? "clock" : "exclamationmark.triangle.fill")
+            }
+            .font(.callout)
+            .foregroundStyle(busy ? Color.secondary : Color.orange)
+        }
+    }
+
+    /// The address of the model's IPv4 line ("IPv4 10.62.238.140/29"), which it gives only while the link is up.
+    private var ipv4: String? {
+        let prefix = "IPv4 "
+        return status.addressLines.first(where: { $0.hasPrefix(prefix) }).map { String($0.dropFirst(prefix.count)) }
     }
 }
 

@@ -175,6 +175,7 @@ final class MenuBarStatus: ObservableObject {
     @Published private(set) var headline = askingHeadline
     @Published private(set) var addressLines: [String] = []     // only while the link is up
     @Published private(set) var networkLines: [String] = []     // from the last read that succeeded
+    @Published private(set) var info: NetworkInfo? = nil        // that read itself; kept and cleared with the lines
     @Published private(set) var networkAt: Date? = nil          // when that read finished
     @Published private(set) var networkNote: String? = nil      // why the last read failed; nil after a success
     @Published private(set) var reading = false                 // a network read runs
@@ -292,12 +293,14 @@ final class MenuBarStatus: ObservableObject {
         switch result {
         case .success(let info):
             networkLines = menuBarNetworkLines(info)
+            self.info = info
             networkAt = at
             networkNote = nil
         case .failure(let failure):
             let (note, modemGone) = menuBarNetworkNote(failure)
             if modemGone {
                 networkLines = []
+                info = nil
                 networkAt = nil
             }
             networkNote = note
