@@ -141,7 +141,7 @@ func asOfText(_ date: Date) -> String {
     "as of \(asOfFormat.string(from: date))"
 }
 
-/// The Driver tab's words before the system first answers (StatusView.swift).
+/// The Driver tab's words before the system first answers (DriverView.swift).
 private let askingHeadline = "Asking the system…"
 
 /// headline() of StatusModel.swift, by another name: inside MenuBarStatus `headline` is the property.
