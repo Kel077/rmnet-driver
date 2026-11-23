@@ -469,44 +469,58 @@ func parseAntennaSignals(rsrp rsrpLines: [String], rsrq rsrqLines: [String],
     }
 }
 
-/// AT+QENG="neighbourcell" (Quectel's AT manual for the RM520N series, 5.20). LTE cells come in two forms: in LTE mode
-/// `+QENG: "neighbourcell intra","LTE",<earfcn>,<PCID>,<RSRQ>,<RSRP>,<RSSI>,<SINR>,<srxlev>,…` (and `"neighbourcell
-/// inter"`, the same fields), RSRQ before RSRP; in WCDMA mode `+QENG: "neighbourcell","LTE",<earfcn>,<PCID>,<RSRP>,
-/// <RSRQ>,<s_rxlev>`, RSRP before RSRQ and no SINR. Also `"neighbourcell","WCDMA",…` and `"neighbourcell…","NR5G",…`.
-/// A field that is `-` (not valid now) is nil.
+/// AT+QENG="neighbourcell" (Quectel's AT manual for the RM520N series, 5.20). A line's layout depends on the mode the
+/// modem is in:
+/// - LTE mode: `+QENG: "neighbourcell intra","LTE",<earfcn>,<PCID>,<RSRQ>,<RSRP>,<RSSI>,<SINR>,<srxlev>,…` (and
+///   `"neighbourcell inter"`, the same fields): RSRQ before RSRP, and the SINR raw, as the serving cell's: dB = raw × 2
+///   − 20 (the manual's Y = 1/5 × X × 10 − 20; a raw 14 is 8 dB). WCDMA cells:
+///   `"neighbourcell","WCDMA",<uarfcn>,<cell_resel_priority>,<thresh_Xhigh>,<thresh_Xlow>,<PSC>,<RSCP>,<ecno>,<srxlev>`.
+/// - WCDMA mode: `"neighbourcell","WCDMA",<uarfcn>,<srxqual>,<PSC>,<RSCP>,<ecno>,<set>,<rank>,<srxlev>`, and LTE cells
+///   `"neighbourcell","LTE",<earfcn>,<PCID>,<RSRP>,<RSRQ>,<s_rxlev>`: RSRP before RSRQ, no SINR.
+/// The mode is the answer's: LTE with an intra or inter line, WCDMA with an LTE line without either; an answer of WCDMA
+/// lines only is told by each line, as the values allow: in LTE mode the sixth value is a threshold (0 or more) and the
+/// eighth the RSCP (below 0); in WCDMA mode the sixth is the RSCP. Also `"neighbourcell…","NR5G",…`. A WCDMA cell's PCI
+/// is its PSC and its RSRP its RSCP. A field that is `-` (not valid now) is nil.
 func parseNeighbourCells(_ lines: [String]) -> [NeighbourCell] {
-    var out: [NeighbourCell] = []
+    var rows: [(fields: [String], rat: String, kind: String?)] = []
     for line in lines {
         guard let f = atFields(line, prefix: "+QENG"), let tag = textField(f, 0),
               tag.hasPrefix("neighbourcell"), let rat = textField(f, 1) else { continue }
-        let kind: String?
-        if tag == "neighbourcell intra" {
-            kind = "intra"
-        } else if tag == "neighbourcell inter" {
-            kind = "inter"
-        } else {
-            let suffix = tag.dropFirst("neighbourcell".count).trimmingCharacters(in: .whitespaces)
-            kind = suffix.isEmpty ? nil : suffix
-        }
-        switch rat {
+        let suffix = tag.dropFirst("neighbourcell".count).trimmingCharacters(in: .whitespaces)
+        rows.append((f, rat, suffix.isEmpty ? nil : suffix))
+    }
+    let lteMode: Bool? = rows.contains { $0.kind == "intra" || $0.kind == "inter" } ? true
+        : rows.contains { $0.rat == "LTE" && $0.kind == nil } ? false : nil
+    return rows.map { row in
+        let f = row.fields
+        switch row.rat {
         case "LTE":
-            // With intra/inter (LTE mode): RSRQ, RSRP, RSSI, SINR. Without (WCDMA mode): RSRP, RSRQ, s_rxlev.
-            let lteMode = kind == "intra" || kind == "inter"
-            out.append(NeighbourCell(rat: rat, kind: kind, channel: intField(f, 2), pci: intField(f, 3),
-                                     rsrp: intField(f, lteMode ? 5 : 4), rsrq: intField(f, lteMode ? 4 : 5),
-                                     sinr: lteMode ? intField(f, 7) : nil))
+            if row.kind == "intra" || row.kind == "inter" {
+                return NeighbourCell(rat: row.rat, kind: row.kind, channel: intField(f, 2), pci: intField(f, 3),
+                                     rsrp: intField(f, 5), rsrq: intField(f, 4), sinr: intField(f, 7).map { $0 * 2 - 20 })
+            }
+            return NeighbourCell(rat: row.rat, kind: row.kind, channel: intField(f, 2), pci: intField(f, 3),
+                                 rsrp: intField(f, 4), rsrq: intField(f, 5), sinr: nil)
         case "NR5G", "NR5G-SA", "NR5G-NSA":
-            out.append(NeighbourCell(rat: "NR5G", kind: kind, channel: intField(f, 2), pci: intField(f, 3),
-                                     rsrp: intField(f, 4), rsrq: intField(f, 5), sinr: intField(f, 6)))
+            return NeighbourCell(rat: "NR5G", kind: row.kind, channel: intField(f, 2), pci: intField(f, 3),
+                                 rsrp: intField(f, 4), rsrq: intField(f, 5), sinr: intField(f, 6))
         case "WCDMA":
-            out.append(NeighbourCell(rat: rat, kind: kind, channel: intField(f, 2), pci: intField(f, 4),
-                                     rsrp: intField(f, 5), rsrq: nil, sinr: nil))
+            let inLte = lteMode ?? wcdmaLineInLteMode(f)
+            return NeighbourCell(rat: row.rat, kind: row.kind, channel: intField(f, 2), pci: intField(f, inLte ? 6 : 4),
+                                 rsrp: intField(f, inLte ? 7 : 5), rsrq: nil, sinr: nil)
         default:
-            out.append(NeighbourCell(rat: rat, kind: kind, channel: intField(f, 2), pci: intField(f, 3),
-                                     rsrp: nil, rsrq: nil, sinr: nil))
+            return NeighbourCell(rat: row.rat, kind: row.kind, channel: intField(f, 2), pci: intField(f, 3),
+                                 rsrp: nil, rsrq: nil, sinr: nil)
         }
     }
-    return out
+}
+
+/// A WCDMA neighbour line on its own: in LTE mode its sixth value (thresh_Xlow) is 0 or more and its eighth (RSCP) is
+/// below 0; in WCDMA mode its sixth is the RSCP, below 0.
+private func wcdmaLineInLteMode(_ f: [String]) -> Bool {
+    if let sixth = intField(f, 5) { return sixth >= 0 }
+    if let eighth = intField(f, 7) { return eighth < 0 }
+    return false
 }
 
 /// The value of one AT+QNWPREFCFG setting: `+QNWPREFCFG: "<name>",<value>`.

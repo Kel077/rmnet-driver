@@ -2011,11 +2011,26 @@ struct ModemServiceTests {
             rig.finish("expect: another module", opens: 1)
         }
         do {
-            // A module that gives no serial number is not the one expected either.
+            // A module that gives no serial number: not known, so never taken for the one expected; not written.
             let rig = onModule(nil, [("AT+QUIMSLOT?", slot1)])
             check(success(rig.service.setSimSlot(2, wait: .sim, expect: watched), "expect: no serial")?.skipped
-                    == .otherModule, "expect: no serial number on the port")
+                    == .moduleUnknown, "expect: no serial number on the port")
             rig.finish("expect: no serial", opens: 1)
+        }
+        do {
+            // No serial number expected (none was known when the modem attached), even with one on the port: not
+            // written, not known which module this is.
+            let rig = onModule("c0ffee01", [("AT+QUIMSLOT?", slot1)])
+            check(success(rig.service.setSimSlot(2, wait: .sim, expect: SimSlotExpectation(module: nil, slot: 1)),
+                          "expect: none expected")?.skipped == .moduleUnknown, "expect: no serial number expected")
+            rig.finish("expect: none expected", opens: 1)
+        }
+        do {
+            // Neither known: two modules not known are not the same one.
+            let rig = onModule(nil, [("AT+QUIMSLOT?", slot1)])
+            check(success(rig.service.setSimSlot(2, wait: .sim, expect: SimSlotExpectation(module: nil, slot: 1)),
+                          "expect: neither")?.skipped == .moduleUnknown, "expect: neither module known, not written")
+            rig.finish("expect: neither", opens: 1)
         }
         do {
             // The radio switched off meanwhile: not written.
@@ -2039,21 +2054,42 @@ struct ModemServiceTests {
             rig.finish("expect: SIM", opens: 1)
         }
         do {
-            // Still starting (busy) is not "unusable": not written.
+            // Still starting (busy) is not "unusable": not written, the SIM not told yet.
             let rig = onModule("c0ffee01", [("AT+QUIMSLOT?", slot1), ("AT+CFUN?", radioOn), ("AT+CPIN?", cme(14))])
-            check(success(rig.service.setSimSlot(2, wait: .sim, expect: watched), "expect: busy")?.skipped == .simUsable,
+            check(success(rig.service.setSimSlot(2, wait: .sim, expect: watched), "expect: busy")?.skipped == .simUnknown,
                   "expect: a SIM still starting")
             rig.finish("expect: busy", opens: 1)
         }
         do {
-            // A switch back: the module and the slot tried only, no radio or SIM read.
-            let back = SimSlotExpectation(module: "c0ffee01", slot: 2, unusableSim: false)
-            let rig = onModule("c0ffee01", [("AT+QUIMSLOT?", slot2), ("AT+QUIMSLOT=1", ok), ("AT+QUIMSLOT?", slot1),
+            // The SIM not read: not written, not told yet.
+            let rig = onModule("c0ffee01", [("AT+QUIMSLOT?", slot1), ("AT+CFUN?", radioOn), ("AT+CPIN?", timedOut)])
+            check(success(rig.service.setSimSlot(2, wait: .sim, expect: watched), "expect: SIM unread")?.skipped
+                    == .simUnknown, "expect: the SIM not read")
+        }
+        do {
+            // A switch back: checked as the try was, on the slot tried: the module, the slot, the radio and its SIM.
+            let back = SimSlotExpectation(module: "c0ffee01", slot: 2)
+            let rig = onModule("c0ffee01", [("AT+QUIMSLOT?", slot2), ("AT+CFUN?", radioOn), ("AT+CPIN?", cme(10)),
+                                            ("AT+QUIMSLOT=1", ok), ("AT+QUIMSLOT?", slot1),
                                             ("AT+CPIN?", cme(10))] + Array(repeating: ("AT+CPIN?", cme(10)), count: 15))
             let change = success(rig.service.setSimSlot(1, wait: .sim, expect: back), "expect: switch back")
             check(change?.changed == true && change?.after == 1 && change?.skipped == nil, "expect: the switch back written",
                   "\(String(describing: change))")
             rig.finish("expect: switch back", opens: 1)
+        }
+        do {
+            // A switch back whose slot tried has just become ready: not written, that SIM is kept.
+            let rig = onModule("c0ffee01", [("AT+QUIMSLOT?", slot2), ("AT+CFUN?", radioOn), ("AT+CPIN?", cpinReady)])
+            check(success(rig.service.setSimSlot(1, wait: .sim, expect: SimSlotExpectation(module: "c0ffee01", slot: 2)),
+                          "expect: back, ready")?.skipped == .simUsable, "expect: a switch back away from a ready SIM refused")
+            rig.finish("expect: back, ready", opens: 1)
+        }
+        do {
+            // A switch back on another module: not written.
+            let rig = onModule("0badbeef", [("AT+QUIMSLOT?", slot2)])
+            check(success(rig.service.setSimSlot(1, wait: .sim, expect: SimSlotExpectation(module: "c0ffee01", slot: 2)),
+                          "expect: back, module")?.skipped == .otherModule, "expect: a switch back on another module refused")
+            rig.finish("expect: back, module", opens: 1)
         }
         // The background turn: each command's lines, or the error line; one port.
         do {
@@ -2282,51 +2318,99 @@ struct ModemServiceTests {
             check(ch == .rebooting(before: first, after: next), "imei: set with reboot")
             rig.finish("imei: with reboot", opens: 1)
         }
-        // The change's own port open: the module it is on and the IMEI before go back with the outcome; with a module
-        // asked for (Change Back…), another one is refused before anything is sent.
+        // The restart refused or not answered after the IMEI was written and read back: a success with that said (the
+        // write and the restart are apart).
+        do {
+            let rig = Rig([("AT+EGMR=0,7", readFirst), ("AT+EGMR=1,7,\"\(next)\"", ok), ("AT+EGMR=0,7", readNext),
+                           ("AT+CFUN=1,1", .failure(.modem("ERROR")))])
+            let ch = success(rig.service.setImei(next, reboot: true), "imei: restart refused")
+            check(ch == .restartFailed(before: first, after: next, sentence: "The IMEI is now \(next), but the modem was not "
+                                       + "restarted. The modem refused the command (ERROR). It takes effect at the next "
+                                       + "restart (AT+CFUN=1,1 or a replug)."), "imei: restart refused, written",
+                  "\(String(describing: ch))")
+            rig.finish("imei: restart refused", opens: 1)
+        }
+        do {
+            let rig = Rig([("AT+EGMR=0,7", readFirst), ("AT+EGMR=1,7,\"\(next)\"", ok), ("AT+EGMR=0,7", readNext),
+                           ("AT+CFUN=1,1", timedOut)])
+            let ch = success(rig.service.setImei(next, reboot: true), "imei: restart not answered")
+            if case .restartFailed(let b, let a, let sentence)? = ch {
+                check(b == first && a == next && sentence.contains("It is not known whether the modem is restarting."),
+                      "imei: restart not answered, written", sentence)
+            } else {
+                check(false, "imei: restart not answered, written", "\(String(describing: ch))")
+            }
+        }
+        // The change's own port open: the module it is on and the IMEI before go back with the outcome. With what the
+        // change was confirmed for, another module (or one with no serial number) is refused before anything is read,
+        // and another IMEI before anything is written.
         func onModule(_ serial: String?, _ script: [(String, Answer)]) -> Rig {
             let port = ScriptedPort("port 1", script)
             port.deviceSerial = serial
             return Rig([.success(port)])
         }
+        let confirmed = ImeiExpectation(module: "TESTMODULE1", before: first)
         do {
-            let rig = onModule("c0ffee01", [("AT+EGMR=0,7", readFirst), ("AT+EGMR=1,7,\"\(next)\"", ok),
-                                            ("AT+EGMR=0,7", readNext)])
-            let write = rig.service.setImei(next, reboot: false, module: nil)
+            let rig = onModule("TESTMODULE1", [("AT+EGMR=0,7", readFirst), ("AT+EGMR=1,7,\"\(next)\"", ok),
+                                               ("AT+EGMR=0,7", readNext)])
+            let write = rig.service.setImei(next, reboot: false, expect: nil)
             check(write == ImeiWrite(outcome: .success(.setTakesEffectAfterRestart(before: first, after: next)),
-                                     module: "c0ffee01", before: first), "imei: the session's module and IMEI before",
+                                     module: "TESTMODULE1", before: first), "imei: the session's module and IMEI before",
                   "\(write)")
             rig.finish("imei: session", opens: 1)
         }
         do {
-            let rig = onModule("c0ffee01", [])
-            let write = rig.service.setImei(next, reboot: true, module: "0badbeef")
-            check(write.outcome.failureText?.contains("not the module") == true
+            let rig = onModule("TESTMODULE2", [])
+            let write = rig.service.setImei(next, reboot: true, expect: confirmed)
+            check(write.outcome.failureText?.contains("not the module this change was confirmed for") == true
                     && write.outcome.failureText?.hasSuffix("Nothing was changed.") == true,
                   "imei: another module refused", "\(write)")
-            check(write.module == "c0ffee01" && write.before == nil, "imei: refused before the IMEI read", "\(write)")
+            check(write.module == "TESTMODULE2" && write.before == nil, "imei: refused before the IMEI read", "\(write)")
             rig.finish("imei: another module", opens: 1)
         }
         do {
-            let rig = onModule("c0ffee01", [("AT+EGMR=0,7", readFirst), ("AT+EGMR=1,7,\"\(next)\"", ok),
-                                            ("AT+EGMR=0,7", readNext), ("AT+CFUN=1,1", ok)])
-            let write = rig.service.setImei(next, reboot: true, module: "c0ffee01")
-            check(write.outcome == .success(.rebooting(before: first, after: next)), "imei: the module asked for is written",
+            let rig = onModule(nil, [])
+            let write = rig.service.setImei(next, reboot: true, expect: confirmed)
+            check(write.outcome.failureText?.contains("this one has none") == true, "imei: no serial number, refused",
                   "\(write)")
-            rig.finish("imei: the module asked for", opens: 1)
+            rig.finish("imei: no serial number", opens: 1)
+        }
+        do {
+            // The IMEI changed since the question (another tool): nothing written.
+            let rig = onModule("TESTMODULE1", [("AT+EGMR=0,7", .success(["+EGMR: \"123456789012347\""]))])
+            let write = rig.service.setImei(next, reboot: true, expect: confirmed)
+            check(write.outcome.failureText == "The modem's IMEI is 123456789012347 now, not \(first) as when the change "
+                  + "was confirmed. Nothing was changed.", "imei: another IMEI, refused", "\(write)")
+            check(write.before == "123456789012347", "imei: the IMEI before as read", "\(write)")
+            rig.finish("imei: another IMEI", opens: 1)
+        }
+        do {
+            let rig = onModule("TESTMODULE1", [("AT+EGMR=0,7", readFirst), ("AT+EGMR=1,7,\"\(next)\"", ok),
+                                               ("AT+EGMR=0,7", readNext), ("AT+CFUN=1,1", ok)])
+            let write = rig.service.setImei(next, reboot: true, expect: confirmed)
+            check(write.outcome == .success(.rebooting(before: first, after: next)), "imei: as confirmed, written",
+                  "\(write)")
+            rig.finish("imei: as confirmed", opens: 1)
+        }
+        do {
+            // The IMEI and the module read for the question: one port open.
+            let rig = onModule("TESTMODULE1", [("AT+EGMR=0,7", readFirst)])
+            check(success(rig.service.imeiReading(), "imei: reading") == ImeiReading(imei: first, module: "TESTMODULE1"),
+                  "imei: the IMEI and the module read together")
+            rig.finish("imei: reading", opens: 1)
         }
         do {
             let rig = Rig([.failure(.busy)])
-            let write = rig.service.setImei(next, reboot: true, module: nil)
+            let write = rig.service.setImei(next, reboot: true, expect: nil)
             check(write.module == nil && write.before == nil && write.outcome.failureText != nil,
                   "imei: a port that does not open: nothing known", "\(write)")
             rig.finish("imei: busy", opens: 1)
         }
         do {
             // The IMEI read fails on the session: the module known, the IMEI before not.
-            let rig = onModule("c0ffee01", [("AT+EGMR=0,7", .failure(.modem("ERROR")))])
-            let write = rig.service.setImei(next, reboot: true, module: nil)
-            check(write.module == "c0ffee01" && write.before == nil && write.outcome.failureText != nil,
+            let rig = onModule("TESTMODULE1", [("AT+EGMR=0,7", .failure(.modem("ERROR")))])
+            let write = rig.service.setImei(next, reboot: true, expect: nil)
+            check(write.module == "TESTMODULE1" && write.before == nil && write.outcome.failureText != nil,
                   "imei: the read failed, the module known", "\(write)")
             rig.finish("imei: read failed", opens: 1)
         }

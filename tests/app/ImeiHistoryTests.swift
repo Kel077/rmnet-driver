@@ -52,6 +52,8 @@ struct ImeiHistoryTests {
         order()
         printed()
         screenRows()
+        restartApart()
+        fifo()
         print("ImeiHistory: \(checks) checks passed")
     }
 
@@ -259,7 +261,7 @@ struct ImeiHistoryTests {
                                          outcome: .success(.rebooting(before: zeros, after: counting)),
                                          source: .cli, module: "f00dcafe", at: t0)
         equal(restarted, ImeiHistoryEntry(time: t0, before: zeros, after: counting, source: .cli, result: .succeeded,
-                                          restart: true, module: "f00dcafe",
+                                          restart: true, restartResult: .succeeded, module: "f00dcafe",
                                           message: "IMEI set to \(counting); the modem is restarting.", note: nil),
               "outcome: restarting")
 
@@ -319,7 +321,8 @@ struct ImeiHistoryTests {
         equal(entries.count, 2, "json: entries")
         equal(entries.first?["after"] as? String, zeros, "json: newest first")
         equal(Set(entries.first?.keys.map { $0 } ?? []),
-              ["time", "before", "after", "source", "result", "restart", "module", "message", "note"], "json: every key")
+              ["time", "before", "after", "source", "result", "restart", "restartResult", "module", "message", "note"],
+              "json: every key (restartResult added)")
         check(entries.first?["module"] is NSNull, "json: unknown module is null")
     }
 
@@ -344,6 +347,67 @@ struct ImeiHistoryTests {
         let noneAttached = imeiHistoryRows(h, currentImei: counting, currentModule: nil)
         check(noneAttached.allSatisfy { !$0.otherModule }, "rows: no module attached, none is another")
         check(noneAttached.allSatisfy { !$0.canChangeBack }, "rows: no module known attached, no Change Back")
+    }
+
+    // The write and the restart recorded apart: an IMEI written and read back whose restart failed succeeded, with its
+    // restart failed, and can be changed back; the key is in every line (null when not known), and lines written before
+    // it existed read as before.
+    static func restartApart() {
+        let sentence = "The IMEI is now \(counting), but the modem was not restarted. The modem refused the command (ERROR). "
+            + "It takes effect at the next restart (AT+CFUN=1,1 or a replug)."
+        let e = imeiHistoryEntry(after: counting, before: zeros, restart: true,
+                                 outcome: .success(.restartFailed(before: zeros, after: counting, sentence: sentence)),
+                                 source: .app, module: "TESTMODULE1", at: t0)
+        check(e?.result == .succeeded && e?.restartResult == .failed && e?.message == sentence,
+              "restart apart: written, its restart failed", "\(String(describing: e))")
+        guard let e else { return }
+        let line = imeiHistoryLine(e)
+        check(line.contains("\"restartResult\":\"failed\""), "restart apart: in the line", line)
+        equal(imeiHistoryEntry(line: line), e, "restart apart: read back")
+        check(imeiHistoryLine(entry(zeros, counting)).contains("\"restartResult\":null"), "restart apart: null when not known")
+        // A line from before: no restartResult key; read as it was, with none.
+        let old = "{\"after\":\"\(counting)\",\"before\":\"\(zeros)\",\"message\":\"IMEI set.\",\"module\":\"TESTMODULE1\","
+            + "\"note\":null,\"restart\":true,\"result\":\"failed\",\"source\":\"app\",\"time\":\"2026-11-22T02:57:14-05:00\"}"
+        let read = imeiHistoryEntry(line: old)
+        check(read?.result == .failed && read?.restartResult == nil && read?.module == "TESTMODULE1",
+              "restart apart: an older line read as before", "\(String(describing: read))")
+        let odd = old.replacingOccurrences(of: "\"note\":null", with: "\"note\":null,\"restartResult\":\"maybe\"")
+        check(imeiHistoryEntry(line: odd) != nil && imeiHistoryEntry(line: odd)?.restartResult == nil,
+              "restart apart: an unknown value is none")
+        // Change Back offered for it; printed with `restart failed`; in the JSON.
+        let rows = imeiHistoryRows(ImeiHistory(entries: [e], skippedLines: 0), currentImei: counting,
+                                   currentModule: "TESTMODULE1")
+        check(rows.first?.canChangeBack == true, "restart apart: can be changed back")
+        let printed = imeiHistoryLines(ImeiHistory(entries: [e], skippedLines: 0), location: "/x")
+        check(printed[1].hasSuffix("module TESTMODULE1  restart failed"), "restart apart: printed", printed[1])
+        let json = imeiHistoryJSON(ImeiHistory(entries: [e], skippedLines: 0), location: "/x")
+        let first = (json["entries"] as? [[String: Any]])?.first
+        equal(first?["restartResult"] as? String, "failed", "restart apart: in the JSON")
+        equal(first?["result"] as? String, "succeeded", "restart apart: the JSON's result is the write's")
+    }
+
+    // A FIFO where the file should be: refused at once, never waited on (it is opened without blocking and checked).
+    static func fifo() {
+        let fm = FileManager.default
+        let url = temporaryFile()
+        let base = url.deletingLastPathComponent().deletingLastPathComponent()
+        defer { try? fm.removeItem(at: base) }
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                attributes: [.posixPermissions: 0o700])
+        check(mkfifo(url.path, 0o600) == 0, "fifo: made")
+        let file = ImeiHistoryFile(url: url)
+        let done = DispatchSemaphore(value: 0)
+        var loaded: Result<ImeiHistory, ModemFailure>? = nil
+        var appended: String? = nil
+        DispatchQueue.global().async {
+            loaded = file.load()
+            appended = file.append(entry(zeros, counting))
+            done.signal()
+        }
+        check(done.wait(timeout: .now() + 3) == .success, "fifo: not waited on")
+        check(loaded?.failureMessage?.contains("not a file of yours") == true, "fifo: a load refused",
+              "\(String(describing: loaded))")
+        check(appended?.contains("not a file of yours") == true, "fifo: an append refused", "\(String(describing: appended))")
     }
 }
 

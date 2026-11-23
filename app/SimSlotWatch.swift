@@ -12,10 +12,14 @@
 // for longer than two background turns (the Mac slept, a turn was skipped); the 25 s then start again.
 //
 // The switch itself checks again, on the port that writes AT+QUIMSLOT=, before it writes (SimSlotExpectation): the same
-// module (its USB serial number, read when it attached), still on the slot that was read, the radio on and the SIM
-// still unusable; otherwise nothing is written and the watcher starts again or stops (SimSlotSkip). Its switch back is
-// part of the same change (ModemController.changeSimSlot), so a quit waits for both and never leaves the modem on the
-// empty slot it tried.
+// module (its USB serial number, read when it attached, or read again when it was not known then; a module whose serial
+// number is still not known is never switched), still on the slot that was read, the radio on and the SIM still
+// unusable; otherwise nothing is written and the watcher starts again or stops (SimSlotSkip). The switch back checks
+// the same on the slot it tried, so a SIM that has become ready there meanwhile is kept. When the SIM of the slot tried
+// could not be told after the switch (not read, busy), nothing is concluded: the watcher reads it on later turns
+// (`verifying`) until it is told. A switch back that is not made because something is not known yet (the radio, the SIM,
+// the module) is tried again on the next turn. The switch back is part of the same change as the try
+// (ModemController.changeSimSlot), so a quit waits for both and never leaves the modem on the empty slot it tried.
 //
 // SimSlotWatch is the decision, a value tested by tests/app/SimSlotWatchTests.swift; SimSlotWatcher runs it in the app:
 // it reads the SIM in the app's background turn (ModemPulse.swift) while it watches, and switches with the modem
@@ -30,10 +34,11 @@ struct SimSlotWatch: Equatable {
         case watching                                            // a modem attached; no verdict yet
         case unusable(since: Date, slot: Int, state: SimState)   // the slot in use has had no usable SIM since then
         case switching(from: Int, to: Int, reason: SimState)     // trying the other slot
+        case verifying(from: Int, to: Int, reason: SimState)     // switched; the SIM of the slot tried not told yet
         case switchingBack(original: Int, tried: Int, reason: SimState, triedState: SimState?)
     }
 
-    enum Action: Equatable { case none, switchSlot(Int) }
+    enum Action: Equatable { case none, switchSlot(Int), say(String) }
 
     /// How long the slot in use must have no usable SIM before the other slot is tried.
     static let patience: TimeInterval = 25
@@ -47,7 +52,7 @@ struct SimSlotWatch: Equatable {
     /// The watcher wants the SIM read: a modem attached and no verdict yet.
     var wantsReads: Bool {
         switch phase {
-        case .watching, .unusable: return true
+        case .watching, .unusable, .verifying: return true
         default: return false
         }
     }
@@ -62,6 +67,24 @@ struct SimSlotWatch: Equatable {
     /// With `enabled` off (Settings) it keeps watching but never switches.
     mutating func read(sim: SimState?, radio: RadioState?, slot: Int?, at: Date, enabled: Bool) -> Action {
         guard wantsReads else { return .none }
+        if case .verifying(let from, let to, let reason) = phase {
+            // The slot tried, until its SIM is told with the radio on: usable, the switch stands; unusable, back.
+            guard let sim, let slot, radio == .on else { return .none }
+            guard slot == to else {
+                phase = .idle                                       // switched elsewhere meanwhile
+                return .none
+            }
+            switch simConclusive(sim) {
+            case true?:
+                phase = .idle
+                return .say(switchedLine(to: to, reason: reason, from: from))
+            case false?:
+                phase = .switchingBack(original: from, tried: to, reason: reason, triedState: sim)
+                return .switchSlot(from)
+            case nil:
+                return .none
+            }
+        }
         guard let sim, let slot, let radio else {                   // a part not read: a break, start again
             missed()
             return .none
@@ -98,6 +121,7 @@ struct SimSlotWatch: Equatable {
     /// SIM", which starts the patience again. Nothing while it does not watch.
     mutating func missed() {
         guard wantsReads else { return }
+        if case .verifying = phase { return }                       // still not told: keep reading the slot tried
         phase = .watching
         lastRead = nil
     }
@@ -109,10 +133,10 @@ struct SimSlotWatch: Equatable {
         if case .switching = phase { phase = .watching }
     }
 
-    /// The expectation of the switch back (retryAction): the module, on the slot tried.
+    /// The expectation of the switch back (retryAction): the module, on the slot tried, still without a usable SIM.
     func retryExpectation(module: String?) -> SimSlotExpectation? {
         if case .switchingBack(_, let tried, _, _) = phase {
-            return SimSlotExpectation(module: module, slot: tried, unusableSim: false)
+            return SimSlotExpectation(module: module, slot: tried, unusableSim: true)
         }
         return nil
     }
@@ -123,7 +147,9 @@ struct SimSlotWatch: Equatable {
         return .none
     }
 
-    /// What came of a switch: the action that follows (the switch back), and the line to show, if any.
+    /// What came of a switch: the action that follows (the switch back), and the line to show, if any. Something not
+    /// known yet (the module, the radio, the SIM) concludes nothing: the try is watched for again, the slot tried read
+    /// again (`verifying`), or the switch back tried again on the next turn.
     mutating func switched(_ outcome: Result<SimSlotChange, ModemFailure>) -> (action: Action, line: String?) {
         switch phase {
         case .switching(let from, let to, let reason):
@@ -131,28 +157,43 @@ struct SimSlotWatch: Equatable {
             case .failure:
                 phase = .idle
                 return (.none, "\(reasonWords(reason, slot: from)); could not switch to SIM \(to).")
-            case .success(let c) where c.skipped == .radioNotOn || c.skipped == .simUsable:
-                phase = .watching                                   // not so on the port that writes: watch again
+            case .success(let c) where c.skipped == .otherModule || c.skipped == .otherSlot:
+                phase = .idle                                       // another module, or switched elsewhere meanwhile
+                return (.none, nil)
+            case .success(let c) where c.skipped != nil:
+                phase = .watching                                   // not so (or not known) on the port that writes
                 return (.none, nil)
             case .success(let c) where !c.changed:
-                phase = .idle                                       // switched elsewhere meanwhile, or another module
+                phase = .idle                                       // on that slot already
                 return (.none, nil)
             case .success(let c):
-                if let sim = c.sim, simUnusable(sim) {
-                    phase = .switchingBack(original: from, tried: to, reason: reason, triedState: sim)
+                switch c.sim.flatMap(simConclusive) {
+                case false?:
+                    phase = .switchingBack(original: from, tried: to, reason: reason, triedState: c.sim)
                     return (.switchSlot(from), nil)
+                case true?:
+                    phase = .idle
+                    return (.none, switchedLine(to: to, reason: reason, from: from))
+                case nil:
+                    phase = .verifying(from: from, to: to, reason: reason)
+                    return (.none, nil)
                 }
-                phase = .idle
-                return (.none, "Switched to SIM \(to): \(reasonWords(reason, slot: from).lowercasedFirst).")
             }
         case .switchingBack(let original, let tried, let reason, let triedState):
-            phase = .idle
             switch outcome {
             case .failure:
+                phase = .idle
                 return (.none, "\(reasonWords(triedState ?? .notInserted, slot: tried)) either; could not switch back to SIM \(original).")
-            case .success(let c) where c.skipped != nil:
-                return (.none, nil)                                 // another slot or module by then: left as it is
+            case .success(let c) where c.skipped == .simUsable:
+                phase = .idle                                       // the slot tried has a usable SIM by now: kept
+                return (.none, switchedLine(to: tried, reason: reason, from: original))
+            case .success(let c) where c.skipped == .radioNotOn || c.skipped == .simUnknown || c.skipped == .moduleUnknown:
+                return (.none, nil)                                 // not known yet: tried again on the next turn
+            case .success(let c) where c.skipped != nil || !c.changed:
+                phase = .idle                                       // another slot or module by then: left as it is
+                return (.none, nil)
             case .success:
+                phase = .idle
                 let neither = reason == .notInserted && (triedState ?? .notInserted) == .notInserted
                 return (.none, neither ? "No SIM in either slot." : "No usable SIM in either slot.")
             }
@@ -160,6 +201,11 @@ struct SimSlotWatch: Equatable {
             return (.none, nil)
         }
     }
+}
+
+/// "Switched to SIM 2: no SIM in slot 1."
+private func switchedLine(to: Int, reason: SimState, from: Int) -> String {
+    "Switched to SIM \(to): \(reasonWords(reason, slot: from).lowercasedFirst)."
 }
 
 /// "No SIM in slot 1", "SIM failure in slot 1".
@@ -251,13 +297,29 @@ final class SimSlotWatcher: ObservableObject {
         let sim = a["AT+CPIN?"].flatMap(simState)
         let radio = a["AT+CFUN?"].flatMap { parseRadio($0.lines) }
         let slot = a["AT+QUIMSLOT?"].flatMap { parseSimSlot($0.lines) }
-        if case .switchSlot(let other) = watch.read(sim: sim, radio: radio, slot: slot, at: now(), enabled: enabled()),
-           case .switching(let from, _, _) = watch.phase {
-            start(other, expect: SimSlotExpectation(module: attachedModule, slot: from))
+        switch watch.read(sim: sim, radio: radio, slot: slot, at: now(), enabled: enabled()) {
+        case .switchSlot(let target):
+            if case .switching(let from, _, _) = watch.phase {
+                start(target, expect: SimSlotExpectation(module: attachedModule, slot: from))
+            } else if let expect = watch.retryExpectation(module: attachedModule) {
+                start(target, expect: expect)                       // back, from the slot tried (`verifying`)
+            }
+        case .say(let words):
+            line = words
+            lineAt = now()
+        case .none:
+            break
         }
     }
 
-    private func start(_ slot: Int, expect: SimSlotExpectation) {
+    /// A module whose serial number was not known when it attached is read again first; one still not known is not
+    /// switched (the port finds `moduleUnknown`, and the watcher checks again later).
+    private func start(_ slot: Int, expect given: SimSlotExpectation) {
+        var expect = given
+        if expect.module == nil, let read = module() {
+            attachedModule = read
+            expect = SimSlotExpectation(module: read, slot: given.slot, unusableSim: given.unusableSim)
+        }
         switchRunning = true
         let started = switchSlot(slot, expect) { [weak self] outcome in
             guard let self else { return nil }

@@ -212,6 +212,23 @@ enum ImeiChange: Equatable {
     case unchanged(String)
     case rebooting(before: String, after: String)
     case setTakesEffectAfterRestart(before: String, after: String)
+    /// Written and read back, but the restart asked for was refused or got no answer: `sentence` says which, and that
+    /// the new IMEI takes effect at the next restart.
+    case restartFailed(before: String, after: String, sentence: String)
+}
+
+/// What a change of the IMEI was confirmed for (the window's question, `imei set`'s): the module (its USB serial number)
+/// and the IMEI it had then. The port that writes checks both first (ModemService.setImei) and writes nothing on another
+/// module or over another IMEI.
+struct ImeiExpectation: Equatable {
+    let module: String
+    let before: String
+}
+
+/// The IMEI and the module it was read on (the port's USB serial number; nil when the module gives none).
+struct ImeiReading: Equatable {
+    let imei: String
+    let module: String?
 }
 
 /// An IMEI change as its own port session saw it (ModemService.setImei): the outcome, the module the port was opened on
@@ -245,9 +262,11 @@ protocol ModemServing {
     func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure>
     func lockCellInUse(_ cell: CellInUse) -> Result<CellLockChange, ModemFailure>    // refuses what cellInUseProblem does
     func imei() -> Result<String, ModemFailure>
-    /// `module`: write only on the module with that USB serial number (Change Back…, which undoes a change recorded on
-    /// it), checked on the port that writes; nil: on any.
-    func setImei(_ imei: String, reboot: Bool, module: String?) -> ImeiWrite
+    /// The IMEI and the module of the port it was read on, in one port open (what a change is confirmed for).
+    func imeiReading() -> Result<ImeiReading, ModemFailure>
+    /// `expect`: write only on that module over that IMEI, checked on the port that writes (the window's Change… and
+    /// Change Back…, `imei set`); nil: on any.
+    func setImei(_ imei: String, reboot: Bool, expect: ImeiExpectation?) -> ImeiWrite
     func simSlot() -> Result<Int, ModemFailure>                                       // AT+QUIMSLOT?
     /// `expect`: an automatic switch's expectation, checked on the port that writes (SimSlotExpectation); nil: none.
     func setSimSlot(_ slot: Int, wait: SimSlotWait, expect: SimSlotExpectation?) -> Result<SimSlotChange, ModemFailure>
@@ -256,7 +275,12 @@ protocol ModemServing {
 extension ModemServing {
     /// On any module; the outcome only.
     func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure> {
-        setImei(imei, reboot: reboot, module: nil).outcome
+        setImei(imei, reboot: reboot, expect: nil).outcome
+    }
+
+    /// For services that cannot tell the module (the tests' fakes): the IMEI, on a module not known.
+    func imeiReading() -> Result<ImeiReading, ModemFailure> {
+        imei().map { ImeiReading(imei: $0, module: nil) }
     }
 
     /// Asked by the owner: no expectation.
@@ -843,10 +867,10 @@ struct SimSlotChange: Equatable {
 }
 
 /// What an automatic switch (SimSlotWatch.swift) expects to find on the port that would write AT+QUIMSLOT=, checked
-/// there first, in the same port open (ModemService.setSimSlot): the module it watched (its USB serial number, nil when
-/// it gives none), still on `slot`; and with `unusableSim`, the radio still on (AT+CFUN? 1) and the SIM still without
-/// a usable SIM (AT+CPIN?, simUnusable). Anything else, or a part that cannot be read: nothing is written, and the
-/// change says why (`skipped`). A switch back checks the module and the slot only.
+/// there first, in the same port open (ModemService.setSimSlot): the module it watched (its USB serial number: one not
+/// known, here or on the port, is never taken for the same), still on `slot`; and with `unusableSim`, the radio still on
+/// (AT+CFUN? 1) and the SIM still without a usable SIM (AT+CPIN?, simUnusable). Anything else, or a part that cannot be
+/// read: nothing is written, and the change says why (`skipped`). The try and the switch back both check all of it.
 struct SimSlotExpectation: Equatable {
     let module: String?
     let slot: Int
@@ -860,9 +884,21 @@ enum SimSlotOutcome: Equatable {
     case cancelled
 }
 
-/// Why an automatic switch was not made: another module on the port, another slot in use, the radio not on (or not
-/// read), or a SIM that is usable now (or whose state could not be read).
-enum SimSlotSkip: Equatable { case otherModule, otherSlot, radioNotOn, simUsable }
+/// Why an automatic switch was not made: the module not known (no serial number here or on the port), another module
+/// on the port, another slot in use, the radio not on (or not read), a SIM that is usable now, or a SIM whose state
+/// could not be told (not read, busy, another answer). The first, the radio and the SIM not told are "not known yet":
+/// the watcher checks again later.
+enum SimSlotSkip: Equatable { case moduleUnknown, otherModule, otherSlot, radioNotOn, simUsable, simUnknown }
+
+/// A SIM state that says what the slot has: a usable SIM (true), none usable (false), or not yet told (nil: busy while it
+/// starts, or another answer).
+func simConclusive(_ state: SimState) -> Bool? {
+    switch state {
+    case .ready, .pin, .puk, .pin2, .puk2: return true
+    case .notInserted, .failure: return false
+    case .busy, .other: return nil
+    }
+}
 
 /// The result line of a slot change.
 func simSlotSentence(_ c: SimSlotChange) -> String {
@@ -1342,8 +1378,9 @@ func imeiCommand(_ imei: String) -> String {
     "AT+EGMR=1,7,\"\(imei)\""
 }
 
-func imeiQuestion(before: String?, after: String, reboot: Bool) -> (title: String, message: String) {
-    let current = before.map { "Current IMEI: \($0)." } ?? "Current IMEI could not be read."
+func imeiQuestion(before: String?, after: String, reboot: Bool, module: String? = nil) -> (title: String, message: String) {
+    let current = (module.map { "Module: \($0).\n" } ?? "")
+        + (before.map { "Current IMEI: \($0)." } ?? "Current IMEI could not be read.")
     let effect = reboot
         ? "RMNet restarts the modem right away so the network sees the new IMEI (~30 s without service)."
         : "The new IMEI is stored and takes effect after the next modem restart."
@@ -1359,6 +1396,8 @@ func imeiSentence(_ change: ImeiChange) -> String {
         return "IMEI set to \(after); the modem is restarting."
     case .setTakesEffectAfterRestart(_, let after):
         return "IMEI set to \(after); it takes effect at the next restart (AT+CFUN=1,1 or a replug)."
+    case .restartFailed(_, _, let sentence):
+        return sentence
     }
 }
 

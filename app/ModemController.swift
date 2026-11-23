@@ -989,9 +989,11 @@ final class ModemController: ObservableObject {
         finished(succeeded: (try? outcome.get()) != nil, changed: true)
     }
 
-    /// `onModule`: Change Back… of a history entry, which writes only on the module the entry was recorded on (checked on
-    /// the port that writes, ModemService.setImei); nil: Change…, on the module attached.
-    func changeImei(_ newImei: String, reboot: Bool, onModule: String? = nil) {
+    /// `expect`: what the window's question was confirmed for (the module shown and the IMEI then; for Change Back… the
+    /// module the history entry was recorded on): written only when the port that writes finds both
+    /// (ModemService.setImei); nil: on any (the tests). An IMEI written whose restart failed is a warning: the IMEI shown
+    /// is the new one.
+    func changeImei(_ newImei: String, reboot: Bool, expect: ImeiExpectation? = nil) {
         guard !stopping else { return }
         if let problem = imeiProblem(newImei) { return refuse("\(problem) Nothing was changed.") }
         if let current = imei, current == newImei {
@@ -1005,7 +1007,7 @@ final class ModemController: ObservableObject {
         // is in it.
         submit(.imei, line: "Setting IMEI to \(newImei)…", quitLine: ModemController.imeiQuitLine,
                { (service: ModemServing) -> Result<ImeiAttempt, ModemFailure> in
-                   let write = service.setImei(newImei, reboot: reboot, module: onModule)
+                   let write = service.setImei(newImei, reboot: reboot, expect: expect)
                    let outcome = write.outcome
                    guard let history else { return .success(ImeiAttempt(outcome: outcome)) }
                    var problem: String? = nil
@@ -1022,13 +1024,15 @@ final class ModemController: ObservableObject {
             let notRecorded = done.recordProblem.map { " The change was not recorded in the IMEI history: \($0)" } ?? ""
             switch done.outcome {
             case .success(let ch):
+                var later = false
                 switch ch {
                 case .unchanged(let current): self.imei = current
                 case .rebooting(_, let after): self.imei = after
-                case .setTakesEffectAfterRestart: break
+                case .setTakesEffectAfterRestart: later = true
+                case .restartFailed(_, let after, _):
+                    self.imei = after
+                    later = true
                 }
-                var later = false
-                if case .setTakesEffectAfterRestart = ch { later = true }
                 self.setResult(imeiSentence(ch) + notRecorded, failure: false,
                                kind: notRecorded.isEmpty && !later ? .success : .warning)
             case .failure(let failure):
@@ -1078,9 +1082,10 @@ final class ModemController: ObservableObject {
                 self.setResult(automatic ? "" : failure.message, failure: !automatic)
             }
             if let back = completion?(.finished(outcome)), simSlots.contains(back) {
-                // The switch back: on the module the switch expected, from the slot it went to. A quit that waits goes on
-                // waiting (its line stays): `running` is set again before this returns.
-                let undo = SimSlotExpectation(module: expect?.module, slot: slot, unusableSim: false)
+                // The switch back: on the module the switch expected, from the slot it went to, while that slot still has
+                // no usable SIM with the radio on (checked on the port that writes, as the try was). A quit that waits
+                // goes on waiting (its line stays): `running` is set again before this returns.
+                let undo = SimSlotExpectation(module: expect?.module, slot: slot, unusableSim: true)
                 self.runSimSlot(back, automatic: true, expect: undo, completion: completion)
                 return
             }

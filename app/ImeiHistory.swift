@@ -1,6 +1,7 @@
 // The IMEI history: one entry for each change of the modem's IMEI made with RMNet (the SIM & Data screen's Change…,
 // `RMNet imei set`), and for a change made otherwise that was recorded afterwards. Each entry has the time, the
-// IMEI before and after, where the change came from, whether it succeeded, the module (its USB serial number, which
+// IMEI before and after, where the change came from, whether the IMEI was written (and, apart from it, whether the
+// restart asked for went), the module (its USB serial number, which
 // an IMEI change does not touch, so that the history of a module plugged into several Macs can be told apart) and the
 // sentence RMNet showed.
 //
@@ -36,8 +37,12 @@ struct ImeiHistoryEntry: Equatable {
     var before: String?          // nil: not known
     var after: String            // the IMEI asked for
     var source: ImeiChangeSource
-    var result: ImeiChangeResult
+    var result: ImeiChangeResult // the IMEI written and read back (succeeded), or not (failed: it may still have changed)
     var restart: Bool?           // the modem was to restart at once (nil: not known)
+    /// The restart asked for (`restart` true) after a write that succeeded: the modem took the command (succeeded), or it
+    /// refused it or did not answer (failed: the new IMEI takes effect at the next restart). nil: none asked, or an entry
+    /// written before RMNet recorded it apart (those recorded a failed restart as a failed change).
+    var restartResult: ImeiChangeResult? = nil
     var module: String?          // the module's USB serial number (nil: not known)
     var message: String?         // the sentence RMNet showed for the change
     var note: String?            // for an entry recorded afterwards: how it was made
@@ -81,6 +86,7 @@ func imeiHistoryObject(_ e: ImeiHistoryEntry) -> [String: Any] {
     func orNull<T>(_ v: T?) -> Any { v.map { $0 as Any } ?? NSNull() }
     return ["time": imeiHistoryTimeText(e.time), "before": orNull(e.before), "after": e.after,
             "source": e.source.rawValue, "result": e.result.rawValue, "restart": orNull(e.restart),
+            "restartResult": orNull(e.restartResult?.rawValue),
             "module": orNull(e.module), "message": orNull(e.message), "note": orNull(e.note)]
 }
 
@@ -90,7 +96,8 @@ func imeiHistoryLine(_ e: ImeiHistoryEntry) -> String {
     return String(data: data, encoding: .utf8) ?? "{}"
 }
 
-/// A line read back; nil when it is not an entry (not JSON, no valid time, no `after`, an unknown source or result).
+/// A line read back; nil when it is not an entry (not JSON, no valid time, no `after`, an unknown source or result). A
+/// line without `restartResult` (written before it was recorded) has none; an unknown value is none too.
 func imeiHistoryEntry(line: String) -> ImeiHistoryEntry? {
     guard let data = line.data(using: .utf8),
           let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -99,8 +106,9 @@ func imeiHistoryEntry(line: String) -> ImeiHistoryEntry? {
           let source = (o["source"] as? String).flatMap(ImeiChangeSource.init(rawValue:)),
           let result = (o["result"] as? String).flatMap(ImeiChangeResult.init(rawValue:)) else { return nil }
     return ImeiHistoryEntry(time: time, before: o["before"] as? String, after: after, source: source, result: result,
-                            restart: o["restart"] as? Bool, module: o["module"] as? String,
-                            message: o["message"] as? String, note: o["note"] as? String)
+                            restart: o["restart"] as? Bool,
+                            restartResult: (o["restartResult"] as? String).flatMap(ImeiChangeResult.init(rawValue:)),
+                            module: o["module"] as? String, message: o["message"] as? String, note: o["note"] as? String)
 }
 
 /// The file's text read back: blank lines ignored, any other line that is not an entry skipped and counted.
@@ -165,13 +173,16 @@ final class ImeiHistoryFile: ImeiHistoryKeeping {
             if problem.isEmpty { return .success(ImeiHistory(entries: [], skippedLines: 0)) }
             return .failure(ModemFailure(message: problem))
         }
-        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        // Without blocking: a FIFO put where the file should be would otherwise hold the open until a writer comes; it is
+        // refused by the check on the opened file instead. A regular file reads the same either way.
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         guard fd >= 0 else {
             if errno == ENOENT { return .success(ImeiHistory(entries: [], skippedLines: 0)) }
             return .failure(ModemFailure(message: openProblem(errno)))
         }
         defer { close(fd) }
         if let problem = fileProblem(fd) { return .failure(ModemFailure(message: problem)) }
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK)
         guard flock(fd, LOCK_SH) == 0 else { return .failure(ModemFailure(message: unreadable)) }
         defer { flock(fd, LOCK_UN) }
         var bytes: [UInt8] = []
@@ -193,10 +204,11 @@ final class ImeiHistoryFile: ImeiHistoryKeeping {
     /// byte written however many writes it takes. The file is made owner-only, its folder too.
     func append(_ entry: ImeiHistoryEntry) -> String? {
         if let problem = folderProblem(creating: true) { return problem }
-        let fd = open(url.path, O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        let fd = open(url.path, O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0o600)
         guard fd >= 0 else { return openProblem(errno) }
         defer { close(fd) }
         if let problem = fileProblem(fd) { return problem }
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK)
         guard flock(fd, LOCK_EX) == 0 else { return unwritable }
         defer { flock(fd, LOCK_UN) }
         var bytes = Array((imeiHistoryLine(entry) + "\n").utf8)
@@ -271,7 +283,9 @@ struct ImeiHistoryRecorder {
 
 /// The entry for a change asked for (`after`), from the IMEI and the module the change's port open read (ImeiWrite) and
 /// the service's answer; nil when the modem already had that IMEI (nothing was written). A failure is recorded as
-/// failed with its sentence: it may still have changed the IMEI (the sentence then says so).
+/// failed with its sentence: it may still have changed the IMEI (the sentence then says so). The write and the restart
+/// are recorded apart: an IMEI written and read back whose restart failed is a change that succeeded, with its restart
+/// failed (so it can be changed back).
 func imeiHistoryEntry(after: String, before: String?, restart: Bool, outcome: Result<ImeiChange, ModemFailure>,
                       source: ImeiChangeSource, module: String?, at time: Date) -> ImeiHistoryEntry? {
     switch outcome {
@@ -279,12 +293,16 @@ func imeiHistoryEntry(after: String, before: String?, restart: Bool, outcome: Re
         return nil
     case .success(let change):
         let was: String
+        let restarted: ImeiChangeResult?
         switch change {
-        case .rebooting(let b, _), .setTakesEffectAfterRestart(let b, _): was = b
-        case .unchanged(let b): was = b
+        case .rebooting(let b, _): was = b; restarted = .succeeded
+        case .setTakesEffectAfterRestart(let b, _): was = b; restarted = nil
+        case .restartFailed(let b, _, _): was = b; restarted = .failed
+        case .unchanged(let b): was = b; restarted = nil
         }
         return ImeiHistoryEntry(time: time, before: was, after: after, source: source, result: .succeeded,
-                                restart: restart, module: module, message: imeiSentence(change), note: nil)
+                                restart: restart, restartResult: restarted, module: module, message: imeiSentence(change),
+                                note: nil)
     case .failure(let failure):
         return ImeiHistoryEntry(time: time, before: before, after: after, source: source, result: .failed,
                                 restart: restart, module: module, message: failure.message, note: nil)
@@ -303,7 +321,8 @@ private let localTimeText: DateFormatter = {
 }()
 
 /// `imei history`: a headline, then each entry newest first on one line (time in the Mac's time zone, before and
-/// after, the result, where it came from, the module), its sentence or note indented below; then where it is kept.
+/// after, the result, where it came from, the module, `restart failed` when the restart after a write did), its
+/// sentence or note indented below; then where it is kept.
 func imeiHistoryLines(_ history: ImeiHistory, location: String) -> [String] {
     var lines: [String] = []
     let n = history.entries.count
@@ -316,6 +335,7 @@ func imeiHistoryLines(_ history: ImeiHistory, location: String) -> [String] {
         var parts = ["\(localTimeText.string(from: e.time))", "\(e.before ?? "unknown") -> \(e.after)",
                      e.result.rawValue, e.source.rawValue]
         if let m = e.module { parts.append("module \(m)") }
+        if e.restartResult == .failed { parts.append("restart failed") }
         lines.append(parts.joined(separator: "  "))
         for text in [e.note, e.message].compactMap({ $0 }) where !text.isEmpty {
             lines.append("  \(text)")

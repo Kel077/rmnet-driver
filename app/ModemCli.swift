@@ -567,25 +567,37 @@ private func unlockCell(_ service: ModemServing, scope: CellUnlockScope, _ outpu
     }
 }
 
-/// `imei set`. Once the change has been sent to the service (not when it is refused before, the IMEI is already the
-/// one asked or the question is cancelled), it is recorded in the IMEI history, succeeded or failed, with the module and
-/// the IMEI before as the change's own port open read them (ImeiWrite); a history that cannot be written adds a line
-/// saying so and does not change the exit code.
+/// `imei set`. Reads the IMEI and the module first (one port open), then asks (unless --yes; without a terminal it
+/// changes nothing and exits 2), also with --no-reboot, naming both IMEIs and the module, and writes only on that module
+/// over that IMEI (ImeiExpectation, checked on the port that writes): a modem swapped or changed meanwhile is left as it
+/// is. A module that gives no serial number is not changed (the change could not be tied to it). Once the change has
+/// been sent to the service (not when it is refused before, the IMEI is already the one asked or the question is
+/// cancelled), it is recorded in the IMEI history, succeeded or failed, with the module and the IMEI before as the
+/// change's own port open read them (ImeiWrite); a history that cannot be written adds a line saying so and does not
+/// change the exit code. An IMEI written whose restart failed prints its sentence and the way back, and exits 1.
 private func setImei(_ service: ModemServing, _ value: String, reboot: Bool, yes: Bool,
                      ask: (String) -> String?, history: ImeiHistoryRecorder?, _ output: (String) -> Void) -> Int32 {
     if let problem = imeiProblem(value) { return fail("imei", "\(problem) Nothing was changed.", output) }
-    switch service.imei() {
+    let reading: ImeiReading
+    switch service.imeiReading() {
     case .failure(let failure): return fail("imei", failure.message, output)
-    case .success(let current):
-        if current == value {
+    case .success(let read):
+        if read.imei == value {
             output("imei: already \(value); nothing changed")
             return 0
         }
+        reading = read
     }
-    if reboot && !yes {
-        guard let answer = ask(restartQuestion) else {
-            output("imei: no terminal to ask on, so nothing changed; run again with --yes to restart the modem "
-                   + "without asking")
+    guard let module = reading.module else {
+        return fail("imei", "The modem gives no USB serial number, so the change cannot be tied to this module. "
+                    + "Nothing was changed.", output)
+    }
+    if !yes {
+        let what = "The IMEI of module \(module) will change from \(reading.imei) to \(value). "
+        let question = reboot ? what + restartQuestion
+            : what + "It takes effect at the next restart. Continue? [y/N] "
+        guard let answer = ask(question) else {
+            output("imei: no terminal to ask on, so nothing changed; run again with --yes to change it without asking")
             return 2
         }
         guard ["y", "yes"].contains(answer.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
@@ -593,7 +605,7 @@ private func setImei(_ service: ModemServing, _ value: String, reboot: Bool, yes
             return 1
         }
     }
-    let write = service.setImei(value, reboot: reboot, module: nil)
+    let write = service.setImei(value, reboot: reboot, expect: ImeiExpectation(module: module, before: reading.imei))
     let outcome = write.outcome
     if let history, let entry = imeiHistoryEntry(after: value, before: write.before, restart: reboot, outcome: outcome,
                                                  source: .cli, module: write.module, at: history.now()),
@@ -607,11 +619,14 @@ private func setImei(_ service: ModemServing, _ value: String, reboot: Bool, yes
         output("imei: \(imeiSentence(change))")
         switch change {
         case .unchanged:
-            break
+            return 0
         case .rebooting(let before, _), .setTakesEffectAfterRestart(let before, _):
             output("imei: to put it back: RMNet imei set \(before)")
+            return 0
+        case .restartFailed(let before, _, _):
+            output("imei: to put it back: RMNet imei set \(before)")
+            return 1
         }
-        return 0
     }
 }
 

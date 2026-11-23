@@ -45,6 +45,8 @@ struct SimSlotWatchTests {
         skipped()
         watcher()
         watcherBreaksAndCancels()
+        notKnownYet()
+        watcherNotKnownYet()
         settings()
         print("SIM slot watch: \(checks) checks passed")
     }
@@ -293,6 +295,7 @@ struct SimSlotWatchTests {
             return w
         }
         for (skip, phase) in [(SimSlotSkip.radioNotOn, SimSlotWatch.Phase.watching), (.simUsable, .watching),
+                              (.simUnknown, .watching), (.moduleUnknown, .watching),
                               (.otherModule, .idle), (.otherSlot, .idle)] {
             var w = trying()
             let next = w.switched(.success(SimSlotChange(before: 1, after: 1, skipped: skip)))
@@ -306,7 +309,7 @@ struct SimSlotWatchTests {
         equal(b.phase, .idle, "switch back not made: settled")
         var e = trying()
         _ = e.switched(switched(1, 2, .notInserted))
-        equal(e.retryExpectation(module: "c0ffee01"), SimSlotExpectation(module: "c0ffee01", slot: 2, unusableSim: false),
+        equal(e.retryExpectation(module: "c0ffee01"), SimSlotExpectation(module: "c0ffee01", slot: 2, unusableSim: true),
               "the switch back's expectation: the module, on the slot tried")
         var none = SimSlotWatch()
         check(none.retryExpectation(module: nil) == nil, "no switch back: no expectation")
@@ -403,7 +406,7 @@ struct SimSlotWatchTests {
         check(!w.switchRunning, "watcher: a cancelled switch back frees the watcher")
         _ = w.pulseCommands()
         equal(asked, [2, 1, 1], "watcher: the switch back asked again on the next turn")
-        equal(expectations.last, SimSlotExpectation(module: "c0ffee01", slot: 2, unusableSim: false),
+        equal(expectations.last, SimSlotExpectation(module: "c0ffee01", slot: 2, unusableSim: true),
               "watcher: asked again with the module, on the slot tried")
         finish(switched(2, 1, .notInserted))
 
@@ -465,6 +468,121 @@ struct SimSlotWatchTests {
         clock = at(95)
         w.pulseAnswers(.success(full))
         equal(asked, [2, 2], "watcher: tries again after the patience")
+    }
+
+    // Nothing concluded from what is not known: the SIM of the slot tried not told after the switch (not read, busy)
+    // is read on later turns; a switch back whose slot tried has a usable SIM by then is not made; one not made because
+    // the radio, the SIM or the module was not known is tried again.
+    static func notKnownYet() {
+        func trying(_ slot: Int = 1) -> SimSlotWatch {
+            var w = SimSlotWatch()
+            w.attached()
+            _ = w.read(sim: .notInserted, radio: .on, slot: slot, at: at(0), enabled: true)
+            _ = w.read(sim: .notInserted, radio: .on, slot: slot, at: at(25), enabled: true)
+            return w
+        }
+        for (sim, name) in [(SimState?.none, "not read"), (.busy, "busy"), (.other("+CME ERROR: 3"), "another answer")] {
+            var w = trying()
+            let next = w.switched(switched(1, 2, sim))
+            check(next.action == .none && next.line == nil, "tried, SIM \(name): nothing concluded, no line")
+            equal(w.phase, .verifying(from: 1, to: 2, reason: .notInserted), "tried, SIM \(name): read again")
+            check(w.wantsReads, "tried, SIM \(name): reads wanted")
+        }
+        // Verifying: not read, the radio off, busy, a turn missed: still verifying; then ready: the switch stands.
+        var v = trying()
+        _ = v.switched(switched(1, 2, nil))
+        equal(v.read(sim: nil, radio: .on, slot: 2, at: at(40), enabled: true), .none, "verifying: SIM not read")
+        equal(v.read(sim: .notInserted, radio: .airplane, slot: 2, at: at(55), enabled: true), .none,
+              "verifying: the radio not on")
+        equal(v.read(sim: .busy, radio: .on, slot: 2, at: at(70), enabled: true), .none, "verifying: busy")
+        v.missed()
+        equal(v.phase, .verifying(from: 1, to: 2, reason: .notInserted), "verifying: a missed turn concludes nothing")
+        equal(v.read(sim: .ready, radio: .on, slot: 2, at: at(85), enabled: true),
+              .say("Switched to SIM 2: no SIM in slot 1."), "verifying: ready, the switch stands")
+        equal(v.phase, .idle, "verifying: settled")
+        // Verifying, then no SIM there either: back, with the slot tried's expectation.
+        var n = trying()
+        _ = n.switched(switched(1, 2, .busy))
+        equal(n.read(sim: .notInserted, radio: .on, slot: 2, at: at(40), enabled: true), .switchSlot(1),
+              "verifying: no SIM there either, back")
+        equal(n.phase, .switchingBack(original: 1, tried: 2, reason: .notInserted, triedState: .notInserted),
+              "verifying: switching back")
+        equal(n.retryExpectation(module: "TESTMODULE1"), SimSlotExpectation(module: "TESTMODULE1", slot: 2),
+              "verifying: the switch back checks the slot tried")
+        // Verifying, switched elsewhere meanwhile: nothing more.
+        var e = trying()
+        _ = e.switched(switched(1, 2, nil))
+        equal(e.read(sim: .ready, radio: .on, slot: 1, at: at(40), enabled: true), .none, "verifying: another slot")
+        equal(e.phase, .idle, "verifying: another slot, settled")
+
+        // The switch back: the slot tried has a usable SIM by then (it was slow): kept, and said.
+        var r = trying()
+        _ = r.switched(switched(1, 2, .notInserted))
+        let kept = r.switched(.success(SimSlotChange(before: 2, after: 2, skipped: .simUsable)))
+        check(kept.action == .none && kept.line == "Switched to SIM 2: no SIM in slot 1.", "back: SIM ready there, kept",
+              "\(kept)")
+        equal(r.phase, .idle, "back: kept, settled")
+        // Not known yet (the radio, the SIM, the module): tried again on the next turn.
+        for skip in [SimSlotSkip.radioNotOn, .simUnknown, .moduleUnknown] {
+            var p = trying()
+            _ = p.switched(switched(1, 2, .notInserted))
+            let next = p.switched(.success(SimSlotChange(before: 2, after: 2, skipped: skip)))
+            check(next.action == .none && next.line == nil, "back, \(skip): nothing concluded")
+            equal(p.retryAction, .switchSlot(1), "back, \(skip): tried again")
+            equal(p.retryExpectation(module: "TESTMODULE1"), SimSlotExpectation(module: "TESTMODULE1", slot: 2),
+                  "back, \(skip): with the same checks")
+        }
+    }
+
+    // The watcher: a module not known when it attached is read again before a switch, and one still not known is
+    // passed as not known (the port then refuses it); a slot tried whose SIM was not told is read until it is; a switch
+    // back whose radio was not on is tried again on the next turn.
+    static func watcherNotKnownYet() {
+        var clock = at(0)
+        var serial: String? = nil
+        var expectations: [SimSlotExpectation] = []
+        var pending: [(SimSlotOutcome) -> Int?] = []
+        let w = SimSlotWatcher(enabled: { true }, module: { serial }, switchSlot: { slot, expect, done in
+            expectations.append(expect)
+            pending.append(done)
+            return true
+        }, now: { clock })
+        func answers(_ cpin: PulseAnswer, slot: Int) -> Result<[String: PulseAnswer], ModemFailure> {
+            .success(["AT+CPIN?": cpin, "AT+CFUN?": .lines(["+CFUN: 1"]), "AT+QUIMSLOT?": .lines(["+QUIMSLOT: \(slot)"])])
+        }
+        let empty = PulseAnswer.refused("+CME ERROR: 10")
+        w.modemPresent(true)                       // no serial number known yet
+        w.pulseAnswers(answers(empty, slot: 1))
+        clock = at(25)
+        w.pulseAnswers(answers(empty, slot: 1))
+        equal(expectations.last, SimSlotExpectation(module: nil, slot: 1), "watcher: module still not known, passed so")
+        _ = pending.removeFirst()(.finished(.success(SimSlotChange(before: 1, after: 1, skipped: .moduleUnknown))))
+        check(!w.switchRunning && w.phase == .watching, "watcher: not known, watching again")
+        serial = "TESTMODULE1"                     // known by now
+        clock = at(40)
+        w.pulseAnswers(answers(empty, slot: 1))
+        clock = at(65)
+        w.pulseAnswers(answers(empty, slot: 1))
+        equal(expectations.last, SimSlotExpectation(module: "TESTMODULE1", slot: 1), "watcher: the module read again")
+
+        // Switched; the SIM of slot 2 not told: read on later turns, then none there either: back, checked on slot 2.
+        _ = pending.removeFirst()(.finished(.success(SimSlotChange(before: 1, after: 2, sim: .busy))))
+        check(!w.switchRunning, "watcher: verifying, nothing running")
+        equal(w.pulseCommands(), SimSlotWatcher.commands, "watcher: verifying, reads the slot tried")
+        clock = at(80)
+        w.pulseAnswers(answers(.refused("+CME ERROR: 14"), slot: 2))
+        equal(expectations.count, 2, "watcher: busy, nothing yet")
+        clock = at(95)
+        w.pulseAnswers(answers(empty, slot: 2))
+        equal(expectations.last, SimSlotExpectation(module: "TESTMODULE1", slot: 2), "watcher: back, checked on slot 2")
+        // The radio was not on when the switch back checked: tried again on the next turn.
+        _ = pending.removeFirst()(.finished(.success(SimSlotChange(before: 2, after: 2, skipped: .radioNotOn))))
+        check(!w.switchRunning, "watcher: the switch back not made yet")
+        _ = w.pulseCommands()
+        equal(expectations.count, 4, "watcher: the switch back asked again on the next turn")
+        _ = pending.removeFirst()(.finished(.success(SimSlotChange(before: 2, after: 1, sim: .notInserted))))
+        equal(w.line, "No SIM in either slot.", "watcher: then made")
+        equal(w.phase, .idle, "watcher: settled")
     }
 
     // The settings: on by default, kept, read back.

@@ -728,14 +728,16 @@ final class ModemService: ModemServing {
         }
     }
 
-    /// An automatic switch's expectation against what this port finds: nil when it holds (the switch may be made).
+    /// An automatic switch's expectation against what this port finds: nil when it holds (the switch may be made). A
+    /// module not known (no serial number expected, or none on this port) is never the same one.
     private func recheck(_ link: Link, _ expect: SimSlotExpectation, slot: Int) -> SimSlotSkip? {
-        guard link.deviceSerial == expect.module else { return .otherModule }
+        guard let module = expect.module, let here = link.deviceSerial else { return .moduleUnknown }
+        guard here == module else { return .otherModule }
         guard slot == expect.slot else { return .otherSlot }
         guard expect.unusableSim else { return nil }
         guard parseRadio(link.read("AT+CFUN?")) == .on else { return .radioNotOn }
-        guard case .success(let sim) = readSimState(link), simUnusable(sim) else { return .simUsable }
-        return nil
+        guard case .success(let sim) = readSimState(link), let usable = simConclusive(sim) else { return .simUnknown }
+        return usable ? .simUsable : nil
     }
 
     // MARK: Short reads (the app's background turn)
@@ -971,16 +973,22 @@ final class ModemService: ModemServing {
         }
     }
 
+    func imeiReading() -> Result<ImeiReading, ModemFailure> {
+        withPort({ describe($0) }) { link in readImei(link).map { ImeiReading(imei: $0, module: link.deviceSerial) } }
+    }
+
     /// Reads the module (the port's) and the IMEI before on the port that writes, and hands them back with the outcome
-    /// (ImeiWrite), so the history records the module written to; with `module`, writes only on that one.
-    func setImei(_ imei: String, reboot: Bool, module: String?) -> ImeiWrite {
+    /// (ImeiWrite), so the history records the module written to. With `expect` (what the change was confirmed for),
+    /// writes only when this port finds that module (a module that gives no serial number is not it) and that IMEI.
+    /// A restart that fails after the IMEI was written and read back is a success with that said (restartFailed).
+    func setImei(_ imei: String, reboot: Bool, expect: ImeiExpectation?) -> ImeiWrite {
         if let problem = imeiProblem(imei) { return ImeiWrite(outcome: failure("\(problem) Nothing was changed.")) }
         var seen = ImeiWrite(outcome: failure("Nothing was changed."))
         seen.outcome = withPort({ "\(describe($0)) Nothing was changed." }) { link in
             seen.module = link.deviceSerial
-            if let module, link.deviceSerial != module {
-                return failure("The modem attached is not the module this change was made on (serial number \(module); "
-                               + "this one has \(link.deviceSerial ?? "none")). Nothing was changed.")
+            if let expect, link.deviceSerial != expect.module {
+                return failure("The modem attached is not the module this change was confirmed for (serial number "
+                               + "\(expect.module); this one has \(link.deviceSerial ?? "none")). Nothing was changed.")
             }
             let before: String
             switch readImei(link) {
@@ -988,6 +996,10 @@ final class ModemService: ModemServing {
             case .failure(let f): return failure("\(f.message) Nothing was changed.")
             }
             seen.before = before
+            if let expect, before != expect.before {
+                return failure("The modem's IMEI is \(before) now, not \(expect.before) as when the change was confirmed. "
+                               + "Nothing was changed.")
+            }
             if before == imei { return .success(.unchanged(before)) }
             let was = "It was \(before). The modem was not restarted."
             switch link.command(imeiCommand(imei), timeout: ModemService.writeTimeout) {
@@ -1012,10 +1024,12 @@ final class ModemService: ModemServing {
             case .success:
                 return .success(.rebooting(before: before, after: imei))
             case .failure(let error) where isRefusal(error):
-                return failure("The IMEI is now \(imei), but the modem was not restarted. \(describe(error)) It \(nextRestart)")
+                return .success(.restartFailed(before: before, after: imei, sentence: "The IMEI is now \(imei), but the "
+                                               + "modem was not restarted. \(describe(error)) It \(nextRestart)"))
             case .failure(let error):
-                return failure("The IMEI is now \(imei). It is not known whether the modem is restarting. "
-                               + "\(describe(error)) If it does not restart, the new IMEI \(nextRestart)")
+                return .success(.restartFailed(before: before, after: imei, sentence: "The IMEI is now \(imei). It is not "
+                                               + "known whether the modem is restarting. \(describe(error)) If it does not "
+                                               + "restart, the new IMEI \(nextRestart)"))
             }
         }
         return seen

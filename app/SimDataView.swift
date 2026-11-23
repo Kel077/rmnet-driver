@@ -18,7 +18,7 @@ private enum SettingsAction {
     case apply
     case putBack
     case pin(attempts: Int)   // the attempts left the confirmation showed (ruling R13)
-    case imei(String, reboot: Bool, module: String?)   // module: Change Back…'s, written only on that module
+    case imei(String, reboot: Bool, expect: ImeiExpectation)   // written only on that module over that IMEI
     case simSlot(Int)
 }
 
@@ -439,10 +439,15 @@ struct SimApnTab: View {
         editingImei = true
     }
 
+    /// The question names the IMEI and the module shown; the change is written only on that module over that IMEI (for
+    /// Change Back…, the module its entry was recorded on), so a modem swapped or changed after the question is left
+    /// as it is.
     private func askImeiChange() {
-        guard imeiProblem(draftImei) == nil else { return }
-        let q = imeiQuestion(before: controller.imei, after: draftImei, reboot: rebootImei)
-        imeiAsk = Question(action: .imei(draftImei, reboot: rebootImei, module: imeiBack?.module),
+        guard imeiProblem(draftImei) == nil, let before = controller.imei,
+              let module = imeiBack?.module ?? controller.moduleSerial else { return }
+        let q = imeiQuestion(before: before, after: draftImei, reboot: rebootImei, module: module)
+        imeiAsk = Question(action: .imei(draftImei, reboot: rebootImei,
+                                         expect: ImeiExpectation(module: module, before: before)),
                            title: q.title, message: q.message,
                            confirm: "Change IMEI", destructive: rebootImei, cancelIsDefault: true)
         controller.setConfirming(true)
@@ -583,8 +588,8 @@ struct SimApnTab: View {
         case .pin(let attempts):
             controller.enterPin(pin, shownAttempts: attempts)
             unlocking = false
-        case let .imei(newImei, reboot, module):
-            controller.changeImei(newImei, reboot: reboot, onModule: module)
+        case let .imei(newImei, reboot, expect):
+            controller.changeImei(newImei, reboot: reboot, expect: expect)
             editingImei = false
         case .simSlot(let slot):
             simWatcher.switchedByHand()
@@ -788,7 +793,7 @@ struct ImeiSheet: View {
     }()
 
     private var canSubmit: Bool {
-        guard imeiProblem(draft) == nil, controller.imei != nil else { return false }
+        guard imeiProblem(draft) == nil, controller.imei != nil, controller.moduleSerial != nil else { return false }
         return draft != controller.imei
     }
 
@@ -825,6 +830,10 @@ struct ImeiSheet: View {
                 Text("This is the IMEI the modem has now.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+            }
+            if controller.moduleSerial == nil {
+                ProblemNote(text: "The modem's USB serial number is not known, so the change cannot be tied to this "
+                            + "module. Refresh, then try again.")
             }
             Toggle("Restart the modem now", isOn: $rebootNow)
                 .toggleStyle(.checkbox)

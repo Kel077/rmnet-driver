@@ -612,9 +612,10 @@ struct ModemNetworkTests {
             "+QENG: \"neighbourcell intra\",\"LTE\",1300,128,-11,-98,-68,14,0",
             "+QENG: \"neighbourcell inter\",\"LTE\",100,45,-14,-105,-75,6,0",
         ])
+        // The SINR raw, as the serving cell's: dB = raw x 2 - 20 (14 is 8 dB, 6 is -8 dB).
         check(nbs == [
-            NeighbourCell(rat: "LTE", kind: "intra", channel: 1300, pci: 128, rsrp: -98, rsrq: -11, sinr: 14),
-            NeighbourCell(rat: "LTE", kind: "inter", channel: 100, pci: 45, rsrp: -105, rsrq: -14, sinr: 6),
+            NeighbourCell(rat: "LTE", kind: "intra", channel: 1300, pci: 128, rsrp: -98, rsrq: -11, sinr: 8),
+            NeighbourCell(rat: "LTE", kind: "inter", channel: 100, pci: 45, rsrp: -105, rsrq: -14, sinr: -8),
         ], "parseNeighbourCells: LTE intra and inter", "\(nbs)")
         // The manual's example (LTE mode): an intra cell, and inter cells whose PCI and values are `-` (not valid now).
         let manual = parseNeighbourCells([
@@ -622,7 +623,7 @@ struct ModemNetworkTests {
             "+QENG: \"neighbourcell inter\",\"LTE\",39148,-,-,-,-,-,37,0,30,7,-,-,-,-",
         ])
         check(manual == [
-            NeighbourCell(rat: "LTE", kind: "intra", channel: 38950, pci: 276, rsrp: -88, rsrq: -3, sinr: 0),
+            NeighbourCell(rat: "LTE", kind: "intra", channel: 38950, pci: 276, rsrp: -88, rsrq: -3, sinr: -20),
             NeighbourCell(rat: "LTE", kind: "inter", channel: 39148, pci: nil, rsrp: nil, rsrq: nil, sinr: nil),
         ], "parseNeighbourCells: the manual's LTE-mode example", "\(manual)")
         // WCDMA mode: LTE cells without intra/inter, RSRP before RSRQ, no SINR; WCDMA cells as before.
@@ -634,6 +635,34 @@ struct ModemNetworkTests {
             NeighbourCell(rat: "WCDMA", kind: nil, channel: 10713, pci: 371, rsrp: -95, rsrq: nil, sinr: nil),
             NeighbourCell(rat: "LTE", kind: nil, channel: 66786, pci: 301, rsrp: -101, rsrq: -13, sinr: nil),
         ], "parseNeighbourCells: WCDMA mode's LTE cells, RSRP before RSRQ", "\(fromWcdma)")
+        // LTE mode's WCDMA cells: <uarfcn>,<cell_resel_priority>,<thresh_Xhigh>,<thresh_Xlow>,<PSC>,<RSCP>,<ecno>,
+        // <srxlev>: the PSC and the RSCP after the thresholds, not the thresholds.
+        let lteModeWcdma = parseNeighbourCells([
+            "+QENG: \"neighbourcell intra\",\"LTE\",1300,128,-11,-98,-68,14,0",
+            "+QENG: \"neighbourcell\",\"WCDMA\",10713,3,20,12,371,-95,-8,20",
+        ])
+        check(lteModeWcdma.last == NeighbourCell(rat: "WCDMA", kind: nil, channel: 10713, pci: 371, rsrp: -95, rsrq: nil,
+                                                 sinr: nil),
+              "parseNeighbourCells: LTE mode's WCDMA cells, PSC and RSCP after the thresholds", "\(lteModeWcdma)")
+        // WCDMA lines alone: each told by its values (a threshold of 0 or more where WCDMA mode has the RSCP).
+        let wcdmaOnly = parseNeighbourCells([
+            "+QENG: \"neighbourcell\",\"WCDMA\",10713,3,20,12,371,-95,-8,20",
+            "+QENG: \"neighbourcell\",\"WCDMA\",10737,12,402,-101,-11,1,2,18",
+        ])
+        check(wcdmaOnly == [
+            NeighbourCell(rat: "WCDMA", kind: nil, channel: 10713, pci: 371, rsrp: -95, rsrq: nil, sinr: nil),
+            NeighbourCell(rat: "WCDMA", kind: nil, channel: 10737, pci: 402, rsrp: -101, rsrq: nil, sinr: nil),
+        ], "parseNeighbourCells: WCDMA lines alone, each layout told by its values", "\(wcdmaOnly)")
+        // An LTE line without intra or inter: the answer is WCDMA mode's, its WCDMA lines read so.
+        let wcdmaModeBoth = parseNeighbourCells([
+            "+QENG: \"neighbourcell\",\"WCDMA\",10713,0,371,-95,-8,1,2,20",
+            "+QENG: \"neighbourcell\",\"LTE\",66786,301,-101,-13,22",
+        ])
+        check(wcdmaModeBoth.first == NeighbourCell(rat: "WCDMA", kind: nil, channel: 10713, pci: 371, rsrp: -95, rsrq: nil,
+                                                   sinr: nil), "parseNeighbourCells: WCDMA mode told by its LTE line")
+        // A SINR that is `-`: none.
+        check(parseNeighbourCells(["+QENG: \"neighbourcell intra\",\"LTE\",1300,128,-11,-98,-68,-,0"]).first?.sinr == nil,
+              "parseNeighbourCells: a SINR of `-` is none")
 
         print("modem network: \(checks) checks passed")
     }

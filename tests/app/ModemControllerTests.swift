@@ -79,7 +79,7 @@ final class FakeService: ModemServing, CustomReflectable {
     private var lockCellInUseResults: [Result<CellLockChange, ModemFailure>] = []
     private var setImeiResults: [Result<ImeiChange, ModemFailure>] = []
     private var setSimSlotResults: [Result<SimSlotChange, ModemFailure>] = []
-    private var imeiModules: [String?] = []                    // each setImei's `module` (Change Back…'s)
+    private var imeiExpectations: [ImeiExpectation?] = []      // each setImei's `expect` (what the window confirmed)
     private var slotExpectations: [SimSlotExpectation?] = []   // each setSimSlot's `expect`
     private var session: (module: String?, before: String?) = ("c0ffee01", "000000000000091")
     private var antennasCount = 0
@@ -255,8 +255,8 @@ final class FakeService: ModemServing, CustomReflectable {
     }
 
     /// The module and the IMEI before that setImei's own port open reads (`imeiSession`).
-    func setImei(_ imei: String, reboot: Bool, module: String?) -> ImeiWrite {
-        locked { imeiModules.append(module) }
+    func setImei(_ imei: String, reboot: Bool, expect: ImeiExpectation?) -> ImeiWrite {
+        locked { imeiExpectations.append(expect) }
         enter(.setImei(imei, reboot: reboot))
         return locked { ImeiWrite(outcome: setImeiResults.removeFirst(), module: session.module, before: session.before) }
     }
@@ -269,7 +269,7 @@ final class FakeService: ModemServing, CustomReflectable {
         return locked { setSimSlotResults.removeFirst() }
     }
 
-    var imeiModulesAsked: [String?] { locked { imeiModules } }
+    var imeiExpectationsAsked: [ImeiExpectation?] { locked { imeiExpectations } }
     var slotExpectationsAsked: [SimSlotExpectation?] { locked { slotExpectations } }
     var imeiSession: (module: String?, before: String?) {
         get { locked { session } }
@@ -2536,16 +2536,19 @@ struct ModemControllerTests {
         check(c.imeiHistory == ImeiHistory(entries: [], skippedLines: 0) && c.moduleSerial == "f00dcafe",
               "history: read with the settings", "\(String(describing: c.imeiHistory)) \(String(describing: c.moduleSerial))")
 
-        c.changeImei("000000000000141", reboot: true)
+        // As the window asks it: on the module shown, over the IMEI shown.
+        let confirmed = ImeiExpectation(module: "f00dcafe", before: "000000000000091")
+        c.changeImei("000000000000141", reboot: true, expect: confirmed)
         rig.waitForCall(3, "history: setImei runs")
         rig.fake.releaseSetImei(.success(.rebooting(before: "000000000000091", after: "000000000000141")))
         pump(until: { c.result.contains("restarting") }, "history: the change finishes")
         check(keeper.entries == [ImeiHistoryEntry(time: when, before: "000000000000091", after: "000000000000141",
-                                                  source: .app, result: .succeeded, restart: true, module: "c0ffee01",
+                                                  source: .app, result: .succeeded, restart: true,
+                                                  restartResult: .succeeded, module: "c0ffee01",
                                                   message: "IMEI set to 000000000000141; the modem is restarting.",
                                                   note: nil)],
               "history: the change recorded with its own port's module", "\(keeper.entries)")
-        equal(rig.fake.imeiModulesAsked, [nil], "history: Change… on any module")
+        equal(rig.fake.imeiExpectationsAsked, [confirmed], "history: Change… writes only what was confirmed")
         check(c.moduleSerial == "f00dcafe", "history: the module shown is the registry's")
         check(c.imeiHistory?.entries == keeper.entries, "history: read again after the change")
         rig.fake.queueImei(.success("000000000000141"))
@@ -2566,13 +2569,35 @@ struct ModemControllerTests {
         rig.fake.queueImei(.success("000000000000141"))
         rig.answerSettings(7, .success(listing()), .success(ready), "history: the read after the failed change")
         rig.fake.imeiSession = (module: "c0ffee01", before: "000000000000117")
-        c.changeImei("000000000000091", reboot: true, onModule: "c0ffee01")
+        let back = ImeiExpectation(module: "c0ffee01", before: "000000000000141")
+        c.changeImei("000000000000091", reboot: true, expect: back)
         rig.waitForCall(9, "history: Change Back runs")
         rig.fake.releaseSetImei(.success(.rebooting(before: "000000000000117", after: "000000000000091")))
         pump(until: { keeper.entries.count == 2 && c.result.contains("restarting") }, "history: Change Back finishes")
-        equal(rig.fake.imeiModulesAsked.last, "c0ffee01", "history: Change Back asks for its entry's module")
+        equal(rig.fake.imeiExpectationsAsked.last, back, "history: Change Back asks for its entry's module")
         equal(keeper.entries.last?.before, "000000000000117", "history: the IMEI before as the change's port read it")
         equal(keeper.entries.last?.module, "c0ffee01", "history: and its module")
+
+        // Written and read back, the restart refused: a warning, the new IMEI shown, recorded as a change that
+        // succeeded with its restart failed, so it can still be changed back.
+        rig.fake.queueImei(.success("000000000000091"))
+        rig.answerSettings(10, .success(listing()), .success(ready), "history: the read after Change Back")
+        rig.fake.imeiSession = (module: "f00dcafe", before: "000000000000091")
+        let sentence = "The IMEI is now 000000000000141, but the modem was not restarted. The modem refused the command "
+            + "(ERROR). It takes effect at the next restart (AT+CFUN=1,1 or a replug)."
+        c.changeImei("000000000000141", reboot: true, expect: confirmed)
+        rig.waitForCall(12, "history: a change whose restart fails")
+        rig.fake.releaseSetImei(.success(.restartFailed(before: "000000000000091", after: "000000000000141",
+                                                        sentence: sentence)))
+        pump(until: { keeper.entries.count == 3 && c.resultKind != .progress }, "history: it finishes")
+        check(c.result == sentence && c.resultKind == .warning, "history: restart failed, a warning", "\(c.resultKind) \(c.result)")
+        equal(c.imei, "000000000000141", "history: the new IMEI shown")
+        let last = keeper.entries.last
+        check(last?.result == .succeeded && last?.restartResult == .failed && last?.restart == true,
+              "history: written, its restart failed, recorded apart", "\(String(describing: last))")
+        let rows = imeiHistoryRows(ImeiHistory(entries: keeper.entries, skippedLines: 0), currentImei: "000000000000141",
+                                   currentModule: "f00dcafe")
+        check(rows.first?.canChangeBack == true, "history: and it can be changed back")
         c.setTabShown(nil)
     }
 }
@@ -2693,7 +2718,7 @@ extension ModemControllerTests {
         rig.fake.releaseSetSimSlot(.success(SimSlotChange(before: 1, after: 2, sim: .notInserted)))
         rig.waitForCall(2, "switch back: runs at once, while the app quits")
         equal(rig.fake.allCalls.last, .setSimSlot(1, .sim), "switch back: to slot 1")
-        equal(rig.fake.slotExpectationsAsked.last, SimSlotExpectation(module: "c0ffee01", slot: 2, unusableSim: false),
+        equal(rig.fake.slotExpectationsAsked.last, SimSlotExpectation(module: "c0ffee01", slot: 2, unusableSim: true),
               "switch back: expects the module, on the slot tried")
         check(rig.replies.isEmpty && c.running == .simSlot, "switch back: the quit still waits", "\(rig.replies)")
         equal(c.quitNotice.line, "RMNet quits when the SIM slot has been switched.", "switch back: the line stays")

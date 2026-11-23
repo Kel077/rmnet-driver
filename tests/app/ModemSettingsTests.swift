@@ -106,7 +106,7 @@ struct NoModem: ModemServing {
     func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure> { .failure(failure) }
     func lockCellInUse(_ cell: CellInUse) -> Result<CellLockChange, ModemFailure> { .failure(failure) }
     func imei() -> Result<String, ModemFailure> { .failure(failure) }
-    func setImei(_ imei: String, reboot: Bool, module: String?) -> ImeiWrite { ImeiWrite(outcome: .failure(failure)) }
+    func setImei(_ imei: String, reboot: Bool, expect: ImeiExpectation?) -> ImeiWrite { ImeiWrite(outcome: .failure(failure)) }
     func simSlot() -> Result<Int, ModemFailure> { .failure(failure) }
     func setSimSlot(_ slot: Int, wait: SimSlotWait, expect: SimSlotExpectation?) -> Result<SimSlotChange, ModemFailure> {
         .failure(failure)
@@ -873,6 +873,22 @@ struct ModemSettingsTests {
         expectEqual(imeiProblem("12345") ?? "", "An IMEI is 15 ASCII digits (0 to 9).", "imeiProblem: too short")
         expectEqual(imeiCommand("000000000000141"), "AT+EGMR=1,7,\"000000000000141\"", "imeiCommand")
         check(JSONSerialization.isValidJSONObject(imeiJSON("000000000000141")), "imeiJSON: valid")
+
+        // --- IMEI words and SIM states told apart ------------------------------------------------
+        let restartSentence = "The IMEI is now 123456789012347, but the modem was not restarted. Made-up reason."
+        expectEqual(imeiSentence(.restartFailed(before: "000000000000091", after: "123456789012347",
+                                                sentence: restartSentence)), restartSentence,
+                    "imeiSentence: a restart that failed says so")
+        expectEqual(imeiQuestion(before: "000000000000091", after: "123456789012347", reboot: false,
+                                 module: "TESTMODULE1").message,
+                    "Module: TESTMODULE1.\nCurrent IMEI: 000000000000091.\nNew IMEI: 123456789012347.\n"
+                    + "The new IMEI is stored and takes effect after the next modem restart.",
+                    "imeiQuestion: names the module it is confirmed for")
+        check(service.imeiReading() == .failure(ModemFailure(message: "The modem is not attached.")),
+              "imeiReading: a service without its own reads the IMEI, on a module not known")
+        check(simConclusive(.ready) == true && simConclusive(.pin) == true && simConclusive(.notInserted) == false
+                && simConclusive(.failure) == false && simConclusive(.busy) == nil && simConclusive(.other("x")) == nil,
+              "simConclusive: usable, none usable, or not told yet")
 
         print("modem settings: \(checks) checks passed")
     }

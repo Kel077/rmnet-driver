@@ -140,6 +140,8 @@ final class FakeModem: ModemServing {
     var imeiResult: Result<String, ModemFailure> = .success("000000000000091")
     var setImeiResult: Result<ImeiChange, ModemFailure>? = nil
     var sessionModule: String? = "c0ffee01"     // the module setImei's own port open is on
+    var readingModule: String? = "c0ffee01"     // the module imeiReading's port open is on (what is confirmed)
+    var imeiExpectAsked: [ImeiExpectation?] = []
     var sessionBefore: String? = nil            // the IMEI it reads before the write (nil: imeiResult's)
     var simSlotResult: Result<Int, ModemFailure> = .success(1)
     var setSimSlotResult: Result<SimSlotChange, ModemFailure>? = nil
@@ -268,6 +270,10 @@ final class FakeModem: ModemServing {
         events.append("imei")
         return imeiResult
     }
+    func imeiReading() -> Result<ImeiReading, ModemFailure> {
+        events.append("imeiReading")
+        return imeiResult.map { ImeiReading(imei: $0, module: readingModule) }
+    }
     func simSlot() -> Result<Int, ModemFailure> {
         events.append("simSlot")
         return simSlotResult
@@ -282,11 +288,22 @@ final class FakeModem: ModemServing {
                                       registration: Registration(status: .home, domain: "5GS"), secondsToRegister: 5))
     }
     /// The module and the IMEI before that the change's own port open reads (ImeiWrite): `sessionModule`, and the IMEI
-    /// `imeiResult` gives (or `sessionBefore` when set).
-    func setImei(_ imei: String, reboot: Bool, module: String?) -> ImeiWrite {
+    /// `imeiResult` gives (or `sessionBefore` when set). An expectation they do not meet writes nothing, as the service.
+    func setImei(_ imei: String, reboot: Bool, expect: ImeiExpectation?) -> ImeiWrite {
         events.append("setImei")
         imeiSetAsked.append((imei: imei, reboot: reboot))
+        imeiExpectAsked.append(expect)
         let before = sessionBefore ?? (try? imeiResult.get()) ?? "000000000000091"
+        if let expect, sessionModule != expect.module {
+            return ImeiWrite(outcome: .failure(ModemFailure(message: "The modem attached is not the module this change "
+                                                            + "was confirmed for. Nothing was changed.")),
+                             module: sessionModule)
+        }
+        if let expect, before != expect.before {
+            return ImeiWrite(outcome: .failure(ModemFailure(message: "The modem's IMEI is \(before) now, not "
+                                                            + "\(expect.before) as when the change was confirmed. Nothing was changed.")),
+                             module: sessionModule, before: before)
+        }
         if let r = setImeiResult { return ImeiWrite(outcome: r, module: sessionModule, before: before) }
         if before == imei { return ImeiWrite(outcome: .success(.unchanged(before)), module: sessionModule, before: before) }
         return ImeiWrite(outcome: .success(reboot ? .rebooting(before: before, after: imei)
@@ -1786,14 +1803,60 @@ struct ModemCliTests {
 
         fake = FakeModem()
         expectLines(run(["imei", "set", "000000000000141"], fake, answer: nil, "imei no tty"), [
-            "imei: no terminal to ask on, so nothing changed; run again with --yes to restart the modem without asking",
+            "imei: no terminal to ask on, so nothing changed; run again with --yes to change it without asking",
         ], code: 2, "imei set: refuses restart without terminal")
+        check(!fake.events.contains("setImei"), "imei set: nothing written without an answer")
 
         fake = FakeModem()
         expectLines(run(["imei", "set", "000000000000141", "--yes"], fake, "imei --yes"), [
             "imei: IMEI set to 000000000000141; the modem is restarting.",
             "imei: to put it back: RMNet imei set 000000000000091",
         ], code: 0, "imei set --yes")
+        equal(fake.imeiExpectAsked, [ImeiExpectation(module: "c0ffee01", before: "000000000000091")],
+              "imei set: written only on the module and over the IMEI read first")
+
+        // --no-reboot asks too (the write is a change), naming the module and both IMEIs.
+        fake = FakeModem()
+        expectLines(run(["imei", "set", "000000000000141", "--no-reboot"], fake, answer: nil, "imei no-reboot no tty"), [
+            "imei: no terminal to ask on, so nothing changed; run again with --yes to change it without asking",
+        ], code: 2, "imei set --no-reboot: asks, and without a terminal changes nothing")
+        check(!fake.events.contains("setImei"), "imei set --no-reboot: nothing written unasked")
+        fake = FakeModem()
+        let asked = run(["imei", "set", "000000000000141", "--no-reboot"], fake, answer: "y", "imei no-reboot asked")
+        equal(asked.code, 0, "imei set --no-reboot: answered yes, written")
+        equal(asked.questions, ["The IMEI of module c0ffee01 will change from 000000000000091 to 000000000000141. "
+                                + "It takes effect at the next restart. Continue? [y/N] "], "imei set --no-reboot: the question")
+        equal(fake.imeiSetAsked.last?.reboot, false, "imei set --no-reboot: not restarted")
+
+        // Another module on the port that writes (swapped after the question): nothing written, said, exit 1.
+        fake = FakeModem()
+        fake.sessionModule = "0badbeef"
+        let swapped = run(["imei", "set", "000000000000141", "--yes"], fake, "imei swapped")
+        check(swapped.code == 1 && swapped.lines.last?.hasPrefix("imei: The modem attached is not the module") == true,
+              "imei set: another module when writing, nothing written", "\(swapped.lines)")
+        // The IMEI changed meanwhile (another tool): nothing written, said.
+        fake = FakeModem()
+        fake.sessionBefore = "000000000000117"
+        let moved = run(["imei", "set", "000000000000141", "--yes"], fake, "imei moved")
+        check(moved.code == 1 && moved.lines.last?.contains("now, not 000000000000091") == true,
+              "imei set: another IMEI when writing, nothing written", "\(moved.lines)")
+        // A module that gives no serial number: not changed, not even asked.
+        fake = FakeModem()
+        fake.readingModule = nil
+        expectLines(run(["imei", "set", "000000000000141", "--yes"], fake, "imei no module"), [
+            "imei: The modem gives no USB serial number, so the change cannot be tied to this module. Nothing was changed.",
+        ], code: 1, "imei set: no module, nothing changed")
+        check(!fake.events.contains("setImei"), "imei set: no module, nothing written")
+
+        // Written and read back, the restart refused: said, the way back, exit 1.
+        fake = FakeModem()
+        let sentence = "The IMEI is now 000000000000141, but the modem was not restarted. The modem refused the command "
+            + "(ERROR). It takes effect at the next restart (AT+CFUN=1,1 or a replug)."
+        fake.setImeiResult = .success(.restartFailed(before: "000000000000091", after: "000000000000141", sentence: sentence))
+        expectLines(run(["imei", "set", "000000000000141", "--yes"], fake, "imei restart failed"), [
+            "imei: \(sentence)",
+            "imei: to put it back: RMNet imei set 000000000000091",
+        ], code: 1, "imei set: written, the restart failed")
 
         imeiHistoryVerbs()
     }
@@ -1810,17 +1873,27 @@ struct ModemCliTests {
         _ = run(["imei", "set", "000000000000141", "--yes"], fake, history: recorder, "history: set")
         equal(keeper.entries.count, 1, "history: one entry after a change")
         equal(keeper.entries.first, ImeiHistoryEntry(time: when, before: "000000000000091", after: "000000000000141",
-                                                     source: .cli, result: .succeeded, restart: true, module: "c0ffee01",
+                                                     source: .cli, result: .succeeded, restart: true,
+                                                     restartResult: .succeeded, module: "c0ffee01",
                                                      message: "IMEI set to 000000000000141; the modem is restarting.",
                                                      note: nil), "history: the entry")
 
-        // The IMEI before as the change's port read it (another tool changed it after the verb's first read).
+        // The IMEI before and the module as the change's port read them (another tool changed the IMEI after the verb's
+        // first read): nothing written, recorded as failed with what that port read.
         fake = FakeModem()
         fake.sessionBefore = "000000000000117"
-        fake.sessionModule = "0badbeef"
         _ = run(["imei", "set", "000000000000141", "--yes"], fake, history: recorder, "history: the session's")
         equal(keeper.entries.last?.before, "000000000000117", "history: the IMEI before from the change's port")
-        equal(keeper.entries.last?.module, "0badbeef", "history: the module from the change's port")
+        equal(keeper.entries.last?.module, "c0ffee01", "history: the module from the change's port")
+        equal(keeper.entries.last?.result, .failed, "history: not written over another IMEI")
+        keeper.entries.removeLast()
+        // Written, the restart refused: recorded as written, its restart failed.
+        fake = FakeModem()
+        fake.setImeiResult = .success(.restartFailed(before: "000000000000091", after: "000000000000141",
+                                                     sentence: "Made-up sentence."))
+        _ = run(["imei", "set", "000000000000141", "--yes"], fake, history: recorder, "history: restart failed")
+        check(keeper.entries.last?.result == .succeeded && keeper.entries.last?.restartResult == .failed,
+              "history: written, its restart failed, recorded apart")
         keeper.entries.removeLast()
 
         fake = FakeModem()
@@ -1833,7 +1906,7 @@ struct ModemCliTests {
 
         fake = FakeModem()
         fake.setImeiResult = .failure(ModemFailure(message: "The IMEI was not changed. ERROR"))
-        let failed = run(["imei", "set", "000000000000141", "--no-reboot"], fake, history: recorder, "history: failed")
+        let failed = run(["imei", "set", "000000000000141", "--no-reboot", "--yes"], fake, history: recorder, "history: failed")
         equal(failed.code, 1, "history: a failure still exits 1")
         equal(keeper.entries.last?.result, .failed, "history: a failure recorded as failed")
         equal(keeper.entries.last?.restart, false, "history: --no-reboot recorded")
