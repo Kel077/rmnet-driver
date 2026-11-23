@@ -13,9 +13,17 @@
 //
 // The window deletes and sends again what it listed, by stored index; another program (`RMNet sms delete`, say) may
 // have changed the store since, and the modem fills the lowest free index, so an index can hold another message by
-// then. So a delete or a Retry from the window first checks, in the same session, that the module, the SIM and the
-// storages are those of the listing and that every part is still there as listed (AT+CMGL=1, 2 and 3, which change no
-// status: only an unread entry that is listed is made read, 8.6); if not, it does nothing and the window lists again.
+// then. So a delete or a Retry from the window first checks, in the same session, that the module (its USB serial
+// number: one that gives none is never taken for the same), the SIM (its IMSI, needed to send and for a store on the
+// SIM) and the storages are those of the listing, and that every part is still there as listed, its raw PDU unchanged
+// (AT+CMGL=1, 2 and 3, which change no status: only an unread entry that is listed is made read, 8.6); if not, it does
+// nothing and the window lists again.
+//
+// What became of each part sent from the store is kept across runs in the record of sent messages
+// (SmsSendLedger.swift), shared with `RMNet sms send`: written, confirmed sent (+CMSS), or not known. A listing marks a
+// part the record confirms as sent (never offered for Retry, also when the modem still lists it as unsent), and Retry
+// refuses one. A send reports apart what reached the network and what is kept on the modem (a copy as sent that could
+// not be written, a part still listed as unsent) and in the record.
 //
 // AT+CMGL and AT+CMGR have no mode that leaves an unread message unread in the RM520N's manual (8.6, 8.7: listing or
 // reading a "REC UNREAD" entry makes it "REC READ"), so the background check for new messages never lists or reads one:
@@ -85,6 +93,7 @@ final class SmsService: SmsServing {
     private static let slicePause: TimeInterval = 0.35
 
     private let openPort: () -> Result<SmsPort, AtError>
+    private let ledger: SmsSendLedgerKeeping?
     private let healCnmiOnOpen: Bool
     private let sleep: (TimeInterval) -> Void
     private let now: () -> Date
@@ -94,13 +103,15 @@ final class SmsService: SmsServing {
     convenience init(waitForPort: Bool = true) {
         self.init(open: waitForPort ? { AtPort.open().map { $0 as SmsPort } }
                                     : { AtPort.openWithoutWaiting().map { $0 as SmsPort } },
-                  healCnmiOnOpen: true)
+                  ledger: SmsSendLedgerFile.standard, healCnmiOnOpen: true)
     }
 
-    init(open: @escaping () -> Result<SmsPort, AtError>, healCnmiOnOpen: Bool = false,
+    /// `ledger`: the record of sent messages (nil: none is kept or read).
+    init(open: @escaping () -> Result<SmsPort, AtError>, ledger: SmsSendLedgerKeeping? = nil, healCnmiOnOpen: Bool = false,
          sleep: @escaping (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
          now: @escaping () -> Date = { Date() }) {
         openPort = open
+        self.ledger = ledger
         self.healCnmiOnOpen = healCnmiOnOpen
         self.sleep = sleep
         self.now = now
@@ -132,8 +143,10 @@ final class SmsService: SmsServing {
             case .failure:
                 place.complete = false
             }
-            return .success(SmsListing(messages: messages, used: store?.used, total: store?.total, parts: parts,
-                                       place: place))
+            var listing = SmsListing(messages: messages, used: store?.used, total: store?.total, parts: parts,
+                                     place: place)
+            noteRecord(on: &listing)
+            return .success(listing)
         case .failure(let error):
             return .failure(SmsFailure(message: "The messages could not be listed. \(describe(error))"))
         }
@@ -210,6 +223,7 @@ final class SmsService: SmsServing {
         defer { port?.close() }
         var opened: SmsSession? = nil
         var stores: Bool? = nil
+        var storage: String? = nil
         var unanswered: AtError = .timeout
         for _ in 0..<2 {
             port?.close()
@@ -225,7 +239,10 @@ final class SmsService: SmsServing {
                 return .failure(SmsFailure(message: "\(failure.message) Nothing was sent."))
             }
             switch s.command("AT+CPMS?", timeout: SmsService.readTimeout) {
-            case .success(let lines): stores = parseStorageNames(lines).map { $0.read == $0.write } ?? false
+            case .success(let lines):
+                let names = parseStorageNames(lines)
+                stores = names.map { $0.read == $0.write } ?? false
+                storage = names?.write
             case .failure(let error): if isModemRefusal(error) { stores = false } else { unanswered = error }
             }
             if stores != nil { break }
@@ -235,14 +252,20 @@ final class SmsService: SmsServing {
                                        + "\(describe(unanswered)) Nothing was sent."))
         }
         guard stores else { return sendDirectly(parts, on: session) }
+        // Who sends, for the record of sent messages: the module, the SIM (AT+CIMI) and the storage written to.
+        var imsi: String? = nil
+        if case .success(let lines) = session.command("AT+CIMI", timeout: SmsService.readTimeout) { imsi = parseImsi(lines) }
+        let sender = Sender(module: session.port.deviceSerial, imsi: imsi, storage: storage)
 
         var written: [(index: Int, hex: String)] = []
+        var unrecorded: String? = nil
         for (n, part) in parts.enumerated() {
             let reason: String
             switch session.send("AT+CMGW=\(part.tpduLength),2", afterPrompt: part.hex, timeout: SmsService.writeTimeout) {
             case .success(let lines):
                 if let index = parseStoreIndex(lines) {
                     written.append((index, part.hex))
+                    unrecorded = unrecorded ?? recordParts([(index, part.hex)], .written, by: sender)
                     continue
                 }
                 reason = "The modem did not say where it stored it (no +CMGW line)."
@@ -259,9 +282,49 @@ final class SmsService: SmsServing {
             let which = parts.count == 1 ? "The message" : "Part \(n + 1) of \(parts.count)"
             var message = "\(which) could not be stored on the modem. \(reason) Nothing was sent."
             if left > 0 { message += " Parts already stored are listed as Not sent." }
-            return .failure(SmsFailure(message: message))
+            return .failure(SmsFailure(message: message, record: SmsSendRecord(unrecorded: unrecorded),
+                                       reachedModem: left > 0))
         }
-        return sendStored(written, on: session)
+        return sendStored(written, on: session, by: sender, unrecorded: unrecorded)
+    }
+
+    /// Who sends a stored part: the module, the SIM's IMSI and the storage written to (the record of sent messages'
+    /// key, SmsPartKey).
+    private struct Sender {
+        let module: String?
+        let imsi: String?
+        let storage: String?
+    }
+
+    /// Records parts in the record of sent messages; nil when recorded (or none is kept), else why not.
+    private func recordParts(_ parts: [(index: Int, hex: String)], _ state: SmsPartState, by sender: Sender) -> String? {
+        guard let ledger, !parts.isEmpty else { return nil }
+        let keys = parts.compactMap { SmsPartKey(module: sender.module, imsi: sender.imsi, storage: sender.storage,
+                                                 index: $0.index, hex: $0.hex) }
+        guard keys.count == parts.count else {
+            return "the modem gives no USB serial number, or its SIM could not be identified."
+        }
+        let at = now()
+        return ledger.record(keys.map { SmsLedgerEvent(time: at, key: $0, state: state) })
+    }
+
+    /// A listing's unsent parts as the record of sent messages knows them (confirmed sent, or not known).
+    private func noteRecord(on listing: inout SmsListing) {
+        guard let ledger, listing.place.complete, listing.parts.contains(where: { $0.status == .unsent }) else { return }
+        switch ledger.states() {
+        case .failure(let why):
+            listing.ledgerProblem = why.message
+        case .success(let states):
+            for p in listing.parts where p.status == .unsent {
+                guard let key = SmsPartKey(module: listing.place.device, imsi: listing.place.sim,
+                                           storage: listing.place.listsFrom, index: p.index, hex: p.hex) else { continue }
+                switch states[key] {
+                case .confirmed?: listing.sentConfirmed.insert(p.index)
+                case .unknown?: listing.sendUnknown.insert(p.index)
+                default: break
+                }
+            }
+        }
     }
 
     /// The window's Retry: the listed unsent parts checked first (checkListed: still unsent, as listed, where listed),
@@ -282,14 +345,37 @@ final class SmsService: SmsServing {
         if let failure = usePduMode(session) ?? checkListed(targets, listedFrom: place, sending: true, on: session) {
             return .failure(failure.adding(" Nothing was sent."))
         }
-        return sendStored(targets.map { ($0.index, $0.hex) }, on: session)
+        // A part RMNet confirmed sent is never sent again, also when the modem still lists it as unsent.
+        let sender = Sender(module: place.device, imsi: place.sim, storage: place.writesTo)
+        if let ledger {
+            switch ledger.states() {
+            case .failure(let why):
+                return .failure(SmsFailure(message: "RMNet cannot tell whether these parts were sent already: "
+                                           + "\(why.message) Nothing was sent."))
+            case .success(let states):
+                for part in targets {
+                    if let key = SmsPartKey(module: sender.module, imsi: sender.imsi, storage: sender.storage,
+                                            index: part.index, hex: part.hex), states[key] == .confirmed {
+                        return .failure(SmsFailure(message: "Stored part \(part.index) was sent already (the modem "
+                                                   + "confirmed it); it is not sent again. Nothing was sent.",
+                                                   listingChanged: true))
+                    }
+                }
+            }
+        }
+        return sendStored(targets.map { ($0.index, $0.hex) }, on: session, by: sender, unrecorded: nil)
     }
 
     /// AT+CMSS for each stored part in turn; after each that went, its stored status is made "sent" (markSent). A part
     /// the modem refused was not sent; after any other failure it is not known (sendFailure). Either way it and the
-    /// parts after it stay stored as unsent. What became of each part is in the result's record.
-    private func sendStored(_ stored: [(index: Int, hex: String)], on session: SmsSession) -> Result<SmsSent, SmsFailure> {
-        var record = SmsSendRecord()
+    /// parts after it stay stored as unsent. What became of each part is in the result's record, and in the record of
+    /// sent messages as soon as it is known (confirmed, or not known).
+    private func sendStored(_ stored: [(index: Int, hex: String)], on session: SmsSession, by sender: Sender,
+                            unrecorded firstProblem: String?) -> Result<SmsSent, SmsFailure> {
+        var record = SmsSendRecord(unrecorded: firstProblem)
+        func note(_ parts: [(index: Int, hex: String)], _ state: SmsPartState) {
+            if let problem = recordParts(parts, state, by: sender), record.unrecorded == nil { record.unrecorded = problem }
+        }
         for (n, part) in stored.enumerated() {
             let reason: String
             let known: Bool
@@ -297,8 +383,12 @@ final class SmsService: SmsServing {
             case .success(let lines):
                 if parseStoredSendReference(lines) != nil {
                     let marked = markSent(part.index, written: part.hex, on: session)
-                    if let sent = marked.sent { record.sent.append(sent) }
-                    if let still = marked.stillUnsent { record.stillUnsent.append(still) }
+                    var confirmed = [(part.index, marked.hex)]
+                    if let copy = marked.sentAt, copy != part.index { confirmed.append((copy, marked.hex)) }
+                    note(confirmed, .confirmed)
+                    if let at = marked.sentAt { record.sent.append(StoredPart(index: at, hex: marked.hex)) }
+                    else { record.unarchived += 1 }
+                    if marked.stillUnsent { record.stillUnsent.append(StoredPart(index: part.index, hex: marked.hex)) }
                     continue
                 }
                 reason = "The modem did not confirm it with a +CMSS line."
@@ -307,34 +397,35 @@ final class SmsService: SmsServing {
                 reason = describe(error)
                 known = isModemRefusal(error)
             }
-            if !known { record.unknown.append(StoredPart(index: part.index, hex: part.hex)) }
+            if !known {
+                record.unknown.append(StoredPart(index: part.index, hex: part.hex))
+                note([part], .unknown)
+            }
             return .failure(SmsFailure(message: sendFailure(part: n, of: stored.count, reason: reason, known: known)
                                        + " It is kept on the modem as Not sent: Retry sends it, Delete removes it.",
-                                       record: record))
+                                       record: record, reachedModem: true))
         }
         return .success(SmsSent(parts: stored.count, indices: record.sent.map { $0.index }, record: record))
     }
 
     /// The modem should list a part it sent from its store as "sent". One that still says "unsent" (AT+CMGR) is deleted
     /// and written again as sent (AT+CMGD, then AT+CMGW=<length>,3: the delete frees the place the copy needs), so it is
-    /// never offered for Retry. `sent`: where the part is stored as sent now (nil: its copy could not be written, so it
-    /// is no longer stored); `stillUnsent`: the part is still stored as unsent, or that is not known (its status could
-    /// not be read, or the delete failed), though it was sent.
-    private func markSent(_ index: Int, written: String, on session: SmsSession) -> (sent: StoredPart?, stillUnsent: StoredPart?) {
+    /// not offered for Retry. `sentAt`: where the part is stored as sent now (nil: its copy could not be written, so it
+    /// is no longer stored); `stillUnsent`: the part is still stored as unsent at its index, or that is not known (its
+    /// status could not be read, or the delete failed), though it was sent; `hex`: its raw PDU as stored.
+    private func markSent(_ index: Int, written: String, on session: SmsSession) -> (sentAt: Int?, stillUnsent: Bool, hex: String) {
         guard case .success(let lines) = session.command("AT+CMGR=\(index)", timeout: SmsService.readTimeout),
               let entry = parseReadEntry(lines) else {
-            let part = StoredPart(index: index, hex: written)
-            return (part, part)
+            return (index, true, written)
         }
-        let part = StoredPart(index: index, hex: entry.hex)
-        guard entry.status == .unsent, let length = submitLength(entry.hex) else { return (part, nil) }
+        guard entry.status == .unsent, let length = submitLength(entry.hex) else { return (index, false, entry.hex) }
         guard case .success = session.command("AT+CMGD=\(index)", timeout: SmsService.deleteTimeout) else {
-            return (part, part)
+            return (index, true, entry.hex)
         }
         guard case .success(let answer) = session.send("AT+CMGW=\(length),3", afterPrompt: entry.hex,
                                                        timeout: SmsService.writeTimeout),
-              let copy = parseStoreIndex(answer) else { return (nil, nil) }
-        return (StoredPart(index: copy, hex: entry.hex), nil)
+              let copy = parseStoreIndex(answer) else { return (nil, false, entry.hex) }
+        return (copy, false, entry.hex)
     }
 
     /// AT+CMGS for each part, as before stored sending: when the modem would store where it does not list.
@@ -354,7 +445,8 @@ final class SmsService: SmsServing {
                 reason = describe(error)
                 known = isModemRefusal(error)
             }
-            return .failure(SmsFailure(message: sendFailure(part: n, of: parts.count, reason: reason, known: known)))
+            return .failure(SmsFailure(message: sendFailure(part: n, of: parts.count, reason: reason, known: known),
+                                       reachedModem: n > 0 || !known))
         }
         return .success(SmsSent(parts: parts.count, indices: [], stored: false))
     }
@@ -436,7 +528,12 @@ final class SmsService: SmsServing {
             return SmsFailure(message: "Where the messages are stored was not known when they were listed. List them again.",
                               listingChanged: true)
         }
-        guard session.port.deviceSerial == listed.device else {
+        // The module: known on both sides and the same (two modules that give no serial number are not the same one).
+        guard let device = listed.device, let here = session.port.deviceSerial else {
+            return SmsFailure(message: "RMNet cannot tell which modem this is (it gives no USB serial number), so it "
+                              + "changes nothing listed.")
+        }
+        guard here == device else {
             return SmsFailure(message: "\(changed) another modem is attached.", listingChanged: true)
         }
         let now: SmsPlace
@@ -447,6 +544,13 @@ final class SmsService: SmsServing {
         }
         guard now.complete, now.listsFrom == listed.listsFrom, now.writesTo == listed.writesTo else {
             return SmsFailure(message: "\(changed) it stores them in another place now.", listingChanged: true)
+        }
+        // The SIM: known and the same to send, or when the messages are stored on the SIM; else only the same.
+        if sending || listed.listsFrom == "SM" {
+            guard listed.sim != nil, now.sim != nil else {
+                return SmsFailure(message: "RMNet cannot tell which SIM is in use (AT+CIMI gave no IMSI), so it changes "
+                                  + "nothing listed.")
+            }
         }
         guard now.sim == listed.sim else {
             return SmsFailure(message: "\(changed) another SIM is in use.", listingChanged: true)
@@ -476,7 +580,7 @@ final class SmsService: SmsServing {
         }
         for part in parts {
             guard let now = found[part.index], allowed(part.status).contains(now.status),
-                  pduSignature(now.hex) == pduSignature(part.hex) else {
+                  now.hex.uppercased() == part.hex.uppercased() else {
                 return SmsFailure(message: "\(changed) stored part \(part.index) is not the one listed.",
                                   listingChanged: true)
             }

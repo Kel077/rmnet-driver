@@ -18,6 +18,9 @@ struct SmsView: View {
     @ObservedObject var controller: SmsController
     @State private var confirmingMessage: SmsMessage? = nil              // the message the delete confirmation is about
     @State private var confirmingConversation: SmsConversation? = nil    // the conversation it is about
+    // What the open confirmation deletes, frozen when it opened (SmsController.target): never what a listing that
+    // comes while it is open has at the same indices. nil: no longer listed when it opened.
+    @State private var confirmingTarget: SmsTarget? = nil
     @State private var writing = false                                   // the New Message sheet is open
 
     var body: some View {
@@ -35,7 +38,7 @@ struct SmsView: View {
                         .disabled(!controller.changeEnabled)
                 }
                 ToolbarItem(placement: .primaryAction) {
-                    Button { confirmingConversation = controller.shownConversation } label: {
+                    Button { askDelete(controller.shownConversation) } label: {
                         Label("Delete Conversation…", systemImage: "trash")
                     }
                     .help("Delete Conversation…")
@@ -57,7 +60,7 @@ struct SmsView: View {
                                 isPresented: Binding(get: { confirmingMessage != nil },
                                                      set: { if !$0 { confirmingMessage = nil } }),
                                 titleVisibility: .visible, presenting: confirmingMessage) { m in
-                Button("Delete", role: .destructive) { controller.delete(m) }
+                Button("Delete", role: .destructive) { controller.delete(confirmingTarget) }
                 Button("Cancel", role: .cancel) {}
             } message: { m in
                 Text(verbatim: deleteQuestion(m).message)
@@ -66,11 +69,25 @@ struct SmsView: View {
                                 isPresented: Binding(get: { confirmingConversation != nil },
                                                      set: { if !$0 { confirmingConversation = nil } }),
                                 titleVisibility: .visible, presenting: confirmingConversation) { c in
-                Button("Delete Conversation", role: .destructive) { controller.deleteConversation(c) }
+                Button("Delete Conversation", role: .destructive) {
+                    controller.deleteConversation(c, target: .some(confirmingTarget))
+                }
                 Button("Cancel", role: .cancel) {}
             } message: { c in
                 Text(verbatim: deleteConversationQuestion(c).message)
             }
+    }
+
+    /// Opens the delete confirmation for `m`, with what it will delete frozen now.
+    private func askDelete(_ m: SmsMessage) {
+        confirmingTarget = controller.target(for: [m])
+        confirmingMessage = m
+    }
+
+    private func askDelete(_ c: SmsConversation?) {
+        guard let c else { return }
+        confirmingTarget = controller.target(for: c)
+        confirmingConversation = c
     }
 
     @ViewBuilder private var content: some View {
@@ -107,8 +124,8 @@ struct SmsView: View {
                 .frame(minWidth: 240, idealWidth: 290, maxWidth: 330)
                 Divider()
                 ConversationPane(controller: controller, conversation: controller.shownConversation,
-                                 deleteMessage: { confirmingMessage = $0 },
-                                 deleteConversation: { confirmingConversation = $0 })
+                                 deleteMessage: { askDelete($0) },
+                                 deleteConversation: { askDelete($0) })
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
@@ -402,7 +419,10 @@ private struct ConversationPane: View {
                     }
                 }
                 Divider()
-                ReplyField(controller: controller, number: c.number)
+                // Its own field for each conversation (and its own binding): text an input method commits after
+                // another conversation was chosen goes to this one, never to the next.
+                ReplyField(controller: controller, conversation: c.id, number: c.number)
+                    .id(c.id)
             }
         } else {
             EmptyState(symbol: "bubble.left.and.bubble.right", title: "No conversation selected",
@@ -507,6 +527,7 @@ private struct Bubble: View {
 /// new line). A number that cannot take a reply (a name, such as a carrier's) says so instead.
 private struct ReplyField: View {
     @ObservedObject var controller: SmsController
+    let conversation: String
     let number: String
 
     var body: some View {
@@ -514,7 +535,10 @@ private struct ReplyField: View {
             VStack(alignment: .leading, spacing: Spacing.xs) {
                 HStack(alignment: .bottom, spacing: Spacing.s) {
                     let edge = RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    PlainTextEditor(text: $controller.replyText, composing: $controller.replyComposing,
+                    let key = conversation
+                    PlainTextEditor(text: Binding(get: { controller.replyDraft(for: key) },
+                                                  set: { controller.setReplyDraft($0, for: key) }),
+                                    composing: $controller.replyComposing,
                                     editable: controller.running != .sending)
                         .frame(height: 54)
                         .clipShape(edge)

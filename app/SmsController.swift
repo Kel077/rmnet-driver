@@ -59,20 +59,33 @@ final class SmsController: ObservableObject {
         }
     }
     @Published var composing = false  // an input method has text in the field that is not committed yet
-    /// The conversation shown (conversationKey of its number). Showing it is reading it: its unread marks go.
+    /// The conversation shown (conversationKey of its number). Showing it is reading it: its unread marks go. Another
+    /// one has its own reply field (SmsView's ReplyField), so nothing is being composed in it yet.
     @Published var selectedConversation: String? = nil {
-        didSet { markShownConversationRead() }
+        didSet {
+            markShownConversationRead()
+            if selectedConversation != oldValue, replyComposing { replyComposing = false }
+        }
     }
     /// Each conversation's reply being written (by conversationKey), so a reply never goes to another conversation
     /// than the one it was written in. Not saved anywhere.
     @Published private(set) var replyDrafts: [String: String] = [:]
-    /// The reply of the conversation shown.
+    /// The reply of the conversation shown (reading it; the field writes with setReplyDraft, for its own conversation).
     var replyText: String {
         get { selectedConversation.flatMap { replyDrafts[$0] } ?? "" }
         set {
             guard let key = selectedConversation else { return }
-            replyDrafts[key] = newValue.isEmpty ? nil : newValue
+            setReplyDraft(newValue, for: key)
         }
+    }
+
+    /// The reply written in the conversation `key`, whichever conversation is shown when it comes (an input method can
+    /// commit its text after another conversation was chosen: it goes to the one it was typed in).
+    func replyDraft(for key: String) -> String { replyDrafts[key] ?? "" }
+
+    func setReplyDraft(_ text: String, for key: String) {
+        let value: String? = text.isEmpty ? nil : text
+        if replyDrafts[key] != value { replyDrafts[key] = value }
     }
     @Published var replyComposing = false
     /// When this run of RMNet sent each stored part of the last listing (index → time), so a sent message has a time:
@@ -334,9 +347,13 @@ final class SmsController: ObservableObject {
         var times: [Int: Date] = [:]
         for p in listing.parts { if let t = sentTimes[StoredPart(p)] { times[p.index] = t } }
         if times != sentAt { sentAt = times }
+        // Confirmed sent: in this run (in memory) or by the record of sent messages (any run, the window's or a verb's).
+        let confirmed = listing.sentConfirmed.union(
+            listing.parts.filter { confirmedParts.contains(StoredPart($0)) }.map { $0.index })
         let unknown = Set(listing.parts.filter { unknownParts.contains(StoredPart($0)) }.map { $0.index })
+            .union(listing.sendUnknown).subtracting(confirmed)
         if unknown != unconfirmed { unconfirmed = unknown }
-        let found = settled(listing.messages, parts: listing.parts, confirmed: confirmedParts)
+        let found = settled(listing.messages, confirmedIndices: confirmed)
         messages = found
         listedAt = Date()
         listFailure = nil
@@ -601,32 +618,42 @@ final class SmsController: ObservableObject {
         runPendingIfIdle()
     }
 
+    /// The stored parts of `messages` exactly as the last listing has them, and where they were listed from: what a delete
+    /// confirmed now will delete, whatever later listings bring (SmsTarget). nil when a message is not in the last
+    /// listing as it is (it changed, or went), or a part of it is missing.
+    func target(for messages: [SmsMessage]) -> SmsTarget? {
+        guard !messages.isEmpty, messages.allSatisfy({ self.messages.contains($0) }) else { return nil }
+        let indices = Set(messages.flatMap { $0.indices })
+        let parts = listedParts.filter { indices.contains($0.index) }
+        guard Set(parts.map { $0.index }) == indices else { return nil }
+        return SmsTarget(parts: parts, place: listedPlace)
+    }
+
+    func target(for conversation: SmsConversation) -> SmsTarget? { target(for: conversation.messages) }
+
     /// Deletes every stored part of `message`, if it is still listed and nothing else runs.
     func delete(_ message: SmsMessage) {
+        delete(target(for: [message]))
+    }
+
+    /// Deletes what a confirmation was opened for (`target`, frozen when it opened: target(for:)), checked against the
+    /// modem first: never a part a later listing has at the same index. nil: it was no longer listed when it opened.
+    func delete(_ target: SmsTarget?, then done: (() -> Void)? = nil) {
         guard !stopping else { return }
-        // A refresh may have started just before the confirmation opened.
+        // A refresh may have started just before the confirmation closed.
         guard running == nil else {
             setResult("The modem was busy with another request. Nothing was deleted; press Delete again.", failure: true)
             return
         }
-        guard messages.contains(where: { $0.key == message.key }) else {
-            setResult("That message is no longer listed. Nothing was deleted.", failure: true)
-            return
-        }
-        startDelete(message.indices, then: nil)
-    }
-
-    /// The listed parts at `indices`, checked against the modem and deleted (SmsService); `then` runs after a success.
-    private func startDelete(_ indices: [Int], then done: (() -> Void)?) {
-        let parts = listedParts.filter { indices.contains($0.index) }
-        guard Set(parts.map { $0.index }) == Set(indices) else {
+        guard let target else {
             setResult("That message is no longer listed. Nothing was deleted.", failure: true)
             return
         }
         running = .deleting
-        setResult("Deleting \(parts.count) stored part(s)…", failure: false, kind: .progress)
+        setResult("Deleting \(target.parts.count) stored part(s)…", failure: false, kind: .progress)
         let service = self.service
-        let place = listedPlace
+        let parts = target.parts
+        let place = target.place
         queue.async {
             let result = service.delete(parts, listedFrom: place)
             DispatchQueue.main.async {
@@ -659,11 +686,13 @@ final class SmsController: ObservableObject {
     }
 
     /// Sends the stored parts of `message` that are not sent (Retry), once, after checking that the modem still has
-    /// them as listed (SmsService.resend).
+    /// them as listed (SmsService.resend): `message` as shown, which must be in the last listing as it is; its parts as
+    /// that listing has them, never what a later listing has at the same indices. A part RMNet confirmed sent is never
+    /// among them.
     func retry(_ message: SmsMessage) {
         guard running == nil, !stopping, !message.unsentIndices.isEmpty else { return }
         let parts = listedParts.filter { message.unsentIndices.contains($0.index) && $0.status == .unsent }
-        guard parts.count == message.unsentIndices.count else {
+        guard messages.contains(message), parts.count == message.unsentIndices.count else {
             setResult("That message is no longer listed. Nothing was sent.", failure: true)
             return
         }
@@ -677,16 +706,12 @@ final class SmsController: ObservableObject {
         }
     }
 
-    /// Deletes every stored part of every message of `conversation`, checked against the modem first.
-    func deleteConversation(_ conversation: SmsConversation) {
-        guard !stopping else { return }
-        guard running == nil else {
-            setResult("The modem was busy with another request. Nothing was deleted; press Delete again.", failure: true)
-            return
-        }
-        let indices = conversation.messages.flatMap { $0.indices }
-        guard !indices.isEmpty else { return }
-        startDelete(indices) { [weak self] in
+    /// Deletes every stored part of every message of `conversation`, checked against the modem first; `target`: what
+    /// its confirmation was opened for (nil: the conversation as the last listing has it now).
+    func deleteConversation(_ conversation: SmsConversation, target given: SmsTarget?? = nil) {
+        guard !conversation.messages.isEmpty else { return }
+        let target = given ?? target(for: conversation)
+        delete(target) { [weak self] in
             guard let self else { return }
             if self.selectedConversation == conversation.id { self.selectedConversation = nil }
             self.replyDrafts[conversation.id] = nil
@@ -748,14 +773,23 @@ final class SmsController: ObservableObject {
                 text = ""
                 selectedConversation = conversationKey(number, home: homeCallingCode(imsi: listedPlace.sim))
             }
-            setResult("Sent to \(number) in \(sent.parts) part(s)."
-                      + (sent.stored ? "" : " It is not stored on the modem: it writes messages to another storage than "
-                         + "the one it lists."), failure: false, kind: sent.stored ? .success : .warning)
+            // Sent, and apart from it, what is kept on the modem and in the record of sent messages (a warning).
+            let notes = smsArchiveNotes(sent.record)
+            setResult((["Sent to \(number) in \(sent.parts) part(s)."]
+                       + (sent.stored ? [] : ["It is not stored on the modem: it writes messages to another storage than "
+                                              + "the one it lists."]) + notes).joined(separator: " "),
+                      failure: false, kind: sent.stored && notes.isEmpty ? .success : .warning)
             clearResultOnTyping = sheet
             succeeded = true
         case .failure(let failure):
             keep(failure.record)
-            setResult(failure.message, failure: true)
+            var line = ([failure.message] + smsArchiveNotes(failure.record)).joined(separator: " ")
+            // A part went, may have, or is stored for Retry: the whole text is not offered again.
+            if failure.reachedModem {
+                if let reply { replyDrafts[reply] = nil } else if sheet { text = "" }
+                if reply != nil || sheet { line += " The text was cleared so that no part is sent twice." }
+            }
+            setResult(line, failure: true)
             succeeded = false
         }
         if answeredQuit(succeeded: succeeded) { return }

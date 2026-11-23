@@ -82,7 +82,7 @@ app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build
 		build/quit-tests build/menubar-tests build/window-tests build/signal-tests build/throughput-tests \
 		build/shell-tests build/networkview-tests build/overview-tests build/imeihistory-tests build/simslot-tests \
 		build/messagealerts-tests build/smsservice-tests build/conversations-tests build/pulse-tests \
-		build/resultline-tests
+		build/resultline-tests build/smsledger-tests build/replyeditor-tests
 	./build/app-tests
 	./build/sms-tests
 	./build/at-tests
@@ -109,6 +109,8 @@ app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build
 	./build/conversations-tests
 	./build/pulse-tests
 	./build/resultline-tests
+	./build/smsledger-tests
+	./build/replyeditor-tests
 
 build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
 	@mkdir -p build
@@ -133,7 +135,7 @@ build/nmea-tests: app/Nmea.swift tests/app/NmeaTests.swift
 
 # The gps verb switches GNSS over the AT port: AtPort.swift, ModemService.swift (AtCommanding), SmsService.swift
 # (describe) and what they need. The tests drive a fake switch and a scripted port; no port is opened.
-build/gpsread-tests: app/AtPort.swift app/SmsModel.swift app/SmsService.swift app/ModemNetwork.swift \
+build/gpsread-tests: app/AtPort.swift app/SmsModel.swift app/SmsService.swift app/SmsSendLedger.swift app/ModemNetwork.swift \
 		app/ModemSettings.swift app/ModemService.swift app/Nmea.swift app/GpsCommand.swift tests/app/GpsReadTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
@@ -147,7 +149,7 @@ build/modemset-tests: app/ModemNetwork.swift app/ModemSettings.swift tests/app/M
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 # SmsService.swift brings describe(_: AtError).
-build/modemsvc-tests: app/AtPort.swift app/SmsModel.swift app/SmsService.swift app/ModemNetwork.swift \
+build/modemsvc-tests: app/AtPort.swift app/SmsModel.swift app/SmsService.swift app/SmsSendLedger.swift app/ModemNetwork.swift \
 		app/ModemSettings.swift app/ModemService.swift tests/app/ModemServiceTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
@@ -168,7 +170,7 @@ build/quit-tests: app/SmsModel.swift app/MessageAlerts.swift app/SmsConversation
 # The menu bar item's model: the status model for the headline, the AT port's and the modem's files for the
 # failures' wording (the real ModemService, behind a port that never opens), the signal's bars for the signal bars
 # style (its setting in a user defaults suite of the test's own). No port is opened.
-build/menubar-tests: app/StatusModel.swift app/AtPort.swift app/SmsModel.swift app/SmsService.swift \
+build/menubar-tests: app/StatusModel.swift app/AtPort.swift app/SmsModel.swift app/SmsService.swift app/SmsSendLedger.swift \
 		app/ModemNetwork.swift app/ModemSettings.swift app/ModemService.swift app/SignalQuality.swift app/MenuBarStatus.swift \
 		tests/app/MenuBarStatusTests.swift
 	@mkdir -p build
@@ -228,7 +230,7 @@ build/messagealerts-tests: app/SmsModel.swift app/ModemNetwork.swift app/ModemSe
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 # Sending from the modem's store (AT+CMGW, AT+CMSS), Retry and the direct send, against a scripted port.
-build/smsservice-tests: app/AtPort.swift app/SmsModel.swift app/SmsService.swift tests/app/SmsServiceTests.swift
+build/smsservice-tests: app/AtPort.swift app/SmsModel.swift app/SmsService.swift app/SmsSendLedger.swift tests/app/SmsServiceTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
@@ -239,7 +241,7 @@ build/conversations-tests: app/SmsModel.swift app/SmsConversations.swift tests/a
 
 # The background turn as the app wires it: the real short reads behind a scripted port, the menu bar's signal bars and
 # two recording riders; a busy port and a timeout part way through a turn.
-build/pulse-tests: app/StatusModel.swift app/AtPort.swift app/SmsModel.swift app/SmsService.swift \
+build/pulse-tests: app/StatusModel.swift app/AtPort.swift app/SmsModel.swift app/SmsService.swift app/SmsSendLedger.swift \
 		app/ModemNetwork.swift app/ModemSettings.swift app/ModemService.swift app/SignalQuality.swift app/MenuBarStatus.swift \
 		app/ModemPulse.swift tests/app/ModemPulseTests.swift
 	@mkdir -p build
@@ -247,6 +249,17 @@ build/pulse-tests: app/StatusModel.swift app/AtPort.swift app/SmsModel.swift app
 
 # A result line's banner: a success goes after 8 s (not under the pointer), the rest stay; on a fake clock.
 build/resultline-tests: app/ResultLine.swift tests/app/ResultLineTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+# The record of sent messages: its lines, the latest state of each part, the file kept only as it should be.
+build/smsledger-tests: app/SmsSendLedger.swift tests/app/SmsSendLedgerTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+# The reply field off screen (AppKit): text an input method still composes when the field goes is committed to its
+# own conversation, never to the next one's.
+build/replyeditor-tests: app/PlainTextEditor.swift tests/app/PlainTextEditorTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 

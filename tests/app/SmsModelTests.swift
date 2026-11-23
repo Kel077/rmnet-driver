@@ -916,7 +916,8 @@ struct SmsModelTests {
         check(sentJSON?["time"] is NSNull && sentJSON?["sender"] as? String == "+12025550199", "sms list --json: no time, the recipient")
         equal(json.first { ($0["indices"] as? [Int]) == [0] }?["status"] as? String, "received", "sms list --json: status received")
         equal(Set(sentJSON?.keys.map { $0 } ?? []),
-              ["indices", "unread", "sender", "time", "text", "missingParts", "readable", "status"], "sms list --json: the keys")
+              ["indices", "unread", "sender", "time", "text", "missingParts", "readable", "status", "notConfirmed"],
+              "sms list --json: the keys (notConfirmed added)")
     }
 
     /// WAP Push MMS notifications (single-part and multi-part) and `sms unblock` parsing and output.

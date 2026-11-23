@@ -145,15 +145,8 @@ func deleteConversationQuestion(_ c: SmsConversation) -> (title: String, message
 /// unsent part is sent. `parts`: the listing's stored entries, to tell that the part at an index is that one.
 func settled(_ messages: [SmsMessage], parts: [StoredPdu], confirmed: Set<StoredPart>) -> [SmsMessage] {
     guard !confirmed.isEmpty else { return messages }
-    var listed: [Int: StoredPart] = [:]
-    for p in parts where listed[p.index] == nil { listed[p.index] = StoredPart(p) }
-    return messages.map { m in
-        guard m.box == .unsent else { return m }
-        var copy = m
-        copy.unsentIndices = m.unsentIndices.filter { !(listed[$0].map(confirmed.contains) ?? false) }
-        if copy.unsentIndices.isEmpty { copy.box = .sent }
-        return copy
-    }
+    let indices = Set(parts.filter { confirmed.contains(StoredPart($0)) }.map { $0.index })
+    return settled(messages, confirmedIndices: indices)
 }
 
 /// `conversations` under another name, for SmsController, whose property has that name.

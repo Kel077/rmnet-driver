@@ -185,7 +185,176 @@ struct SmsServiceTests {
         deleting()
         counting()
         unblockingAndHealing()
+        identityNotKnown()
+        rawPdus()
+        recordOfSends()
+        reachedModem()
         print("sms service: \(checks) checks passed")
+    }
+
+    // Two modules that give no serial number (and refuse AT+CIMI) are not the same one: nothing listed on the first is
+    // sent again or deleted on the second. A SIM not known: nothing sent again; a delete of what is stored on the module
+    // (not on the SIM) needs the module only.
+    static func identityNotKnown() {
+        let part = stored(3, .unsent, submit("Made-up part"))
+        let unknown = SmsPlace(device: nil, sim: nil, listsFrom: "ME", writesTo: "ME")
+        let second = ScriptedPort([pduMode], device: nil)
+        let r = failure(service(second).resend([part], listedFrom: unknown), "no serial: retry")
+        check(r.message.hasPrefix("RMNet cannot tell which modem this is") && !second.lines.contains { $0.hasPrefix("AT+CMSS") },
+              "no serial on either: nothing sent again", r.message)
+        finished(second, "no serial: retry")
+        let gone = ScriptedPort([pduMode], device: nil)
+        check(failure(service(gone).delete([part], listedFrom: unknown), "no serial: delete").message
+                .hasSuffix("Nothing was deleted."), "no serial on either: nothing deleted")
+        check(!gone.lines.contains { $0.hasPrefix("AT+CMGD") }, "no serial: no AT+CMGD")
+        finished(gone, "no serial: delete")
+        // Listed with a serial number, the port gives none: refused too.
+        let anon = ScriptedPort([pduMode], device: nil)
+        check(failure(service(anon).resend([part], listedFrom: place), "anonymous port").message
+                .hasPrefix("RMNet cannot tell which modem this is"), "a port with no serial number: nothing sent")
+        finished(anon, "anonymous port")
+
+        // The SIM not known (AT+CIMI refused when listed and now): nothing sent again.
+        let noSim = SmsPlace(device: "TESTMODULE1", sim: nil, listsFrom: "ME", writesTo: "ME")
+        let simless = ScriptedPort([pduMode, sameStorage, ("AT+CIMI", .failure(.modem("+CME ERROR: 10")))])
+        check(failure(service(simless).resend([part], listedFrom: noSim), "no SIM: retry").message
+                .hasPrefix("RMNet cannot tell which SIM is in use"), "no SIM known: nothing sent again")
+        finished(simless, "no SIM: retry")
+        // A delete from the module's own store with no SIM: the module and the PDU tell it.
+        let meDelete = ScriptedPort([pduMode, sameStorage, ("AT+CIMI", .failure(.modem("+CME ERROR: 10"))),
+                                     ("AT+CMGL=1", listed([received(0)])), ("AT+CMGD=0", ok)])
+        equal(try? service(meDelete).delete([received(0, .unread)], listedFrom: noSim).get(), 1,
+              "no SIM, stored on the module: deleted")
+        finished(meDelete, "no SIM, module store")
+        // Stored on the SIM with no SIM known: refused.
+        let onSim = SmsPlace(device: "TESTMODULE1", sim: nil, listsFrom: "SM", writesTo: "SM")
+        let smDelete = ScriptedPort([pduMode, ("AT+CPMS?", .success(["+CPMS: \"SM\",1,50,\"SM\",1,50,\"SM\",1,50"])),
+                                     ("AT+CIMI", .failure(.modem("+CME ERROR: 10")))])
+        check(failure(service(smDelete).delete([received(0, .unread)], listedFrom: onSim), "SM, no SIM").message
+                .hasPrefix("RMNet cannot tell which SIM is in use"), "stored on the SIM, no SIM known: nothing deleted")
+        finished(smDelete, "SM, no SIM")
+    }
+
+    // An unsent part is checked by its whole raw PDU: one that differs only in the message reference (TP-MR) or the
+    // service centre field is not the one listed.
+    static func rawPdus() {
+        let p = submit("Made-up part")
+        var other = Array(p.hex)
+        other.replaceSubrange(4..<6, with: Array("7F"))
+        let listedPart = StoredPdu(index: 3, status: .unsent, hex: p.hex)
+        let now = StoredPdu(index: 3, status: .unsent, hex: String(other))
+        check(pduSignature(now.hex) == pduSignature(listedPart.hex), "raw: the two have the same signature")
+        let port = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGL=2", listed([now]))])
+        let f = failure(service(port).resend([listedPart], listedFrom: place), "raw")
+        check(f.listingChanged && !port.lines.contains { $0.hasPrefix("AT+CMSS") }, "raw: another raw PDU, nothing sent",
+              f.message)
+        finished(port, "raw")
+    }
+
+    // The record of sent messages: written, confirmed, not known; read by a listing (a part RMNet confirmed sent is
+    // settled as sent) and by Retry (never sent again), across services (processes) sharing the file.
+    static func recordOfSends() {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rmnet-sms-ledger-\(getpid())-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let file = SmsSendLedgerFile(url: folder.appendingPathComponent("RMNet/sms-sends.jsonl"))
+        let pdu = submit("Made-up text")
+
+        // Sent; the modem left it unsent and the delete of it was refused: stored as unsent, but confirmed.
+        let first = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 5"])),
+                                  ("AT+CMSS=5", .success(["+CMSS: 12"])), ("AT+CMGR=5", readBack(2, pdu.hex)),
+                                  ("AT+CMGD=5", .failure(.modem("+CMS ERROR: 321")))])
+        let sent = try? SmsService(open: { .success(first) }, ledger: file).send(to: number, text: "Made-up text").get()
+        check(sent?.record.stillUnsent.count == 1 && sent?.record.unrecorded == nil, "record: sent, recorded",
+              "\(String(describing: sent))")
+        finished(first, "record: send")
+        guard case .success(let states) = file.states() else { return check(false, "record: readable") }
+        let key = SmsPartKey(module: "TESTMODULE1", imsi: imsi, storage: "ME", index: 5, hex: pdu.hex)!
+        equal(states[key], .confirmed, "record: the part confirmed")
+        // The file has no number, no text and no IMSI.
+        let text = (try? String(contentsOf: file.url, encoding: .utf8)) ?? ""
+        check(!text.contains(imsi) && !text.contains("2025550100") && !text.contains(pdu.hex),
+              "record: no IMSI, number or PDU in the file", text)
+
+        // Another run (a new service, the window or the verb): the listing has it unsent; it is settled as sent.
+        let unsentNow = StoredPdu(index: 5, status: .unsent, hex: pdu.hex)
+        let relist = ScriptedPort([pduMode, ("AT+CMGL=4", listed([unsentNow])), sameStorage, simRead])
+        guard case .success(let listing) = SmsService(open: { .success(relist) }, ledger: file).list() else {
+            return check(false, "record: listing")
+        }
+        equal(listing.sentConfirmed, [5], "record: after a restart, the part is known as sent")
+        equal(settled(listing.messages, confirmedIndices: listing.sentConfirmed).first?.box, .sent,
+              "record: and the message is sent, with no Retry")
+        check(smsListLines(listing, time: { _ in "t" }).contains { $0.hasPrefix("[5] sent to") },
+              "record: `sms list` lists it sent")
+        // Retry of it (a stale window, or a listing without the record): refused, nothing sent.
+        let retry = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGL=2", listed([unsentNow]))])
+        let refused = failure(SmsService(open: { .success(retry) }, ledger: file).resend([unsentNow], listedFrom: place),
+                              "record: retry")
+        check(refused.message.hasPrefix("Stored part 5 was sent already") && !retry.lines.contains { $0.hasPrefix("AT+CMSS") },
+              "record: a confirmed part is never sent again", refused.message)
+        finished(retry, "record: retry")
+
+        // The same PDU written again at that index (a new send of the same text): not confirmed any more.
+        let again = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 5"])),
+                                  ("AT+CMSS=5", .failure(.timeout))])
+        let unknown = failure(SmsService(open: { .success(again) }, ledger: file).send(to: number, text: "Made-up text"),
+                              "record: unknown")
+        check(unknown.reachedModem && unknown.record.unknown.count == 1, "record: no answer, not known")
+        guard case .success(let after) = file.states() else { return check(false, "record: readable again") }
+        equal(after[key], .unknown, "record: the new write, then no answer: not known")
+        let relist2 = ScriptedPort([pduMode, ("AT+CMGL=4", listed([unsentNow])), sameStorage, simRead])
+        let l2 = try? SmsService(open: { .success(relist2) }, ledger: file).list().get()
+        check(l2?.sentConfirmed == [] && l2?.sendUnknown == [5], "record: listed as not confirmed")
+        check(l2.map { smsListLines($0, time: { _ in "t" }) }?.contains { $0.hasPrefix("[5] unsent (not confirmed) to") }
+                == true, "record: `sms list` says not confirmed")
+        let json = l2.map { smsListJSON($0, time: { _ in "t" }) }
+        equal(json?.first?["notConfirmed"] as? Bool, true, "record: --json notConfirmed")
+
+        // Another module or SIM with the same index and PDU: not that part.
+        let elsewhere = ScriptedPort([pduMode, ("AT+CMGL=4", listed([unsentNow])), sameStorage,
+                                      ("AT+CIMI", .success(["310150987654321"]))], device: "TESTMODULE2")
+        let l3 = try? SmsService(open: { .success(elsewhere) }, ledger: file).list().get()
+        check(l3?.sentConfirmed == [] && l3?.sendUnknown == [], "record: another module and SIM know nothing of it")
+
+        // The record unreadable: Retry refuses, said; a record that cannot be written is said, the send stands.
+        let memory = SmsSendLedgerMemory()
+        memory.loadFailure = "The record of sent messages could not be read (/x)."
+        let blind = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGL=2", listed([unsentNow]))])
+        check(failure(SmsService(open: { .success(blind) }, ledger: memory).resend([unsentNow], listedFrom: place),
+                      "record: unreadable").message.hasPrefix("RMNet cannot tell whether these parts were sent already"),
+              "record: unreadable, nothing sent again")
+        memory.loadFailure = nil
+        memory.refuse = "The record of sent messages could not be written (/x)."
+        let quiet = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 6"])),
+                                  ("AT+CMSS=6", .success(["+CMSS: 13"])), ("AT+CMGR=6", readBack(3, pdu.hex))])
+        let q = try? SmsService(open: { .success(quiet) }, ledger: memory).send(to: number, text: "Made-up text").get()
+        check(q?.record.unrecorded == "The record of sent messages could not be written (/x)." && q?.archived == true,
+              "record: not written, said; the send stands")
+        check(q.map { smsArchiveNotes($0.record) }?.last == "The send was not recorded: The record of sent messages could "
+              + "not be written (/x).", "record: the note")
+    }
+
+    // Whether a failed send reached the modem (a part went, may have, or is stored for Retry): then the whole text must
+    // not be sent again.
+    static func reachedModem() {
+        let long = String(repeating: "made-up ", count: 25)
+        let partly = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 5"])),
+                                   ("AT+CMGW=*", .success(["+CMGW: 6"])), ("AT+CMSS=5", .success(["+CMSS: 12"])),
+                                   ("AT+CMGR=5", .success(["+CMGR: 3,,140", "00"])),
+                                   ("AT+CMSS=6", .failure(.modem("+CMS ERROR: 500")))])
+        check(failure(service(partly).send(to: number, text: long), "partly").reachedModem, "part 1 sent: reached")
+        let nothing = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .failure(.modem("+CMS ERROR: 322")))])
+        check(!failure(service(nothing).send(to: number, text: "Made-up"), "nothing").reachedModem,
+              "nothing stored: not reached (the text can be sent again)")
+        let direct = ScriptedPort([pduMode, ("AT+CPMS?", .success(["+CPMS: \"SM\",0,50,\"ME\",3,255,\"ME\",3,255"])),
+                                   ("AT+CMGS=*", .success(["+CMGS: 7"])), ("AT+CMGS=*", .failure(.modem("+CMS ERROR: 500")))])
+        check(failure(service(direct).send(to: number, text: long), "direct partly").reachedModem,
+              "sent directly, part 1 went: reached")
+        let directNone = ScriptedPort([pduMode, ("AT+CPMS?", .success(["+CPMS: \"SM\",0,50,\"ME\",3,255,\"ME\",3,255"])),
+                                       ("AT+CMGS=*", .failure(.modem("+CMS ERROR: 500")))])
+        check(!failure(service(directNone).send(to: number, text: "Made-up"), "direct none").reachedModem,
+              "sent directly, refused at once: not reached")
     }
 
     // A stored part's identity: its PDU without the service centre field and, sent, without the message reference.
@@ -205,7 +374,7 @@ struct SmsServiceTests {
     // One part: stored unsent, sent from the store (120 s), read back as sent.
     static func storedSend() {
         let pdu = submit("Made-up text")
-        let port = ScriptedPort([pduMode, sameStorage, ("AT+CMGW=\(pdu.tpduLength),2", .success(["+CMGW: 5"])),
+        let port = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=\(pdu.tpduLength),2", .success(["+CMGW: 5"])),
                                  ("AT+CMSS=5", .success(["+CMSS: 12"])), ("AT+CMGR=5", readBack(3, pdu.hex))])
         let result = service(port).send(to: number, text: "Made-up text")
         equal(try? result.get(), SmsSent(parts: 1, indices: [5], record: SmsSendRecord(sent: [StoredPart(index: 5, hex: pdu.hex)])),
@@ -228,7 +397,7 @@ struct SmsServiceTests {
     static func markedSent() {
         let pdu = submit("Made-up text")
         let part = StoredPart(index: 5, hex: pdu.hex)
-        let port = ScriptedPort([pduMode, sameStorage, ("AT+CMGW=*", .success(["+CMGW: 5"])),
+        let port = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 5"])),
                                  ("AT+CMSS=5", .success(["+CMSS: 12"])), ("AT+CMGR=5", readBack(2, pdu.hex)),
                                  ("AT+CMGD=5", ok), ("AT+CMGW=\(pdu.tpduLength),3", .success(["+CMGW: 6"]))])
         equal(try? service(port).send(to: number, text: "Made-up text").get(),
@@ -238,23 +407,27 @@ struct SmsServiceTests {
         finished(port, "marked sent")
 
         // The delete refused: still listed unsent, though sent (never offered for Retry).
-        let kept = ScriptedPort([pduMode, sameStorage, ("AT+CMGW=*", .success(["+CMGW: 5"])),
+        let kept = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 5"])),
                                  ("AT+CMSS=5", .success(["+CMSS: 12"])), ("AT+CMGR=5", readBack(2, pdu.hex)),
                                  ("AT+CMGD=5", .failure(.modem("+CMS ERROR: 321")))])
         equal((try? service(kept).send(to: number, text: "Made-up text").get())?.record,
               SmsSendRecord(sent: [part], stillUnsent: [part]), "marked sent: not deleted, still unsent but sent")
         finished(kept, "not deleted")
 
-        // The copy not written (after the delete): sent, no longer stored; nothing offered for Retry.
-        let lost = ScriptedPort([pduMode, sameStorage, ("AT+CMGW=*", .success(["+CMGW: 5"])),
+        // The copy not written (after the delete): sent, but no longer stored. The send and the archive are reported
+        // apart: a success that is not archived (not a plain success), with a sentence that says so.
+        let lost = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 5"])),
                                  ("AT+CMSS=5", .success(["+CMSS: 12"])), ("AT+CMGR=5", readBack(2, pdu.hex)),
                                  ("AT+CMGD=5", ok), ("AT+CMGW=*", .failure(.modem("+CMS ERROR: 322")))])
         let r = try? service(lost).send(to: number, text: "Made-up text").get()
-        check(r?.parts == 1 && r?.record == SmsSendRecord(), "marked sent: the copy not written, the send stands", "\(String(describing: r))")
+        check(r?.parts == 1 && r?.indices == [] && r?.record.unarchived == 1 && r?.archived == false,
+              "archive failed: sent, not kept on the modem", "\(String(describing: r))")
+        equal(r.map { smsArchiveNotes($0.record) }, ["1 sent part could not be kept on the modem as sent, so it is no "
+                                                       + "longer listed."], "archive failed: said apart from the send")
         finished(lost, "copy not written")
 
         // The status not read: the send stands; kept as still unsent (if it is listed so, it is not offered for Retry).
-        let quiet = ScriptedPort([pduMode, sameStorage, ("AT+CMGW=*", .success(["+CMGW: 5"])),
+        let quiet = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 5"])),
                                   ("AT+CMSS=5", .success(["+CMSS: 12"])), ("AT+CMGR=5", .failure(.modem("+CMS ERROR: 321")))])
         equal(try? service(quiet).send(to: number, text: "Made-up text").get(),
               SmsSent(parts: 1, indices: [5], record: SmsSendRecord(sent: [part], stillUnsent: [part])),
@@ -265,7 +438,7 @@ struct SmsServiceTests {
     // Two parts: every part stored first; a send refused, a send with no answer, a part that cannot be stored.
     static func partsAndFailures() {
         let long = String(repeating: "made-up ", count: 25)
-        let refused = ScriptedPort([pduMode, sameStorage, ("AT+CMGW=*", .success(["+CMGW: 5"])),
+        let refused = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 5"])),
                                     ("AT+CMGW=*", .success(["+CMGW: 6"])), ("AT+CMSS=5", .success(["+CMSS: 12"])),
                                     ("AT+CMGR=5", .success(["+CMGR: 3,,140", "00"])),
                                     ("AT+CMSS=6", .failure(.modem("+CMS ERROR: 500")))])
@@ -280,7 +453,7 @@ struct SmsServiceTests {
 
         // No answer: not known; the port is not used again; the part is recorded as not known.
         let pdu = submit("Made-up")
-        let unknown = ScriptedPort([pduMode, sameStorage, ("AT+CMGW=*", .success(["+CMGW: 5"])),
+        let unknown = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 5"])),
                                     ("AT+CMSS=5", .failure(.timeout))])
         let u = failure(service(unknown).send(to: number, text: "Made-up"), "no answer")
         check(u.message.contains("It is not known whether it was sent.")
@@ -290,14 +463,14 @@ struct SmsServiceTests {
         equal(u.record, SmsSendRecord(unknown: [StoredPart(index: 5, hex: pdu.hex)]), "no answer: recorded as not known")
         finished(unknown, "no answer")
 
-        let noLine = ScriptedPort([pduMode, sameStorage, ("AT+CMGW=*", .success(["+CMGW: 5"])), ("AT+CMSS=5", ok)])
+        let noLine = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 5"])), ("AT+CMSS=5", ok)])
         let n = failure(service(noLine).send(to: number, text: "Made-up"), "no +CMSS")
         check(n.message.contains("The modem did not confirm it with a +CMSS line."), "OK without +CMSS: not known")
         equal(n.record.unknown.map { $0.index }, [5], "OK without +CMSS: recorded as not known")
         finished(noLine, "no +CMSS")
 
         // Part 2 cannot be stored (the store is full): part 1 deleted again, nothing sent.
-        let full = ScriptedPort([pduMode, sameStorage, ("AT+CMGW=*", .success(["+CMGW: 5"])),
+        let full = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 5"])),
                                  ("AT+CMGW=*", .failure(.modem("+CMS ERROR: 322"))), ("AT+CMGD=5", ok)])
         equal(failureMessage(service(full).send(to: number, text: long), "store full"),
               "Part 2 of 2 could not be stored on the modem. The modem refused the command (+CMS ERROR: 322). Nothing was sent.",
@@ -306,7 +479,7 @@ struct SmsServiceTests {
         finished(full, "store full")
 
         // Part 1 could not be deleted again: said so.
-        let stuck = ScriptedPort([pduMode, sameStorage, ("AT+CMGW=*", .success(["+CMGW: 5"])),
+        let stuck = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 5"])),
                                   ("AT+CMGW=*", .failure(.modem("+CMS ERROR: 322"))),
                                   ("AT+CMGD=5", .failure(.modem("+CMS ERROR: 321")))])
         check(failureMessage(service(stuck).send(to: number, text: long), "not deleted again")
@@ -315,14 +488,14 @@ struct SmsServiceTests {
         finished(stuck, "not deleted again")
 
         // Part 2's write got no answer: the port is closed, so part 1 is not deleted (and is said to be listed).
-        let lost = ScriptedPort([pduMode, sameStorage, ("AT+CMGW=*", .success(["+CMGW: 5"])), ("AT+CMGW=*", .failure(.timeout))])
+        let lost = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 5"])), ("AT+CMGW=*", .failure(.timeout))])
         check(failureMessage(service(lost).send(to: number, text: long), "write no answer")
                 .hasSuffix("Nothing was sent. Parts already stored are listed as Not sent."),
               "write with no answer: nothing more on the port, part 1 listed")
         finished(lost, "write no answer")
 
         // No +CMGW line: not known where it went; nothing sent, nothing deleted.
-        let noIndex = ScriptedPort([pduMode, sameStorage, ("AT+CMGW=*", ok)])
+        let noIndex = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", ok)])
         equal(failureMessage(service(noIndex).send(to: number, text: "Made-up"), "no index"),
               "The message could not be stored on the modem. The modem did not say where it stored it (no +CMGW line). "
               + "Nothing was sent.", "no index: the sentence")
@@ -346,7 +519,7 @@ struct SmsServiceTests {
 
         let pdu = submit("Made-up")
         let first = ScriptedPort([pduMode, ("AT+CPMS?", .failure(.timeout))])
-        let second = ScriptedPort([pduMode, sameStorage, ("AT+CMGW=*", .success(["+CMGW: 5"])),
+        let second = ScriptedPort([pduMode, sameStorage, simRead, ("AT+CMGW=*", .success(["+CMGW: 5"])),
                                    ("AT+CMSS=5", .success(["+CMSS: 12"])), ("AT+CMGR=5", readBack(3, pdu.hex))])
         equal((try? service([first, second]).send(to: number, text: "Made-up").get())?.indices, [5],
               "storages not answered: stored and sent on a new port")

@@ -55,11 +55,21 @@ struct SubmitPdu: Equatable { let hex: String; let tpduLength: Int }
 
 /// A sentence for the owner. `listingChanged`: what the window listed is no longer what the modem has (another module or
 /// SIM, another storage, or a stored part that changed), so nothing was done and the window lists again. `record`: what
-/// became of the parts of a send that failed part way (SmsSendRecord).
+/// became of the parts of a send that failed part way (SmsSendRecord). `reachedModem`: a part of the message went, or
+/// may have, or is stored on the modem for Retry: the whole text must not be sent again (the window clears it).
 struct SmsFailure: Error, Equatable {
     let message: String
     var listingChanged = false
     var record = SmsSendRecord()
+    var reachedModem = false
+}
+
+/// Listed parts as they were when a delete was confirmed or a Retry pressed, and where they were listed from: the
+/// change is made only on that module and SIM, in that storage, on parts that are still exactly those (their raw PDUs),
+/// never on what a later listing has at the same indices.
+struct SmsTarget: Equatable {
+    let parts: [StoredPdu]
+    let place: SmsPlace
 }
 
 /// Where a listing came from: the module (the USB serial number of the device the port was opened on), the SIM (its
@@ -82,6 +92,11 @@ struct SmsListing: Equatable {
     let total: Int?
     var parts: [StoredPdu] = []
     var place = SmsPlace()
+    /// From the record of sent messages (SmsSendLedger.swift): stored indices listed as unsent that RMNet confirmed
+    /// sent (never sent again), and those whose send got no answer (Not confirmed); why the record could not be read.
+    var sentConfirmed: Set<Int> = []
+    var sendUnknown: Set<Int> = []
+    var ledgerProblem: String? = nil
 }
 
 /// A stored part as the modem keeps it: its index and what it holds (pduSignature: the PDU without its service centre
@@ -99,22 +114,59 @@ struct StoredPart: Hashable {
     init(_ stored: StoredPdu) { self.init(index: stored.index, hex: stored.hex) }
 }
 
-/// What became of a send's stored parts, for the window (in memory): `sent`, each part the modem confirmed (+CMSS),
-/// where it is stored now; `stillUnsent`, those of them the modem still lists as unsent (they were sent: never offered
-/// for Retry); `unknown`, a part whose send got no answer (it may have gone: marked Not confirmed).
+/// What became of a send's stored parts, for the window (in memory; across runs the record of sent messages keeps the
+/// same, SmsSendLedger.swift): `sent`, each part the modem confirmed (+CMSS), where it is stored now; `stillUnsent`,
+/// those of them the modem still lists as unsent (they were sent: never offered for Retry); `unknown`, a part whose send
+/// got no answer (it may have gone: marked Not confirmed); `unarchived`, how many sent parts are no longer stored (their
+/// copy as sent could not be written); `unrecorded`, why the record of sent messages could not be written.
 struct SmsSendRecord: Equatable {
     var sent: [StoredPart] = []
     var stillUnsent: [StoredPart] = []
     var unknown: [StoredPart] = []
+    var unarchived = 0
+    var unrecorded: String? = nil
 }
 
 /// A send that went: how many parts, and where they are stored as sent (none when the modem could not store them and
-/// they were sent directly: `stored` false).
+/// they were sent directly: `stored` false). `archived`: every part is kept on the modem as sent.
 struct SmsSent: Equatable {
     let parts: Int
     var indices: [Int] = []
     var stored = true
     var record = SmsSendRecord()
+
+    var archived: Bool { stored && record.unarchived == 0 && record.stillUnsent.isEmpty }
+}
+
+/// What a send's sentence adds about where its parts are kept and recorded (empty when all is well): parts sent but no
+/// longer stored, parts sent but still listed as unsent, a record of sent messages that could not be written.
+func smsArchiveNotes(_ record: SmsSendRecord) -> [String] {
+    var notes: [String] = []
+    if record.unarchived > 0 {
+        let n = record.unarchived
+        notes.append("\(n) sent \(n == 1 ? "part" : "parts") could not be kept on the modem as sent, so "
+                     + "\(n == 1 ? "it is" : "they are") no longer listed.")
+    }
+    if !record.stillUnsent.isEmpty {
+        let n = record.stillUnsent.count
+        notes.append("\(n) sent \(n == 1 ? "part is" : "parts are") still stored as unsent on the modem; RMNet does not "
+                     + "send \(n == 1 ? "it" : "them") again.")
+    }
+    if let why = record.unrecorded { notes.append("The send was not recorded: \(why)") }
+    return notes
+}
+
+/// The messages as RMNet knows them: a message whose unsent parts RMNet confirmed sent (`confirmed`, stored indices)
+/// keeps only the others for Retry, and is sent when none is left.
+func settled(_ messages: [SmsMessage], confirmedIndices confirmed: Set<Int>) -> [SmsMessage] {
+    guard !confirmed.isEmpty else { return messages }
+    return messages.map { m in
+        guard m.box == .unsent else { return m }
+        var copy = m
+        copy.unsentIndices = m.unsentIndices.filter { !confirmed.contains($0) }
+        if copy.unsentIndices.isEmpty { copy.box = .sent }
+        return copy
+    }
 }
 
 /// The background count (SmsServing.countUnread): the store's entries, how many are received, and how many of those are
@@ -1323,12 +1375,14 @@ func verificationCode(in text: String) -> String? {
 // MARK: - What `RMNet sms list` prints
 
 /// The headline, the store's warning, then each message: `[indices] unread|read <sender> <time>` for a received one,
-/// `[indices] sent to|unsent to <recipient> no time` for one RMNet stored to send, and its text indented below.
+/// `[indices] sent to|unsent to <recipient> no time` for one RMNet stored to send (`unsent (not confirmed) to` when a
+/// part's send got no answer: it may have gone), and its text indented below. The messages as the record of sent
+/// messages settles them (a part RMNet confirmed sent is sent).
 func smsListLines(_ listing: SmsListing, time: (Date) -> String) -> [String] {
     var lines = [listHeadline(count: listing.messages.count, used: listing.used, total: listing.total)]
     let warning = storeWarning(used: listing.used, total: listing.total)
     if !warning.isEmpty { lines.append("sms: \(warning)") }
-    for m in listing.messages {
+    for m in settled(listing.messages, confirmedIndices: listing.sentConfirmed) {
         let indices = "[" + m.indices.map(String.init).joined(separator: ",") + "]"
         guard m.readable else {
             lines.append("\(indices) not readable")
@@ -1338,7 +1392,8 @@ func smsListLines(_ listing: SmsListing, time: (Date) -> String) -> [String] {
         switch m.box {
         case .received: state = m.unread ? "unread" : "read"
         case .sent: state = "sent to"
-        case .unsent: state = "unsent to"
+        case .unsent:
+            state = m.unsentIndices.contains(where: listing.sendUnknown.contains) ? "unsent (not confirmed) to" : "unsent to"
         }
         var head = "\(indices) \(state) \(m.sender) \(m.timestamp.map(time) ?? "no time")"
         if m.missingParts > 0 { head += " (\(m.missingParts) part(s) missing)" }
@@ -1352,13 +1407,20 @@ func smsListLines(_ listing: SmsListing, time: (Date) -> String) -> [String] {
 }
 
 /// `sms list --json`: one object a message, the keys it always had and `status` (added): "received", "sent" or
-/// "unsent"; for the last two `sender` is the recipient and `time` is null.
-func smsListJSON(_ messages: [SmsMessage], time: (Date) -> String) -> [[String: Any]] {
+/// "unsent"; for the last two `sender` is the recipient and `time` is null. `notConfirmed` (added): an unsent part's
+/// send got no answer (it may have gone). With `listing`, the messages as the record of sent messages settles them.
+func smsListJSON(_ messages: [SmsMessage], time: (Date) -> String, notConfirmed: Set<Int> = []) -> [[String: Any]] {
     messages.map { m in
         ["indices": m.indices, "unread": m.unread, "sender": m.sender,
          "time": m.timestamp.map(time) ?? NSNull(), "text": m.text,
-         "missingParts": m.missingParts, "readable": m.readable, "status": m.box.rawValue]
+         "missingParts": m.missingParts, "readable": m.readable, "status": m.box.rawValue,
+         "notConfirmed": m.box == .unsent && m.unsentIndices.contains(where: notConfirmed.contains)]
     }
+}
+
+func smsListJSON(_ listing: SmsListing, time: (Date) -> String) -> [[String: Any]] {
+    smsListJSON(settled(listing.messages, confirmedIndices: listing.sentConfirmed), time: time,
+                notConfirmed: listing.sendUnknown)
 }
 
 /// The confirmation before a delete: the sender, and how many stored parts go.

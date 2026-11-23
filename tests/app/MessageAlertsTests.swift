@@ -77,6 +77,7 @@ final class FakeSms: SmsServing {
     var deletes: [(parts: [StoredPdu], place: SmsPlace)] = []
     var sendIndex = 9
     var resendResult: Result<SmsSent, SmsFailure>? = nil
+    var sendResult: Result<SmsSent, SmsFailure>? = nil
 
     func list() -> Result<SmsListing, SmsFailure> {
         lists += 1
@@ -95,6 +96,7 @@ final class FakeSms: SmsServing {
     }
     func send(to number: String, text: String) -> Result<SmsSent, SmsFailure> {
         sends.append((number, text))
+        if let sendResult { return sendResult }
         let part = StoredPart(index: sendIndex, hex: String(format: "00%04X", sendIndex))
         return .success(SmsSent(parts: 1, indices: [sendIndex], record: SmsSendRecord(sent: [part])))
     }
@@ -121,6 +123,9 @@ struct MessageAlertsTests {
         controller()
         turnedOffDuringCount()
         ownMessages()
+        frozenTargets()
+        partlySent()
+        recordAndDrafts()
         print("message alerts: \(checks) checks passed")
     }
 
@@ -515,5 +520,157 @@ struct MessageAlertsTests {
         equal(screen.deletes.first?.place, place, "own: with where it was listed")
         check(c.selectedConversation == nil, "own: nothing shown after")
         equal(alerts, [], "own: nothing RMNet sent was announced")
+    }
+
+    // What a confirmation deletes is frozen when it opens: a listing that comes meanwhile (another module, another
+    // contact's message at the same index) does not change it; a Retry of a message no longer listed as it was sends
+    // nothing.
+    static func frozenTargets() {
+        let screen = FakeSms()
+        let c = SmsController(service: screen, queue: DispatchQueue(label: "sms.frozen"), replyToQuit: { _ in },
+                              requestAttention: {})
+        let first = SmsPlace(device: "TESTMODULE1", sim: "310150123456789", listsFrom: "ME", writesTo: "ME")
+        let mine = SmsMessage(indices: [3], unread: false, sender: "+12025550101", timestamp: t0, text: "Made-up one",
+                              missingParts: 0, readable: true)
+        let unsentMine = SmsMessage(indices: [4], unread: false, sender: "+12025550101", timestamp: nil, text: "Made-up",
+                                    missingParts: 0, readable: true, box: .unsent, unsentIndices: [4])
+        screen.listing = .success(listingOf([mine, unsentMine], used: 2, place: first))
+        c.refresh()
+        pump(until: { c.listed && c.running == nil }, "frozen: listed")
+        guard let target = c.target(for: [mine]) else { return check(false, "frozen: a target") }
+        equal(target.parts.map { $0.index }, [3], "frozen: the message's parts")
+        equal(target.place, first, "frozen: where they were listed")
+        let conversationTarget = c.conversations.first.flatMap { c.target(for: $0) }
+
+        // The confirmation is open; a listing comes: another module, another contact's messages at indices 3 and 4.
+        let second = SmsPlace(device: "TESTMODULE2", sim: "310150123456789", listsFrom: "ME", writesTo: "ME")
+        let theirs = SmsMessage(indices: [3], unread: false, sender: "+12025550109", timestamp: t0.addingTimeInterval(60),
+                                text: "Made-up other", missingParts: 0, readable: true)
+        let theirsUnsent = SmsMessage(indices: [4], unread: false, sender: "+12025550109", timestamp: nil, text: "Other",
+                                      missingParts: 0, readable: true, box: .unsent, unsentIndices: [4])
+        var later = listingOf([theirs, theirsUnsent], used: 2, place: second)
+        later = SmsListing(messages: later.messages, used: 2, total: 50,
+                           parts: [StoredPdu(index: 3, status: .read, hex: "00AAAA"),
+                                   StoredPdu(index: 4, status: .unsent, hex: "00BBBB")], place: second)
+        screen.listing = .success(later)
+        c.refresh()
+        pump(until: { c.messages.contains(theirs) && c.running == nil }, "frozen: listed again")
+        // Confirmed now: what it was opened for, where it was listed, never what is at index 3 now.
+        c.delete(target)
+        pump(until: { c.running == nil && screen.deletes.count == 1 }, "frozen: deleted")
+        equal(screen.deletes.last?.parts, target.parts, "frozen: the parts frozen at the confirmation")
+        equal(screen.deletes.last?.place, first, "frozen: and the module they were listed on")
+        check(screen.deletes.last?.parts.first?.hex != "00AAAA", "frozen: not the new message at the same index")
+        // The conversation's confirmation the same way.
+        c.deleteConversation(SmsConversation(id: "+12025550101", number: "+12025550101", messages: [mine, unsentMine],
+                                             unread: 0), target: .some(conversationTarget))
+        pump(until: { c.running == nil && screen.deletes.count == 2 }, "frozen: conversation deleted")
+        equal(screen.deletes.last?.place, first, "frozen: the conversation's place frozen too")
+        equal(Set(screen.deletes.last?.parts.map { $0.hex } ?? []), Set(conversationTarget?.parts.map { $0.hex } ?? []),
+              "frozen: the conversation's parts frozen too")
+        // A confirmation opened for a message no longer listed as it was: nothing.
+        check(c.target(for: [mine]) == nil, "frozen: not listed any more, no target")
+        c.delete(c.target(for: [mine]))
+        equal(c.result, "That message is no longer listed. Nothing was deleted.", "frozen: said")
+        equal(screen.deletes.count, 2, "frozen: nothing more deleted")
+        // A Retry pressed on the message as it was shown before the listing: nothing sent.
+        c.retry(unsentMine)
+        equal(c.result, "That message is no longer listed. Nothing was sent.", "frozen: a stale Retry refused")
+        check(screen.resends.isEmpty, "frozen: nothing sent again")
+        // A Retry of the message as listed now: its own parts and place.
+        c.retry(theirsUnsent)
+        pump(until: { c.running == nil && screen.resends.count == 1 }, "frozen: retried")
+        check(screen.resends.last?.parts.map { $0.hex } == ["00BBBB"] && screen.resends.last?.place == second,
+              "frozen: a Retry of what is listed now, as listed")
+    }
+
+    // A send that failed after a part went (or may have, or is stored for Retry): the whole text is cleared, so it is
+    // never sent again in full; a failure that reached nothing keeps the text.
+    static func partlySent() {
+        let screen = FakeSms()
+        let c = SmsController(service: screen, queue: DispatchQueue(label: "sms.partly"), replyToQuit: { _ in },
+                              requestAttention: {})
+        let them = SmsMessage(indices: [0], unread: false, sender: "+12025550102", timestamp: t0, text: "Made-up",
+                              missingParts: 0, readable: true)
+        screen.listing = .success(listingOf([them], used: 1))
+        c.refresh()
+        pump(until: { c.listed && c.running == nil }, "partly: listed")
+        c.selectedConversation = "+12025550102"
+        c.replyText = String(repeating: "made-up ", count: 25)
+        screen.sendResult = .failure(SmsFailure(message: "Part 2 of 2 was refused. Made-up reason. 1 of 2 parts were sent; "
+                                                + "the message is incomplete at the receiver. It is kept on the modem as "
+                                                + "Not sent: Retry sends it, Delete removes it.",
+                                                record: SmsSendRecord(sent: [StoredPart(index: 5, hex: "0011")]),
+                                                reachedModem: true))
+        c.sendReply()
+        pump(until: { c.running == nil && screen.sends.count == 1 }, "partly: sent part way")
+        equal(c.replyText, "", "partly: the text cleared")
+        check(!c.replyEnabled, "partly: Send has nothing to send again")
+        check(c.result.hasSuffix("The text was cleared so that no part is sent twice."), "partly: said", c.result)
+        c.sendReply()
+        settle()
+        equal(screen.sends.count, 1, "partly: pressing Send again sends nothing")
+
+        // Nothing reached the modem: the text stays, to send again.
+        c.replyText = "Made-up again"
+        screen.sendResult = .failure(SmsFailure(message: "The message was refused. Made-up. Nothing was sent."))
+        c.sendReply()
+        pump(until: { c.running == nil && screen.sends.count == 2 }, "partly: refused")
+        equal(c.replyText, "Made-up again", "partly: nothing went, the text kept")
+
+        // The New Message sheet: the same.
+        c.to = "+12025550103"
+        c.text = "Made-up sheet"
+        screen.sendResult = .failure(SmsFailure(message: "Made-up failure.", reachedModem: true))
+        c.send()
+        pump(until: { c.running == nil && screen.sends.count == 3 }, "partly: the sheet")
+        equal(c.text, "", "partly: the sheet's text cleared")
+
+        // Sent, but not kept on the modem as sent: a warning that says so, apart from the send.
+        screen.sendResult = .success(SmsSent(parts: 1, indices: [], record: SmsSendRecord(unarchived: 1)))
+        c.replyText = "Made-up kept"
+        c.sendReply()
+        pump(until: { c.running == nil && screen.sends.count == 4 }, "partly: not archived")
+        check(c.resultKind == .warning && c.result == "Sent to +12025550102 in 1 part(s). 1 sent part could not be kept on "
+              + "the modem as sent, so it is no longer listed.", "partly: archive failure, a warning", c.result)
+    }
+
+    // The record of sent messages settles a listing (a part confirmed sent in any run has no Retry; one not known is Not
+    // confirmed); a reply's text goes to the conversation it was typed in.
+    static func recordAndDrafts() {
+        let screen = FakeSms()
+        let c = SmsController(service: screen, queue: DispatchQueue(label: "sms.record"), replyToQuit: { _ in },
+                              requestAttention: {})
+        let long = SmsMessage(indices: [10, 11, 12], unread: false, sender: "+12025550104", timestamp: nil, text: "Long",
+                              missingParts: 0, readable: true, box: .unsent, unsentIndices: [11, 12])
+        var listing = listingOf([long], used: 3)
+        listing.sentConfirmed = [11]
+        listing.sendUnknown = [12]
+        screen.listing = .success(listing)
+        c.refresh()
+        pump(until: { c.listed && c.running == nil }, "record: listed")
+        equal(c.messages.first?.unsentIndices, [12], "record: a part confirmed in another run is not offered for Retry")
+        check(c.unconfirmed.contains(12) && !c.unconfirmed.contains(11), "record: one not known is Not confirmed")
+        c.retry(c.messages[0])
+        pump(until: { c.running == nil && screen.resends.count == 1 }, "record: retried")
+        equal(screen.resends.last?.parts.map { $0.index }, [12], "record: only the part not confirmed is sent again")
+        // All confirmed: sent.
+        listing.sentConfirmed = [11, 12]
+        listing.sendUnknown = []
+        screen.listing = .success(listing)
+        c.refresh()
+        pump(until: { c.running == nil && c.messages.first?.box == .sent }, "record: all confirmed")
+
+        // Drafts: written for one conversation while another is shown, it stays the first one's.
+        c.selectedConversation = "+12025550104"
+        c.setReplyDraft("Made-up for 0104", for: "+12025550104")
+        c.selectedConversation = "+12025550105"
+        c.setReplyDraft("Made-up late commit", for: "+12025550104")
+        equal(c.replyDraft(for: "+12025550104"), "Made-up late commit", "drafts: a late commit goes to its own conversation")
+        equal(c.replyDraft(for: "+12025550105"), "", "drafts: never to the one shown now")
+        equal(c.replyText, "", "drafts: the one shown has its own (empty)")
+        c.replyComposing = true
+        c.selectedConversation = "+12025550104"
+        check(!c.replyComposing, "drafts: another conversation is not composing")
     }
 }

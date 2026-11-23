@@ -163,10 +163,10 @@ func printMessages(_ listing: SmsListing) {
     for line in smsListLines(listing, time: localTime) { print(line) }
 }
 
-func printMessagesJSON(_ messages: [SmsMessage]) {
+func printMessagesJSON(_ listing: SmsListing) {
     let iso = ISO8601DateFormatter()
     iso.timeZone = .current
-    let array = smsListJSON(messages, time: { iso.string(from: $0) })
+    let array = smsListJSON(listing, time: { iso.string(from: $0) })
     if array.isEmpty {
         print("[]")
         return
@@ -190,7 +190,7 @@ func runSms(_ command: SmsCommand, service: SmsServing) -> Int32 {
     case .list(let json):
         switch service.list() {
         case .success(let listing):
-            if json { printMessagesJSON(listing.messages) } else { printMessages(listing) }
+            if json { printMessagesJSON(listing) } else { printMessages(listing) }
             return 0
         case .failure(let failure):
             print("sms: \(failure.message)")
@@ -207,9 +207,16 @@ func runSms(_ command: SmsCommand, service: SmsServing) -> Int32 {
             if !sent.stored {
                 print("sms: not stored: the modem writes messages to another storage than the one it lists (AT+CPMS)")
             }
+            // Sent, and what is kept of it on the modem and in the record of sent messages, apart.
+            for note in smsArchiveNotes(sent.record) { print("sms: \(note)") }
             return 0
         case .failure(let failure):
             print("sms: \(failure.message)")
+            for note in smsArchiveNotes(failure.record) { print("sms: \(note)") }
+            if failure.reachedModem {
+                print("sms: do not send the whole text again: parts of it went, may have gone, or are stored on the "
+                      + "modem as unsent (the window's Retry sends only those)")
+            }
             return 1
         }
     case .delete(let indices):
