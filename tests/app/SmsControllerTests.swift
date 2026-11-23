@@ -160,6 +160,28 @@ let listFailed = SmsFailure(message: "Another program is using the modem's spare
 let deleteFailed = SmsFailure(message: "Stored part 3 could not be deleted. The modem refused the command (ERROR). "
                               + "0 of 2 stored part(s) were deleted before it.")
 
+func equal<T: Equatable>(_ got: T, _ want: T, _ name: String) {
+    check(got == want, name, "got \(got)\nwant \(want)")
+}
+
+/// Timers that run when the test moves the time on (the result banner's).
+final class FakeClock {
+    private(set) var now: TimeInterval = 0
+    private var timers: [(due: TimeInterval, body: () -> Void)] = []
+
+    func after(_ delay: TimeInterval, _ body: @escaping () -> Void) { timers.append((now + delay, body)) }
+
+    func advance(_ seconds: TimeInterval) {
+        let end = now + seconds
+        while let next = timers.enumerated().filter({ $0.element.due <= end }).min(by: { $0.element.due < $1.element.due }) {
+            timers.remove(at: next.offset)
+            now = next.element.due
+            next.element.body()
+        }
+        now = end
+    }
+}
+
 // MARK: - The checks
 
 @main
@@ -171,6 +193,7 @@ struct SmsControllerTests {
         quitting()
         resuming()
         composingAndStore()
+        banner()
         print("smsui-test: \(checks) checks passed")
     }
 
@@ -492,5 +515,76 @@ struct SmsControllerTests {
               "store: the warning reaches the list line", c.listText)
         rig.list(listing([message([1])], used: nil, total: nil))
         check(!c.listText.contains("stored parts"), "store: unknown use is not shown", c.listText)
+    }
+
+    // The result banner: dismissed, the line is cleared in the controller, so showing another screen and this one
+    // again (or a new window, which reads the same controller) does not bring it back; a success goes after 8 s; a
+    // failure stays; a new result replaces the old one.
+    static func banner() {
+        let fake = FakeService()
+        let clock = FakeClock()
+        let c = SmsController(service: fake, replyToQuit: { _ in }, requestAttention: {}, resultTimer: clock.after)
+        func send(_ outcome: Result<Int, SmsFailure>) {
+            c.to = "+12025550100"
+            c.text = "Made-up text"
+            c.send()
+            pump(until: { fake.blocked == 1 }, "banner: the send reaches the service")
+            check(c.resultKind == .progress, "banner: the send's words while it runs", "\(c.resultKind)")
+            clock.advance(30)
+            check(!c.result.isEmpty, "banner: a request's words do not go by themselves")
+            fake.releaseSend(outcome)
+            pump(until: { c.running == nil }, "banner: the send comes back")
+        }
+
+        // Dismissed: cleared, and another screen and back (with its listing) does not bring it back.
+        send(.success(1))
+        equal(c.result, "Sent to +12025550100 in 1 part(s).", "banner: the success")
+        check(c.resultKind == .success, "banner: a success")
+        c.dismissResult()
+        equal(c.result, "", "banner: dismissed, the line is cleared")
+        c.setTabShown(false)
+        c.setTabShown(true)
+        pump(until: { fake.blocked == 1 }, "banner: the screen lists again")
+        fake.releaseList(listing([]))
+        pump(until: { c.running == nil }, "banner: the listing comes back")
+        c.setTabShown(false)
+        equal(c.result, "", "banner: dismissed, it does not come back on another screen and back")
+
+        // A success goes after 8 s, not before.
+        send(.success(1))
+        clock.advance(7.5)
+        equal(c.result, "Sent to +12025550100 in 1 part(s).", "banner: a success still there at 7.5 s")
+        clock.advance(0.5)
+        equal(c.result, "", "banner: a success gone at 8 s")
+        // Not while the pointer is on it.
+        send(.success(1))
+        c.hoverResult(true)
+        clock.advance(20)
+        check(!c.result.isEmpty, "banner: under the pointer, it stays")
+        c.hoverResult(false)
+        clock.advance(ResultExpiry.afterHover)
+        equal(c.result, "", "banner: gone after the pointer left")
+
+        // A failure stays until dismissed or replaced.
+        send(.failure(refused))
+        clock.advance(3600)
+        equal(c.result, refused.message, "banner: a failure stays")
+        check(c.resultKind == .failure && c.resultIsFailure, "banner: a failure")
+        // A new result replaces it (and a success's time starts with it).
+        send(.success(2))
+        equal(c.result, "Sent to +12025550100 in 2 part(s).", "banner: the next result replaces the failure")
+        clock.advance(8)
+        equal(c.result, "", "banner: and goes as a success")
+
+        // A success with something to read (not stored on the modem) is a warning: it stays.
+        c.to = "+12025550100"
+        c.text = "Made-up text"
+        c.send()
+        pump(until: { fake.blocked == 1 }, "banner: a send")
+        fake.releaseSent(.success(SmsSent(parts: 1, indices: [], stored: false)))
+        pump(until: { c.running == nil }, "banner: it comes back")
+        check(c.resultKind == .warning, "banner: not stored, a warning", "\(c.resultKind)")
+        clock.advance(60)
+        check(c.result.hasPrefix("Sent to +12025550100 in 1 part(s). It is not stored"), "banner: a warning stays", c.result)
     }
 }

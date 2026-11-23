@@ -451,7 +451,27 @@ final class StatusController: ObservableObject {
     @Published private(set) var status = DriverStatus(entries: [], modem: .absent, attached: false, properties: [:])
     @Published private(set) var listing = ListingState.asking
     @Published private(set) var busy = false
+    // The request's words while it runs, then its result: the Driver screen's banner (and the Overview's line under its
+    // Driver card). Dismissed, it is cleared; a success goes by itself (ResultLine.swift).
     @Published private(set) var progress = ""
+    @Published private(set) var progressKind = ResultKind.success
+    private lazy var expiry = ResultExpiry(after: mainRunLoopAfter, clear: { [weak self] in self?.say("", .success) })
+
+    /// The banner's X: the line is cleared, so it does not come back on another screen or a new window.
+    func dismissResult() {
+        say("", .success)
+    }
+
+    /// The pointer on the banner (true) or off it: a success does not go while it is on it.
+    func hoverResult(_ on: Bool) {
+        expiry.hover(on)
+    }
+
+    private func say(_ text: String, _ kind: ResultKind) {
+        progress = text
+        progressKind = kind
+        expiry.shown(text, kind)
+    }
 
     private(set) var bundledVersion = bundledDriverVersion() ?? ""
     private let manager = ExtensionManager()
@@ -496,37 +516,39 @@ final class StatusController: ObservableObject {
     // progress line says why.
     func install() {
         guard installEnabled else {
-            progress = notSentText(action: installButtonTitle, busy: busy, known: known)
+            say(notSentText(action: installButtonTitle, busy: busy, known: known), .failure)
             return
         }
         let updating = !status.entries.isEmpty
         let version = bundledVersion
         busy = true
-        progress = "Asking the system to install version \(version)…"
+        say("Asking the system to install version \(version)…", .progress)
         manager.activate(
-            replacing: { [weak self] old, new in self?.progress = "Replacing version \(old) with version \(new)…" },
+            replacing: { [weak self] old, new in self?.say("Replacing version \(old) with version \(new)…", .progress) },
             needsApproval: { [weak self] in
-                self?.progress = "Waiting for approval in System Settings, General, Login Items & Extensions, Driver Extensions."
+                self?.say("Waiting for approval in System Settings, General, Login Items & Extensions, Driver Extensions.",
+                          .progress)
             },
             completion: { [weak self] outcome in
                 guard let self = self else { return }
                 guard case .completed = outcome else {
-                    self.finish(self.answer(outcome, request: "installation of version \(version)"))
+                    self.finish(self.answer(outcome, request: "installation of version \(version)"), self.kind(outcome))
                     return
                 }
-                self.progress = "The system accepted version \(version); reading the listing again…"
+                self.say("The system accepted version \(version); reading the listing again…", .progress)
                 self.manager.properties(timeout: 10) { answer in
                     guard case .listed(let found) = answer else {
-                        self.finish("The system accepted version \(version), but did not list the driver afterwards.")
+                        self.finish("The system accepted version \(version), but did not list the driver afterwards.",
+                                    .warning)
                         return
                     }
                     let now = found.map(ExtensionEntry.init)
                     if installConfirmed(now, version: version) {
                         self.finish(updating
                             ? "Version \(version) is installed. It loads when the modem is next plugged in or the Mac restarts; until then the old build may still be attached."
-                            : "Version \(version) is installed.")
+                            : "Version \(version) is installed.", updating ? .warning : .success)
                     } else {
-                        self.finish("The system accepted version \(version); it now lists \(describeListing(now)).")
+                        self.finish("The system accepted version \(version); it now lists \(describeListing(now)).", .warning)
                     }
                 }
             })
@@ -534,38 +556,47 @@ final class StatusController: ObservableObject {
 
     func remove() {
         guard removeEnabled else {
-            progress = notSentText(action: "Remove", busy: busy, known: known)
+            say(notSentText(action: "Remove", busy: busy, known: known), .failure)
             return
         }
         let version = bundledVersion
         busy = true
         manager.remove(
             status: status, bundledVersion: version,
-            step: { [weak self] text in self?.progress = text },
+            step: { [weak self] text in self?.say(text, .progress) },
             completion: { [weak self] result in
                 guard let self = self else { return }
                 switch result {
                 case .notSent(let why):
-                    self.finish("Nothing was sent. " + why)
+                    self.finish("Nothing was sent. " + why, .failure)
                 case .activationEnded(.willCompleteAfterReboot):
-                    self.finish("The system will install version \(version) after a restart; press Remove again then. Nothing was removed.")
+                    self.finish("The system will install version \(version) after a restart; press Remove again then. Nothing was removed.",
+                                .warning)
                 case .activationEnded(let outcome):
                     self.finish(self.answer(outcome, request: "installation of version \(version) that comes first")
-                                + " Nothing was removed.")
+                                + " Nothing was removed.", .failure)
                 case .listingAfterActivation(let what):
-                    self.finish("The system accepted version \(version) first, but then \(what), so the removal was not asked for. Nothing was removed.")
+                    self.finish("The system accepted version \(version) first, but then \(what), so the removal was not asked for. Nothing was removed.",
+                                .failure)
                 case .deactivation(.completed):
-                    self.finish("The system accepted the removal. The driver keeps the modem's network port until the modem is unplugged or the Mac restarts.")
+                    self.finish("The system accepted the removal. The driver keeps the modem's network port until the modem is unplugged or the Mac restarts.",
+                                .warning)
                 case .deactivation(let outcome):
-                    self.finish(self.answer(outcome, request: "removal"))
+                    self.finish(self.answer(outcome, request: "removal"), self.kind(outcome))
                 }
             })
     }
 
-    private func finish(_ text: String) {
-        progress = text
+    private func finish(_ text: String, _ kind: ResultKind) {
         busy = false
+        say(text, kind)
         refresh()
+    }
+
+    // A request the system did not complete: a warning when it completes after a restart, else a failure.
+    private func kind(_ outcome: RequestOutcome) -> ResultKind {
+        if case .willCompleteAfterReboot = outcome { return .warning }
+        return .failure
     }
 
     private func words(_ outcome: RequestOutcome) -> String {

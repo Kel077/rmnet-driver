@@ -405,31 +405,44 @@ struct KeyValueRow: View {
     }
 }
 
-/// A result line as a banner: a green check after a change that succeeded, a red exclamation after one that did
-/// not, a spinner while one runs; the controller's words unchanged (selectable), and a dismiss button.
+/// A result line as a banner: a spinner while its request runs, a green check after a change that succeeded, an orange
+/// triangle after one that succeeded with something to read, a red exclamation after one that did not; the
+/// controller's words unchanged (selectable), and a dismiss button.
 struct Banner: View {
     let text: String
-    let isFailure: Bool
-    var inProgress = false
+    let kind: ResultKind
     let onDismiss: () -> Void
 
-    init(text: String, isFailure: Bool, inProgress: Bool = false, onDismiss: @escaping () -> Void) {
+    init(text: String, kind: ResultKind, onDismiss: @escaping () -> Void) {
         self.text = text
-        self.isFailure = isFailure
-        self.inProgress = inProgress
+        self.kind = kind
         self.onDismiss = onDismiss
     }
 
     var body: some View {
-        let tint: Color = inProgress ? .accentColor : isFailure ? .red : .green
+        let tint: Color = switch kind {
+        case .progress: .accentColor
+        case .success: .green
+        case .warning: .orange
+        case .failure: .red
+        }
         HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
             Group {
-                if inProgress {
+                switch kind {
+                case .progress:
                     ProgressView().controlSize(.small)
-                } else {
-                    Image(systemName: isFailure ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                case .success:
+                    Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(tint)
-                        .accessibilityLabel(Text(isFailure ? "Failed" : "Done"))
+                        .accessibilityLabel(Text("Done"))
+                case .warning:
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(tint)
+                        .accessibilityLabel(Text("Warning"))
+                case .failure:
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .foregroundStyle(tint)
+                        .accessibilityLabel(Text("Failed"))
                 }
             }
             .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
@@ -459,32 +472,35 @@ struct Banner: View {
 }
 
 extension View {
-    /// The screen's banner slot: its result line (`text`; "" for none) as a Banner at the bottom of the screen,
-    /// over its content's inset. Dismissed, it stays away until the text changes. Attach it to the screen's root.
-    func resultBanner(_ text: String, isFailure: Bool, inProgress: Bool = false) -> some View {
-        modifier(ResultBannerSlot(text: text, isFailure: isFailure, inProgress: inProgress))
+    /// The screen's banner slot: its controller's result line (`text`; "" for none) as a Banner at the bottom of the
+    /// screen, over its content's inset. Its X calls `dismiss`, which clears the line in the controller (so it stays
+    /// away on every screen and in a new window); `hover` tells the controller where the pointer is, so that a success
+    /// does not go by itself while it is being read (ResultLine.swift). Attach it to the screen's root.
+    func resultBanner(_ text: String, kind: ResultKind, dismiss: @escaping () -> Void,
+                      hover: @escaping (Bool) -> Void) -> some View {
+        modifier(ResultBannerSlot(text: text, kind: kind, dismiss: dismiss, hover: hover))
     }
 }
 
 private struct ResultBannerSlot: ViewModifier {
     let text: String
-    let isFailure: Bool
-    let inProgress: Bool
-    @State private var dismissed = false
+    let kind: ResultKind
+    let dismiss: () -> Void
+    let hover: (Bool) -> Void
 
     func body(content: Content) -> some View {
         content
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                if !text.isEmpty && !dismissed {
-                    Banner(text: text, isFailure: isFailure, inProgress: inProgress) { dismissed = true }
+                if !text.isEmpty {
+                    Banner(text: text, kind: kind, onDismiss: dismiss)
+                        .onHover(perform: hover)
+                        .onDisappear { hover(false) }
                         .padding(.horizontal, Spacing.l)
                         .padding(.bottom, Spacing.m)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
             .animation(.snappy, value: text)
-            .animation(.snappy, value: dismissed)
-            .onChange(of: text) { _, _ in dismissed = false }
     }
 }
 

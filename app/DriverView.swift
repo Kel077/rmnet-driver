@@ -73,9 +73,6 @@ struct StatusView: View {
                 if !guidance.isEmpty {
                     AdviceLines(lines: guidance, attention: pill.state == .attention || pill.state == .error)
                 }
-                if !controller.progress.isEmpty {
-                    ProgressLine(text: controller.progress, busy: controller.busy)
-                }
                 // With no advice above them, the buttons have what this app carries beside them.
                 actions(note: guidance.isEmpty && controller.known
                         ? driverActionNote(status, bundledVersion: controller.bundledVersion) : nil)
@@ -110,6 +107,9 @@ struct StatusView: View {
                 .help("Read the driver's status again")
             }
         }
+        // The request's words while it runs, then its result (ResultLine.swift), as on the other screens.
+        .resultBanner(controller.progress, kind: controller.progressKind, dismiss: controller.dismissResult,
+                      hover: controller.hoverResult)
         .confirmationDialog("Remove the RMNet driver?", isPresented: $confirmingRemove) {
             Button("Remove", role: .destructive) { controller.remove() }
             Button("Cancel", role: .cancel) {}
@@ -264,32 +264,6 @@ private struct AdviceLines: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-}
-
-/// What the running request is doing (with a spinner), or how the last one ended; the controller's words unchanged.
-private struct ProgressLine: View {
-    let text: String
-    let busy: Bool
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
-            Group {
-                if busy {
-                    ProgressView()
-                        .controlSize(.small)
-                        .accessibilityLabel(Text("In progress"))
-                } else {
-                    Image(systemName: "text.bubble")
-                        .foregroundStyle(.secondary)
-                        .accessibilityHidden(true)
-                }
-            }
-            .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
-            Text(verbatim: text)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }

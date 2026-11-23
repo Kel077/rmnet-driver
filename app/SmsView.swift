@@ -41,9 +41,9 @@ struct SmsView: View {
                         .help("New Message")
                 }
             }
-            // The last send's, retry's or delete's result; only the next one replaces it.
-            .resultBanner(controller.result, isFailure: controller.resultIsFailure,
-                          inProgress: controller.running == .sending || controller.running == .deleting)
+            // The last send's, retry's or delete's result, until the next one, its X, or (a success) 8 s.
+            .resultBanner(controller.result, kind: controller.resultKind, dismiss: controller.dismissResult,
+                          hover: controller.hoverResult)
             .sheet(isPresented: $writing) { ComposeSheet(controller: controller) }
             .onChange(of: confirmingMessage != nil || confirmingConversation != nil) { _, open in
                 controller.setConfirmingDelete(open)

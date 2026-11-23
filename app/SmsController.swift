@@ -42,9 +42,11 @@ final class SmsController: ObservableObject {
         didSet { if unreadNotice.count != unread.count { unreadNotice.count = unread.count } }
     }
     @Published private(set) var running: SmsActivity? = nil
-    // The result of the last send or delete (or what runs now). A listing never writes here.
+    // The result of the last send or delete (or what runs now). A listing never writes here. Its banner: dismissed,
+    // it is cleared; a success goes by itself (ResultLine.swift).
     @Published private(set) var result = ""
     @Published private(set) var resultIsFailure = false
+    @Published private(set) var resultKind = ResultKind.success
     @Published var to = ""     // not saved anywhere
     @Published var text = "" { // not saved anywhere; always the committed text the field shows
         // After a success, starting a new message clears the result line.
@@ -109,6 +111,9 @@ final class SmsController: ObservableObject {
 
     static let refreshInterval: TimeInterval = 15
 
+    private let resultTimer: (TimeInterval, @escaping () -> Void) -> Void
+    private lazy var expiry = ResultExpiry(after: resultTimer, clear: { [weak self] in self?.setResult("", failure: false) })
+
     /// `backgroundService`: the background listing's service (nil: `service`). `notifyEnabled` and `alert`: whether
     /// to check for new messages in the background and announce them, and how (the tests' defaults: never).
     init(service: SmsServing,
@@ -117,7 +122,9 @@ final class SmsController: ObservableObject {
          requestAttention: @escaping () -> Void,
          backgroundService: SmsServing? = nil,
          notifyEnabled: @escaping () -> Bool = { false },
-         alert: @escaping (MessageAlert) -> Void = { _ in }) {
+         alert: @escaping (MessageAlert) -> Void = { _ in },
+         resultTimer: @escaping (TimeInterval, @escaping () -> Void) -> Void = mainRunLoopAfter) {
+        self.resultTimer = resultTimer
         self.service = service
         self.queue = queue
         self.replyToQuit = replyToQuit
@@ -365,7 +372,7 @@ final class SmsController: ObservableObject {
             return
         }
         running = .deleting
-        setResult("Deleting \(parts.count) stored part(s)…", failure: false)
+        setResult("Deleting \(parts.count) stored part(s)…", failure: false, kind: .progress)
         let service = self.service
         let place = listedPlace
         queue.async {
@@ -409,7 +416,7 @@ final class SmsController: ObservableObject {
             return
         }
         running = .sending
-        setResult("Sending \(parts.count) stored part(s) to \(message.sender) again…", failure: false)
+        setResult("Sending \(parts.count) stored part(s) to \(message.sender) again…", failure: false, kind: .progress)
         let service = self.service
         let place = listedPlace
         queue.async {
@@ -450,7 +457,8 @@ final class SmsController: ObservableObject {
     private func startSend(to number: String, body: String, reply: String?, sheet: Bool = false) {
         let parts = partCount(body)
         running = .sending
-        setResult("Sending \(parts) part(s) to \(number). This can take up to two minutes per part.", failure: false)
+        setResult("Sending \(parts) part(s) to \(number). This can take up to two minutes per part.", failure: false,
+                  kind: .progress)
         let service = self.service
         queue.async {
             let result = service.send(to: number, text: body)
@@ -490,7 +498,7 @@ final class SmsController: ObservableObject {
             }
             setResult("Sent to \(number) in \(sent.parts) part(s)."
                       + (sent.stored ? "" : " It is not stored on the modem: it writes messages to another storage than "
-                         + "the one it lists."), failure: false)
+                         + "the one it lists."), failure: false, kind: sent.stored ? .success : .warning)
             clearResultOnTyping = sheet
             succeeded = true
         case .failure(let failure):
@@ -502,10 +510,24 @@ final class SmsController: ObservableObject {
         if active { refresh() }
     }
 
-    private func setResult(_ line: String, failure: Bool) {
+    /// The banner's X: the line is cleared, so it does not come back on another screen or a new window.
+    func dismissResult() {
+        setResult("", failure: false)
+    }
+
+    /// The pointer on the banner (true) or off it: a success does not go while it is on it.
+    func hoverResult(_ on: Bool) {
+        expiry.hover(on)
+    }
+
+    /// `kind`: progress for a request's words while it runs, warning for a success with something to read; a failure
+    /// is one, anything else a success.
+    private func setResult(_ line: String, failure: Bool, kind: ResultKind = .success) {
         result = line
         resultIsFailure = failure
+        resultKind = failure ? .failure : kind
         if !line.isEmpty { clearResultOnTyping = false }
+        expiry.shown(line, resultKind)
     }
 }
 

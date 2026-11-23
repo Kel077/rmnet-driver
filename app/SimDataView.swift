@@ -196,8 +196,8 @@ struct SimApnTab: View {
                 .help("Read the SIM and the data profiles again")
             }
         }
-        .resultBanner(controller.result, isFailure: controller.resultIsFailure,
-                      inProgress: controller.running != nil && controller.running != .reading)
+        .resultBanner(controller.result, kind: controller.resultKind, dismiss: controller.dismissResult,
+                      hover: controller.hoverResult)
         .modifier(Confirmation(question: $question, controller: controller, perform: perform, closed: clearPin))
         .sheet(isPresented: $unlocking, onDismiss: unlockClosed) {
             UnlockSheet(controller: controller, pin: $pin, lastAttempt: $lastAttempt, unlock: askPin,

@@ -120,6 +120,7 @@ final class ModemController: ObservableObject {
     // A read never writes here.
     @Published private(set) var result = ""
     @Published private(set) var resultIsFailure = false
+    @Published private(set) var resultKind = ResultKind.success   // its banner (ResultLine.swift)
     @Published private(set) var undo: ModemUndo? = nil
     @Published var form: ProfileSettings? = nil   // the editor's values for the driver's profile
     @Published var pickedMode: String? = nil      // the Network screen's picker
@@ -169,7 +170,9 @@ final class ModemController: ObservableObject {
 
     init(service: ModemServing, queue: DispatchQueue, driverProfile: @escaping () -> Int?,
          replyToQuit: @escaping (Bool) -> Void, requestAttention: @escaping () -> Void,
-         now: @escaping () -> Date = { Date() }, imeiHistory: ImeiHistoryRecorder? = nil) {
+         now: @escaping () -> Date = { Date() }, imeiHistory: ImeiHistoryRecorder? = nil,
+         resultTimer: @escaping (TimeInterval, @escaping () -> Void) -> Void = mainRunLoopAfter) {
+        self.resultTimer = resultTimer
         self.service = service
         self.queue = queue
         self.driverProfile = driverProfile
@@ -178,6 +181,9 @@ final class ModemController: ObservableObject {
         self.now = now
         self.history = imeiHistory
     }
+
+    private let resultTimer: (TimeInterval, @escaping () -> Void) -> Void
+    private lazy var expiry = ResultExpiry(after: resultTimer, clear: { [weak self] in self?.setResult("", failure: false) })
 
     deinit { timer?.invalidate() }
 
@@ -466,7 +472,7 @@ final class ModemController: ObservableObject {
     private func readFinished() {
         if let waiting = change {
             running = waiting.activity
-            setResult(waiting.line, failure: false)
+            setResult(waiting.line, failure: false, kind: .progress)
             return
         }
         finished(succeeded: true, changed: false)
@@ -570,9 +576,9 @@ final class ModemController: ObservableObject {
         change = next
         if running == nil {
             running = activity
-            setResult(line, failure: false)
+            setResult(line, failure: false, kind: .progress)
         } else {
-            setResult("Waiting for the current read to finish…", failure: false)
+            setResult("Waiting for the current read to finish…", failure: false, kind: .progress)
         }
         let service = self.service
         queue.async {
@@ -635,7 +641,7 @@ final class ModemController: ObservableObject {
             // (ruling R8).
             let noWayBack = puttingBack || canonicalMode(done.before) != nil ? ""
                 : " The earlier value \(modemTextSafe(done.before)) \(modeAtWayBack(done.before))"
-            setResult(modeSentence(done) + noWayBack, failure: false)
+            setResult(modeSentence(done) + noWayBack, failure: false, kind: noWayBack.isEmpty ? .success : .warning)
         case .failure(let failure):
             setPick(info?.mode)
             setResult(failure.message, failure: true)
@@ -1021,7 +1027,10 @@ final class ModemController: ObservableObject {
                 case .rebooting(_, let after): self.imei = after
                 case .setTakesEffectAfterRestart: break
                 }
-                self.setResult(imeiSentence(ch) + notRecorded, failure: false)
+                var later = false
+                if case .setTakesEffectAfterRestart = ch { later = true }
+                self.setResult(imeiSentence(ch) + notRecorded, failure: false,
+                               kind: notRecorded.isEmpty && !later ? .success : .warning)
             case .failure(let failure):
                 self.setResult(failure.message + notRecorded, failure: true)
             }
@@ -1079,9 +1088,23 @@ final class ModemController: ObservableObject {
         }
     }
 
-    private func setResult(_ line: String, failure: Bool) {
+    /// The banner's X: the line is cleared, so it does not come back on another screen or a new window.
+    func dismissResult() {
+        setResult("", failure: false)
+    }
+
+    /// The pointer on the banner (true) or off it: a success does not go while it is on it.
+    func hoverResult(_ on: Bool) {
+        expiry.hover(on)
+    }
+
+    /// `kind`: progress for a change's words while it runs (or waits), warning for a success with something to read;
+    /// a failure is one, anything else a success.
+    private func setResult(_ line: String, failure: Bool, kind: ResultKind = .success) {
         result = line
         resultIsFailure = failure
+        resultKind = failure ? .failure : kind
+        expiry.shown(line, resultKind)
     }
 }
 

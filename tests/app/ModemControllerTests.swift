@@ -359,6 +359,24 @@ func onMainOnly(_ what: String) {
     changesSeen += 1
 }
 
+/// Timers that run when the test moves the time on (the result banner's).
+final class FakeClock {
+    private(set) var now: TimeInterval = 0
+    private var timers: [(due: TimeInterval, body: () -> Void)] = []
+
+    func after(_ delay: TimeInterval, _ body: @escaping () -> Void) { timers.append((now + delay, body)) }
+
+    func advance(_ seconds: TimeInterval) {
+        let end = now + seconds
+        while let next = timers.enumerated().filter({ $0.element.due <= end }).min(by: { $0.element.due < $1.element.due }) {
+            timers.remove(at: next.offset)
+            now = next.element.due
+            next.element.body()
+        }
+        now = end
+    }
+}
+
 /// A controller with a fake service on its own queue, the driver's profile number it reads, and what it
 /// answered to quits and how often it asked for attention.
 final class Rig {
@@ -369,6 +387,7 @@ final class Rig {
     var replies: [Bool] = []
     var attention = 0
     var history: ImeiHistoryRecorder? = nil   // set before the controller is first used
+    var resultClock: FakeClock? = nil          // the result banner's timers when set (before first use); real ones otherwise
     private var watchers: [AnyCancellable] = []
     lazy var controller: ModemController = makeController()
 
@@ -380,7 +399,8 @@ final class Rig {
                                 replyToQuit: { [unowned self] in self.replies.append($0) },
                                 requestAttention: { [unowned self] in self.attention += 1 },
                                 now: { [unowned self] in self.clock ?? Date() },
-                                imeiHistory: history)
+                                imeiHistory: history,
+                                resultTimer: resultClock.map { $0.after } ?? mainRunLoopAfter)
         watchers.append(c.objectWillChange.sink { _ in onMainOnly("a published value of the controller") })
         watchers.append(c.quitNotice.objectWillChange.sink { _ in onMainOnly("the quit notice") })
         liveControllers.append { [weak c] in c }
@@ -524,6 +544,7 @@ struct ModemControllerTests {
         simSlotChanges()
         simSlotSwitchBack()
         simSlotDroppedAtQuit()
+        resultBanner()
         check(changesSeen > 0, "main thread: the controllers' changes were watched")
         print("modem controller: \(checks) checks passed")
     }
@@ -2552,6 +2573,66 @@ struct ModemControllerTests {
         equal(rig.fake.imeiModulesAsked.last, "c0ffee01", "history: Change Back asks for its entry's module")
         equal(keeper.entries.last?.before, "000000000000117", "history: the IMEI before as the change's port read it")
         equal(keeper.entries.last?.module, "c0ffee01", "history: and its module")
+        c.setTabShown(nil)
+    }
+}
+
+extension ModemControllerTests {
+    // The result banner of the Network and SIM & Data screens: dismissed, the line is cleared in the controller, so
+    // another screen and back does not bring it back; a success goes after 8 s; a failure stays; a warning stays; the
+    // next result replaces the old one.
+    static func resultBanner() {
+        let rig = Rig()
+        let clock = FakeClock()
+        rig.resultClock = clock
+        let c = rig.controller
+        c.setTabShown(.simAndApn)
+        rig.answerSettings(1, .success(listing()), .success(ready), "banner: first settings read")
+
+        // Each change asks for an IMEI the modem does not have (the same one is refused before the port).
+        func setImei(_ outcome: Result<ImeiChange, ModemFailure>, _ name: String) {
+            let n = rig.fake.calls.count + 1
+            let wanted = c.imei == "000000000000141" ? "000000000000091" : "000000000000141"
+            c.changeImei(wanted, reboot: true)
+            rig.waitForCall(n, "\(name): setImei runs")
+            check(c.resultKind == .progress, "\(name): the change's words while it runs", "\(c.resultKind)")
+            rig.fake.releaseSetImei(outcome)
+            pump(until: { c.resultKind != .progress }, "\(name): the change finishes")
+            rig.fake.queueImei(.success(c.imei ?? wanted))
+            rig.answerSettings(n + 1, .success(listing()), .success(ready), "\(name): the read after it")
+        }
+
+        // Dismissed: cleared; another screen and back (with its read) does not bring it back.
+        setImei(.success(.rebooting(before: "000000000000091", after: "000000000000141")), "dismissed")
+        equal(c.result, "IMEI set to 000000000000141; the modem is restarting.", "banner: the success")
+        check(c.resultKind == .success, "banner: a success")
+        c.dismissResult()
+        equal(c.result, "", "banner: dismissed, cleared")
+        let before = rig.fake.calls.count
+        c.setTabShown(nil)
+        rig.fake.queueImei(.success(c.imei ?? "000000000000141"))
+        c.setTabShown(.simAndApn)
+        rig.answerSettings(before + 1, .success(listing()), .success(ready), "banner: back on SIM & Data")
+        equal(c.result, "", "banner: dismissed, it does not come back on another screen and back")
+
+        // A success goes after 8 s, not before.
+        setImei(.success(.rebooting(before: "000000000000091", after: "000000000000141")), "expires")
+        clock.advance(7.5)
+        equal(c.result, "IMEI set to 000000000000141; the modem is restarting.", "banner: still there at 7.5 s")
+        clock.advance(0.5)
+        equal(c.result, "", "banner: gone at 8 s")
+
+        // A failure stays; the next result replaces it.
+        setImei(.failure(ModemFailure(message: "The IMEI was not changed. ERROR")), "failure")
+        clock.advance(3600)
+        equal(c.result, "The IMEI was not changed. ERROR", "banner: a failure stays")
+        check(c.resultKind == .failure, "banner: a failure")
+        // A success that takes effect later: a warning, which stays too; it replaces the failure.
+        setImei(.success(.setTakesEffectAfterRestart(before: "000000000000091", after: "000000000000141")), "warning")
+        check(c.resultKind == .warning && c.result.hasPrefix("IMEI set to 000000000000141; it takes effect"),
+              "banner: the next result replaces the failure, as a warning", c.result)
+        clock.advance(3600)
+        check(!c.result.isEmpty, "banner: a warning stays")
         c.setTabShown(nil)
     }
 }

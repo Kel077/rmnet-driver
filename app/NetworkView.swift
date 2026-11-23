@@ -108,8 +108,8 @@ struct NetworkTab: View {
                 .disabled(!controller.refreshEnabled)
             }
         }
-        .resultBanner(controller.result, isFailure: controller.resultIsFailure,
-                      inProgress: controller.running != nil && controller.running != .reading)
+        .resultBanner(controller.result, kind: controller.resultKind, dismiss: controller.dismissResult,
+                      hover: controller.hoverResult)
         .modifier(Confirmation(question: $question, controller: controller, perform: perform, closed: {}))
         // Reads pause while a sheet is open, as for a confirmation; however it closes, they go on.
         .sheet(item: $editing, onDismiss: { controller.setConfirming(false) }) { edit in

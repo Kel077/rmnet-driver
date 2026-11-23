@@ -81,7 +81,8 @@ app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build
 		build/modemnet-tests build/modemset-tests build/modemsvc-tests build/modemcli-tests build/modemui-tests \
 		build/quit-tests build/menubar-tests build/window-tests build/signal-tests build/throughput-tests \
 		build/shell-tests build/networkview-tests build/overview-tests build/imeihistory-tests build/simslot-tests \
-		build/messagealerts-tests build/smsservice-tests build/conversations-tests build/pulse-tests
+		build/messagealerts-tests build/smsservice-tests build/conversations-tests build/pulse-tests \
+		build/resultline-tests
 	./build/app-tests
 	./build/sms-tests
 	./build/at-tests
@@ -107,6 +108,7 @@ app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build
 	./build/smsservice-tests
 	./build/conversations-tests
 	./build/pulse-tests
+	./build/resultline-tests
 
 build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
 	@mkdir -p build
@@ -121,7 +123,7 @@ build/at-tests: app/AtPort.swift tests/app/AtPortTests.swift
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 build/smsui-tests: app/SmsModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/MessageAlerts.swift \
-		app/SmsConversations.swift app/SmsController.swift tests/app/SmsControllerTests.swift
+		app/SmsConversations.swift app/ResultLine.swift app/SmsController.swift tests/app/SmsControllerTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
@@ -154,11 +156,11 @@ build/modemcli-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHis
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
-build/modemui-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift app/ModemController.swift tests/app/ModemControllerTests.swift
+build/modemui-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift app/ResultLine.swift app/ModemController.swift tests/app/ModemControllerTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
-build/quit-tests: app/SmsModel.swift app/MessageAlerts.swift app/SmsConversations.swift app/SmsController.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift \
+build/quit-tests: app/SmsModel.swift app/MessageAlerts.swift app/SmsConversations.swift app/ResultLine.swift app/SmsController.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift \
 		app/ModemController.swift app/QuitGate.swift app/SimSlotWatch.swift tests/app/QuitGateTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
@@ -185,7 +187,7 @@ build/throughput-tests: app/ThroughputSampler.swift tests/app/ThroughputSamplerT
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 # The screens map to the modem's reads (ModemTab), and every headline of StatusModel.swift has a pill.
-build/shell-tests: app/StatusModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift app/ModemController.swift \
+build/shell-tests: app/StatusModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift app/ResultLine.swift app/ModemController.swift \
 		app/ShellModel.swift tests/app/ShellModelTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
@@ -193,7 +195,7 @@ build/shell-tests: app/StatusModel.swift app/ModemNetwork.swift app/ModemSetting
 # The Network screen's cards (NetworkView.swift's NetworkCards); its views, and the files they use, are compiled
 # but never drawn.
 build/networkview-tests: app/StatusModel.swift app/Registry.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift \
-		app/ModemController.swift app/ShellModel.swift app/SignalQuality.swift app/ThroughputSampler.swift \
+		app/ResultLine.swift app/ModemController.swift app/ShellModel.swift app/SignalQuality.swift app/ThroughputSampler.swift \
 		app/ModemViewParts.swift app/DesignKit.swift app/Charts.swift app/NetworkView.swift \
 		tests/app/NetworkViewTests.swift
 	@mkdir -p build
@@ -201,7 +203,7 @@ build/networkview-tests: app/StatusModel.swift app/Registry.swift app/ModemNetwo
 
 # What the Overview's cards say: the signal history and the SIM read (ModemController, ModemSettings), the
 # driver's status and advice (StatusModel), the pill the driver card agrees with (ShellModel), the quality zones.
-build/overview-tests: app/StatusModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift app/ModemController.swift \
+build/overview-tests: app/StatusModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift app/ResultLine.swift app/ModemController.swift \
 		app/ShellModel.swift app/SignalQuality.swift app/OverviewModel.swift tests/app/OverviewModelTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
@@ -221,7 +223,7 @@ build/simslot-tests: app/ModemNetwork.swift app/ModemSettings.swift app/SimSlotW
 # New messages in the background: the count, the baseline, what is new and what a notification says; the Messages
 # controller's part, against a fake service (the background turn itself: build/pulse-tests).
 build/messagealerts-tests: app/SmsModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/MessageAlerts.swift \
-		app/ModemPulse.swift app/SmsConversations.swift app/SmsController.swift tests/app/MessageAlertsTests.swift
+		app/ModemPulse.swift app/SmsConversations.swift app/ResultLine.swift app/SmsController.swift tests/app/MessageAlertsTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
@@ -240,6 +242,11 @@ build/conversations-tests: app/SmsModel.swift app/SmsConversations.swift tests/a
 build/pulse-tests: app/StatusModel.swift app/AtPort.swift app/SmsModel.swift app/SmsService.swift \
 		app/ModemNetwork.swift app/ModemSettings.swift app/ModemService.swift app/SignalQuality.swift app/MenuBarStatus.swift \
 		app/ModemPulse.swift tests/app/ModemPulseTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+# A result line's banner: a success goes after 8 s (not under the pointer), the rest stay; on a fake clock.
+build/resultline-tests: app/ResultLine.swift tests/app/ResultLineTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
