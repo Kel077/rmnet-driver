@@ -139,6 +139,8 @@ final class FakeModem: ModemServing {
     var setPersistResult: Result<CellLockChange, ModemFailure>? = nil
     var imeiResult: Result<String, ModemFailure> = .success("000000000000091")
     var setImeiResult: Result<ImeiChange, ModemFailure>? = nil
+    var sessionModule: String? = "c0ffee01"     // the module setImei's own port open is on
+    var sessionBefore: String? = nil            // the IMEI it reads before the write (nil: imeiResult's)
     var simSlotResult: Result<Int, ModemFailure> = .success(1)
     var setSimSlotResult: Result<SimSlotChange, ModemFailure>? = nil
     var simSlotsAsked: [(slot: Int, wait: SimSlotWait)] = []
@@ -153,6 +155,8 @@ final class FakeModem: ModemServing {
     var nrLockSet: [NrCellLock?] = []
     var lteLockSet: [[LteLockedCell]] = []
     var persistSet: [(Bool, Bool)] = []
+    var cellsInUse: [CellInUse] = []
+    var lockCellInUseResult: Result<CellLockChange, ModemFailure>? = nil
     var imeiSetAsked: [(imei: String, reboot: Bool)] = []
 
     func networkInfo() -> Result<NetworkInfo, ModemFailure> {
@@ -238,6 +242,20 @@ final class FakeModem: ModemServing {
         let after = CellLockState(lte: cells, nr: before.nr, persistLte: before.persistLte, persistNr: before.persistNr)
         return .success(before == after ? .unchanged(after) : .changed(before: before, after: after))
     }
+    // As the service: the serving cell (networkResult's) checked by cellInUseLock, then locked as setNrCellLock or
+    // setLteCellLock does here.
+    func lockCellInUse(_ cell: CellInUse) -> Result<CellLockChange, ModemFailure> {
+        events.append("lockCellInUse")
+        cellsInUse.append(cell)
+        if let r = lockCellInUseResult { return r }
+        if let problem = cellInUseProblem(cell) { return .failure(ModemFailure(message: "\(problem) Nothing was changed.")) }
+        let info = (try? networkResult.get()) ?? NetworkInfo()
+        switch cellInUseLock(cell, serving: info.serving, carriers: info.carrierComponents) {
+        case .refused(let why): return .failure(ModemFailure(message: "\(why) Nothing was changed."))
+        case .nr(let lock): return setNrCellLock(lock)
+        case .lte(let one): return setLteCellLock([one])
+        }
+    }
     func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure> {
         events.append("setCellLockPersist")
         persistSet.append((lte, nr))
@@ -254,7 +272,7 @@ final class FakeModem: ModemServing {
         events.append("simSlot")
         return simSlotResult
     }
-    func setSimSlot(_ slot: Int, wait: SimSlotWait) -> Result<SimSlotChange, ModemFailure> {
+    func setSimSlot(_ slot: Int, wait: SimSlotWait, expect: SimSlotExpectation?) -> Result<SimSlotChange, ModemFailure> {
         events.append("setSimSlot")
         simSlotsAsked.append((slot: slot, wait: wait))
         if let r = setSimSlotResult { return r }
@@ -263,14 +281,17 @@ final class FakeModem: ModemServing {
         return .success(SimSlotChange(before: before, after: slot, sim: .ready, secondsToSim: 2,
                                       registration: Registration(status: .home, domain: "5GS"), secondsToRegister: 5))
     }
-    func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure> {
+    /// The module and the IMEI before that the change's own port open reads (ImeiWrite): `sessionModule`, and the IMEI
+    /// `imeiResult` gives (or `sessionBefore` when set).
+    func setImei(_ imei: String, reboot: Bool, module: String?) -> ImeiWrite {
         events.append("setImei")
         imeiSetAsked.append((imei: imei, reboot: reboot))
-        if let r = setImeiResult { return r }
-        let before = (try? imeiResult.get()) ?? "000000000000091"
-        if before == imei { return .success(.unchanged(before)) }
-        return .success(reboot ? .rebooting(before: before, after: imei)
-                               : .setTakesEffectAfterRestart(before: before, after: imei))
+        let before = sessionBefore ?? (try? imeiResult.get()) ?? "000000000000091"
+        if let r = setImeiResult { return ImeiWrite(outcome: r, module: sessionModule, before: before) }
+        if before == imei { return ImeiWrite(outcome: .success(.unchanged(before)), module: sessionModule, before: before) }
+        return ImeiWrite(outcome: .success(reboot ? .rebooting(before: before, after: imei)
+                                                  : .setTakesEffectAfterRestart(before: before, after: imei)),
+                         module: sessionModule, before: before)
     }
 }
 
@@ -398,7 +419,7 @@ struct ModemCliTests {
               + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes] | "
               + "at [--timeout <seconds>] <command> | "
               + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa] | "
-              + "cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current | "
+              + "cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current [--scs <kHz>] | "
               + "cell lock lte <earfcn>:<pci>[,…] | cell unlock [sa|lte] | cell persist on|off | "
               + "imei [--json] | imei set <imei> [--no-reboot] [--yes] | imei history [--json]",
               "modemUsage: the brief's usage without the leading RMNet", modemUsage)
@@ -410,7 +431,13 @@ struct ModemCliTests {
         expectParse(["antennas", "--json"], .antennas(json: true))
         expectParse(["cell"], .cellShow(json: false))
         expectParse(["cell", "--json"], .cellShow(json: true))
-        expectParse(["cell", "lock", "current"], .cellLockCurrent)
+        expectParse(["cell", "lock", "current"], .cellLockCurrent(scsKHz: nil))
+        expectParse(["cell", "lock", "current", "--scs", "30"], .cellLockCurrent(scsKHz: 30))
+        for words in [["cell", "lock", "current", "--scs"], ["cell", "lock", "current", "--scs", "x"],
+                      ["cell", "lock", "current", "--scs", "30", "extra"], ["cell", "lock", "current", "30"],
+                      ["cell", "lock", "current", "--scs", "-15"]] {
+            check(parseModem(words) == nil, "parseModem: \(words.joined(separator: " ")) is wrong usage")
+        }
         expectParse(["cell", "lock", "sa", "147", "520110", "30", "n41"],
                     .cellLockNr(NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41)))
         expectParse(["cell", "lock", "lte", "1300:128,100:45"],
@@ -532,7 +559,8 @@ struct ModemCliTests {
                                         .simUnlock(lastAttempt: false), .simUnlock(lastAttempt: true),
                                         .usbModeSet(.qmi, reboot: true, yes: false), .usbModeSet(.ecm, reboot: false, yes: true),
                                         .bandsSet(.sa, [41]), .bandsSet(.lte, [3, 41]), .bandsReset(nil), .bandsReset(.nsa),
-                                        .cellLockCurrent, .cellUnlock(.both), .cellPersist(true),
+                                        .cellLockCurrent(scsKHz: nil), .cellLockCurrent(scsKHz: 30),
+                                        .cellUnlock(.both), .cellPersist(true),
                                         .imeiSet("000000000000141", reboot: true, yes: false)]
         let reading: [ModemCommand] = [.network(json: false), .network(json: true), .antennas(json: false),
                                        .radio(on: nil), .mode(nil),
@@ -1703,6 +1731,30 @@ struct ModemCliTests {
         ], code: 0, "cell lock current: locks SA leg")
         check(fake.nrLockSet == [NrCellLock(pci: 32, arfcn: 504990, scsKHz: 30, band: 41)],
               "cell lock current: passed right NR parameters")
+        check(fake.cellsInUse == [.serving(scsKHz: nil)], "cell lock current: the serving cell, read with the lock")
+        check(!fake.events.contains("networkInfo"), "cell lock current: no separate network read before the lock")
+
+        // A serving 5G SA cell whose subcarrier spacing the modem does not give: refused, never guessed; `--scs` gives it.
+        var noScs = saInfo
+        noScs.serving = parseServingCell(
+            ["+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",001,01,FEDCBA987,32,00F00D,504990,41,12,-95,-10,8,-,-"])
+        fake = FakeModem()
+        fake.networkResult = .success(noScs)
+        expectLines(run(["cell", "lock", "current"], fake, "cell lock current, no SCS"), [
+            "cell: The modem does not report the subcarrier spacing of its serving 5G SA cell (n41, PCI 32, ARFCN 504990); "
+                + "give it with --scs (15, 30, 60, 120 or 240 kHz). Nothing was changed.",
+        ], code: 1, "cell lock current: no SCS, refused")
+        check(fake.nrLockSet.isEmpty, "cell lock current: no SCS, nothing locked")
+        fake = FakeModem()
+        fake.networkResult = .success(noScs)
+        expectLines(run(["cell", "lock", "current", "--scs", "30"], fake, "cell lock current --scs"), [
+            "cell: Locked 5G SA cell to band n41, PCI 32, ARFCN 504990, SCS 30 kHz.",
+        ], code: 0, "cell lock current --scs: locks with the SCS given")
+        fake = FakeModem()
+        expectLines(run(["cell", "lock", "current", "--scs", "15"], fake, "cell lock current --scs differs"), [
+            "cell: The modem reports a subcarrier spacing of 30 kHz for its serving 5G SA cell, not 15 kHz. Nothing was changed.",
+        ], code: 1, "cell lock current --scs: one the modem contradicts is refused")
+        check(fake.nrLockSet.isEmpty, "cell lock current --scs differs: nothing locked")
 
         fake = FakeModem()
         expectLines(run(["cell", "lock", "sa", "147", "520110", "30", "n41"], fake, "cell lock sa"), [
@@ -1746,9 +1798,9 @@ struct ModemCliTests {
         imeiHistoryVerbs()
     }
 
-    /// `imei set` records each change it sends in the IMEI history (with the IMEI before, `cli`, the module and the
-    /// result), and nothing when it sends none; `imei history` prints the history, also as JSON, and never asks the
-    /// modem anything.
+    /// `imei set` records each change it sends in the IMEI history (with the IMEI before and the module as the change's
+    /// own port open read them, not the registry's module or an earlier read; `cli`; the result), and nothing when it
+    /// sends none; `imei history` prints the history, also as JSON, and never asks the modem anything.
     static func imeiHistoryVerbs() {
         let when = Date(timeIntervalSince1970: 1_795_000_000)
         let keeper = MemoryHistory()
@@ -1758,9 +1810,18 @@ struct ModemCliTests {
         _ = run(["imei", "set", "000000000000141", "--yes"], fake, history: recorder, "history: set")
         equal(keeper.entries.count, 1, "history: one entry after a change")
         equal(keeper.entries.first, ImeiHistoryEntry(time: when, before: "000000000000091", after: "000000000000141",
-                                                     source: .cli, result: .succeeded, restart: true, module: "f00dcafe",
+                                                     source: .cli, result: .succeeded, restart: true, module: "c0ffee01",
                                                      message: "IMEI set to 000000000000141; the modem is restarting.",
                                                      note: nil), "history: the entry")
+
+        // The IMEI before as the change's port read it (another tool changed it after the verb's first read).
+        fake = FakeModem()
+        fake.sessionBefore = "000000000000117"
+        fake.sessionModule = "0badbeef"
+        _ = run(["imei", "set", "000000000000141", "--yes"], fake, history: recorder, "history: the session's")
+        equal(keeper.entries.last?.before, "000000000000117", "history: the IMEI before from the change's port")
+        equal(keeper.entries.last?.module, "0badbeef", "history: the module from the change's port")
+        keeper.entries.removeLast()
 
         fake = FakeModem()
         _ = run(["imei", "set", "000000000000091"], fake, history: recorder, "history: unchanged")

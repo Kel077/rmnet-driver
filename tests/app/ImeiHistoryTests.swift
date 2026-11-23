@@ -45,6 +45,9 @@ struct ImeiHistoryTests {
         check(imeiProblem(zeros) == nil && imeiProblem(counting) == nil, "the made-up IMEIs have valid check digits")
         lines()
         file()
+        fileSafety()
+        bytesAndTails()
+        shortWrites()
         entriesFromOutcomes()
         order()
         printed()
@@ -131,6 +134,121 @@ struct ImeiHistoryTests {
         try? FileManager.default.removeItem(at: url.deletingLastPathComponent().deletingLastPathComponent())
     }
 
+    // Only a regular file of the user's, owner-only, in a folder of the user's that nobody else can write, opened without
+    // following a symbolic link: anything else is a sentence, and nothing is read from it or written to it.
+    static func fileSafety() {
+        let fm = FileManager.default
+        let base = temporaryFile().deletingLastPathComponent().deletingLastPathComponent()
+        defer { try? fm.removeItem(at: base) }
+        let folder = base.appendingPathComponent("history")
+        try? fm.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+
+        // The history a symbolic link to another file: refused, and the other file untouched.
+        let target = base.appendingPathComponent("elsewhere.txt")
+        fm.createFile(atPath: target.path, contents: Data("keep\n".utf8), attributes: [.posixPermissions: 0o600])
+        let linked = folder.appendingPathComponent("linked.jsonl")
+        try? fm.createSymbolicLink(at: linked, withDestinationURL: target)
+        let viaLink = ImeiHistoryFile(url: linked)
+        check(viaLink.append(entry(zeros, counting)) != nil, "safety: an append through a symbolic link is refused")
+        check(viaLink.load().failureMessage?.contains("symbolic link") == true, "safety: a load through one too",
+              "\(viaLink.load())")
+        equal(try? String(contentsOf: target, encoding: .utf8), "keep\n", "safety: the link's target untouched")
+
+        // Readable by others: refused.
+        let open = folder.appendingPathComponent("open.jsonl")
+        fm.createFile(atPath: open.path, contents: Data((imeiHistoryLine(entry(zeros, counting)) + "\n").utf8),
+                      attributes: [.posixPermissions: 0o644])
+        let wide = ImeiHistoryFile(url: open)
+        check(wide.load().failureMessage?.contains("only you can read and write") == true, "safety: a 0644 file is refused")
+        check(wide.append(entry(zeros, counting)) != nil, "safety: and not appended to")
+        equal((try? Data(contentsOf: open)).map { $0.count },
+              imeiHistoryLine(entry(zeros, counting)).utf8.count + 1, "safety: the 0644 file unchanged")
+
+        // A folder that is not a regular file: refused.
+        let notFile = folder.appendingPathComponent("dir.jsonl")
+        try? fm.createDirectory(at: notFile, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        check(ImeiHistoryFile(url: notFile).load().failureMessage != nil, "safety: a folder in its place is refused")
+
+        // Its folder writable by others, or a symbolic link: refused.
+        let shared = base.appendingPathComponent("shared")
+        try? fm.createDirectory(at: shared, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o777])
+        _ = chmod(shared.path, 0o777)
+        let inShared = ImeiHistoryFile(url: shared.appendingPathComponent("imei-history.jsonl"))
+        check(inShared.append(entry(zeros, counting))?.contains("folder") == true, "safety: a folder others can write")
+        check(!fm.fileExists(atPath: shared.appendingPathComponent("imei-history.jsonl").path),
+              "safety: nothing made in it")
+        let linkedFolder = base.appendingPathComponent("linked-folder")
+        try? fm.createSymbolicLink(at: linkedFolder, withDestinationURL: folder)
+        let throughFolder = ImeiHistoryFile(url: linkedFolder.appendingPathComponent("imei-history.jsonl"))
+        check(throughFolder.append(entry(zeros, counting))?.contains("folder") == true, "safety: a linked folder")
+        check(throughFolder.load().failureMessage?.contains("folder") == true, "safety: a linked folder, loading")
+    }
+
+    // Lines split at LF bytes: bytes that are not UTF-8 cost their line only; a last line without its LF (a write cut
+    // short) is counted when broken, and the next append starts on a line of its own.
+    static func bytesAndTails() {
+        let good = imeiHistoryLine(entry(zeros, counting))
+        var bytes = Array((good + "\n").utf8)
+        bytes += [0x7B, 0xFF, 0xFE, 0x22, 0x7D, 0x0A]                 // {\xff\xfe"}: not UTF-8
+        bytes += Array((imeiHistoryLine(entry(counting, zeros, at: 60)) + "\r\n").utf8)
+        bytes += Array("\u{2028}\n".utf8)                                 // a line of a Unicode separator only
+        let h = parseImeiHistory(bytes: bytes)
+        equal(h.entries, [entry(zeros, counting), entry(counting, zeros, at: 60)], "bytes: both good lines read")
+        equal(h.skippedLines, 0 + 1, "bytes: the bad bytes cost one line")
+
+        let url = temporaryFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent().deletingLastPathComponent()) }
+        let keeper = ImeiHistoryFile(url: url)
+        check(keeper.append(entry(zeros, counting)) == nil, "tail: first append")
+        // A write cut short: half a line, no LF.
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(Data(good.utf8.prefix(20)))
+            handle.closeFile()
+        }
+        check(keeper.append(entry(counting, zeros, at: 60)) == nil, "tail: append after a cut-short line")
+        let after = try? keeper.load().get()
+        equal(after?.entries, [entry(zeros, counting), entry(counting, zeros, at: 60)],
+              "tail: the new entry on a line of its own")
+        equal(after?.skippedLines, 1, "tail: the cut-short line counted")
+        let raw = (try? Data(contentsOf: url)).map { [UInt8]($0) } ?? []
+        equal(raw.filter { $0 == 0x0A }.count, 3, "tail: a LF added before the new line")
+        equal(raw.last, 0x0A, "tail: the file ends with a LF")
+
+        // A complete last line without its LF is read, and the next append does not join it.
+        let bare = temporaryFile()
+        defer { try? FileManager.default.removeItem(at: bare.deletingLastPathComponent().deletingLastPathComponent()) }
+        try? FileManager.default.createDirectory(at: bare.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        FileManager.default.createFile(atPath: bare.path, contents: Data(good.utf8), attributes: [.posixPermissions: 0o600])
+        let bareKeeper = ImeiHistoryFile(url: bare)
+        equal(try? bareKeeper.load().get().entries, [entry(zeros, counting)], "tail: a last line without LF is read")
+        check(bareKeeper.append(entry(counting, zeros, at: 60)) == nil, "tail: append after it")
+        equal(try? bareKeeper.load().get(), ImeiHistory(entries: [entry(zeros, counting), entry(counting, zeros, at: 60)],
+                                                        skippedLines: 0), "tail: both lines whole")
+    }
+
+    // write(2) may write fewer bytes than asked: the append goes on until every byte is written; one that writes
+    // nothing is a sentence.
+    static func shortWrites() {
+        let url = temporaryFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent().deletingLastPathComponent()) }
+        var calls = 0
+        let dribble = ImeiHistoryFile(url: url, write: { fd, p, n in
+            calls += 1
+            return Darwin.write(fd, p, min(n, 7))
+        })
+        check(dribble.append(entry(zeros, counting)) == nil, "short: append in pieces")
+        check(dribble.append(entry(counting, zeros, at: 60)) == nil, "short: another")
+        check(calls > 2, "short: more than one write each", "\(calls)")
+        equal(try? dribble.load().get(), ImeiHistory(entries: [entry(zeros, counting), entry(counting, zeros, at: 60)],
+                                                     skippedLines: 0), "short: both entries whole")
+
+        let stuck = ImeiHistoryFile(url: url, write: { _, _, _ in 0 })
+        check(stuck.append(entry(zeros, zeros, at: 120))?.contains("could not be written") == true,
+              "short: a write that writes nothing is a sentence")
+    }
+
     // The service's outcome as an entry: nothing for an IMEI already set; the before from the service on success,
     // the one known before on failure.
     static func entriesFromOutcomes() {
@@ -205,8 +323,8 @@ struct ImeiHistoryTests {
         check(entries.first?["module"] is NSNull, "json: unknown module is null")
     }
 
-    // The screen's rows: Change Back… only for a change that succeeded on the attached module, back to a valid IMEI
-    // other than the current one.
+    // The screen's rows: Change Back… only for a change that succeeded on the attached module (both known and the
+    // same: an entry without its module is only shown), back to a valid IMEI other than the current one.
     static func screenRows() {
         let mine = entry(zeros, counting, at: 0, module: "f00dcafe")
         let elsewhere = entry(zeros, counting, at: 10, module: "0badbeef")
@@ -217,12 +335,21 @@ struct ImeiHistoryTests {
 
         let rows = imeiHistoryRows(h, currentImei: counting, currentModule: "f00dcafe")
         equal(rows.map { $0.entry }, h.newestFirst, "rows: newest first")
-        equal(rows.map { $0.canChangeBack }, [true, false, false, false, true], "rows: change back offered")
+        equal(rows.map { $0.canChangeBack }, [false, false, false, false, true], "rows: change back offered")
+        check(!rows[0].canChangeBack && rows[0].entry.module == nil, "rows: an entry without its module is only shown")
         equal(rows.map { $0.otherModule }, [false, false, false, true, false], "rows: other module")
 
         let backNow = imeiHistoryRows(h, currentImei: zeros, currentModule: "f00dcafe")
         check(backNow.allSatisfy { !$0.canChangeBack }, "rows: not back to the IMEI the modem has now")
         let noneAttached = imeiHistoryRows(h, currentImei: counting, currentModule: nil)
         check(noneAttached.allSatisfy { !$0.otherModule }, "rows: no module attached, none is another")
+        check(noneAttached.allSatisfy { !$0.canChangeBack }, "rows: no module known attached, no Change Back")
+    }
+}
+
+extension Result {
+    var failureMessage: String? {
+        if case .failure(let f) = self { return (f as? ModemFailure)?.message ?? "\(f)" }
+        return nil
     }
 }

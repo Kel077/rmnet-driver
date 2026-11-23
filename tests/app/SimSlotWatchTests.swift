@@ -1,7 +1,9 @@
 // Tests for app/SimSlotWatch.swift and app/AppSettings.swift: when the other SIM slot is tried (no usable SIM in the slot
-// in use for 25 s, the radio on), when not (a SIM there, busy, the radio off, the setting off, no modem), what follows a
-// switch (staying, or switching back once), the lines it leaves, never switching back and forth within one attach, a
-// switch that did not start, and the watcher's commands, answers and attaches; then the settings' defaults and keeping.
+// in use for 25 s without a break, the radio on), when not (a SIM there, busy, the radio off, the setting off, no modem,
+// a read missing or too late: the wait starts again), what follows a switch (staying, switching back once, or nothing
+// when the port that writes found otherwise), the lines it leaves, never switching back and forth within one attach, a
+// switch that did not start or was cancelled, and the watcher's commands, answers, attaches and expectations; then the
+// settings' defaults and keeping.
 // Built with swiftc by `make app-test` from app/ModemNetwork.swift, app/ModemSettings.swift, app/SimSlotWatch.swift,
 // app/AppSettings.swift and this file; no AppKit, no modem.
 // Stops at the first failure, prints which check failed and exits 1.
@@ -39,7 +41,10 @@ struct SimSlotWatchTests {
         afterTheSwitch()
         backAndForth()
         notStarted()
+        breaks()
+        skipped()
         watcher()
+        watcherBreaksAndCancels()
         settings()
         print("SIM slot watch: \(checks) checks passed")
     }
@@ -94,21 +99,29 @@ struct SimSlotWatchTests {
         _ = pin.read(sim: .pin, radio: .on, slot: 1, at: at(0), enabled: true)
         equal(pin.phase, .idle, "asking for its PIN: a SIM is there")
 
-        var unread = SimSlotWatch()
-        unread.attached()
-        _ = unread.read(sim: .notInserted, radio: .on, slot: 1, at: at(0), enabled: true)
-        equal(unread.read(sim: .notInserted, radio: nil, slot: 1, at: at(30), enabled: true), .none, "radio not read")
-        equal(unread.read(sim: .notInserted, radio: .on, slot: nil, at: at(31), enabled: true), .none, "slot not read")
-        equal(unread.read(sim: nil, radio: .on, slot: 1, at: at(32), enabled: true), .none, "SIM not read")
-        equal(unread.read(sim: .other("+CME ERROR: 3"), radio: .on, slot: 1, at: at(33), enabled: true), .none,
-              "another answer: no verdict")
-        equal(unread.read(sim: .notInserted, radio: .on, slot: 1, at: at(34), enabled: true), .switchSlot(2),
-              "the wait kept across reads with no verdict")
+        // Each part not read, and another answer, is a break: the wait starts again at the next "unusable".
+        for (name, sim, radio, slot) in [("radio not read", SimState.notInserted, RadioState?.none, Int?.some(1)),
+                                         ("slot not read", .notInserted, .on, nil),
+                                         ("SIM not read", nil, .on, 1),
+                                         ("another answer", .other("+CME ERROR: 3"), .on, 1)] as [(String, SimState?, RadioState?, Int?)] {
+            var unread = SimSlotWatch()
+            unread.attached()
+            _ = unread.read(sim: .notInserted, radio: .on, slot: 1, at: at(0), enabled: true)
+            _ = unread.read(sim: .notInserted, radio: .on, slot: 1, at: at(15), enabled: true)
+            equal(unread.read(sim: sim, radio: radio, slot: slot, at: at(30), enabled: true), .none, "\(name): no verdict")
+            equal(unread.phase, .watching, "\(name): watching again")
+            equal(unread.read(sim: .notInserted, radio: .on, slot: 1, at: at(34), enabled: true), .none,
+                  "\(name): the wait starts again")
+            equal(unread.read(sim: .notInserted, radio: .on, slot: 1, at: at(45), enabled: true), .none, "\(name): 11 s")
+            equal(unread.read(sim: .notInserted, radio: .on, slot: 1, at: at(59), enabled: true), .switchSlot(2),
+                  "\(name): 25 s after the break")
+        }
 
         var off = SimSlotWatch()
         off.attached()
-        _ = off.read(sim: .notInserted, radio: .on, slot: 1, at: at(0), enabled: false)
-        equal(off.read(sim: .notInserted, radio: .on, slot: 1, at: at(60), enabled: false), .none, "setting off: no switch")
+        for t in stride(from: 0.0, through: 60, by: 15) {
+            equal(off.read(sim: .notInserted, radio: .on, slot: 1, at: at(t), enabled: false), .none, "setting off: no switch")
+        }
         equal(off.read(sim: .notInserted, radio: .on, slot: 1, at: at(61), enabled: true), .switchSlot(2),
               "setting turned on: switches at the next read")
 
@@ -228,19 +241,102 @@ struct SimSlotWatchTests {
         equal(b.retryAction, .none, "stopped: nothing")
     }
 
+    // Breaks in "no usable SIM": a turn without a read, or one too long after the last (the Mac slept, turns skipped).
+    static func breaks() {
+        var w = SimSlotWatch()
+        w.attached()
+        _ = w.read(sim: .notInserted, radio: .on, slot: 1, at: at(0), enabled: true)
+        _ = w.read(sim: .notInserted, radio: .on, slot: 1, at: at(15), enabled: true)
+        w.missed()
+        equal(w.phase, .watching, "missed: watching again")
+        equal(w.read(sim: .notInserted, radio: .on, slot: 1, at: at(30), enabled: true), .none, "missed: the wait starts again")
+        equal(w.read(sim: .notInserted, radio: .on, slot: 1, at: at(45), enabled: true), .none, "missed: 15 s")
+        equal(w.read(sim: .notInserted, radio: .on, slot: 1, at: at(55), enabled: true), .switchSlot(2), "missed: 25 s after")
+
+        var gap = SimSlotWatch()
+        gap.attached()
+        _ = gap.read(sim: .notInserted, radio: .on, slot: 1, at: at(0), enabled: true)
+        equal(gap.read(sim: .notInserted, radio: .on, slot: 1, at: at(41), enabled: true), .none,
+              "gap: 41 s without a read is a break")
+        equal(gap.phase, .unusable(since: at(41), slot: 1, state: .notInserted), "gap: the wait starts at the late read")
+        equal(gap.read(sim: .notInserted, radio: .on, slot: 1, at: at(66), enabled: true), .switchSlot(2), "gap: 25 s later")
+
+        var exact = SimSlotWatch()
+        exact.attached()
+        _ = exact.read(sim: .notInserted, radio: .on, slot: 1, at: at(0), enabled: true)
+        equal(exact.read(sim: .notInserted, radio: .on, slot: 1, at: at(40), enabled: true), .switchSlot(2),
+              "gap: 40 s is still two turns")
+
+        var back = SimSlotWatch()
+        back.attached()
+        _ = back.read(sim: .notInserted, radio: .on, slot: 1, at: at(100), enabled: true)
+        equal(back.read(sim: .notInserted, radio: .on, slot: 1, at: at(130), enabled: true), .switchSlot(2), "clock: forward")
+        var setBack = SimSlotWatch()
+        setBack.attached()
+        _ = setBack.read(sim: .notInserted, radio: .on, slot: 1, at: at(100), enabled: true)
+        equal(setBack.read(sim: .notInserted, radio: .on, slot: 1, at: at(70), enabled: true), .none,
+              "clock: set back is a break")
+
+        var idle = SimSlotWatch()
+        idle.missed()
+        equal(idle.phase, .idle, "missed: nothing while it does not watch")
+    }
+
+    // The port that writes found otherwise (SimSlotSkip): the radio off or a SIM there by then: watch again; another
+    // module or slot: nothing more. A switch back not made: no line.
+    static func skipped() {
+        func trying() -> SimSlotWatch {
+            var w = SimSlotWatch()
+            w.attached()
+            _ = w.read(sim: .notInserted, radio: .on, slot: 1, at: at(0), enabled: true)
+            _ = w.read(sim: .notInserted, radio: .on, slot: 1, at: at(25), enabled: true)
+            return w
+        }
+        for (skip, phase) in [(SimSlotSkip.radioNotOn, SimSlotWatch.Phase.watching), (.simUsable, .watching),
+                              (.otherModule, .idle), (.otherSlot, .idle)] {
+            var w = trying()
+            let next = w.switched(.success(SimSlotChange(before: 1, after: 1, skipped: skip)))
+            check(next.action == .none && next.line == nil, "skipped \(skip): no switch, no line")
+            equal(w.phase, phase, "skipped \(skip): phase")
+        }
+        var b = trying()
+        _ = b.switched(switched(1, 2, .notInserted))
+        let notBack = b.switched(.success(SimSlotChange(before: 1, after: 1, skipped: .otherSlot)))
+        check(notBack.action == .none && notBack.line == nil, "switch back not made: no line")
+        equal(b.phase, .idle, "switch back not made: settled")
+        var e = trying()
+        _ = e.switched(switched(1, 2, .notInserted))
+        equal(e.retryExpectation(module: "c0ffee01"), SimSlotExpectation(module: "c0ffee01", slot: 2, unusableSim: false),
+              "the switch back's expectation: the module, on the slot tried")
+        var none = SimSlotWatch()
+        check(none.retryExpectation(module: nil) == nil, "no switch back: no expectation")
+        none.attached()
+    }
+
     // The watcher: its commands while it watches, the answers turned into a switch, the attaches, a switch by hand.
     static func watcher() {
         var clock = at(0)
         var enabled = true
         var asked: [Int] = []
-        var pending: [(Result<SimSlotChange, ModemFailure>) -> Void] = []
+        var expectations: [SimSlotExpectation] = []
+        var pending: [(SimSlotOutcome) -> Int?] = []
         var accept = true
-        let w = SimSlotWatcher(enabled: { enabled }, switchSlot: { slot, done in
+        let w = SimSlotWatcher(enabled: { enabled }, module: { "c0ffee01" }, switchSlot: { slot, expect, done in
             guard accept else { return false }
             asked.append(slot)
+            expectations.append(expect)
             pending.append(done)
             return true
         }, now: { clock })
+        // The controller's part: the outcome to the watcher; a slot it hands back is switched to at once, as part of the
+        // same change (asked, and answered later through the same completion).
+        func finish(_ outcome: Result<SimSlotChange, ModemFailure>) {
+            let done = pending.removeFirst()
+            if let back = done(.finished(outcome)) {
+                asked.append(back)
+                pending.insert(done, at: 0)
+            }
+        }
         func answers(_ cpin: PulseAnswer, cfun: String = "+CFUN: 1", slot: Int = 1) -> Result<[String: PulseAnswer], ModemFailure> {
             .success(["AT+CPIN?": cpin, "AT+CFUN?": .lines([cfun]), "AT+QUIMSLOT?": .lines(["+QUIMSLOT: \(slot)"])])
         }
@@ -250,15 +346,24 @@ struct SimSlotWatchTests {
         w.modemPresent(true)
         equal(w.pulseCommands(), SimSlotWatcher.commands, "watcher: attached, the three reads")
         w.pulseAnswers(answers(empty))
-        clock = at(30)
+        clock = at(15)
         w.pulseAnswers(.failure(ModemFailure(message: "The modem's AT port is busy.")))
         check(asked.isEmpty, "watcher: a busy turn decides nothing")
         w.pulseAnswers(answers(empty))
-        equal(asked, [2], "watcher: switches to slot 2")
+        clock = at(30)
+        w.pulseAnswers(answers(empty))
+        check(asked.isEmpty, "watcher: a busy turn was a break: 15 s since")
+        clock = at(40)
+        w.pulseAnswers(answers(empty))
+        equal(asked, [2], "watcher: switches to slot 2, 25 s after the break")
+        equal(expectations, [SimSlotExpectation(module: "c0ffee01", slot: 1)],
+              "watcher: expects the module that attached, on slot 1, the radio on and the SIM unusable")
         equal(w.pulseCommands(), [], "watcher: no reads while it switches")
-        pending.removeFirst()(switched(1, 2, .ready))
+        check(w.switchRunning, "watcher: a switch runs")
+        finish(switched(1, 2, .ready))
         equal(w.line, "Switched to SIM 2: no SIM in slot 1.", "watcher: the line")
-        equal(w.lineAt, at(30), "watcher: when")
+        equal(w.lineAt, at(40), "watcher: when")
+        check(!w.switchRunning, "watcher: the switch has finished")
         equal(w.pulseCommands(), [], "watcher: settled, no reads")
 
         // Still present: no new watch. Gone and back: a new one.
@@ -275,26 +380,32 @@ struct SimSlotWatchTests {
         clock = at(130)
         w.pulseAnswers(answers(empty))
         equal(asked, [2], "watcher: tries slot 2")
-        pending.removeFirst()(switched(1, 2, .notInserted))
-        equal(asked, [2, 1], "watcher: and back to slot 1")
-        pending.removeFirst()(switched(2, 1, .notInserted))
+        finish(switched(1, 2, .notInserted))
+        equal(asked, [2, 1], "watcher: and back to slot 1, as part of the same change")
+        check(w.switchRunning && w.line == "Switched to SIM 2: no SIM in slot 1.",
+              "watcher: still running, no new line yet")
+        finish(switched(2, 1, .notInserted))
         equal(w.line, "No SIM in either slot.", "watcher: neither slot")
+        check(!w.switchRunning, "watcher: both finished")
 
-        // A switch back that could not start is asked again on the next turn.
+        // A switch back that was cancelled (dropped before it ran) is asked again on the next turn, with its expectation.
         w.modemPresent(false)
         w.modemPresent(true)
         asked = []
+        expectations = []
         clock = at(200)
         w.pulseAnswers(answers(empty))
         clock = at(230)
         w.pulseAnswers(answers(empty))
-        accept = false
-        pending.removeFirst()(switched(1, 2, .notInserted))
-        equal(asked, [2], "watcher: the switch back did not start")
-        accept = true
+        finish(switched(1, 2, .notInserted))
+        equal(asked, [2, 1], "watcher: the switch back handed to the controller")
+        _ = pending.removeFirst()(.cancelled)
+        check(!w.switchRunning, "watcher: a cancelled switch back frees the watcher")
         _ = w.pulseCommands()
-        equal(asked, [2, 1], "watcher: the switch back asked again on the next turn")
-        pending.removeFirst()(switched(2, 1, .notInserted))
+        equal(asked, [2, 1, 1], "watcher: the switch back asked again on the next turn")
+        equal(expectations.last, SimSlotExpectation(module: "c0ffee01", slot: 2, unusableSim: false),
+              "watcher: asked again with the module, on the slot tried")
+        finish(switched(2, 1, .notInserted))
 
         // A switch by hand stops the watch; the setting off never switches.
         w.modemPresent(false)
@@ -307,9 +418,53 @@ struct SimSlotWatchTests {
         asked = []
         clock = at(300)
         w.pulseAnswers(answers(empty))
-        clock = at(400)
+        clock = at(330)
         w.pulseAnswers(answers(empty))
         check(asked.isEmpty, "watcher: the setting off, no switch")
+        accept = false
+        enabled = true
+        clock = at(340)
+        w.pulseAnswers(answers(empty))
+        check(asked.isEmpty && !w.switchRunning, "watcher: a switch that did not start leaves it free")
+        equal(w.pulseCommands(), SimSlotWatcher.commands, "watcher: and watching again")
+    }
+
+    // The watcher and breaks: a turn with a command missing (not read in time) starts the wait again; a try that was
+    // cancelled (dropped when the app began to quit, the quit then cancelled) frees it, and it watches again.
+    static func watcherBreaksAndCancels() {
+        var clock = at(0)
+        var asked: [Int] = []
+        var pending: [(SimSlotOutcome) -> Int?] = []
+        let w = SimSlotWatcher(enabled: { true }, switchSlot: { slot, _, done in
+            asked.append(slot)
+            pending.append(done)
+            return true
+        }, now: { clock })
+        let empty = PulseAnswer.refused("+CME ERROR: 10")
+        let full: [String: PulseAnswer] = ["AT+CPIN?": empty, "AT+CFUN?": .lines(["+CFUN: 1"]),
+                                           "AT+QUIMSLOT?": .lines(["+QUIMSLOT: 1"])]
+        w.modemPresent(true)
+        w.pulseAnswers(.success(full))
+        clock = at(15)
+        var partial = full
+        partial["AT+QUIMSLOT?"] = nil      // the turn's last read timed out: not in the answers
+        w.pulseAnswers(.success(partial))
+        clock = at(30)
+        w.pulseAnswers(.success(full))
+        check(asked.isEmpty, "watcher: a command missing is a break")
+        clock = at(55)
+        w.pulseAnswers(.success(full))
+        equal(asked, [2], "watcher: 25 s after the break")
+
+        _ = pending.removeFirst()(.cancelled)
+        check(!w.switchRunning, "watcher: a cancelled try frees it")
+        equal(w.phase, .watching, "watcher: and it watches again")
+        equal(w.pulseCommands(), SimSlotWatcher.commands, "watcher: reads again")
+        clock = at(70)
+        w.pulseAnswers(.success(full))
+        clock = at(95)
+        w.pulseAnswers(.success(full))
+        equal(asked, [2, 2], "watcher: tries again after the patience")
     }
 
     // The settings: on by default, kept, read back.
@@ -318,13 +473,13 @@ struct SimSlotWatchTests {
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let s = AppSettings(defaults: defaults)
-        check(s.simAutoSwitch && s.notifyMessages && s.notificationShowsText, "settings: on by default")
+        check(s.simAutoSwitch && s.notifyMessages, "settings: on by default")
         s.simAutoSwitch = false
-        s.notificationShowsText = false
+        s.notifyMessages = false
         equal(defaults.object(forKey: "simAutoSwitch") as? Bool, false, "settings: kept under simAutoSwitch")
-        equal(defaults.object(forKey: "notificationShowsText") as? Bool, false, "settings: kept under notificationShowsText")
+        equal(defaults.object(forKey: "notifyNewMessages") as? Bool, false, "settings: kept under notifyNewMessages")
         let again = AppSettings(defaults: defaults)
-        check(!again.simAutoSwitch && again.notifyMessages && !again.notificationShowsText, "settings: read back")
+        check(!again.simAutoSwitch && !again.notifyMessages, "settings: read back")
         defaults.set("yes", forKey: "notifyNewMessages")
         check(AppSettings(defaults: defaults).notifyMessages, "settings: a value not a Bool is on")
     }

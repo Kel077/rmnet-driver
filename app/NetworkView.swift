@@ -139,6 +139,11 @@ struct NetworkTab: View {
                               cellLockDraft = nil
                               controller.setConfirming(false)
                           },
+                          lockInUse: { cell in
+                              controller.lockCellInUse(cell)
+                              cellLockDraft = nil
+                              controller.setConfirming(false)
+                          },
                           cancel: {
                               cellLockDraft = nil
                               controller.setConfirming(false)
@@ -874,7 +879,10 @@ private struct BandTag: View {
 /// The sheet Lock… opens: a 5G SA cell (`AT+QNWLOCK="common/5g"`: band, PCI, ARFCN, subcarrier spacing) or up to ten
 /// LTE cells (`AT+QNWLOCK="common/4g"`: EARFCN and PCI each), filled in from a cell in use when one was chosen, else
 /// from the lock in place; the cells in use, to fill it in; the rule a value breaks; what a lock does; Lock (the
-/// default button) and Cancel. The sheet is the question, as the bands sheet is.
+/// default button) and Cancel. The sheet is the question, as the bands sheet is. The subcarrier spacing is never
+/// guessed: one the modem does not report for a cell must be chosen. A cell in use (one of `quickTargets`) is locked
+/// with `lockInUse`, which locks it only while the modem still uses it (read again with the lock); any other cell with
+/// `lockNr` or `lockLte`, as typed.
 struct CellLockSheet: View {
     enum Mode: String, CaseIterable {
         case sa = "5G SA"
@@ -891,29 +899,32 @@ struct CellLockSheet: View {
     let quickTargets: [NetworkCards.LockTarget]
     let lockNr: (NrCellLock) -> Void
     let lockLte: ([LteLockedCell]) -> Void
+    let lockInUse: (CellInUse) -> Void
     let cancel: () -> Void
 
     @State private var mode: Mode
     @State private var nrBand: String
     @State private var nrPci: String
     @State private var nrArfcn: String
-    @State private var nrScs: Int
+    @State private var nrScs: Int?        // nil: not chosen (the modem did not report it, or nothing was filled in)
     @State private var lteRows: [LteRowDraft]
 
     init(controller: ModemController, initialTarget: NetworkCards.LockTarget?, initialMode: Mode? = nil,
          quickTargets: [NetworkCards.LockTarget], lockNr: @escaping (NrCellLock) -> Void,
-         lockLte: @escaping ([LteLockedCell]) -> Void, cancel: @escaping () -> Void) {
+         lockLte: @escaping ([LteLockedCell]) -> Void, lockInUse: @escaping (CellInUse) -> Void,
+         cancel: @escaping () -> Void) {
         self.controller = controller
         self.quickTargets = quickTargets
         self.lockNr = lockNr
         self.lockLte = lockLte
+        self.lockInUse = lockInUse
         self.cancel = cancel
 
         var startMode: Mode = initialMode ?? .sa
         var band = ""
         var pci = ""
         var arfcn = ""
-        var scs = 30
+        var scs: Int? = nil
         var lte: [LteRowDraft] = [LteRowDraft(earfcn: "", pci: "")]
 
         let currentNr = controller.cellLock?.nr
@@ -950,8 +961,16 @@ struct CellLockSheet: View {
         let trimmedBand = (bandClean.first == "n" || bandClean.first == "N") ? String(bandClean.dropFirst()) : bandClean
         guard let pci = Int(nrPci.trimmingCharacters(in: .whitespacesAndNewlines)),
               let arfcn = Int(nrArfcn.trimmingCharacters(in: .whitespacesAndNewlines)),
-              let band = Int(trimmedBand) else { return nil }
+              let band = Int(trimmedBand), let nrScs else { return nil }
         return NrCellLock(pci: pci, arfcn: arfcn, scsKHz: nrScs, band: band)
+    }
+
+    /// The band, PCI and ARFCN are whole numbers (the subcarrier spacing aside).
+    private var numbersEntered: Bool {
+        let bandClean = nrBand.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedBand = (bandClean.first == "n" || bandClean.first == "N") ? String(bandClean.dropFirst()) : bandClean
+        return Int(nrPci.trimmingCharacters(in: .whitespacesAndNewlines)) != nil
+            && Int(nrArfcn.trimmingCharacters(in: .whitespacesAndNewlines)) != nil && Int(trimmedBand) != nil
     }
 
     private var supportedSaBands: [Int]? {
@@ -973,7 +992,11 @@ struct CellLockSheet: View {
         switch mode {
         case .sa:
             if nrBand.isEmpty && nrPci.isEmpty && nrArfcn.isEmpty { return nil }
-            guard let parsedNr else { return "Enter the band, PCI and ARFCN as whole numbers." }
+            guard let parsedNr else {
+                return nrScs == nil && numbersEntered
+                    ? "Choose the subcarrier spacing: the modem does not report it for every cell."
+                    : "Enter the band, PCI and ARFCN as whole numbers."
+            }
             return nrCellLockProblem(parsedNr, supportedSaBands: supportedSaBands)
         case .lte:
             if lteRows.allSatisfy({ $0.earfcn.isEmpty && $0.pci.isEmpty }) { return nil }
@@ -1071,8 +1094,11 @@ struct CellLockSheet: View {
                     GridRow {
                         Text("Subcarrier spacing").foregroundStyle(.secondary)
                         Picker("Subcarrier spacing", selection: $nrScs) {
+                            if nrScs == nil {
+                                Text("Choose").tag(Int?.none)
+                            }
                             ForEach(validNrScsKHz, id: \.self) { scs in
-                                Text(verbatim: "\(scs) kHz").tag(scs)
+                                Text(verbatim: "\(scs) kHz").tag(Int?.some(scs))
                             }
                         }
                         .labelsHidden()
@@ -1135,9 +1161,15 @@ struct CellLockSheet: View {
                 Button("Lock") {
                     switch mode {
                     case .sa:
-                        if let parsedNr { lockNr(parsedNr) }
+                        guard let parsedNr else { return }
+                        if NetworkCards.inUse(parsedNr, among: quickTargets) { lockInUse(.nr(parsedNr)) } else { lockNr(parsedNr) }
                     case .lte:
-                        if let parsedLte { lockLte(parsedLte) }
+                        guard let parsedLte else { return }
+                        if let one = parsedLte.first, parsedLte.count == 1, NetworkCards.inUse(one, among: quickTargets) {
+                            lockInUse(.lte(one))
+                        } else {
+                            lockLte(parsedLte)
+                        }
                     }
                 }
                 .keyboardShortcut(.defaultAction)
@@ -1588,8 +1620,22 @@ enum NetworkCards {
     // MARK: Cell lock
 
     enum LockTargetKind: Equatable {
-        case nr(NrCellLock)
+        case nr(NrCellTarget)
         case lte(LteLockedCell)
+    }
+
+    /// A 5G SA cell in use: its band, PCI and ARFCN, and its subcarrier spacing when the modem reports it (the serving
+    /// leg's); nil when it does not (a secondary carrier: AT+QCAINFO gives none), to be chosen, never guessed.
+    struct NrCellTarget: Equatable {
+        let pci: Int
+        let arfcn: Int
+        let band: Int
+        let scsKHz: Int?
+
+        /// The same cell as `lock` (band, PCI and ARFCN; a spacing reported must be the lock's).
+        func isCell(_ lock: NrCellLock) -> Bool {
+            lock.pci == pci && lock.arfcn == arfcn && lock.band == band && (scsKHz == nil || scsKHz == lock.scsKHz)
+        }
     }
 
     /// A cell in use the modem can be locked to: its band ("n41"), its role ("Primary", "Secondary", "Serving"),
@@ -1605,7 +1651,8 @@ enum NetworkCards {
     }
 
     /// Lockable 5G SA and LTE cells from AT+QCAINFO's carriers (primary, then secondary) and the serving legs, each
-    /// once. 5G cells only while the modem is on 5G SA (an NSA leg cannot be locked with "common/5g").
+    /// once. 5G cells only while the modem is on 5G SA (an NSA leg cannot be locked with "common/5g"); a 5G cell's
+    /// subcarrier spacing only as the serving leg reports it.
     static func lockTargets(_ info: NetworkInfo?) -> [LockTarget] {
         guard let info else { return [] }
         let legs = info.serving?.cells ?? []
@@ -1625,11 +1672,10 @@ enum NetworkCards {
             let role = comp.role == "PCC" ? "Primary" : "Secondary"
             if comp.rat == "NR5G", allowNrSa, comp.band.hasPrefix("n"), let bandNum = Int(comp.band.dropFirst()) {
                 let legMatch = legs.first { $0.rat == "NR5G-SA" && $0.band == comp.band && $0.pci == pci && $0.channel == channel }
-                let scs = legMatch?.scsKHz ?? defaultNrScsKHz(band: bandNum, duplex: legMatch?.duplex)
                 add(LockTarget(band: comp.band, role: role,
                                detail: words(comp.bandwidthMHz, pci: pci, channel: "ARFCN \(channel)"),
-                               kind: .nr(NrCellLock(pci: pci, arfcn: channel, scsKHz: scs, band: bandNum))),
-                    key: "NR:\(bandNum):\(pci):\(channel):\(scs)")
+                               kind: .nr(NrCellTarget(pci: pci, arfcn: channel, band: bandNum, scsKHz: legMatch?.scsKHz))),
+                    key: "NR:\(bandNum):\(pci):\(channel)")
             } else if comp.rat == "LTE" {
                 add(LockTarget(band: comp.band, role: role,
                                detail: words(comp.bandwidthMHz, pci: pci, channel: "EARFCN \(channel)"),
@@ -1641,11 +1687,10 @@ enum NetworkCards {
         for leg in legs {
             guard let channel = leg.channel, let pci = leg.pci else { continue }
             if leg.rat == "NR5G-SA", let bandStr = leg.band, bandStr.hasPrefix("n"), let bandNum = Int(bandStr.dropFirst()) {
-                let scs = leg.scsKHz ?? defaultNrScsKHz(band: bandNum, duplex: leg.duplex)
                 add(LockTarget(band: bandStr, role: "Serving",
                                detail: words(leg.bandwidthMHz, pci: pci, channel: "ARFCN \(channel)"),
-                               kind: .nr(NrCellLock(pci: pci, arfcn: channel, scsKHz: scs, band: bandNum))),
-                    key: "NR:\(bandNum):\(pci):\(channel):\(scs)")
+                               kind: .nr(NrCellTarget(pci: pci, arfcn: channel, band: bandNum, scsKHz: leg.scsKHz))),
+                    key: "NR:\(bandNum):\(pci):\(channel)")
             } else if leg.rat == "LTE" {
                 add(LockTarget(band: leg.band ?? "LTE", role: "Serving",
                                detail: words(leg.bandwidthMHz, pci: pci, channel: "EARFCN \(channel)"),
@@ -1660,9 +1705,19 @@ enum NetworkCards {
     static func targetIsLocked(_ target: LockTarget, _ lock: CellLockState?) -> Bool {
         guard let lock else { return false }
         switch target.kind {
-        case .nr(let nr): return lock.nr == nr
+        case .nr(let nr): return lock.nr.map(nr.isCell) ?? false
         case .lte(let cell): return lock.lte == [cell]
         }
+    }
+
+    /// A 5G SA lock that is one of the cells in use (so the sheet locks it with lockCellInUse, only while it still is).
+    static func inUse(_ lock: NrCellLock, among targets: [LockTarget]) -> Bool {
+        targets.contains { if case .nr(let t) = $0.kind { return t.isCell(lock) } else { return false } }
+    }
+
+    /// An LTE cell that is one of the cells in use.
+    static func inUse(_ cell: LteLockedCell, among targets: [LockTarget]) -> Bool {
+        targets.contains { $0.kind == .lte(cell) }
     }
 
     /// A 5G SA lock in the card's words: "n41 · PCI 186 · ARFCN 520110 · SCS 30 kHz".

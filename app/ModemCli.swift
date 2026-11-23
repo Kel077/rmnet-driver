@@ -41,7 +41,7 @@ enum ModemCommand: Equatable {
     case bandsReset(BandRat?)                   // nil: lte, nsa and sa, in that order
     case cellShow(json: Bool)
     case cellLockNr(NrCellLock)
-    case cellLockCurrent
+    case cellLockCurrent(scsKHz: Int?)          // the serving cell's SCS when the modem gives none (`--scs`)
     case cellLockLte([LteLockedCell])
     case cellUnlock(CellUnlockScope)
     case cellPersist(Bool)
@@ -77,7 +77,7 @@ let modemUsage = "network [--json] | antennas [--json] | radio [on|off] | mode [
     + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes] | "
     + "at [--timeout <seconds>] <command> | "
     + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa] | "
-    + "cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current | "
+    + "cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current [--scs <kHz>] | "
     + "cell lock lte <earfcn>:<pci>[,…] | cell unlock [sa|lte] | cell persist on|off | "
     + "imei [--json] | imei set <imei> [--no-reboot] [--yes] | imei history [--json]"
 
@@ -154,7 +154,9 @@ private func parseCell(_ words: [String]) -> ModemCommand? {
         let args = Array(words.dropFirst())
         switch args {
         case ["current"]:
-            return .cellLockCurrent
+            return .cellLockCurrent(scsKHz: nil)
+        case _ where args.count == 3 && args[0] == "current" && args[1] == "--scs":
+            return parseAsciiInt(args[2]).map { .cellLockCurrent(scsKHz: $0) }
         case _ where args.count == 5 && args[0] == "sa":
             let bandRaw = (args[4].first == "n" || args[4].first == "N") ? String(args[4].dropFirst()) : args[4]
             guard let pci = parseAsciiInt(args[1]),
@@ -425,8 +427,15 @@ func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int
             output("cell: \(cellLockSentence(ch))")
             return 0
         }
-    case .cellLockCurrent:
-        return lockCurrentCell(service, output)
+    case .cellLockCurrent(let scs):
+        // The serving cell is read and locked in one port session (ModemService.lockCellInUse); its subcarrier
+        // spacing is the modem's, or `--scs` when the modem gives none, never guessed.
+        switch service.lockCellInUse(.serving(scsKHz: scs)) {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let ch):
+            output("cell: \(cellLockSentence(ch))")
+            return 0
+        }
     case .cellLockLte(let cells):
         switch service.setLteCellLock(cells) {
         case .failure(let failure): return fail("cell", failure.message, output)
@@ -516,35 +525,6 @@ private func showCell(_ service: ModemServing, json: Bool, _ output: (String) ->
     }
 }
 
-private func lockCurrentCell(_ service: ModemServing, _ output: (String) -> Void) -> Int32 {
-    let info: NetworkInfo
-    switch service.networkInfo() {
-    case .failure(let failure): return fail("cell", failure.message, output)
-    case .success(let read): info = read
-    }
-    let legs = info.serving?.cells ?? []
-    if let sa = legs.first(where: { $0.rat == "NR5G-SA" }),
-       let pci = sa.pci, let arfcn = sa.channel, let bandStr = sa.band,
-       bandStr.hasPrefix("n"), let band = Int(bandStr.dropFirst()) {
-        let scs = sa.scsKHz ?? defaultNrScsKHz(band: band, duplex: sa.duplex)
-        switch service.setNrCellLock(NrCellLock(pci: pci, arfcn: arfcn, scsKHz: scs, band: band)) {
-        case .failure(let failure): return fail("cell", failure.message, output)
-        case .success(let ch):
-            output("cell: \(cellLockSentence(ch))")
-            return 0
-        }
-    }
-    if let lte = legs.first(where: { $0.rat == "LTE" }), let earfcn = lte.channel, let pci = lte.pci {
-        switch service.setLteCellLock([LteLockedCell(earfcn: earfcn, pci: pci)]) {
-        case .failure(let failure): return fail("cell", failure.message, output)
-        case .success(let ch):
-            output("cell: \(cellLockSentence(ch))")
-            return 0
-        }
-    }
-    return fail("cell", "No lockable 5G SA or LTE serving cell is currently active.", output)
-}
-
 private func unlockCell(_ service: ModemServing, scope: CellUnlockScope, _ output: (String) -> Void) -> Int32 {
     switch scope {
     case .sa:
@@ -588,12 +568,12 @@ private func unlockCell(_ service: ModemServing, scope: CellUnlockScope, _ outpu
 }
 
 /// `imei set`. Once the change has been sent to the service (not when it is refused before, the IMEI is already the
-/// one asked or the question is cancelled), it is recorded in the IMEI history, succeeded or failed; a history that
-/// cannot be written adds a line saying so and does not change the exit code.
+/// one asked or the question is cancelled), it is recorded in the IMEI history, succeeded or failed, with the module and
+/// the IMEI before as the change's own port open read them (ImeiWrite); a history that cannot be written adds a line
+/// saying so and does not change the exit code.
 private func setImei(_ service: ModemServing, _ value: String, reboot: Bool, yes: Bool,
                      ask: (String) -> String?, history: ImeiHistoryRecorder?, _ output: (String) -> Void) -> Int32 {
     if let problem = imeiProblem(value) { return fail("imei", "\(problem) Nothing was changed.", output) }
-    let before: String
     switch service.imei() {
     case .failure(let failure): return fail("imei", failure.message, output)
     case .success(let current):
@@ -601,7 +581,6 @@ private func setImei(_ service: ModemServing, _ value: String, reboot: Bool, yes
             output("imei: already \(value); nothing changed")
             return 0
         }
-        before = current
     }
     if reboot && !yes {
         guard let answer = ask(restartQuestion) else {
@@ -614,9 +593,10 @@ private func setImei(_ service: ModemServing, _ value: String, reboot: Bool, yes
             return 1
         }
     }
-    let outcome = service.setImei(value, reboot: reboot)
-    if let history, let entry = imeiHistoryEntry(after: value, before: before, restart: reboot, outcome: outcome,
-                                                 source: .cli, module: history.module(), at: history.now()),
+    let write = service.setImei(value, reboot: reboot, module: nil)
+    let outcome = write.outcome
+    if let history, let entry = imeiHistoryEntry(after: value, before: write.before, restart: reboot, outcome: outcome,
+                                                 source: .cli, module: write.module, at: history.now()),
        let problem = history.keeper.append(entry) {
         output("imei: the change was not recorded in the IMEI history. \(problem)")
     }

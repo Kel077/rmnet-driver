@@ -10,7 +10,7 @@
 //        RMNet usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes]
 //        RMNet at [--timeout <seconds>] <command>
 //        RMNet bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa]
-//        RMNet cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current
+//        RMNet cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current [--scs <kHz>]
 //        RMNet cell lock lte <earfcn>:<pci>[,…] | cell unlock [sa|lte] | cell persist on|off
 //        RMNet imei [--json] | imei set <imei> [--no-reboot] [--yes] | imei history [--json]
 //        RMNet (no argument, or opened from the Finder): the status window.

@@ -104,10 +104,13 @@ struct NoModem: ModemServing {
     func setNrCellLock(_ lock: NrCellLock?) -> Result<CellLockChange, ModemFailure> { .failure(failure) }
     func setLteCellLock(_ cells: [LteLockedCell]) -> Result<CellLockChange, ModemFailure> { .failure(failure) }
     func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure> { .failure(failure) }
+    func lockCellInUse(_ cell: CellInUse) -> Result<CellLockChange, ModemFailure> { .failure(failure) }
     func imei() -> Result<String, ModemFailure> { .failure(failure) }
-    func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure> { .failure(failure) }
+    func setImei(_ imei: String, reboot: Bool, module: String?) -> ImeiWrite { ImeiWrite(outcome: .failure(failure)) }
     func simSlot() -> Result<Int, ModemFailure> { .failure(failure) }
-    func setSimSlot(_ slot: Int, wait: SimSlotWait) -> Result<SimSlotChange, ModemFailure> { .failure(failure) }
+    func setSimSlot(_ slot: Int, wait: SimSlotWait, expect: SimSlotExpectation?) -> Result<SimSlotChange, ModemFailure> {
+        .failure(failure)
+    }
 }
 
 @main
@@ -819,6 +822,36 @@ struct ModemSettingsTests {
         expectEqual(lteCellLockCommand([LteLockedCell(earfcn: 1300, pci: 128), LteLockedCell(earfcn: 100, pci: 45)]),
                     "AT+QNWLOCK=\"common/4g\",2,1300,128,100,45", "lteCellLockCommand: lock")
         expectEqual(cellLockPersistCommand(lte: true, nr: false), "AT+QNWLOCK=\"save_ctrl\",1,0", "cellLockPersistCommand")
+
+        // A cell in use, against the serving cell and the carriers read with the lock.
+        let saLeg = parseServingCell(
+            ["+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"FDD\",310,260,00A1B2C3D,683,001A2B,396250,25,3,-92,-11,20,0,-"])
+        let scc = parseCarrierComponents(["+QCAINFO: \"PCC\",396250,3,\"NR5G BAND 25\",683",
+                                          "+QCAINFO: \"SCC\",520110,12,\"NR5G BAND 41\",2,147,0,-,-"])
+        let n41 = NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41)
+        check(cellInUseLock(.nr(n41), serving: saLeg, carriers: scc) == .nr(n41),
+              "cellInUseLock: a secondary carrier is in use (its SCS the owner's: the modem gives none for it)")
+        check(cellInUseLock(.nr(NrCellLock(pci: 683, arfcn: 396250, scsKHz: 30, band: 25)), serving: saLeg, carriers: scc)
+                == .refused("The modem reports a subcarrier spacing of 15 kHz for that cell, not 30 kHz."),
+              "cellInUseLock: the serving leg's SCS must be the lock's")
+        check(cellInUseLock(.nr(n41), serving: saLeg, carriers: []) == .refused(
+                "The modem no longer uses that 5G SA cell (n41, PCI 147, ARFCN 520110)."),
+              "cellInUseLock: a carrier gone since")
+        let endc = parseServingCell(["+QENG: \"servingcell\",\"NOCONN\"",
+                                     "+QENG: \"LTE\",\"FDD\",310,260,0ABC123,101,1300,3,5,5,5A0B,-95,-11,-65,15,9,-,-",
+                                     "+QENG: \"NR5G-NSA\",310,260,147,-90,20,-11,520110,41,12,1"])
+        check(cellInUseLock(.nr(n41), serving: endc, carriers: scc) == .refused(
+                "The modem no longer uses that 5G SA cell (n41, PCI 147, ARFCN 520110)."),
+              "cellInUseLock: an NSA leg is not a 5G SA cell in use")
+        check(cellInUseLock(.serving(scsKHz: nil), serving: endc, carriers: []) == .lte(LteLockedCell(earfcn: 1300, pci: 101)),
+              "cellInUseLock: on EN-DC the serving cell is the LTE leg")
+        let lteScc = parseCarrierComponents(["+QCAINFO: \"SCC\",66786,100,\"LTE BAND 66\",1,128,-95,-11,-65,15"])
+        check(cellInUseLock(.lte(LteLockedCell(earfcn: 66786, pci: 128)), serving: endc, carriers: lteScc)
+                == .lte(LteLockedCell(earfcn: 66786, pci: 128)), "cellInUseLock: an LTE carrier is in use")
+        check(cellInUseLock(.serving(scsKHz: nil), serving: nil, carriers: [])
+                == .refused("No lockable 5G SA or LTE serving cell is currently active."), "cellInUseLock: nothing serves")
+        check(cellInUseProblem(.serving(scsKHz: 45)) != nil && cellInUseProblem(.serving(scsKHz: 60)) == nil
+                && cellInUseProblem(.serving(scsKHz: nil)) == nil, "cellInUseProblem: an SCS given must be a spacing")
 
         let lockState = CellLockState(lte: [], nr: NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41),
                                       persistLte: false, persistNr: false)

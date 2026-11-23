@@ -6,6 +6,11 @@
 //
 // The history is kept on this Mac only, in ~/Library/Application Support/RMNet/imei-history.jsonl: one JSON object a
 // line, appended (never rewritten), readable by the owner only. A line that cannot be read is skipped and counted.
+// The file is used only as what it should be: a regular file of the user's, owner-only, in a folder of the user's
+// that nobody else can write, opened without following a symbolic link (checked on the opened file itself); anything
+// else is refused with a sentence. Lines are split at LF bytes, so bytes that are not UTF-8 cost their line only; an
+// append is made under an exclusive lock (flock) shared with every RMNet process, starts on a line of its own when the
+// file does not end with a LF (a write cut short), and writes until every byte is written.
 // Foundation only, so `make app-test` builds it (tests/app/ImeiHistoryTests.swift); nothing here talks to the modem.
 import Foundation
 
@@ -100,10 +105,20 @@ func imeiHistoryEntry(line: String) -> ImeiHistoryEntry? {
 
 /// The file's text read back: blank lines ignored, any other line that is not an entry skipped and counted.
 func parseImeiHistory(_ text: String) -> ImeiHistory {
+    parseImeiHistory(bytes: Array(text.utf8))
+}
+
+/// The file's bytes read back, split at each LF: a line that is not UTF-8 or not an entry is skipped and counted (only
+/// that line), a blank one ignored; a last line without its LF (a write cut short) is read like any other.
+func parseImeiHistory(bytes: [UInt8]) -> ImeiHistory {
     var entries: [ImeiHistoryEntry] = []
     var skipped = 0
-    for raw in text.split(whereSeparator: \.isNewline) {
-        let line = raw.trimmingCharacters(in: .whitespaces)
+    for raw in bytes.split(separator: 0x0A, omittingEmptySubsequences: true) {
+        guard let text = String(bytes: raw, encoding: .utf8) else {
+            skipped += 1
+            continue
+        }
+        let line = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if line.isEmpty { continue }
         if let e = imeiHistoryEntry(line: line) { entries.append(e) } else { skipped += 1 }
     }
@@ -125,8 +140,13 @@ protocol ImeiHistoryKeeping {
 
 final class ImeiHistoryFile: ImeiHistoryKeeping {
     let url: URL
+    private let writeBytes: (Int32, UnsafeRawPointer, Int) -> Int
 
-    init(url: URL) { self.url = url }
+    /// `write`: write(2), or in the tests one that writes fewer bytes than asked.
+    init(url: URL, write: @escaping (Int32, UnsafeRawPointer, Int) -> Int = { Darwin.write($0, $1, $2) }) {
+        self.url = url
+        self.writeBytes = write
+    }
 
     /// ~/Library/Application Support/RMNet/imei-history.jsonl, for the window and the verbs alike (the app is not
     /// sandboxed, so both see the same file).
@@ -137,37 +157,110 @@ final class ImeiHistoryFile: ImeiHistoryKeeping {
     }
 
     var location: String { url.path }
+    private var folder: URL { url.deletingLastPathComponent() }
 
+    /// No file (or no folder) yet is an empty history. Read under a shared lock, so never half an append.
     func load() -> Result<ImeiHistory, ModemFailure> {
-        guard FileManager.default.fileExists(atPath: url.path) else { return .success(ImeiHistory(entries: [], skippedLines: 0)) }
-        do {
-            let text = try String(contentsOf: url, encoding: .utf8)
-            return .success(parseImeiHistory(text))
-        } catch {
-            return .failure(ModemFailure(message: "The IMEI history could not be read (\(url.path))."))
+        if let problem = folderProblem(creating: false) {
+            if problem.isEmpty { return .success(ImeiHistory(entries: [], skippedLines: 0)) }
+            return .failure(ModemFailure(message: problem))
         }
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else {
+            if errno == ENOENT { return .success(ImeiHistory(entries: [], skippedLines: 0)) }
+            return .failure(ModemFailure(message: openProblem(errno)))
+        }
+        defer { close(fd) }
+        if let problem = fileProblem(fd) { return .failure(ModemFailure(message: problem)) }
+        guard flock(fd, LOCK_SH) == 0 else { return .failure(ModemFailure(message: unreadable)) }
+        defer { flock(fd, LOCK_UN) }
+        var bytes: [UInt8] = []
+        var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let n = chunk.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+            if n == 0 { break }
+            if n < 0 {
+                if errno == EINTR { continue }
+                return .failure(ModemFailure(message: unreadable))
+            }
+            bytes.append(contentsOf: chunk[0..<n])
+        }
+        return .success(parseImeiHistory(bytes: bytes))
     }
 
-    /// One write(2) of the line and its newline to the file opened for appending (created owner-only, its folder
-    /// too), so a change recorded by the window and one by a verb at the same moment do not mix their lines.
+    /// The line and its newline, appended under an exclusive lock (a change recorded by the window and one by a verb at
+    /// the same moment do not mix their lines), after a newline of its own when the file does not end with one, every
+    /// byte written however many writes it takes. The file is made owner-only, its folder too.
     func append(_ entry: ImeiHistoryEntry) -> String? {
-        let folder = url.deletingLastPathComponent()
-        do {
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
-                                                    attributes: [.posixPermissions: 0o700])
-        } catch {
-            return "The IMEI history's folder could not be made (\(folder.path))."
-        }
-        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0o600)
-        guard fd >= 0 else { return "The IMEI history could not be opened (\(url.path))." }
+        if let problem = folderProblem(creating: true) { return problem }
+        let fd = open(url.path, O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { return openProblem(errno) }
         defer { close(fd) }
-        let bytes = Array((imeiHistoryLine(entry) + "\n").utf8)
-        let written = bytes.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
-        return written == bytes.count ? nil : "The IMEI history could not be written (\(url.path))."
+        if let problem = fileProblem(fd) { return problem }
+        guard flock(fd, LOCK_EX) == 0 else { return unwritable }
+        defer { flock(fd, LOCK_UN) }
+        var bytes = Array((imeiHistoryLine(entry) + "\n").utf8)
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { return unwritable }
+        if info.st_size > 0 {
+            var last: UInt8 = 0
+            guard pread(fd, &last, 1, info.st_size - 1) == 1 else { return unwritable }
+            if last != 0x0A { bytes.insert(0x0A, at: 0) }
+        }
+        var done = 0
+        while done < bytes.count {
+            let n = bytes.withUnsafeBytes { writeBytes(fd, $0.baseAddress! + done, bytes.count - done) }
+            if n < 0 && errno == EINTR { continue }
+            guard n > 0 else { return unwritable }
+            done += n
+        }
+        return nil
+    }
+
+    private var unreadable: String { "The IMEI history could not be read (\(url.path))." }
+    private var unwritable: String { "The IMEI history could not be written (\(url.path))." }
+
+    private func openProblem(_ code: Int32) -> String {
+        code == ELOOP ? "The IMEI history is a symbolic link, which RMNet does not follow (\(url.path))."
+            : "The IMEI history could not be opened (\(url.path))."
+    }
+
+    /// The folder (made owner-only when `creating` and missing): a directory of the user's, not a symbolic link, that
+    /// nobody else can write. nil: fine; "": missing (not `creating`); else why not.
+    private func folderProblem(creating: Bool) -> String? {
+        var info = stat()
+        if lstat(folder.path, &info) != 0 {
+            guard errno == ENOENT else { return "The IMEI history's folder could not be checked (\(folder.path))." }
+            guard creating else { return "" }
+            do {
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
+                                                        attributes: [.posixPermissions: 0o700])
+            } catch {
+                return "The IMEI history's folder could not be made (\(folder.path))."
+            }
+            guard lstat(folder.path, &info) == 0 else { return "The IMEI history's folder could not be made (\(folder.path))." }
+        }
+        guard info.st_mode & S_IFMT == S_IFDIR, info.st_uid == geteuid(), info.st_mode & 0o022 == 0 else {
+            return "The IMEI history's folder is not a folder of yours that only you can write (\(folder.path)). "
+                + "RMNet does not use it."
+        }
+        return nil
+    }
+
+    /// The file opened: a regular file of the user's that only the user can read or write. nil: fine; else why not.
+    private func fileProblem(_ fd: Int32) -> String? {
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { return "The IMEI history could not be checked (\(url.path))." }
+        guard info.st_mode & S_IFMT == S_IFREG, info.st_uid == geteuid(), info.st_mode & 0o077 == 0 else {
+            return "The IMEI history is not a file of yours that only you can read and write (\(url.path)). "
+                + "RMNet does not use it."
+        }
+        return nil
     }
 }
 
-/// What a change needs to record itself: the file, the attached module's serial number and the clock.
+/// What a change needs to record itself: the file and the clock; and the attached module's serial number, which the
+/// SIM & Data screen shows beside the history (an entry takes its module from the change's own port open, ImeiWrite).
 struct ImeiHistoryRecorder {
     let keeper: ImeiHistoryKeeping
     let module: () -> String?
@@ -176,9 +269,9 @@ struct ImeiHistoryRecorder {
 
 // MARK: - Entries from changes
 
-/// The entry for a change asked for (`after`), from the IMEI known before it and the service's answer; nil when the
-/// modem already had that IMEI (nothing was written). A failure is recorded as failed with its sentence: it may
-/// still have changed the IMEI (the sentence then says so).
+/// The entry for a change asked for (`after`), from the IMEI and the module the change's port open read (ImeiWrite) and
+/// the service's answer; nil when the modem already had that IMEI (nothing was written). A failure is recorded as
+/// failed with its sentence: it may still have changed the IMEI (the sentence then says so).
 func imeiHistoryEntry(after: String, before: String?, restart: Bool, outcome: Result<ImeiChange, ModemFailure>,
                       source: ImeiChangeSource, module: String?, at time: Date) -> ImeiHistoryEntry? {
     switch outcome {
@@ -244,8 +337,8 @@ func imeiHistoryJSON(_ history: ImeiHistory, location: String) -> [String: Any] 
 // MARK: - What the SIM & Data screen shows
 
 /// A row of the screen's history: the change in words, and whether Change Back… is offered for it (a change that
-/// succeeded, on the module attached (or one not known on either side), whose IMEI before is known and is not the
-/// one the modem has now).
+/// succeeded on the module attached, both known and the same, whose IMEI before is known and is not the one the modem
+/// has now). An entry whose module is not known is only shown: it cannot be told which module it would change back.
 struct ImeiHistoryRow: Equatable {
     let entry: ImeiHistoryEntry
     let otherModule: Bool        // made on another module than the one attached
@@ -255,7 +348,9 @@ struct ImeiHistoryRow: Equatable {
 func imeiHistoryRows(_ history: ImeiHistory, currentImei: String?, currentModule: String?) -> [ImeiHistoryRow] {
     history.newestFirst.map { e in
         let other = currentModule != nil && e.module != nil && e.module != currentModule
-        let back = !other && e.result == .succeeded && e.before.map { imeiProblem($0) == nil && $0 != currentImei } == true
+        let sameModule = e.module != nil && e.module == currentModule
+        let back = sameModule && e.result == .succeeded
+            && e.before.map { imeiProblem($0) == nil && $0 != currentImei } == true
         return ImeiHistoryRow(entry: e, otherModule: other, canChangeBack: back)
     }
 }

@@ -337,10 +337,10 @@ struct NetworkViewTests {
         let targets = NetworkCards.lockTargets(richInfo)
         equal(targets, [
             NetworkCards.LockTarget(band: "n25", role: "Primary", detail: "20 MHz · PCI 683 · ARFCN 396250",
-                                    kind: .nr(NrCellLock(pci: 683, arfcn: 396250, scsKHz: 15, band: 25))),
+                                    kind: .nr(NetworkCards.NrCellTarget(pci: 683, arfcn: 396250, band: 25, scsKHz: 15))),
             NetworkCards.LockTarget(band: "n41", role: "Secondary", detail: "100 MHz · PCI 147 · ARFCN 520110",
-                                    kind: .nr(NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41))),
-        ], "lockTargets: builds quick-lock entries for PCC and SCC")
+                                    kind: .nr(NetworkCards.NrCellTarget(pci: 147, arfcn: 520110, band: 41, scsKHz: nil))),
+        ], "lockTargets: builds quick-lock entries for PCC and SCC; the SCC's spacing not reported, not guessed")
         equal(targets[0].label, "n25 · 20 MHz · PCI 683 · ARFCN 396250", "lockTargets: label")
         // EN-DC: no 5G SA target (an NSA leg cannot be locked with common/5g); the LTE leg is one.
         let endcTargets = NetworkCards.lockTargets(info([lte, nsaNr]))
@@ -364,7 +364,10 @@ struct NetworkViewTests {
         equal(NetworkCards.lteLockText(lteOne.lte), "PCI 128 · EARFCN 66786", "lteLockText: one")
         equal(NetworkCards.lteLockText(lteThree.lte), "3 cells (PCI 128, 301, 7)", "lteLockText: three")
 
-        let nrTarget = NetworkCards.LockTarget(band: "n41", role: "Primary", detail: "", kind: .nr(nr))
+        let nrTarget = NetworkCards.LockTarget(band: "n41", role: "Primary", detail: "",
+                                               kind: .nr(NetworkCards.NrCellTarget(pci: 186, arfcn: 520110, band: 41, scsKHz: 30)))
+        let noScs = NetworkCards.LockTarget(band: "n41", role: "Secondary", detail: "",
+                                            kind: .nr(NetworkCards.NrCellTarget(pci: 186, arfcn: 520110, band: 41, scsKHz: nil)))
         let lteTarget = NetworkCards.LockTarget(band: "B66", role: "Serving", detail: "",
                                                 kind: .lte(LteLockedCell(earfcn: 66786, pci: 128)))
         check(NetworkCards.targetIsLocked(nrTarget, lockedNr), "targetIsLocked: the 5G SA lock")
@@ -372,6 +375,19 @@ struct NetworkViewTests {
               "targetIsLocked: not locked, or not read")
         check(NetworkCards.targetIsLocked(lteTarget, lteOne), "targetIsLocked: the one LTE cell")
         check(!NetworkCards.targetIsLocked(lteTarget, lteThree), "targetIsLocked: one of several is not the lock")
+        check(NetworkCards.targetIsLocked(noScs, lockedNr), "targetIsLocked: a cell whose spacing is not reported, by its numbers")
+        let other15 = CellLockState(lte: [], nr: NrCellLock(pci: 186, arfcn: 520110, scsKHz: 15, band: 41),
+                                    persistLte: false, persistNr: false)
+        check(!NetworkCards.targetIsLocked(nrTarget, other15), "targetIsLocked: a spacing reported must be the lock's")
+        // The sheet's Lock: a cell in use is locked only while it still is (lockCellInUse); another as typed.
+        check(NetworkCards.inUse(nr, among: [nrTarget, lteTarget]) && NetworkCards.inUse(nr, among: [noScs]),
+              "inUse: a 5G SA cell in use")
+        check(!NetworkCards.inUse(NrCellLock(pci: 187, arfcn: 520110, scsKHz: 30, band: 41), among: [nrTarget, noScs]),
+              "inUse: another PCI is typed, not in use")
+        check(!NetworkCards.inUse(NrCellLock(pci: 186, arfcn: 520110, scsKHz: 15, band: 41), among: [nrTarget]),
+              "inUse: a spacing other than the one reported is not that cell")
+        check(NetworkCards.inUse(LteLockedCell(earfcn: 66786, pci: 128), among: [lteTarget])
+                && !NetworkCards.inUse(LteLockedCell(earfcn: 66786, pci: 129), among: [lteTarget]), "inUse: an LTE cell")
 
         let allNr = [25, 41, 71, 77, 78]
         let openBands = [set(.lte, allowed: [3, 66], supported: [3, 66]), set(.nsa, allowed: allNr, supported: allNr),

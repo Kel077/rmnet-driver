@@ -9,6 +9,7 @@ import Foundation
 /// What is running on the service's queue; at most one call at a time.
 enum SmsActivity: Equatable {
     case listing
+    case counting   // the background count of unread messages (nothing on the screen shows it)
     case deleting
     case sending
 }
@@ -20,9 +21,12 @@ final class SmsQuitNotice: ObservableObject {
     @Published fileprivate(set) var line = ""
 }
 
-/// How many messages are unread (the window's marks), for the menu bar item's panel; its own object for the same reason.
+/// How many messages are unread, for the menu bar item's panel: the window's marks (`count`), and the unread stored
+/// parts the background count found on the modem since the window last listed (`onModem`; a message of several parts
+/// counts each). Its own object for the same reason.
 final class SmsUnreadNotice: ObservableObject {
     @Published fileprivate(set) var count = 0
+    @Published fileprivate(set) var onModem = 0
 }
 
 /// The app has exactly one, owned by the app delegate (StatusView.swift), so that quitting can wait for a
@@ -41,10 +45,6 @@ final class SmsController: ObservableObject {
     // The result of the last send or delete (or what runs now). A listing never writes here.
     @Published private(set) var result = ""
     @Published private(set) var resultIsFailure = false
-    @Published var selection: SmsMessageKey? = nil {
-        // Selecting a message is reading it: its unread mark goes.
-        didSet { if let s = selection { unread.remove(s) } }
-    }
     @Published var to = ""     // not saved anywhere
     @Published var text = "" { // not saved anywhere; always the committed text the field shows
         // After a success, starting a new message clears the result line.
@@ -60,11 +60,24 @@ final class SmsController: ObservableObject {
     @Published var selectedConversation: String? = nil {
         didSet { markShownConversationRead() }
     }
-    @Published var replyText = ""      // the conversation's reply, not saved anywhere
+    /// Each conversation's reply being written (by conversationKey), so a reply never goes to another conversation
+    /// than the one it was written in. Not saved anywhere.
+    @Published private(set) var replyDrafts: [String: String] = [:]
+    /// The reply of the conversation shown.
+    var replyText: String {
+        get { selectedConversation.flatMap { replyDrafts[$0] } ?? "" }
+        set {
+            guard let key = selectedConversation else { return }
+            replyDrafts[key] = newValue.isEmpty ? nil : newValue
+        }
+    }
     @Published var replyComposing = false
-    /// When this run of RMNet sent each stored part (index → time), so a sent message has a time: the modem keeps none
-    /// for it. In memory only.
+    /// When this run of RMNet sent each stored part of the last listing (index → time), so a sent message has a time:
+    /// the modem keeps none for it. Kept by the part (its index and PDU, sentTimes), so an index that holds another
+    /// message later does not take its time. In memory only.
     @Published private(set) var sentAt: [Int: Date] = [:]
+    /// The stored indices of the last listing whose send got no answer in this run: they may have gone (Not confirmed).
+    @Published private(set) var unconfirmed: Set<Int> = []
 
     let quitNotice = SmsQuitNotice()
     let unreadNotice = SmsUnreadNotice()
@@ -74,6 +87,15 @@ final class SmsController: ObservableObject {
     private let notifyEnabled: () -> Bool        // Settings' Notify about new messages
     private let alert: (MessageAlert) -> Void    // posts a notification (MessageNotifier.swift)
     private var watch = NewMessageWatch()
+    // What the last listing listed (each stored entry) and where from: a delete or a Retry sends them, to be checked
+    // against the modem first (SmsService.checkListed).
+    private var listedParts: [StoredPdu] = []
+    private var listedPlace = SmsPlace(complete: false)
+    // In memory only, kept while the listing still has the part: when each part RMNet sent went, the parts the modem
+    // confirmed but still lists as unsent (never offered for Retry), and those whose send got no answer.
+    private var sentTimes: [StoredPart: Date] = [:]
+    private var confirmedParts: Set<StoredPart> = []
+    private var unknownParts: Set<StoredPart> = []
     private let queue: DispatchQueue
     private let replyToQuit: (Bool) -> Void      // NSApp.reply(toApplicationShouldTerminate:)
     private let requestAttention: () -> Void     // NSApp.requestUserAttention(.criticalRequest)
@@ -108,10 +130,11 @@ final class SmsController: ObservableObject {
     deinit { timer?.invalidate() }
 
     var listed: Bool { listedAt != nil }
-    var selectedMessage: SmsMessage? { messages.first { $0.key == selection } }
     var sendEnabled: Bool { running == nil && !stopping && !composing && canSend(number: to, text: text) }
     /// The messages as conversations, the latest first (SmsConversations.swift).
-    var conversations: [SmsConversation] { RMNetConversations.build(messages, unread: unread, sentAt: sentAt) }
+    var conversations: [SmsConversation] {
+        RMNetConversations.build(messages, unread: unread, sentAt: sentAt, home: homeCallingCode(imsi: listedPlace.sim))
+    }
     var shownConversation: SmsConversation? {
         guard let key = selectedConversation else { return nil }
         return conversations.first { $0.id == key }
@@ -123,7 +146,6 @@ final class SmsController: ObservableObject {
     }
     var replyNote: String { composeNote(replyText, composing: replyComposing) }
     var changeEnabled: Bool { running == nil && !stopping }
-    var deleteEnabled: Bool { running == nil && !stopping && selectedMessage != nil }
     var refreshEnabled: Bool { running == nil && !stopping }
     /// The list's own line: when it was listed and how full the store is, or why the last listing failed.
     var listText: String { listLine(updated: listedAt, failure: listFailure, used: storeUsed, total: storeTotal) }
@@ -238,73 +260,86 @@ final class SmsController: ObservableObject {
         _ = answeredQuit(succeeded: true)
     }
 
-    /// A listing that succeeded, the screen's or the background's: the messages, the store, the unread marks; then what
-    /// is new in it, announced.
+    /// A listing that succeeded: the messages (settled: what RMNet knows of its own sends), the store, the unread marks,
+    /// the parts and their place for a later delete or Retry. The listing made every unread message read on the modem
+    /// and shows it, so the background count starts again from none unread.
     private func apply(_ listing: SmsListing) {
-        let found = listing.messages
+        listedParts = listing.parts
+        listedPlace = listing.place
+        let stored = Set(listing.parts.map(StoredPart.init))
+        let unsent = Set(listing.parts.filter { $0.status == .unsent }.map(StoredPart.init))
+        sentTimes = sentTimes.filter { stored.contains($0.key) }
+        confirmedParts.formIntersection(unsent)
+        unknownParts.formIntersection(unsent)
+        var times: [Int: Date] = [:]
+        for p in listing.parts { if let t = sentTimes[StoredPart(p)] { times[p.index] = t } }
+        if times != sentAt { sentAt = times }
+        let unknown = Set(listing.parts.filter { unknownParts.contains(StoredPart($0)) }.map { $0.index })
+        if unknown != unconfirmed { unconfirmed = unknown }
+        let found = settled(listing.messages, parts: listing.parts, confirmed: confirmedParts)
         messages = found
         listedAt = Date()
         listFailure = nil
         storeUsed = listing.used
         storeTotal = listing.total
         unread = unreadMarks(listed: found, kept: unread)
-        if let s = selection, !found.contains(where: { $0.key == s }) { selection = nil }
-        if let s = selection { unread.remove(s) }
         if active { markShownConversationRead() }
-        announce(watch.listed(found, used: listing.used))
+        watch.listedByWindow(used: listing.used,
+                             received: listing.parts.filter { $0.status == .unread || $0.status == .read }.count)
+        if unreadNotice.onModem != 0 { unreadNotice.onModem = 0 }
     }
 
-    /// Each alert as a notification, while Notify about new messages is on; a new message not while the Messages
-    /// screen is shown and seen (it is in the list there).
-    private func announce(_ alerts: [MessageAlert]) {
+    /// The alert as a notification, while Notify about new messages is on (also when it was turned off while the count
+    /// ran: then nothing); new messages not while the Messages screen is shown and seen (it lists them there).
+    private func announce(_ a: MessageAlert) {
         guard notifyEnabled() else { return }
-        for a in alerts {
-            if case .message = a, active { continue }
-            alert(a)
-        }
+        if case .arrived = a, active { return }
+        alert(a)
     }
 
     // MARK: New messages in the background
 
     /// The background turn's part (ModemPulse.swift): AT+CPMS? every other turn (about every 30 s, from the first),
     /// while Notify about new messages is on, nothing runs, the app does not quit, and the Messages screen does not list
-    /// by itself (shown and seen: it lists every 15 s).
+    /// by itself (shown and seen: it lists every 15 s). With Notify about new messages off nothing is read, and the
+    /// count starts again when it is turned on.
     func pulseCommands(turn: Int) -> [String] {
-        guard notifyEnabled(), !stopping, running == nil, !active, turn % 2 == 1 else { return [] }
+        guard notifyEnabled() else {
+            if watch != NewMessageWatch() { watch = NewMessageWatch() }
+            if unreadNotice.onModem != 0 { unreadNotice.onModem = 0 }
+            return []
+        }
+        guard !stopping, running == nil, !active, turn % 2 == 1 else { return [] }
         return ["AT+CPMS?"]
     }
 
-    /// The count read (or why the port could not be used: the turn is skipped): a count that went up, or the first,
-    /// lists the messages, on a port that does not wait either.
+    /// The store's count read (or why the port could not be used: the turn is skipped): the first, one that changed,
+    /// and every tenth while it stays the same, count the unread messages (countInBackground).
     func pulseAnswers(_ answers: Result<[String: PulseAnswer], ModemFailure>) {
-        guard case .success(let a) = answers, let store = a["AT+CPMS?"] else { return }
-        if watch.storeCount(parseStorage(store.lines)?.used) { listInBackground() }
+        guard notifyEnabled(), case .success(let a) = answers, let store = a["AT+CPMS?"] else { return }
+        if watch.storeCount(parseStorage(store.lines)?.used) { countInBackground() }
     }
 
-    /// As refresh, with the background service; a listing that fails is not shown (it is tried again on a later turn:
-    /// the count it is compared with changes only with a listing).
-    private func listInBackground() {
+    /// The count (SmsServing.countUnread, which lists and reads no unread message), with the background service: a busy
+    /// port fails at once, and a count that fails is tried again on a later turn.
+    private func countInBackground() {
         guard running == nil, !stopping else { return }
-        running = .listing
+        running = .counting
         let service = self.backgroundService
         queue.async {
-            let result = service.list()
-            DispatchQueue.main.async { self.finishBackgroundListing(result) }
+            let result = service.countUnread()
+            DispatchQueue.main.async { self.finishCount(result) }
         }
     }
 
-    private func finishBackgroundListing(_ outcome: Result<SmsListing, SmsFailure>) {
+    private func finishCount(_ outcome: Result<SmsStoreCount, SmsFailure>) {
         running = nil
-        if case .success(let listing) = outcome { apply(listing) }
-        _ = answeredQuit(succeeded: true)
-    }
-
-    /// Shows the message a notification was about, if it is still listed (its parts may have changed since).
-    func select(_ identity: SmsIdentity) {
-        if let m = messages.first(where: { SmsIdentity($0) == identity }) {
-            selection = m.key
-            selectedConversation = conversationKey(m.sender)
+        if case .success(let count) = outcome, notifyEnabled() {
+            let alert = watch.counted(count)
+            if unreadNotice.onModem != count.unread { unreadNotice.onModem = count.unread }
+            if let alert { announce(alert) }
         }
+        _ = answeredQuit(succeeded: true)
     }
 
     /// Deletes every stored part of `message`, if it is still listed and nothing else runs.
@@ -319,13 +354,26 @@ final class SmsController: ObservableObject {
             setResult("That message is no longer listed. Nothing was deleted.", failure: true)
             return
         }
+        startDelete(message.indices, then: nil)
+    }
+
+    /// The listed parts at `indices`, checked against the modem and deleted (SmsService); `then` runs after a success.
+    private func startDelete(_ indices: [Int], then done: (() -> Void)?) {
+        let parts = listedParts.filter { indices.contains($0.index) }
+        guard Set(parts.map { $0.index }) == Set(indices) else {
+            setResult("That message is no longer listed. Nothing was deleted.", failure: true)
+            return
+        }
         running = .deleting
-        setResult("Deleting \(message.indices.count) stored part(s)…", failure: false)
+        setResult("Deleting \(parts.count) stored part(s)…", failure: false)
         let service = self.service
-        let indices = message.indices
+        let place = listedPlace
         queue.async {
-            let result = service.delete(indices: indices)
-            DispatchQueue.main.async { self.finishDelete(result) }
+            let result = service.delete(parts, listedFrom: place)
+            DispatchQueue.main.async {
+                if case .success = result { done?() }
+                self.finishDelete(result)
+            }
         }
     }
 
@@ -334,7 +382,6 @@ final class SmsController: ObservableObject {
         let succeeded: Bool
         switch outcome {
         case .success(let count):
-            selection = nil
             setResult("Deleted \(count) stored part(s).", failure: false)
             clearResultOnTyping = true
             succeeded = true
@@ -346,27 +393,32 @@ final class SmsController: ObservableObject {
         if active { refresh() }
     }
 
-    /// Sends the text to the number once; never retried.
-    /// Sends the reply to the conversation shown, as `send` does; on success the reply is cleared.
+    /// Sends the reply to the conversation shown, as `send` does, once; on success that conversation's reply is cleared.
     func sendReply() {
-        guard replyEnabled, let number = shownConversation?.number else { return }
-        startSend(to: number, body: replyText, reply: true)
+        guard replyEnabled, let c = shownConversation else { return }
+        startSend(to: c.number, body: replyText, reply: c.id)
     }
 
-    /// Sends the stored parts of `message` that are not sent (Retry), once.
+    /// Sends the stored parts of `message` that are not sent (Retry), once, after checking that the modem still has
+    /// them as listed (SmsService.resend).
     func retry(_ message: SmsMessage) {
         guard running == nil, !stopping, !message.unsentIndices.isEmpty else { return }
+        let parts = listedParts.filter { message.unsentIndices.contains($0.index) && $0.status == .unsent }
+        guard parts.count == message.unsentIndices.count else {
+            setResult("That message is no longer listed. Nothing was sent.", failure: true)
+            return
+        }
         running = .sending
-        setResult("Sending \(message.unsentIndices.count) stored part(s) to \(message.sender) again…", failure: false)
+        setResult("Sending \(parts.count) stored part(s) to \(message.sender) again…", failure: false)
         let service = self.service
-        let indices = message.unsentIndices
+        let place = listedPlace
         queue.async {
-            let result = service.resend(indices: indices)
+            let result = service.resend(parts, listedFrom: place)
             DispatchQueue.main.async { self.finishSend(result, number: message.sender, reply: nil) }
         }
     }
 
-    /// Deletes every stored part of every message of `conversation`.
+    /// Deletes every stored part of every message of `conversation`, checked against the modem first.
     func deleteConversation(_ conversation: SmsConversation) {
         guard !stopping else { return }
         guard running == nil else {
@@ -375,15 +427,10 @@ final class SmsController: ObservableObject {
         }
         let indices = conversation.messages.flatMap { $0.indices }
         guard !indices.isEmpty else { return }
-        running = .deleting
-        setResult("Deleting \(indices.count) stored part(s)…", failure: false)
-        let service = self.service
-        queue.async {
-            let result = service.delete(indices: indices)
-            DispatchQueue.main.async {
-                if case .success = result, self.selectedConversation == conversation.id { self.selectedConversation = nil }
-                self.finishDelete(result)
-            }
+        startDelete(indices) { [weak self] in
+            guard let self else { return }
+            if self.selectedConversation == conversation.id { self.selectedConversation = nil }
+            self.replyDrafts[conversation.id] = nil
         }
     }
 
@@ -395,42 +442,59 @@ final class SmsController: ObservableObject {
     /// Sends the New Message sheet's text to its number once; never retried.
     func send() {
         guard sendEnabled else { return }
-        startSend(to: to, body: text, reply: false)
+        startSend(to: to, body: text, reply: nil, sheet: true)
     }
 
-    /// `reply`: true for the conversation's reply, false for the New Message sheet (whose conversation is then shown).
-    private func startSend(to number: String, body: String, reply: Bool) {
+    /// `reply`: the conversation whose reply this is; nil with `sheet` for the New Message sheet (whose conversation is
+    /// then shown), nil without for a Retry.
+    private func startSend(to number: String, body: String, reply: String?, sheet: Bool = false) {
         let parts = partCount(body)
         running = .sending
-        setResult("Sending \(parts) part(s) to \(number). This can take up to a minute per part.", failure: false)
+        setResult("Sending \(parts) part(s) to \(number). This can take up to two minutes per part.", failure: false)
         let service = self.service
         queue.async {
             let result = service.send(to: number, text: body)
-            DispatchQueue.main.async { self.finishSend(result, number: number, reply: reply) }
+            DispatchQueue.main.async { self.finishSend(result, number: number, reply: reply, sheet: sheet) }
         }
     }
 
-    /// `reply` nil: a Retry. The parts' stored indices get the time they were sent (sentAt).
-    private func finishSend(_ outcome: Result<SmsSent, SmsFailure>, number: String, reply: Bool?) {
+    /// What became of the parts (SmsSendRecord) is kept, a success's or a failure's: when each sent part went, which
+    /// are sent though listed unsent, which are not known.
+    private func keep(_ record: SmsSendRecord) {
+        let now = Date()
+        for p in record.sent { sentTimes[p] = now }
+        confirmedParts.formUnion(record.stillUnsent)
+        unknownParts.subtract(record.sent)
+        unknownParts.subtract(record.stillUnsent)
+        unknownParts.formUnion(record.unknown)
+        // Until the next listing, the parts RMNet knows of go on the list it has.
+        var times = sentAt
+        for p in record.sent { times[p.index] = now }
+        if times != sentAt { sentAt = times }
+        let unknown = unconfirmed.subtracting((record.sent + record.stillUnsent).map { $0.index })
+            .union(record.unknown.map { $0.index })
+        if unknown != unconfirmed { unconfirmed = unknown }
+    }
+
+    private func finishSend(_ outcome: Result<SmsSent, SmsFailure>, number: String, reply: String?, sheet: Bool = false) {
         running = nil
         let succeeded: Bool
         switch outcome {
         case .success(let sent):
-            let now = Date()
-            for index in sent.indices { sentAt[index] = now }
-            switch reply {
-            case true?: replyText = ""
-            case false?:
+            keep(sent.record)
+            if let reply {
+                replyDrafts[reply] = nil
+            } else if sheet {
                 text = ""
-                selectedConversation = conversationKey(number)
-            case nil: break
+                selectedConversation = conversationKey(number, home: homeCallingCode(imsi: listedPlace.sim))
             }
             setResult("Sent to \(number) in \(sent.parts) part(s)."
                       + (sent.stored ? "" : " It is not stored on the modem: it writes messages to another storage than "
                          + "the one it lists."), failure: false)
-            clearResultOnTyping = reply == false
+            clearResultOnTyping = sheet
             succeeded = true
         case .failure(let failure):
+            keep(failure.record)
             setResult(failure.message, failure: true)
             succeeded = false
         }
@@ -449,6 +513,6 @@ private func quitWaitLine(_ activity: SmsActivity) -> String {
     switch activity {
     case .sending: return "RMNet quits when the message being sent has finished."
     case .deleting: return "RMNet quits when the message being deleted has finished."
-    case .listing: return "RMNet quits when the current request to the modem has finished."
+    case .listing, .counting: return "RMNet quits when the current request to the modem has finished."
     }
 }

@@ -13,13 +13,12 @@ extension MenuBarStatus {
     /// The app's one, on the registry, the system's listing (asked with a 10 s limit) and the network read with
     /// ModemService on `queue`, the queue the window's screens share for the AT port. The app delegate starts its
     /// polls at launch (`start`).
-    /// The signal bars' reads open the port without waiting for another program (AtPort.openWithoutWaiting), and
-    /// take the window's network read instead while it is fresh (`freshInfo`).
+    /// The signal bars' reads are the app's background turn's (ModemPulse.swift, which the app delegate gives the
+    /// bars' part to); they take the window's network read instead while it is fresh (`freshInfo`).
     static func forApp(queue: DispatchQueue,
                        freshInfo: @escaping () -> (info: NetworkInfo, at: Date)? = { nil }) -> MenuBarStatus {
         let manager = ExtensionManager()
         let service = ModemService()
-        let signalService = ModemService(open: { AtPort.openWithoutWaiting().map { $0 as AtCommanding } })
         let status = MenuBarStatus(
             properties: { readDriverProperties() },
             modem: { readModemModel() },
@@ -30,7 +29,6 @@ extension MenuBarStatus {
             },
             network: { service.networkInfo() },
             queue: queue,
-            signalRead: { query in signalService.signalRead(radio: query == .radio) },
             freshInfo: freshInfo,
             preference: MenuBarIconPreference(defaults: .standard))
         return status
@@ -173,7 +171,7 @@ struct MenuBarPanel: View {
             if let ipv4 {
                 KeyValueRow(label: "IPv4", value: ipv4, copyable: true)
             }
-            if unread.count > 0 {
+            if unread.count > 0 || unread.onModem > 0 {
                 Button {
                     showMessages()
                     let open = openWindow
@@ -182,7 +180,7 @@ struct MenuBarPanel: View {
                     HStack(spacing: Spacing.s) {
                         Image(systemName: "envelope.badge.fill")
                             .foregroundStyle(.blue)
-                        Text(verbatim: unreadLine(unread.count))
+                        Text(verbatim: unreadLine(unread.count, onModem: unread.onModem))
                             .foregroundStyle(.primary)
                         Spacer(minLength: Spacing.s)
                         Image(systemName: "chevron.right")

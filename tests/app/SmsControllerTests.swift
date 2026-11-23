@@ -72,8 +72,14 @@ final class FakeService: SmsServing {
         return locked { sendResults.removeFirst() }
     }
 
-    func resend(indices: [Int]) -> Result<SmsSent, SmsFailure> {
-        enter(.resend(indices))
+    // The window's delete and Retry (checked against the modem by the real service): the indices of the parts.
+    func delete(_ parts: [StoredPdu], listedFrom place: SmsPlace) -> Result<Int, SmsFailure> {
+        enter(.delete(parts.map { $0.index }))
+        return locked { deleteResults.removeFirst() }
+    }
+
+    func resend(_ parts: [StoredPdu], listedFrom place: SmsPlace) -> Result<SmsSent, SmsFailure> {
+        enter(.resend(parts.map { $0.index }))
         return locked { sendResults.removeFirst() }
     }
 
@@ -141,8 +147,10 @@ func message(_ indices: [Int], sender: String = "+27838890001", text: String = "
                text: text, missingParts: 0, readable: true)
 }
 
+/// A listing of `messages`, each stored part listed too (as the service lists them: a delete takes them from there).
 func listing(_ messages: [SmsMessage], used: Int? = nil, total: Int? = nil) -> Result<SmsListing, SmsFailure> {
-    .success(SmsListing(messages: messages, used: used, total: total))
+    let parts = messages.flatMap { m in m.indices.map { StoredPdu(index: $0, status: .read, hex: String(format: "00%04X", $0)) } }
+    return .success(SmsListing(messages: messages, used: used, total: total, parts: parts))
 }
 
 let notKnown = SmsFailure(message: "The message failed. The modem did not answer in time. It is not known whether it was "
@@ -174,7 +182,7 @@ struct SmsControllerTests {
         check(c.sendEnabled, "send: enabled with a number and a text")
         rig.startSend()
         check(c.running == .sending, "send: running is .sending")
-        check(!c.sendEnabled && !c.refreshEnabled && !c.deleteEnabled, "send: nothing else is enabled while it runs")
+        check(!c.sendEnabled && !c.refreshEnabled && !c.changeEnabled, "send: nothing else is enabled while it runs")
         c.send()
         c.tick()
         c.refresh()
@@ -297,7 +305,7 @@ struct SmsControllerTests {
         check(c.result == "Deleting 3 stored part(s)…", "delete: the running sentence", c.result)
         rig.fake.releaseDelete(.success(3))
         pump(until: { c.running == nil }, "the delete comes back")
-        check(c.result == "Deleted 3 stored part(s)." && c.selection == nil, "delete: the success sentence", c.result)
+        check(c.result == "Deleted 3 stored part(s).", "delete: the success sentence", c.result)
 
         let gone = message([9], sender: "+27830000000")
         let before = rig.fake.calls

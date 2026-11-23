@@ -917,104 +917,101 @@ struct MenuBarStatusTests {
         equal(MenuBarIcon.up.accessibilityLabel, "RMNet: connected", "antenna: label kept")
     }
 
-    /// The reads: only with the bars chosen and the driver attached; the window's fresh read instead of one of the
-    /// bars' own; one command on the model's queue; a busy port keeps the bars, stale; the panel's read counts too.
+    /// The reads, all in the background turn (the bars have no timer of their own): only with the bars chosen and the
+    /// driver attached; the window's fresh read instead of one of the bars' own; one command a turn; a busy port, or a
+    /// turn that ended before the bars' command (a timeout on an earlier one), keeps the bars, stale.
     static func signalPolling() {
         var clock = Date(timeIntervalSince1970: 1_800_000_000)
         var properties: DriverProperties? = upProperties
-        var queries: [MenuBarSignalQuery] = []
-        var answers: [Result<NetworkInfo, ModemFailure>] = []
-        var offQueue = 0
         var fresh: (info: NetworkInfo, at: Date)? = nil
-        let lock = NSLock()
         let suite = "io.rmnetdriver.RMNet.tests.poll.\(getpid())"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let queue = DispatchQueue(label: queueName)
-        queue.setSpecific(key: queueKey, value: queueName)
         let s = MenuBarStatus(
             properties: { properties }, modem: { (.qmi(interface: 4), rm520) }, listing: { $0([enabled]) },
             network: { .success(saInfo) }, now: { clock }, queue: queue,
-            signalRead: { query in
-                lock.lock(); defer { lock.unlock() }
-                if Thread.isMainThread || DispatchQueue.getSpecific(key: queueKey) != queueName { offQueue += 1 }
-                queries.append(query)
-                return answers.isEmpty ? .failure(ModemFailure(message: "no answer given")) : answers.removeFirst()
-            },
             freshInfo: { fresh },
             preference: MenuBarIconPreference(defaults: defaults))
-        func readsMade() -> Int { lock.lock(); defer { lock.unlock() }; return queries.count }
-        func answer(_ r: Result<NetworkInfo, ModemFailure>) { lock.lock(); answers.append(r); lock.unlock() }
+        var asked: [[String]] = []
+        // One background turn: the bars' command, if they want one, and the turn's answer to it.
+        func turn(_ answer: (String) -> Result<[String: PulseAnswer], ModemFailure>) {
+            let commands = s.pulseSignalCommands()
+            guard !commands.isEmpty else { return }
+            asked.append(commands)
+            s.pulseSignalAnswers(answer(commands[0]))
+        }
+        func lines(_ l: [String]) -> (String) -> Result<[String: PulseAnswer], ModemFailure> {
+            { command in .success([command: .lines(l)]) }
+        }
+        let sa = "+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",001,01,FEDCBA987,32,00F00D,504990,41,12,-86,-10,10,1,-"
         s.poll()
 
         // The antenna: no read.
-        s.pollSignal()
-        settle()
-        equal(readsMade(), 0, "poll: the antenna reads nothing")
+        turn(lines([sa]))
+        equal(asked.count, 0, "turn: the antenna reads nothing")
 
-        // The bars: a read of the serving cell, on the queue.
+        // The bars: the serving cell.
         s.setIconStyle(.signal)
-        answer(.success(NetworkInfo(serving: ServingCell(state: "NOCONN",
-                                                        cells: [leg("NR5G-SA", band: "n41", rsrp: -86, sinr: 10)]))))
-        s.pollSignal()
-        pump(until: { s.signal != nil }, "poll: the first read")
-        equal(queries, [.servingCell], "poll: one serving-cell read")
-        equal(offQueue, 0, "poll: on the model's queue")
-        equal(s.signal, MenuBarSignal(level: 3, technology: "5G", service: .normal, at: clock), "poll: the bars")
-        equal(s.signalIcon.bars, .filled(3), "poll: drawn")
-        equal(s.signalIcon.text, "5G", "poll: with the technology")
+        turn(lines([sa]))
+        equal(asked, [["AT+QENG=\"servingcell\""]], "turn: one serving-cell read")
+        equal(s.signal, MenuBarSignal(level: 3, technology: "5G", service: .normal, at: clock), "turn: the bars")
+        equal(s.signalIcon.bars, .filled(3), "turn: drawn")
+        equal(s.signalIcon.text, "5G", "turn: with the technology")
         s.setShowsTechnology(false)
-        check(s.signalIcon.text == nil && s.signalIcon.bars == .filled(3), "poll: the technology turned off at once")
-        equal(readsMade(), 1, "poll: turning it off reads nothing")
+        check(s.signalIcon.text == nil && s.signalIcon.bars == .filled(3), "turn: the technology turned off at once")
+        equal(asked.count, 1, "turn: turning it off reads nothing")
         s.setShowsTechnology(true)
 
         // A busy port: the bars kept, stale.
-        answer(.failure(ModemFailure(message: describe(AtError.busy))))
         clock = clock.addingTimeInterval(15)
-        s.pollSignal()
-        pump(until: { s.signal?.stale == true }, "poll: busy")
-        equal(s.signal?.level, 3, "poll: busy keeps the level")
-        check(s.signalIcon.dimmed, "poll: busy dims the bars")
+        turn { _ in .failure(ModemFailure(message: describe(AtError.busy))) }
+        check(s.signal?.stale == true && s.signal?.level == 3, "turn: busy keeps the level, stale")
+        check(s.signalIcon.dimmed, "turn: busy dims the bars")
 
-        // The window's fresh read stands in: no read of the bars' own; then a fresh success clears stale.
+        // A turn that ended before the bars' command (another rider's command timed out first): kept, stale.
+        turn(lines([sa]))
+        equal(s.signal?.stale, false, "turn: an answer is current again")
+        turn { _ in .success(["AT+CPMS?": .lines(["+CPMS: \"ME\",1,255,\"ME\",1,255,\"ME\",1,255"])]) }
+        check(s.signal?.stale == true && s.signal?.level == 3, "turn: no answer to the bars' command keeps the level, stale")
+        // A refusal is an answer: the serving cell not known.
+        turn { command in .success([command: .refused("ERROR")]) }
+        check(s.signal?.stale == false && s.signal?.level == nil, "turn: a refusal leaves the level unknown")
+
+        // The window's fresh read stands in: no read of the bars' own; then a fresh success is current.
         fresh = (saInfo, clock.addingTimeInterval(-3))
-        let before = readsMade()
-        s.pollSignal()
-        settle()
-        equal(readsMade(), before, "poll: the window's fresh read, no port")
-        equal(s.signal?.stale, false, "poll: the fresh read is current")
+        let before = asked.count
+        turn(lines([sa]))
+        equal(asked.count, before, "turn: the window's fresh read, no port")
+        equal(s.signal?.stale, false, "turn: the fresh read is current")
+        equal(s.signal?.level, 3, "turn: the fresh read's level")
         fresh = (saInfo, clock.addingTimeInterval(-16))
-        answer(.success(NetworkInfo(serving: ServingCell(state: "SEARCH", cells: []))))
-        s.pollSignal()
-        pump(until: { s.signal?.service == .searching }, "poll: an old window read does not count")
-        equal(readsMade(), before + 1, "poll: its own read")
+        turn(lines(["+QENG: \"servingcell\",\"SEARCH\""]))
+        equal(asked.count, before + 1, "turn: an old window read does not count")
+        equal(s.signal?.service, .searching, "turn: searching")
 
         // Searching: next the radio, which says it is off.
-        answer(.success(NetworkInfo(radio: .airplane)))
-        s.pollSignal()
-        pump(until: { s.signal?.service == .radioOff }, "poll: the radio read")
-        equal(queries.last, .radio, "poll: searching asks the radio")
-        check(s.signalIcon.airplane, "poll: an airplane")
+        turn(lines(["+CFUN: 4"]))
+        equal(asked.last, ["AT+CFUN?"], "turn: searching asks the radio")
+        check(s.signalIcon.airplane, "turn: an airplane")
 
         // No driver: no read.
         properties = nil
         s.poll()
-        let quiet = readsMade()
-        s.pollSignal()
-        settle()
-        equal(readsMade(), quiet, "poll: no driver, no read")
-        equal(s.signalIcon.mark, .slash, "poll: no driver is struck through")
+        let quiet = asked.count
+        turn(lines([sa]))
+        equal(asked.count, quiet, "turn: no driver, no read")
+        equal(s.signalIcon.mark, .slash, "turn: no driver is struck through")
 
-        // Back to the antenna: polls read nothing.
+        // Back to the antenna: turns read nothing.
         properties = upProperties
         s.poll()
         s.setIconStyle(.antenna)
-        s.pollSignal()
-        settle()
-        equal(readsMade(), quiet, "poll: the antenna again, no read")
+        turn(lines([sa]))
+        equal(asked.count, quiet, "turn: the antenna again, no read")
     }
 
-    /// In the app the signal bars ride the background turn: the command pollSignal would send, then its answers.
+    /// The signal bars ride the background turn: the command they want, then its answers.
     static func pulseSignal() {
         var clock = Date(timeIntervalSince1970: 1_800_000_000)
         let suite = "io.rmnetdriver.RMNet.tests.pulse.\(getpid())"

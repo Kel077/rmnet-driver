@@ -285,7 +285,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) },
         backgroundService: SmsService(waitForPort: false),
         notifyEnabled: { [unowned self] in self.settings.notifyMessages },
-        alert: { [unowned self] alert in self.notifier.post(alert, showText: self.settings.notificationShowsText) })
+        alert: { [unowned self] alert in self.notifier.post(alert) })
 
     // The settings besides the menu bar icon's (AppSettings.swift), the screen a click asks the window for, and the
     // notifications for new messages (MessageNotifier.swift).
@@ -296,7 +296,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Switching SIM slots by itself (SimSlotWatch.swift), with the modem screens' controller.
     private(set) lazy var simWatcher = SimSlotWatcher(
         enabled: { [unowned self] in self.settings.simAutoSwitch },
-        switchSlot: { [unowned self] slot, done in self.modem.changeSimSlot(slot, automatic: true, completion: done) })
+        module: { readModemSerial() },
+        switchSlot: { [unowned self] slot, expect, done in
+            self.modem.changeSimSlot(slot, automatic: true, expect: expect, completion: done)
+        })
 
     // The background turn over the AT port, every 15 s while the app runs (ModemPulse.swift): the signal bars, the
     // check for new messages and the SIM slot watcher, in one port open that does not wait for another program.
@@ -348,9 +351,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // A modem that comes onto USB (or is there now) is watched for an empty SIM slot.
         watchers.append(menuBar.$modemOnUsb.sink { [unowned self] present in self.simWatcher.modemPresent(present) })
         UNUserNotificationCenter.current().delegate = notifier
-        notifier.open = { [unowned self] identity in
+        notifier.open = { [unowned self] in
             self.router.request = .messages
-            if let identity { self.messages.select(identity) }
             _ = AppDelegate.showStatusWindow(using: AppDelegate.openStatusWindow)
         }
         pulse.start()

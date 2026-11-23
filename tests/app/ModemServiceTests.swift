@@ -50,6 +50,7 @@ final class ScriptedPort: AtCommanding {
     private(set) var closed = false
     private(set) var closedItself = false
     var onCommand: (() -> Void)?      // the rig's clock: the time a command takes
+    var deviceSerial: String? = nil   // the module the port is on (AtPort.deviceSerial)
 
     init(_ name: String, _ script: [(String, Answer)]) {
         self.name = name
@@ -396,7 +397,6 @@ struct ModemServiceTests {
         sim()
         pinEntry()
         antennas()
-        signalRead()
         simSlotChanges()
         cellLock()
         imei()
@@ -1985,6 +1985,76 @@ struct ModemServiceTests {
             check(failureMessage(Rig().service.setSimSlot(3, wait: .sim), "slot 3")
                     == "The modem has SIM slots 1 and 2. Nothing was changed.", "setSimSlot: slot 3 refused before the port")
         }
+        // An automatic switch's expectation, checked on the port that writes, before the write.
+        func onModule(_ serial: String?, _ script: [(String, Answer)]) -> Rig {
+            let port = ScriptedPort("port 1", script)
+            port.deviceSerial = serial
+            return Rig([.success(port)])
+        }
+        let watched = SimSlotExpectation(module: "c0ffee01", slot: 1)
+        let radioOn: Answer = .success(["+CFUN: 1"])
+        do {
+            // All as expected: the module, slot 1, the radio on, no SIM: switched.
+            let rig = onModule("c0ffee01", [("AT+QUIMSLOT?", slot1), ("AT+CFUN?", radioOn), ("AT+CPIN?", cme(10)),
+                                            ("AT+QUIMSLOT=2", ok), ("AT+QUIMSLOT?", slot2), ("AT+CPIN?", cpinReady)])
+            let change = success(rig.service.setSimSlot(2, wait: .sim, expect: watched), "expect: holds")
+            check(change == SimSlotChange(before: 1, after: 2, sim: .ready, secondsToSim: 0), "expect: holds, switched",
+                  "\(String(describing: change))")
+            rig.finish("expect: holds", opens: 1)
+        }
+        do {
+            // Another module on the port: nothing more read, nothing written.
+            let rig = onModule("0badbeef", [("AT+QUIMSLOT?", slot1)])
+            let change = success(rig.service.setSimSlot(2, wait: .sim, expect: watched), "expect: another module")
+            check(change == SimSlotChange(before: 1, after: 1, skipped: .otherModule), "expect: another module, not written",
+                  "\(String(describing: change))")
+            rig.finish("expect: another module", opens: 1)
+        }
+        do {
+            // A module that gives no serial number is not the one expected either.
+            let rig = onModule(nil, [("AT+QUIMSLOT?", slot1)])
+            check(success(rig.service.setSimSlot(2, wait: .sim, expect: watched), "expect: no serial")?.skipped
+                    == .otherModule, "expect: no serial number on the port")
+            rig.finish("expect: no serial", opens: 1)
+        }
+        do {
+            // The radio switched off meanwhile: not written.
+            let rig = onModule("c0ffee01", [("AT+QUIMSLOT?", slot1), ("AT+CFUN?", .success(["+CFUN: 4"]))])
+            check(success(rig.service.setSimSlot(2, wait: .sim, expect: watched), "expect: radio")?.skipped == .radioNotOn,
+                  "expect: the radio not on")
+            rig.finish("expect: radio", opens: 1)
+        }
+        do {
+            // The radio not read: not written.
+            let rig = onModule("c0ffee01", [("AT+QUIMSLOT?", slot1), ("AT+CFUN?", .failure(.modem("ERROR")))])
+            check(success(rig.service.setSimSlot(2, wait: .sim, expect: watched), "expect: radio unread")?.skipped
+                    == .radioNotOn, "expect: the radio not read")
+            rig.finish("expect: radio unread", opens: 1)
+        }
+        do {
+            // The SIM ready by now (it was slow to start): not written.
+            let rig = onModule("c0ffee01", [("AT+QUIMSLOT?", slot1), ("AT+CFUN?", radioOn), ("AT+CPIN?", cpinReady)])
+            check(success(rig.service.setSimSlot(2, wait: .sim, expect: watched), "expect: SIM")?.skipped == .simUsable,
+                  "expect: a SIM usable now")
+            rig.finish("expect: SIM", opens: 1)
+        }
+        do {
+            // Still starting (busy) is not "unusable": not written.
+            let rig = onModule("c0ffee01", [("AT+QUIMSLOT?", slot1), ("AT+CFUN?", radioOn), ("AT+CPIN?", cme(14))])
+            check(success(rig.service.setSimSlot(2, wait: .sim, expect: watched), "expect: busy")?.skipped == .simUsable,
+                  "expect: a SIM still starting")
+            rig.finish("expect: busy", opens: 1)
+        }
+        do {
+            // A switch back: the module and the slot tried only, no radio or SIM read.
+            let back = SimSlotExpectation(module: "c0ffee01", slot: 2, unusableSim: false)
+            let rig = onModule("c0ffee01", [("AT+QUIMSLOT?", slot2), ("AT+QUIMSLOT=1", ok), ("AT+QUIMSLOT?", slot1),
+                                            ("AT+CPIN?", cme(10))] + Array(repeating: ("AT+CPIN?", cme(10)), count: 15))
+            let change = success(rig.service.setSimSlot(1, wait: .sim, expect: back), "expect: switch back")
+            check(change?.changed == true && change?.after == 1 && change?.skipped == nil, "expect: the switch back written",
+                  "\(String(describing: change))")
+            rig.finish("expect: switch back", opens: 1)
+        }
         // The background turn: each command's lines, or the error line; one port.
         do {
             let rig = Rig([("AT+CPMS?", .success(["+CPMS: \"ME\",3,255,\"ME\",3,255,\"ME\",3,255"])), ("AT+CPIN?", cme(10)),
@@ -2000,32 +2070,20 @@ struct ModemServiceTests {
             _ = failureMessage(rig.service.shortReads(["AT+CPMS?", "AT+CPIN?"]), "shortReads timeout")
             expectLines(rig.port(1).lines, ["AT+CPMS?"], "shortReads: stops at a timeout")
         }
-    }
-
-    /// The menu bar's signal read: one command on a port of its own, closed at once; a busy port fails with its words.
-    static func signalRead() {
+        // A timeout after the first answer: the answers before it kept, nothing sent after it.
         do {
-            let rig = Rig([("AT+QENG=\"servingcell\"",
-                            .success(["+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",001,01,FEDCBA987,32,00F00D,504990,41,12,-95,-10,8,1,-"]))])
-            let info = success(rig.service.signalRead(radio: false), "signalRead: the serving cell")
-            check(info?.serving?.cells.first?.rsrp == -95 && info?.radio == nil, "signalRead: the serving cell only")
-            rig.finish("signalRead: the serving cell", opens: 1)
+            let rig = Rig([("AT+CPMS?", .success(["+CPMS: \"ME\",3,255,\"ME\",3,255,\"ME\",3,255"])), ("AT+CPIN?", timedOut)])
+            let answers = success(rig.service.shortReads(["AT+CPMS?", "AT+CPIN?", "AT+CFUN?"]), "shortReads partial")
+            check(answers == [.lines(["+CPMS: \"ME\",3,255,\"ME\",3,255,\"ME\",3,255"])],
+                  "shortReads: the answers before a timeout kept", "\(String(describing: answers))")
+            expectLines(rig.port(1).lines, ["AT+CPMS?", "AT+CPIN?"], "shortReads: nothing sent after the timeout")
         }
+        // An I/O error after the first answer: the same.
         do {
-            let rig = Rig([("AT+CFUN?", .success(["+CFUN: 4"]))])
-            let info = success(rig.service.signalRead(radio: true), "signalRead: the radio")
-            check(info?.radio == .airplane && info?.serving == nil, "signalRead: the radio only")
-            rig.finish("signalRead: the radio", opens: 1)
-        }
-        do {
-            let rig = Rig([.failure(.busy)])
-            expectEqual(failureMessage(rig.service.signalRead(radio: false), "signalRead: busy"), describe(.busy), "signalRead: busy")
-            rig.finish("signalRead: busy", opens: 1)
-        }
-        do {
-            let rig = Rig([("AT+QENG=\"servingcell\"", timedOut)])
-            _ = failureMessage(rig.service.signalRead(radio: false), "signalRead: no answer")
-            rig.finish("signalRead: no answer", opens: 1)
+            let rig = Rig([("AT+CFUN?", .success(["+CFUN: 1"])), ("AT+CPIN?", .failure(.io(-536870208)))])
+            let answers = success(rig.service.shortReads(["AT+CFUN?", "AT+CPIN?", "AT+QUIMSLOT?"]), "shortReads I/O")
+            check(answers == [.lines(["+CFUN: 1"])], "shortReads: the answers before an I/O error kept")
+            expectLines(rig.port(1).lines, ["AT+CFUN?", "AT+CPIN?"], "shortReads: nothing sent after the I/O error")
         }
     }
 
@@ -2082,6 +2140,102 @@ struct ModemServiceTests {
                   "setNrCellLock: already unlocked writes nothing")
             rig.finish("setNrCellLock: already unlocked", opens: 1)
         }
+        cellInUse()
+    }
+
+    /// Locking to a cell in use: the serving cell and the carriers read in the session that writes the lock; a cell
+    /// that changed since, or a 5G SA cell whose subcarrier spacing is not known, writes nothing.
+    static func cellInUse() {
+        let unlocked4g: Answer = .success(["+QNWLOCK: \"common/4g\",0"])
+        let unlocked5g: Answer = .success(["+QNWLOCK: \"common/5g\",0"])
+        let persistOff: Answer = .success(["+QNWLOCK: \"save_ctrl\",0,0"])
+        let locked5g: Answer = .success(["+QNWLOCK: \"common/5g\",147,520110,30,41"])
+        // A 5G SA serving cell n41 PCI 147 ARFCN 520110, its SCS code 1 (30 kHz), or "-" (not given).
+        let saServing: Answer = .success(["+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",310,260,00A1B2C3D,147,001A2B,520110,41,12,-92,-11,20,1,-"])
+        let saNoScs: Answer = .success(["+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",310,260,00A1B2C3D,147,001A2B,520110,41,12,-92,-11,20,-,-"])
+        let otherSa: Answer = .success(["+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",310,260,00A1B2C3D,186,001A2B,520110,41,12,-92,-11,20,1,-"])
+        let lteServing: Answer = .success(["+QENG: \"servingcell\",\"NOCONN\",\"LTE\",\"FDD\",310,260,0ABC123,128,66786,66,5,5,5A0B,-95,-11,-65,15,9,-,-"])
+        let qca: Answer = .success(["+QCAINFO: \"PCC\",520110,12,\"NR5G BAND 41\",147"])
+        let nr = NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41)
+        let writeNr: [(String, Answer)] = [
+            ("AT+QNWLOCK=\"common/4g\"", unlocked4g), ("AT+QNWLOCK=\"common/5g\"", unlocked5g),
+            ("AT+QNWLOCK=\"save_ctrl\"", persistOff), ("AT+QNWPREFCFG=\"rf_band\"", .success(rfBandLines)),
+            ("AT+QNWLOCK=\"common/5g\",147,520110,30,41", ok),
+            ("AT+QNWLOCK=\"common/4g\"", unlocked4g), ("AT+QNWLOCK=\"common/5g\"", locked5g),
+            ("AT+QNWLOCK=\"save_ctrl\"", persistOff),
+        ]
+        let open = CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false)
+
+        // `cell lock current`: the serving 5G SA cell with the SCS the modem gives, read and locked in one session.
+        do {
+            let rig = Rig([("AT+QENG=\"servingcell\"", saServing), ("AT+QCAINFO", qca)] + writeNr)
+            let ch = success(rig.service.lockCellInUse(.serving(scsKHz: nil)), "lockCellInUse: the serving cell")
+            check(ch == .changed(before: open, after: CellLockState(lte: [], nr: nr, persistLte: false, persistNr: false)),
+                  "lockCellInUse: the serving 5G SA cell locked")
+            rig.finish("lockCellInUse: the serving cell", opens: 1)
+        }
+        // No SCS given by the modem, none given by the owner: refused, nothing written (no guess).
+        do {
+            let rig = Rig([("AT+QENG=\"servingcell\"", saNoScs), ("AT+QCAINFO", qca)])
+            expectEqual(failureMessage(rig.service.lockCellInUse(.serving(scsKHz: nil)), "lockCellInUse: no SCS"),
+                        "The modem does not report the subcarrier spacing of its serving 5G SA cell (n41, PCI 147, "
+                        + "ARFCN 520110); give it with --scs (15, 30, 60, 120 or 240 kHz). Nothing was changed.",
+                        "lockCellInUse: no SCS, refused")
+            rig.finish("lockCellInUse: no SCS", opens: 1)
+        }
+        // The owner's SCS when the modem gives none.
+        do {
+            let rig = Rig([("AT+QENG=\"servingcell\"", saNoScs), ("AT+QCAINFO", qca)] + writeNr)
+            _ = success(rig.service.lockCellInUse(.serving(scsKHz: 30)), "lockCellInUse: --scs")
+            rig.finish("lockCellInUse: --scs", opens: 1)
+        }
+        // The owner's SCS that is not the one the modem gives: refused.
+        do {
+            let rig = Rig([("AT+QENG=\"servingcell\"", saServing), ("AT+QCAINFO", qca)])
+            expectEqual(failureMessage(rig.service.lockCellInUse(.serving(scsKHz: 15)), "lockCellInUse: SCS differs"),
+                        "The modem reports a subcarrier spacing of 30 kHz for its serving 5G SA cell, not 15 kHz. "
+                        + "Nothing was changed.", "lockCellInUse: a different SCS refused")
+            rig.finish("lockCellInUse: SCS differs", opens: 1)
+        }
+        // An SCS that is no spacing: refused before the port.
+        do {
+            let rig = Rig()
+            _ = failureMessage(rig.service.lockCellInUse(.serving(scsKHz: 45)), "lockCellInUse: 45 kHz")
+            rig.finish("lockCellInUse: 45 kHz", opens: 0)
+        }
+        // The window's cell, still the serving cell: locked.
+        do {
+            let rig = Rig([("AT+QENG=\"servingcell\"", saServing), ("AT+QCAINFO", qca)] + writeNr)
+            _ = success(rig.service.lockCellInUse(.nr(nr)), "lockCellInUse: the window's cell")
+            rig.finish("lockCellInUse: the window's cell", opens: 1)
+        }
+        // The window's cell, gone since it was read (another PCI serves now): nothing written.
+        do {
+            let rig = Rig([("AT+QENG=\"servingcell\"", otherSa), ("AT+QCAINFO", .success([]))])
+            expectEqual(failureMessage(rig.service.lockCellInUse(.nr(nr)), "lockCellInUse: cell gone"),
+                        "The modem no longer uses that 5G SA cell (n41, PCI 147, ARFCN 520110). Nothing was changed.",
+                        "lockCellInUse: a cell no longer in use, refused")
+            rig.finish("lockCellInUse: cell gone", opens: 1)
+        }
+        // The serving LTE cell (`cell lock current` on LTE).
+        do {
+            let lteCell = LteLockedCell(earfcn: 66786, pci: 128)
+            let rig = Rig([("AT+QENG=\"servingcell\"", lteServing), ("AT+QCAINFO", .success([])),
+                           ("AT+QNWLOCK=\"common/4g\"", unlocked4g), ("AT+QNWLOCK=\"common/5g\"", unlocked5g),
+                           ("AT+QNWLOCK=\"save_ctrl\"", persistOff), ("AT+QNWLOCK=\"common/4g\",1,66786,128", ok),
+                           ("AT+QNWLOCK=\"common/4g\"", .success(["+QNWLOCK: \"common/4g\",1,66786,128"])),
+                           ("AT+QNWLOCK=\"common/5g\"", unlocked5g), ("AT+QNWLOCK=\"save_ctrl\"", persistOff)])
+            let ch = success(rig.service.lockCellInUse(.serving(scsKHz: nil)), "lockCellInUse: LTE")
+            check(ch == .changed(before: open, after: CellLockState(lte: [lteCell], nr: nil, persistLte: false, persistNr: false)),
+                  "lockCellInUse: the serving LTE cell locked")
+            rig.finish("lockCellInUse: LTE", opens: 1)
+        }
+        // The serving-cell read times out: nothing more sent, nothing written.
+        do {
+            let rig = Rig([("AT+QENG=\"servingcell\"", timedOut)])
+            _ = failureMessage(rig.service.lockCellInUse(.serving(scsKHz: nil)), "lockCellInUse: timeout")
+            expectLines(rig.port(1).lines, ["AT+QENG=\"servingcell\""], "lockCellInUse: nothing after the timeout")
+        }
     }
 
     static func imei() {
@@ -2128,5 +2282,60 @@ struct ModemServiceTests {
             check(ch == .rebooting(before: first, after: next), "imei: set with reboot")
             rig.finish("imei: with reboot", opens: 1)
         }
+        // The change's own port open: the module it is on and the IMEI before go back with the outcome; with a module
+        // asked for (Change Back…), another one is refused before anything is sent.
+        func onModule(_ serial: String?, _ script: [(String, Answer)]) -> Rig {
+            let port = ScriptedPort("port 1", script)
+            port.deviceSerial = serial
+            return Rig([.success(port)])
+        }
+        do {
+            let rig = onModule("c0ffee01", [("AT+EGMR=0,7", readFirst), ("AT+EGMR=1,7,\"\(next)\"", ok),
+                                            ("AT+EGMR=0,7", readNext)])
+            let write = rig.service.setImei(next, reboot: false, module: nil)
+            check(write == ImeiWrite(outcome: .success(.setTakesEffectAfterRestart(before: first, after: next)),
+                                     module: "c0ffee01", before: first), "imei: the session's module and IMEI before",
+                  "\(write)")
+            rig.finish("imei: session", opens: 1)
+        }
+        do {
+            let rig = onModule("c0ffee01", [])
+            let write = rig.service.setImei(next, reboot: true, module: "0badbeef")
+            check(write.outcome.failureText?.contains("not the module") == true
+                    && write.outcome.failureText?.hasSuffix("Nothing was changed.") == true,
+                  "imei: another module refused", "\(write)")
+            check(write.module == "c0ffee01" && write.before == nil, "imei: refused before the IMEI read", "\(write)")
+            rig.finish("imei: another module", opens: 1)
+        }
+        do {
+            let rig = onModule("c0ffee01", [("AT+EGMR=0,7", readFirst), ("AT+EGMR=1,7,\"\(next)\"", ok),
+                                            ("AT+EGMR=0,7", readNext), ("AT+CFUN=1,1", ok)])
+            let write = rig.service.setImei(next, reboot: true, module: "c0ffee01")
+            check(write.outcome == .success(.rebooting(before: first, after: next)), "imei: the module asked for is written",
+                  "\(write)")
+            rig.finish("imei: the module asked for", opens: 1)
+        }
+        do {
+            let rig = Rig([.failure(.busy)])
+            let write = rig.service.setImei(next, reboot: true, module: nil)
+            check(write.module == nil && write.before == nil && write.outcome.failureText != nil,
+                  "imei: a port that does not open: nothing known", "\(write)")
+            rig.finish("imei: busy", opens: 1)
+        }
+        do {
+            // The IMEI read fails on the session: the module known, the IMEI before not.
+            let rig = onModule("c0ffee01", [("AT+EGMR=0,7", .failure(.modem("ERROR")))])
+            let write = rig.service.setImei(next, reboot: true, module: nil)
+            check(write.module == "c0ffee01" && write.before == nil && write.outcome.failureText != nil,
+                  "imei: the read failed, the module known", "\(write)")
+            rig.finish("imei: read failed", opens: 1)
+        }
+    }
+}
+
+extension Result where Failure == ModemFailure {
+    var failureText: String? {
+        if case .failure(let f) = self { return f.message }
+        return nil
     }
 }

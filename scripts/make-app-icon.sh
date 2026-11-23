@@ -14,10 +14,17 @@ if [ "$width" != "$height" ] || [ "$width" -lt 1024 ]; then
     echo "make-app-icon: $src is $width × $height; it must be square and at least 1024 × 1024" >&2
     exit 1
 fi
-dir=$(cd "$(dirname "$0")/.." && pwd)/app/Assets.xcassets/AppIcon.appiconset
+root=$(cd "$(dirname "$0")/.." && pwd)
+dir=$root/app/Assets.xcassets/AppIcon.appiconset
 for size in 16 32 128 256 512; do
     sips -s format png -z "$size" "$size" "$src" --out "$dir/icon_${size}x${size}.png" >/dev/null
     double=$((size * 2))
     sips -s format png -z "$double" "$double" "$src" --out "$dir/icon_${size}x${size}@2x.png" >/dev/null
 done
-echo "make-app-icon: wrote the ten sizes into $dir; run scripts/install-driver.sh to build and install the app with it"
+if [ -d "$root/app/AppIcon.icon" ]; then
+    # gen.rb takes the Icon Composer document over the PNGs whenever it is there.
+    echo "make-app-icon: wrote the ten sizes into $dir, but app/AppIcon.icon exists and the app uses it:" \
+        "these PNGs are not used while it is there"
+else
+    echo "make-app-icon: wrote the ten sizes into $dir; run scripts/install-driver.sh to build and install the app with it"
+fi

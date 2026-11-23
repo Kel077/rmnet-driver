@@ -13,11 +13,13 @@
 // that the app never opens the port twice at once.
 //
 // The signal bars (the other style, chosen in Settings and kept in the user defaults) show the modem's signal: while
-// they are chosen and the driver is attached, every 15 s (`pollSignal`) they take the window's network read if it is
-// under 15 s old, else send one short command on that same queue, on a port opened without waiting for another
-// program (`RMNet` in a terminal, which waits up to 2 s for the port, then has it): AT+QENG="servingcell", or AT+CFUN?
-// to tell a modem searching from one whose radio is off (nextSignalQuery). A busy port or a read without an answer
-// keeps the last level, dimmed as stale; no error is shown. Nothing read is logged or stored.
+// they are chosen and the driver is attached, they ride the app's background turn (ModemPulse.swift, every 15 s; it is
+// the only thing that reads the port in the background, so the bars have no timer of their own): each turn they take
+// the window's network read if it is under 15 s old, else ask for one short command in the turn's port open, which does
+// not wait for another program (`RMNet` in a terminal, which waits up to 2 s for the port, then has it):
+// AT+QENG="servingcell", or AT+CFUN? to tell a modem searching from one whose radio is off (nextSignalQuery;
+// pulseSignalCommands, pulseSignalAnswers). A busy port, a read without an answer or a turn that ended before the
+// command keeps the last level, dimmed as stale; no error is shown. Nothing read is logged or stored.
 import Foundation
 
 /// The driver's RMNet* registry properties, as strings (readDriverProperties in Registry.swift).
@@ -351,8 +353,7 @@ final class MenuBarStatus: ObservableObject {
     static let pollTolerance: TimeInterval = 1   // the system may fire a poll up to 1 s late, to save power
     static let listingEvery = 12                 // polls between listing questions while no driver is attached
     static let networkSpacing: TimeInterval = 10
-    static let signalInterval: TimeInterval = 15  // the signal bars' reads, while that style is chosen
-    static let signalTolerance: TimeInterval = 3
+    static let signalFresh: TimeInterval = 15     // the window's read stands in for the bars' while younger (a turn)
 
     private let properties: () -> DriverProperties?
     private let modem: () -> (state: ModemState, model: QuectelModel?)
@@ -360,12 +361,10 @@ final class MenuBarStatus: ObservableObject {
     private let network: () -> Result<NetworkInfo, ModemFailure>
     private let now: () -> Date
     private let queue: DispatchQueue
-    private let signalRead: ((MenuBarSignalQuery) -> Result<NetworkInfo, ModemFailure>)?
     private let freshInfo: () -> (info: NetworkInfo, at: Date)?
     private let preference: MenuBarIconPreference?
     private var timer: Timer?
-    private var signalTimer: Timer?
-    private var signalReading = false        // a signal read runs on the queue
+    private var signalReading = false        // the background turn has the bars' command and has not answered yet
     private var lastSignalQuery: MenuBarSignalQuery? = nil
     private var asking = false              // a listing question is pending
     private var panelOpen = false           // between panelOpened() and panelClosed()
@@ -378,18 +377,16 @@ final class MenuBarStatus: ObservableObject {
 
     /// `properties`: the driver's registry properties, nil when it is not attached. `modem`: the modem on USB.
     /// `listing`: asks the system for its entries for the driver and answers on the main thread, nil when it
-    /// gave none. `network`: the read over the AT port; it blocks, and runs only on `queue`. `signalRead`: the
-    /// signal bars' one-command read (it blocks, on `queue`; it must not wait for a port another program holds);
-    /// nil: the bars never read. `freshInfo`: the window's last network read and when it finished, which the bars use
-    /// instead of a read of their own while it is fresh. `preference`: where the style is kept; nil: the antenna,
-    /// kept nowhere.
+    /// gave none. `network`: the read over the AT port; it blocks, and runs only on `queue`. `freshInfo`: the window's
+    /// last network read and when it finished, which the bars use instead of a read of their own while it is fresh.
+    /// `preference`: where the style is kept; nil: the antenna, kept nowhere. The bars' own reads are the background
+    /// turn's (pulseSignalCommands).
     init(properties: @escaping () -> DriverProperties?,
          modem: @escaping () -> (state: ModemState, model: QuectelModel?),
          listing: @escaping (@escaping ([ExtensionEntry]?) -> Void) -> Void,
          network: @escaping () -> Result<NetworkInfo, ModemFailure>,
          now: @escaping () -> Date = { Date() },
          queue: DispatchQueue,
-         signalRead: ((MenuBarSignalQuery) -> Result<NetworkInfo, ModemFailure>)? = nil,
          freshInfo: @escaping () -> (info: NetworkInfo, at: Date)? = { nil },
          preference: MenuBarIconPreference? = nil) {
         self.properties = properties
@@ -398,7 +395,6 @@ final class MenuBarStatus: ObservableObject {
         self.network = network
         self.now = now
         self.queue = queue
-        self.signalRead = signalRead
         self.freshInfo = freshInfo
         self.preference = preference
         self.iconStyle = preference?.load() ?? .antenna
@@ -407,7 +403,6 @@ final class MenuBarStatus: ObservableObject {
 
     deinit {
         timer?.invalidate()
-        signalTimer?.invalidate()
     }
 
     /// The signal bars as the item draws them now.
@@ -422,52 +417,23 @@ final class MenuBarStatus: ObservableObject {
         if showsTechnology != shows { showsTechnology = shows }
     }
 
-    /// Settings' choice: kept, drawn at once, and the signal reads started (at once, then every 15 s) or stopped.
-    /// On the main thread only.
+    /// Settings' choice: kept and drawn at once; the bars read from the next background turn on (pulseSignalCommands),
+    /// the antenna reads nothing. On the main thread only.
     func setIconStyle(_ style: MenuBarIconStyle) {
         dispatchPrecondition(condition: .onQueue(.main))
         preference?.save(style)
         if iconStyle != style { iconStyle = style }
-        updateSignalTimer()
     }
 
-    /// The signal reads run only while the bars are chosen and the polls run (start).
-    private func updateSignalTimer() {
-        // Without a read of its own (the app's), the background turn (ModemPulse.swift) asks pulseSignalCommands.
-        guard iconStyle == .signal, timer != nil, signalRead != nil else {
-            signalTimer?.invalidate()
-            signalTimer = nil
-            return
-        }
-        guard signalTimer == nil else { return }
-        pollSignal()
-        let t = Timer(timeInterval: MenuBarStatus.signalInterval, repeats: true) { [weak self] _ in self?.pollSignal() }
-        t.tolerance = MenuBarStatus.signalTolerance
-        RunLoop.main.add(t, forMode: .common)
-        signalTimer = t
-    }
-
-    /// One turn of the signal bars: nothing while the antenna is chosen, without a driver (there is no modem to ask,
-    /// or no connection to show), or while a read runs (the panel's or the bars' own); the window's network read when
-    /// it finished less than 15 s ago (no port is opened); otherwise one short command on the shared queue, on a port
-    /// opened without waiting for another program: a busy port keeps the last level, marked stale. On the main thread.
-    func pollSignal() {
-        dispatchPrecondition(condition: .onQueue(.main))
-        guard let signalRead, let query = wantedSignalQuery() else { return }
-        signalReading = true
-        queue.async { [weak self] in
-            let result = signalRead(query)
-            DispatchQueue.main.async { self?.finishSignalRead(result) }
-        }
-    }
-
-    /// The read this turn needs, if any (pollSignal's rule; the window's fresh read is taken here, with no read).
+    /// The read this turn needs, if any: nothing while the antenna is chosen, without a driver (there is no modem to
+    /// ask, or no connection to show), or while a read runs (the panel's, or the bars' own in a turn not answered yet);
+    /// the window's network read when it finished less than 15 s ago is taken here, with no read.
     private func wantedSignalQuery() -> MenuBarSignalQuery? {
         guard iconStyle == .signal, driver != nil, !signalReading, !reading else { return nil }
         let at = now()
         if let fresh = freshInfo() {
             let age = at.timeIntervalSince(fresh.at)
-            if age >= 0 && age < MenuBarStatus.signalInterval {
+            if age >= 0 && age < MenuBarStatus.signalFresh {
                 setSignal(menuBarSignal(from: fresh.info, at: fresh.at))
                 return nil
             }
@@ -477,8 +443,9 @@ final class MenuBarStatus: ObservableObject {
         return query
     }
 
-    /// The background turn's part (ModemPulse.swift), in the app: the command pollSignal would send (AT+QENG="servingcell"
-    /// or AT+CFUN?), none when no read is wanted. Its answers come back to pulseSignalAnswers.
+    /// The background turn's part (ModemPulse.swift): the one command the bars want this turn (AT+QENG="servingcell" or
+    /// AT+CFUN?), none when no read is wanted (wantedSignalQuery). Its answers come back to pulseSignalAnswers. On the
+    /// main thread.
     func pulseSignalCommands() -> [String] {
         dispatchPrecondition(condition: .onQueue(.main))
         guard let query = wantedSignalQuery() else { return [] }
@@ -486,16 +453,21 @@ final class MenuBarStatus: ObservableObject {
         return [MenuBarStatus.command(query)]
     }
 
-    /// The background turn's answers (keyed by command), or why the port could not be used: as pollSignal's read.
+    /// The background turn's answers (keyed by command), or why the port could not be used. A refusal leaves its part
+    /// unknown (as an answer without the line); no answer at all (the turn ended before the command: a timeout or an I/O
+    /// error on an earlier one) keeps the last level, marked stale, as a failed read does.
     func pulseSignalAnswers(_ answers: Result<[String: PulseAnswer], ModemFailure>) {
         dispatchPrecondition(condition: .onQueue(.main))
         guard signalReading else { return }
         let query = lastSignalQuery ?? .servingCell
-        finishSignalRead(answers.map { a in
+        let command = MenuBarStatus.command(query)
+        finishSignalRead(answers.flatMap { a in
+            guard let answer = a[command] else {
+                return .failure(ModemFailure(message: "The modem did not answer \(command) in this turn."))
+            }
             var info = NetworkInfo()
-            let lines = a[MenuBarStatus.command(query)]?.lines ?? []
-            if query == .radio { info.radio = parseRadio(lines) } else { info.serving = parseServingCell(lines) }
-            return info
+            if query == .radio { info.radio = parseRadio(answer.lines) } else { info.serving = parseServingCell(answer.lines) }
+            return .success(info)
         })
     }
 
@@ -527,7 +499,6 @@ final class MenuBarStatus: ObservableObject {
         t.tolerance = MenuBarStatus.pollTolerance
         RunLoop.main.add(t, forMode: .common)
         timer = t
-        updateSignalTimer()
     }
 
     /// Reads the registry; asks the system for its listing too (its answer updates the icon and headline when

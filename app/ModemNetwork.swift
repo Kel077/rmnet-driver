@@ -306,15 +306,6 @@ private func intCodeValue(_ fields: [String], _ index: Int, in table: [Int]) -> 
     return table[c]
 }
 
-/// Default NR subcarrier spacing in kHz when Quectel omits `<scs>` (e.g. an SCC in AT+QCAINFO).
-func defaultNrScsKHz(band: Int, duplex: String? = nil) -> Int {
-    if duplex == "TDD" { return 30 }
-    if duplex == "FDD" { return 15 }
-    if band >= 257 { return 120 }
-    if [34, 38, 39, 40, 41, 46, 48, 50, 51, 53, 77, 78, 79, 90].contains(band) { return 30 }
-    return 15
-}
-
 /// A band number with its RAT's mark: NR 41 → "n41", LTE 3 → "B3"; nil unless a positive number.
 private func band(_ mark: String, _ number: Int?) -> String? {
     guard let n = number, n > 0 else { return nil }
@@ -478,8 +469,11 @@ func parseAntennaSignals(rsrp rsrpLines: [String], rsrq rsrqLines: [String],
     }
 }
 
-/// AT+QENG="neighbourcell": `+QENG: "neighbourcell intra","LTE",<earfcn>,<pcid>,<rsrq>,<rsrp>,<rssi>,<sinr>,…`
-/// or `"neighbourcell","WCDMA",…` or `"neighbourcell…","NR5G",…`.
+/// AT+QENG="neighbourcell" (Quectel's AT manual for the RM520N series, 5.20). LTE cells come in two forms: in LTE mode
+/// `+QENG: "neighbourcell intra","LTE",<earfcn>,<PCID>,<RSRQ>,<RSRP>,<RSSI>,<SINR>,<srxlev>,…` (and `"neighbourcell
+/// inter"`, the same fields), RSRQ before RSRP; in WCDMA mode `+QENG: "neighbourcell","LTE",<earfcn>,<PCID>,<RSRP>,
+/// <RSRQ>,<s_rxlev>`, RSRP before RSRQ and no SINR. Also `"neighbourcell","WCDMA",…` and `"neighbourcell…","NR5G",…`.
+/// A field that is `-` (not valid now) is nil.
 func parseNeighbourCells(_ lines: [String]) -> [NeighbourCell] {
     var out: [NeighbourCell] = []
     for line in lines {
@@ -496,11 +490,11 @@ func parseNeighbourCells(_ lines: [String]) -> [NeighbourCell] {
         }
         switch rat {
         case "LTE":
-            let rsrp = intField(f, 5)
-            let rsrq = intField(f, 4)
-            let sinr = intField(f, 7)
+            // With intra/inter (LTE mode): RSRQ, RSRP, RSSI, SINR. Without (WCDMA mode): RSRP, RSRQ, s_rxlev.
+            let lteMode = kind == "intra" || kind == "inter"
             out.append(NeighbourCell(rat: rat, kind: kind, channel: intField(f, 2), pci: intField(f, 3),
-                                     rsrp: rsrp, rsrq: rsrq, sinr: sinr))
+                                     rsrp: intField(f, lteMode ? 5 : 4), rsrq: intField(f, lteMode ? 4 : 5),
+                                     sinr: lteMode ? intField(f, 7) : nil))
         case "NR5G", "NR5G-SA", "NR5G-NSA":
             out.append(NeighbourCell(rat: "NR5G", kind: kind, channel: intField(f, 2), pci: intField(f, 3),
                                      rsrp: intField(f, 4), rsrq: intField(f, 5), sinr: intField(f, 6)))

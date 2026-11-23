@@ -50,14 +50,13 @@ struct SettingsView: View {
             }
             Section {
                 Toggle("Notify about new messages", isOn: $settings.notifyMessages)
-                Toggle("Show message text in notifications", isOn: $settings.notificationShowsText)
-                    .disabled(!settings.notifyMessages)
             } header: {
                 Text("Messages")
             } footer: {
-                Text(verbatim: "While RMNet runs, also with its window closed, it checks for new messages about every 30 "
-                     + "seconds (one short command, skipped while another program uses the modem's AT port). Without "
-                     + "the text, a notification says only who sent the message.")
+                Text(verbatim: "While RMNet runs, also with its window closed, it checks the modem's message count about "
+                     + "every 30 seconds (one short command, skipped while another program uses the modem's AT port). "
+                     + "A notification says only that new messages came in: reading one on the modem marks it read, so "
+                     + "RMNet reads them only when Messages is opened.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

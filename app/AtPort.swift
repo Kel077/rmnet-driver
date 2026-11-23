@@ -186,12 +186,17 @@ final class AtPort {
     // transfer that ends by its timeout cannot have received anything that would be lost.
     private let readSize: Int
     private var echoes = false  // learned at open()
+    /// The USB serial number of the device this port was opened on (read from that device's own registry entry when the
+    /// port opened, so it is the module the commands go to, not another one attached since); nil when it gives none.
+    let deviceSerial: String?
 
-    private init(interface: IOUSBHostInterface, input: IOUSBHostPipe, output: IOUSBHostPipe, readSize: Int) {
+    private init(interface: IOUSBHostInterface, input: IOUSBHostPipe, output: IOUSBHostPipe, readSize: Int,
+                 deviceSerial: String?) {
         self.interface = interface
         self.input = input
         self.output = output
         self.readSize = readSize
+        self.deviceSerial = deviceSerial
     }
 
     deinit { close() }
@@ -242,7 +247,8 @@ final class AtPort {
         do {
             let input = try iface.copyPipe(withAddress: Int(endpoints.input))
             let output = try iface.copyPipe(withAddress: Int(endpoints.output))
-            port = AtPort(interface: iface, input: input, output: output, readSize: endpoints.inputPacketSize)
+            port = AtPort(interface: iface, input: input, output: output, readSize: endpoints.inputPacketSize,
+                          deviceSerial: usbSerial(of: device))
         } catch {
             iface.destroy()
             return .failure(.io(ioStatus(error)))
@@ -430,6 +436,17 @@ final class AtPort {
     private static func hasExclusiveOwner(_ service: io_service_t) -> Bool {
         IORegistryEntryCreateCFProperty(service, "UsbExclusiveOwner" as CFString, kCFAllocatorDefault, 0)?
             .takeRetainedValue() != nil
+    }
+
+    // The device's "USB Serial Number" (as `ioreg` shows it), printable ASCII, at most 64 characters; nil without one.
+    private static func usbSerial(of device: io_service_t) -> String? {
+        for key in ["USB Serial Number", "kUSBSerialNumberString"] {
+            guard let value = IORegistryEntryCreateCFProperty(device, key as CFString, kCFAllocatorDefault, 0)?
+                    .takeRetainedValue() as? String else { continue }
+            let serial = String(value.unicodeScalars.filter { $0.isASCII && $0.value >= 0x20 && $0.value < 0x7F }.prefix(64))
+            if !serial.isEmpty { return serial }
+        }
+        return nil
     }
 
     private static func matchingService(_ className: String, _ properties: [String: Any]) -> io_service_t {

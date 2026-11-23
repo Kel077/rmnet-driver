@@ -183,6 +183,24 @@ struct CellLockState: Equatable {
     var persistsAcrossReboot: Bool { persistLte || persistNr }
 }
 
+/// A cell the modem uses now, locked to only while it still does: the serving cell and the carriers are read again in
+/// the same port session as the lock is written (ModemService.lockCellInUse), so a cell that has changed since the
+/// caller looked is never locked to. `serving`: whatever serves now (`RMNet cell lock current`): its 5G SA leg, else
+/// its LTE leg; `scsKHz` is the subcarrier spacing for a 5G SA cell the modem gives none for (never guessed: without
+/// it the lock is refused). `nr`, `lte`: that cell (the window's Lock of a cell in use).
+enum CellInUse: Equatable {
+    case serving(scsKHz: Int?)
+    case nr(NrCellLock)
+    case lte(LteLockedCell)
+}
+
+/// What a cell in use is locked with, or why it is not (cellInUseLock).
+enum CellInUseCheck: Equatable {
+    case nr(NrCellLock)
+    case lte(LteLockedCell)
+    case refused(String)
+}
+
 /// Outcome of writing a cell lock or persistence setting.
 enum CellLockChange: Equatable {
     case unchanged(CellLockState)
@@ -194,6 +212,16 @@ enum ImeiChange: Equatable {
     case unchanged(String)
     case rebooting(before: String, after: String)
     case setTakesEffectAfterRestart(before: String, after: String)
+}
+
+/// An IMEI change as its own port session saw it (ModemService.setImei): the outcome, the module the port was opened on
+/// (its USB serial number, AtPort.deviceSerial) and the IMEI read on that port before the write; each nil when not known
+/// (the port did not open, the module gives no serial number, the read failed). The IMEI history records these, not
+/// what was read on another port before or after.
+struct ImeiWrite: Equatable {
+    var outcome: Result<ImeiChange, ModemFailure>
+    var module: String? = nil
+    var before: String? = nil
 }
 
 /// The modem over its spare AT port. Each call blocks until done; callers keep it off the main thread.
@@ -215,10 +243,26 @@ protocol ModemServing {
     func setNrCellLock(_ lock: NrCellLock?) -> Result<CellLockChange, ModemFailure>
     func setLteCellLock(_ cells: [LteLockedCell]) -> Result<CellLockChange, ModemFailure>
     func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure>
+    func lockCellInUse(_ cell: CellInUse) -> Result<CellLockChange, ModemFailure>    // refuses what cellInUseProblem does
     func imei() -> Result<String, ModemFailure>
-    func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure>
+    /// `module`: write only on the module with that USB serial number (Change Back…, which undoes a change recorded on
+    /// it), checked on the port that writes; nil: on any.
+    func setImei(_ imei: String, reboot: Bool, module: String?) -> ImeiWrite
     func simSlot() -> Result<Int, ModemFailure>                                       // AT+QUIMSLOT?
-    func setSimSlot(_ slot: Int, wait: SimSlotWait) -> Result<SimSlotChange, ModemFailure>
+    /// `expect`: an automatic switch's expectation, checked on the port that writes (SimSlotExpectation); nil: none.
+    func setSimSlot(_ slot: Int, wait: SimSlotWait, expect: SimSlotExpectation?) -> Result<SimSlotChange, ModemFailure>
+}
+
+extension ModemServing {
+    /// On any module; the outcome only.
+    func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure> {
+        setImei(imei, reboot: reboot, module: nil).outcome
+    }
+
+    /// Asked by the owner: no expectation.
+    func setSimSlot(_ slot: Int, wait: SimSlotWait) -> Result<SimSlotChange, ModemFailure> {
+        setSimSlot(slot, wait: wait, expect: nil)
+    }
 }
 
 // MARK: - Answer lines
@@ -793,9 +837,32 @@ struct SimSlotChange: Equatable {
     var secondsToSim: Int? = nil
     var registration: Registration? = nil
     var secondsToRegister: Int? = nil
+    var skipped: SimSlotSkip? = nil   // an automatic switch not made: what its expectation found otherwise
 
     var changed: Bool { before != after }
 }
+
+/// What an automatic switch (SimSlotWatch.swift) expects to find on the port that would write AT+QUIMSLOT=, checked
+/// there first, in the same port open (ModemService.setSimSlot): the module it watched (its USB serial number, nil when
+/// it gives none), still on `slot`; and with `unusableSim`, the radio still on (AT+CFUN? 1) and the SIM still without
+/// a usable SIM (AT+CPIN?, simUnusable). Anything else, or a part that cannot be read: nothing is written, and the
+/// change says why (`skipped`). A switch back checks the module and the slot only.
+struct SimSlotExpectation: Equatable {
+    let module: String?
+    let slot: Int
+    var unusableSim = true
+}
+
+/// What came of a SIM slot change for its asker (ModemController.changeSimSlot's completion): its outcome, or `cancelled` when it was
+/// dropped before it ran (it waited behind a read when the app began to quit).
+enum SimSlotOutcome: Equatable {
+    case finished(Result<SimSlotChange, ModemFailure>)
+    case cancelled
+}
+
+/// Why an automatic switch was not made: another module on the port, another slot in use, the radio not on (or not
+/// read), or a SIM that is usable now (or whose state could not be read).
+enum SimSlotSkip: Equatable { case otherModule, otherSlot, radioNotOn, simUsable }
 
 /// The result line of a slot change.
 func simSlotSentence(_ c: SimSlotChange) -> String {
@@ -1080,6 +1147,69 @@ func lteCellLockCommand(_ cells: [LteLockedCell]) -> String {
 func nrCellLockCommand(_ lock: NrCellLock?) -> String {
     guard let lock else { return "AT+QNWLOCK=\"common/5g\",0" }
     return "AT+QNWLOCK=\"common/5g\",\(lock.pci),\(lock.arfcn),\(lock.scsKHz),\(lock.band)"
+}
+
+/// What is wrong with a cell in use before anything is read: its values (nrCellLockProblem, lteCellLockProblem), or a
+/// subcarrier spacing given that is not one of validNrScsKHz; nil when nothing is.
+func cellInUseProblem(_ cell: CellInUse) -> String? {
+    switch cell {
+    case .serving(let scs):
+        guard let scs else { return nil }
+        return validNrScsKHz.contains(scs) ? nil : "Subcarrier spacing must be 15, 30, 60, 120 or 240 kHz."
+    case .nr(let lock):
+        return nrCellLockProblem(lock)
+    case .lte(let cell):
+        return lteCellLockProblem([cell])
+    }
+}
+
+/// The lock for a cell in use, against the serving cell (AT+QENG="servingcell") and the carriers (AT+QCAINFO) read in
+/// the session that writes it. A 5G SA cell is in use while the modem is on 5G SA and it is the serving leg or one of
+/// the NR carriers (band, PCI and ARFCN the same); an LTE cell while it is an LTE leg or carrier (EARFCN and PCI). A
+/// subcarrier spacing the modem gives for the cell must be the lock's; one it does not give is never guessed.
+func cellInUseLock(_ cell: CellInUse, serving: ServingCell?, carriers: [CarrierComponent]) -> CellInUseCheck {
+    let legs = serving?.cells ?? []
+    let onSa = legs.contains { $0.rat == "NR5G-SA" }
+    switch cell {
+    case .serving(let given):
+        if let sa = legs.first(where: { $0.rat == "NR5G-SA" }), let pci = sa.pci, let arfcn = sa.channel,
+           let bandText = sa.band, bandText.hasPrefix("n"), let band = Int(bandText.dropFirst()) {
+            switch (sa.scsKHz, given) {
+            case let (read?, given?) where read != given:
+                return .refused("The modem reports a subcarrier spacing of \(read) kHz for its serving 5G SA cell, "
+                                + "not \(given) kHz.")
+            case let (read?, _):
+                return .nr(NrCellLock(pci: pci, arfcn: arfcn, scsKHz: read, band: band))
+            case let (nil, given?):
+                return .nr(NrCellLock(pci: pci, arfcn: arfcn, scsKHz: given, band: band))
+            case (nil, nil):
+                return .refused("The modem does not report the subcarrier spacing of its serving 5G SA cell (n\(band), "
+                                + "PCI \(pci), ARFCN \(arfcn)); give it with --scs (15, 30, 60, 120 or 240 kHz).")
+            }
+        }
+        if let lte = legs.first(where: { $0.rat == "LTE" }), let earfcn = lte.channel, let pci = lte.pci {
+            return .lte(LteLockedCell(earfcn: earfcn, pci: pci))
+        }
+        return .refused("No lockable 5G SA or LTE serving cell is currently active.")
+    case .nr(let lock):
+        let band = "n\(lock.band)"
+        let leg = legs.first { $0.rat == "NR5G-SA" && $0.band == band && $0.pci == lock.pci && $0.channel == lock.arfcn }
+        let carrier = carriers.contains { $0.rat == "NR5G" && $0.band == band && $0.pci == lock.pci && $0.channel == lock.arfcn }
+        guard onSa, leg != nil || carrier else {
+            return .refused("The modem no longer uses that 5G SA cell (\(band), PCI \(lock.pci), ARFCN \(lock.arfcn)).")
+        }
+        if let read = leg?.scsKHz, read != lock.scsKHz {
+            return .refused("The modem reports a subcarrier spacing of \(read) kHz for that cell, not \(lock.scsKHz) kHz.")
+        }
+        return .nr(lock)
+    case .lte(let cell):
+        let inUse = legs.contains { $0.rat == "LTE" && $0.channel == cell.earfcn && $0.pci == cell.pci }
+            || carriers.contains { $0.rat == "LTE" && $0.channel == cell.earfcn && $0.pci == cell.pci }
+        guard inUse else {
+            return .refused("The modem no longer uses that LTE cell (PCI \(cell.pci), EARFCN \(cell.earfcn)).")
+        }
+        return .lte(cell)
+    }
 }
 
 func cellLockPersistCommand(lte: Bool, nr: Bool) -> String {

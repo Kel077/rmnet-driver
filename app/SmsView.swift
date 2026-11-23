@@ -351,7 +351,8 @@ private struct ConversationPane: View {
                     ScrollView {
                         LazyVStack(spacing: Spacing.m) {
                             ForEach(c.messages) { m in
-                                Bubble(message: m, sentAt: controller.sentAt, changeEnabled: controller.changeEnabled,
+                                Bubble(message: m, sentAt: controller.sentAt, unconfirmed: controller.unconfirmed,
+                                       changeEnabled: controller.changeEnabled,
                                        retry: { controller.retry(m) }, delete: { deleteMessage(m) })
                                     .id(m.key)
                             }
@@ -374,11 +375,13 @@ private struct ConversationPane: View {
 }
 
 /// One message: received on the left in gray, sent on the right in blue (dimmed while not sent); under it its time,
-/// or Sent and Not sent with Retry and Delete; Copy Code for a one-time code; a note for a part missing or a message
-/// that cannot be read. Its context menu copies the text or the code, and deletes it.
+/// or Sent, and Not sent or Not confirmed (a send that got no answer: it may have gone) with Retry and Delete; Copy
+/// Code for a one-time code; a note for a part missing or a message that cannot be read. Its context menu copies the
+/// text or the code, and deletes it.
 private struct Bubble: View {
     let message: SmsMessage
     let sentAt: [Int: Date]
+    let unconfirmed: Set<Int>
     let changeEnabled: Bool
     let retry: () -> Void
     let delete: () -> Void
@@ -431,13 +434,17 @@ private struct Bubble: View {
     /// The time of a received message; Sent (with the time when known) or Not sent, with Retry and Delete, for a sent one.
     @ViewBuilder private var meta: some View {
         if message.box == .unsent {
-            Label("Not sent", systemImage: "exclamationmark.circle.fill")
+            let words = sentStatusWords(message, sentAt: sentAt, unconfirmed: unconfirmed, time: { bubbleTime($0) })
+            let maybeSent = words == "Not confirmed"
+            Label(words ?? "Not sent", systemImage: maybeSent ? "questionmark.circle.fill" : "exclamationmark.circle.fill")
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.red)
+                .foregroundStyle(maybeSent ? .orange : .red)
+                .help(maybeSent ? "The modem did not answer when it was sent: it may have been delivered." : "")
             Button("Retry", action: retry)
                 .controlSize(.small)
                 .disabled(!changeEnabled)
-                .help("Send the stored part(s) again")
+                .help(maybeSent ? "Send the stored part(s) again. It may have been delivered already; sending it again "
+                                  + "may deliver it twice." : "Send the stored part(s) again")
             Button("Delete", role: .destructive, action: delete)
                 .controlSize(.small)
                 .disabled(!changeEnabled)

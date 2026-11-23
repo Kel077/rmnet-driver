@@ -49,15 +49,59 @@ enum SmsEncoding { case gsm7, ucs2 }
 /// tpduLength: octets after the SMSC field (what AT+CMGS takes).
 struct SubmitPdu: Equatable { let hex: String; let tpduLength: Int }
 
-/// A sentence for the owner.
-struct SmsFailure: Error, Equatable { let message: String }
+/// A sentence for the owner. `listingChanged`: what the window listed is no longer what the modem has (another module or
+/// SIM, another storage, or a stored part that changed), so nothing was done and the window lists again. `record`: what
+/// became of the parts of a send that failed part way (SmsSendRecord).
+struct SmsFailure: Error, Equatable {
+    let message: String
+    var listingChanged = false
+    var record = SmsSendRecord()
+}
+
+/// Where a listing came from: the module (the USB serial number of the device the port was opened on), the SIM (its
+/// IMSI, AT+CIMI; nil when none could be read) and the storages (AT+CPMS?: <mem1>, listed and deleted from; <mem2>,
+/// written to and sent from; nil when not read). A delete or a Retry of listed parts goes ahead only where all of it is
+/// still the same (SmsService). Kept in memory only, never shown, logged or stored.
+struct SmsPlace: Equatable {
+    var device: String? = nil
+    var sim: String? = nil
+    var listsFrom: String? = nil
+    var writesTo: String? = nil
+    var complete = true     // false: the storages or the SIM could not be read
+}
 
 /// A listing: the messages, and how many of the store's entries are used (nil when the modem's answer to
-/// AT+CPMS? could not be read).
+/// AT+CPMS? could not be read); every stored entry as listed, and where they were listed from.
 struct SmsListing: Equatable {
     let messages: [SmsMessage]
     let used: Int?
     let total: Int?
+    var parts: [StoredPdu] = []
+    var place = SmsPlace()
+}
+
+/// A stored part as the modem keeps it: its index and what it holds (pduSignature: the PDU without its service centre
+/// field and, for an SMS-SUBMIT, without the message reference the modem sets when it sends it). Two listings agree on
+/// a part when both are the same.
+struct StoredPart: Hashable {
+    let index: Int
+    let signature: String
+
+    init(index: Int, hex: String) {
+        self.index = index
+        signature = pduSignature(hex)
+    }
+
+    init(_ stored: StoredPdu) { self.init(index: stored.index, hex: stored.hex) }
+}
+
+/// What became of a send's stored parts, for the window (in memory): `sent`, each part the modem confirmed (+CMSS),
+/// where it is stored now; `stillUnsent`, those of them the modem still lists as unsent (they were sent: never offered
+/// for Retry); `unknown`, a part whose send got no answer (it may have gone: marked Not confirmed).
+struct SmsSendRecord: Equatable {
+    var sent: [StoredPart] = []
+    var stillUnsent: [StoredPart] = []
+    var unknown: [StoredPart] = []
 }
 
 /// A send that went: how many parts, and where they are stored as sent (none when the modem could not store them and
@@ -66,13 +110,38 @@ struct SmsSent: Equatable {
     let parts: Int
     var indices: [Int] = []
     var stored = true
+    var record = SmsSendRecord()
+}
+
+/// The background count (SmsServing.countUnread): the store's entries, how many are received, and how many of those are
+/// unread, found without reading an unread one (AT+CMGL=0 or 4 and AT+CMGR make it read): the entries less the read,
+/// unsent and sent ones (AT+CMGL=1, 2 and 3 change no status).
+struct SmsStoreCount: Equatable {
+    let used: Int
+    let received: Int
+    let unread: Int
 }
 
 protocol SmsServing {
     func list() -> Result<SmsListing, SmsFailure>
-    func delete(indices: [Int]) -> Result<Int, SmsFailure>                   // stored entries deleted
+    func delete(indices: [Int]) -> Result<Int, SmsFailure>                   // stored entries deleted (`sms delete`)
     func send(to number: String, text: String) -> Result<SmsSent, SmsFailure>
-    func resend(indices: [Int]) -> Result<SmsSent, SmsFailure>               // stored unsent parts, sent again
+    /// Deletes listed parts, after checking in the same session that the modem still has them where they were listed.
+    func delete(_ parts: [StoredPdu], listedFrom place: SmsPlace) -> Result<Int, SmsFailure>
+    /// Sends listed unsent parts again (Retry), after the same check.
+    func resend(_ parts: [StoredPdu], listedFrom place: SmsPlace) -> Result<SmsSent, SmsFailure>
+    func countUnread() -> Result<SmsStoreCount, SmsFailure>
+}
+
+// For fakes that need only some of it (the tests'): nothing is done.
+extension SmsServing {
+    func delete(_ parts: [StoredPdu], listedFrom place: SmsPlace) -> Result<Int, SmsFailure> {
+        .failure(SmsFailure(message: "Not available. Nothing was deleted."))
+    }
+    func resend(_ parts: [StoredPdu], listedFrom place: SmsPlace) -> Result<SmsSent, SmsFailure> {
+        .failure(SmsFailure(message: "Not available. Nothing was sent."))
+    }
+    func countUnread() -> Result<SmsStoreCount, SmsFailure> { .failure(SmsFailure(message: "Not available.")) }
 }
 
 // MARK: - The GSM 7-bit default alphabet (TS 23.038 §6.2.1) and its extension table (§6.2.1.1)
@@ -498,6 +567,26 @@ func parseStorageNames(_ lines: [String]) -> (read: String, write: String)? {
         return (fields[0].replacingOccurrences(of: "\"", with: ""), fields[3].replacingOccurrences(of: "\"", with: ""))
     }
     return nil
+}
+
+/// The IMSI AT+CIMI answers (a line of 6 to 15 digits), nil without one.
+func parseImsi(_ lines: [String]) -> String? {
+    lines.map(trimmed).first { (6...15).contains($0.count) && $0.utf8.allSatisfy { $0 >= 0x30 && $0 <= 0x39 } }
+}
+
+/// How many entries an AT+CMGL answer lists (its "+CMGL: <index>,…" lines).
+func listedCount(_ lines: [String]) -> Int {
+    lines.map(trimmed).filter { $0.hasPrefix("+CMGL:") && firstNumber([$0], "+CMGL:") != nil }.count
+}
+
+/// What a stored PDU holds, for telling stored parts apart across listings: its octets after the service centre field
+/// (which the modem may fill in), with an SMS-SUBMIT's message reference (TP-MR, set by the modem when it sends) as 00;
+/// upper-case hex. A PDU that cannot be read is its own upper-case hex.
+func pduSignature(_ hex: String) -> String {
+    guard let all = octets(fromHex: hex), let sc = all.first, all.count > Int(sc) + 1 else { return hex.uppercased() }
+    var tpdu = Array(all[(Int(sc) + 1)...])
+    if tpdu[0] & 0x03 == 1, tpdu.count > 1 { tpdu[1] = 0 }  // TP-MTI 1: SMS-SUBMIT; the next octet is TP-MR
+    return hexString(tpdu)
 }
 
 /// The first field of the first line starting `prefix`, as a non-negative number.

@@ -19,6 +19,12 @@ import Foundation
 protocol AtCommanding: AnyObject {
     func command(_ line: String, timeout: TimeInterval) -> Result<[String], AtError>
     func close()
+    /// The USB serial number of the module the port was opened on (AtPort.deviceSerial); nil when not known.
+    var deviceSerial: String? { get }
+}
+
+extension AtCommanding {
+    var deviceSerial: String? { nil }
 }
 
 extension AtPort: AtCommanding {}
@@ -31,6 +37,9 @@ private final class Link {
     private(set) var broken: AtError?
 
     init(_ port: AtCommanding) { self.port = port }
+
+    /// The module this port was opened on: the one every command of this open goes to.
+    var deviceSerial: String? { port.deviceSerial }
 
     func command(_ line: String, timeout: TimeInterval) -> Result<[String], AtError> {
         if let broken { return .failure(broken) }
@@ -137,22 +146,6 @@ final class ModemService: ModemServing {
             info.carrierComponents = parseCarrierComponents(qca)
             info.mode = parseModePreference(link.read(ModemService.modeRead))
             info.nr5gDisable = parseNr5gDisable(link.read("AT+QNWPREFCFG=\"nr5g_disable_mode\""))
-            if let broken = link.broken { return failure(describe(broken)) }
-            return .success(info)
-        }
-    }
-
-    /// The menu bar's signal bars: one command (3 s at most) on a port of its own, closed at once: AT+QENG="servingcell"
-    /// (the serving cell, `serving`), or AT+CFUN? (`radio`) when `radio` is true. A refusal leaves its part unknown; a
-    /// port that did not open, a timeout or an I/O error fails, with describe(error).
-    func signalRead(radio: Bool) -> Result<NetworkInfo, ModemFailure> {
-        withPort({ describe($0) }) { link in
-            var info = NetworkInfo()
-            if radio {
-                info.radio = parseRadio(link.read("AT+CFUN?"))
-            } else {
-                info.serving = parseServingCell(link.read("AT+QENG=\"servingcell\""))
-            }
             if let broken = link.broken { return failure(describe(broken)) }
             return .success(info)
         }
@@ -676,11 +669,12 @@ final class ModemService: ModemServing {
         }
     }
 
-    /// Reads the slot (nothing is sent when it is already `slot`), sends AT+QUIMSLOT=<slot> (5 s) and reads it back;
+    /// Reads the slot (nothing is sent when it is already `slot`), checks `expect` (an automatic switch's: nothing is
+    /// sent when the port finds otherwise, SimSlotExpectation), sends AT+QUIMSLOT=<slot> (5 s) and reads it back;
     /// then reads AT+CPIN? every second until the new slot's SIM settles (ready, or asking for a PIN or PUK) or 15 s
     /// have passed (an empty slot stays `not inserted`); with `wait` .registration and the SIM ready, the registration
     /// every second for up to 30 s, as the radio switched on does. All on one port open.
-    func setSimSlot(_ slot: Int, wait: SimSlotWait) -> Result<SimSlotChange, ModemFailure> {
+    func setSimSlot(_ slot: Int, wait: SimSlotWait, expect: SimSlotExpectation?) -> Result<SimSlotChange, ModemFailure> {
         guard simSlots.contains(slot) else {
             return failure("The modem has SIM slots 1 and 2. Nothing was changed.")
         }
@@ -691,6 +685,9 @@ final class ModemService: ModemServing {
             case .failure(let f): return .failure(f)
             }
             if before == slot { return .success(SimSlotChange(before: slot, after: slot)) }
+            if let expect, let skip = recheck(link, expect, slot: before) {
+                return .success(SimSlotChange(before: before, after: before, skipped: skip))
+            }
             switch link.command(simSlotCommand(slot), timeout: ModemService.writeTimeout) {
             case .success:
                 break
@@ -731,11 +728,24 @@ final class ModemService: ModemServing {
         }
     }
 
+    /// An automatic switch's expectation against what this port finds: nil when it holds (the switch may be made).
+    private func recheck(_ link: Link, _ expect: SimSlotExpectation, slot: Int) -> SimSlotSkip? {
+        guard link.deviceSerial == expect.module else { return .otherModule }
+        guard slot == expect.slot else { return .otherSlot }
+        guard expect.unusableSim else { return nil }
+        guard parseRadio(link.read("AT+CFUN?")) == .on else { return .radioNotOn }
+        guard case .success(let sim) = readSimState(link), simUnusable(sim) else { return .simUsable }
+        return nil
+    }
+
     // MARK: Short reads (the app's background turn)
 
     /// Sends each command (3 s each) on one port, in order: its lines, or the modem's error line for a command the
-    /// modem refuses (a state for AT+CPIN?); a port that does not open, a timeout or an I/O error fails the whole turn.
-    /// For the app's background turn (ModemPulse.swift), on a service whose port opens without waiting.
+    /// modem refuses (a state for AT+CPIN?). A timeout or an I/O error ends the turn there (nothing more is sent on that
+    /// port): the answers read before it are kept, and the commands from it on have none, so the array is shorter than
+    /// `commands` (ModemPulse gives each rider only the answers there are). A port that does not open, or a first command
+    /// that already fails so, fails the whole turn. For the app's background turn (ModemPulse.swift), on a service whose
+    /// port opens without waiting.
     func shortReads(_ commands: [String]) -> Result<[PulseAnswer], ModemFailure> {
         withPort({ describe($0) }) { link in
             var answers: [PulseAnswer] = []
@@ -743,7 +753,9 @@ final class ModemService: ModemServing {
                 switch link.command(command, timeout: ModemService.readTimeout) {
                 case .success(let lines): answers.append(.lines(lines))
                 case .failure(.modem(let line)): answers.append(.refused(line))
-                case .failure(let error): return failure(describe(error))
+                case .failure(let error):
+                    if answers.isEmpty { return failure(describe(error)) }
+                    return .success(answers)
                 }
             }
             return .success(answers)
@@ -856,64 +868,90 @@ final class ModemService: ModemServing {
 
     func setNrCellLock(_ lock: NrCellLock?) -> Result<CellLockChange, ModemFailure> {
         if let problem = nrCellLockProblem(lock, supportedSaBands: nil) { return failure("\(problem) Nothing was changed.") }
-        return writeCellLock(what: "The 5G SA cell lock", command: nrCellLockCommand(lock),
-                             validate: { link, _ in
-                                 guard let lock else { return nil }
-                                 switch self.readSupportedBands(link, [.sa]) {
-                                 case .failure(let f): return "\(f.message) Nothing was changed."
-                                 case .success(let lists):
-                                     if let problem = nrCellLockProblem(lock, supportedSaBands: lists[.sa] ?? []) {
-                                         return "\(problem) Nothing was changed."
-                                     }
-                                     return nil
-                                 }
-                             },
-                             alreadyEqual: { $0.nr == lock },
-                             verified: { $0.nr == lock })
+        return withPort({ "\(describe($0)) Nothing was changed." }) { link in self.writeNrCellLock(lock, on: link) }
     }
 
     func setLteCellLock(_ cells: [LteLockedCell]) -> Result<CellLockChange, ModemFailure> {
         if let problem = lteCellLockProblem(cells) { return failure("\(problem) Nothing was changed.") }
-        return writeCellLock(what: "The LTE cell lock", command: lteCellLockCommand(cells),
-                             alreadyEqual: { $0.lte == cells },
-                             verified: { $0.lte == cells })
+        return withPort({ "\(describe($0)) Nothing was changed." }) { link in self.writeLteCellLock(cells, on: link) }
     }
 
     func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure> {
-        writeCellLock(what: "The cell-lock persistence setting", command: cellLockPersistCommand(lte: lte, nr: nr),
-                      alreadyEqual: { $0.persistLte == lte && $0.persistNr == nr },
-                      verified: { $0.persistLte == lte && $0.persistNr == nr })
+        withPort({ "\(describe($0)) Nothing was changed." }) { link in
+            writeCellLock(link, what: "The cell-lock persistence setting", command: cellLockPersistCommand(lte: lte, nr: nr),
+                          alreadyEqual: { $0.persistLte == lte && $0.persistNr == nr },
+                          verified: { $0.persistLte == lte && $0.persistNr == nr })
+        }
     }
 
-    private func writeCellLock(what: String, command: String,
+    /// Locks to a cell the modem uses now, in one port session: the serving cell (AT+QENG="servingcell") and the
+    /// carriers (AT+QCAINFO) read, the cell checked against them (cellInUseLock: still in use, its subcarrier spacing
+    /// the one the modem gives, never guessed), then written as setNrCellLock or setLteCellLock does. A cell no longer
+    /// in use, or a read that fails, changes nothing.
+    func lockCellInUse(_ cell: CellInUse) -> Result<CellLockChange, ModemFailure> {
+        if let problem = cellInUseProblem(cell) { return failure("\(problem) Nothing was changed.") }
+        return withPort({ "\(describe($0)) Nothing was changed." }) { link in
+            let serving = parseServingCell(link.read("AT+QENG=\"servingcell\""))
+            let carriers = parseCarrierComponents(link.read("AT+QCAINFO"))
+            if let broken = link.broken { return failure("\(describe(broken)) Nothing was changed.") }
+            switch cellInUseLock(cell, serving: serving, carriers: carriers) {
+            case .refused(let why): return failure("\(why) Nothing was changed.")
+            case .nr(let lock): return self.writeNrCellLock(lock, on: link)
+            case .lte(let one): return self.writeLteCellLock([one], on: link)
+            }
+        }
+    }
+
+    private func writeNrCellLock(_ lock: NrCellLock?, on link: Link) -> Result<CellLockChange, ModemFailure> {
+        writeCellLock(link, what: "The 5G SA cell lock", command: nrCellLockCommand(lock),
+                      validate: { link, _ in
+                          guard let lock else { return nil }
+                          switch self.readSupportedBands(link, [.sa]) {
+                          case .failure(let f): return "\(f.message) Nothing was changed."
+                          case .success(let lists):
+                              if let problem = nrCellLockProblem(lock, supportedSaBands: lists[.sa] ?? []) {
+                                  return "\(problem) Nothing was changed."
+                              }
+                              return nil
+                          }
+                      },
+                      alreadyEqual: { $0.nr == lock },
+                      verified: { $0.nr == lock })
+    }
+
+    private func writeLteCellLock(_ cells: [LteLockedCell], on link: Link) -> Result<CellLockChange, ModemFailure> {
+        writeCellLock(link, what: "The LTE cell lock", command: lteCellLockCommand(cells),
+                      alreadyEqual: { $0.lte == cells },
+                      verified: { $0.lte == cells })
+    }
+
+    private func writeCellLock(_ link: Link, what: String, command: String,
                                validate: ((Link, CellLockState) -> String?)? = nil,
                                alreadyEqual: (CellLockState) -> Bool,
                                verified: (CellLockState) -> Bool) -> Result<CellLockChange, ModemFailure> {
-        withPort({ "\(describe($0)) Nothing was changed." }) { link in
-            let before: CellLockState
-            switch readCellLock(link, includeNeighbours: false) {
-            case .success(let state): before = state
-            case .failure(let f): return failure("\(f.message) Nothing was changed.")
+        let before: CellLockState
+        switch readCellLock(link, includeNeighbours: false) {
+        case .success(let state): before = state
+        case .failure(let f): return failure("\(f.message) Nothing was changed.")
+        }
+        if let problem = validate?(link, before) { return failure(problem) }
+        if alreadyEqual(before) { return .success(.unchanged(before)) }
+        switch link.command(command, timeout: ModemService.writeTimeout) {
+        case .success:
+            break
+        case .failure(let error) where isRefusal(error):
+            return failure("\(what) was not changed. \(describe(error))")
+        case .failure(let error):
+            return failure("It is not known whether \(what.lowercased()) changed. \(describe(error))")
+        }
+        switch readCellLock(link, includeNeighbours: false) {
+        case .success(let after):
+            guard verified(after) else {
+                return failure("The modem answered OK, but read back a different cell-lock state.")
             }
-            if let problem = validate?(link, before) { return failure(problem) }
-            if alreadyEqual(before) { return .success(.unchanged(before)) }
-            switch link.command(command, timeout: ModemService.writeTimeout) {
-            case .success:
-                break
-            case .failure(let error) where isRefusal(error):
-                return failure("\(what) was not changed. \(describe(error))")
-            case .failure(let error):
-                return failure("It is not known whether \(what.lowercased()) changed. \(describe(error))")
-            }
-            switch readCellLock(link, includeNeighbours: false) {
-            case .success(let after):
-                guard verified(after) else {
-                    return failure("The modem answered OK, but read back a different cell-lock state.")
-                }
-                return .success(.changed(before: before, after: after))
-            case .failure(let f):
-                return failure("The modem answered OK, but the cell lock could not be read back. \(f.message)")
-            }
+            return .success(.changed(before: before, after: after))
+        case .failure(let f):
+            return failure("The modem answered OK, but the cell lock could not be read back. \(f.message)")
         }
     }
 
@@ -933,14 +971,23 @@ final class ModemService: ModemServing {
         }
     }
 
-    func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure> {
-        if let problem = imeiProblem(imei) { return failure("\(problem) Nothing was changed.") }
-        return withPort({ "\(describe($0)) Nothing was changed." }) { link in
+    /// Reads the module (the port's) and the IMEI before on the port that writes, and hands them back with the outcome
+    /// (ImeiWrite), so the history records the module written to; with `module`, writes only on that one.
+    func setImei(_ imei: String, reboot: Bool, module: String?) -> ImeiWrite {
+        if let problem = imeiProblem(imei) { return ImeiWrite(outcome: failure("\(problem) Nothing was changed.")) }
+        var seen = ImeiWrite(outcome: failure("Nothing was changed."))
+        seen.outcome = withPort({ "\(describe($0)) Nothing was changed." }) { link in
+            seen.module = link.deviceSerial
+            if let module, link.deviceSerial != module {
+                return failure("The modem attached is not the module this change was made on (serial number \(module); "
+                               + "this one has \(link.deviceSerial ?? "none")). Nothing was changed.")
+            }
             let before: String
             switch readImei(link) {
             case .success(let current): before = current
             case .failure(let f): return failure("\(f.message) Nothing was changed.")
             }
+            seen.before = before
             if before == imei { return .success(.unchanged(before)) }
             let was = "It was \(before). The modem was not restarted."
             switch link.command(imeiCommand(imei), timeout: ModemService.writeTimeout) {
@@ -971,6 +1018,7 @@ final class ModemService: ModemServing {
                                + "\(describe(error)) If it does not restart, the new IMEI \(nextRestart)")
             }
         }
+        return seen
     }
 }
 

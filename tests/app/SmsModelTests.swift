@@ -502,7 +502,8 @@ struct SmsModelTests {
         // 0B 91 7238880900F1 recipient; two time stamps; 00 status.
         expectUnreadable("00" + "06" + "05" + "0B917238880900F1" + "99309251619580" + "99309251619580" + "00",
                          "status report (TP-MTI 2)")
-        // SMS-SUBMIT stored to send (TP-MTI 1, AT+CMGW): its recipient and text, no time.
+        // SMS-SUBMIT stored to send (TP-MTI 1, AT+CMGW): its recipient and text, no time. 00 SMSC; 01 SUBMIT; 00 TP-MR;
+        // 0B 91 2120550521F3 recipient +12025550123 (made up); 00 PID; 00 DCS; 0A septets "hellohello".
         let stored = decode("0001000B912120550521F300000AE8329BFD4697D9EC37", index: 4, status: .sent)
         check(stored.readable && stored.sender == "+12025550123" && stored.text == "hellohello" && stored.timestamp == nil
                 && stored.outgoing && stored.status == .sent, "SMS-SUBMIT stored: recipient and text", "\(stored)")
@@ -838,7 +839,7 @@ struct SmsModelTests {
             "T-Mobile: You have used 75% of your high-speed data for this bill cycle.",   // no code word
             "Running late, see you at the station around six.",
             "Your code is 1234, reference 5678.",                                           // two groups
-            "Call +15555550123 about your code.",                                           // a phone number
+            "Call +12025550123 about your code.",                                           // a phone number
             "Pay $1500 with code word",                                                     // an amount
             "Your balance 1234.56; PIN unchanged",                                          // a decimal
             "Your code is 123.",                                                            // too short
@@ -854,12 +855,14 @@ struct SmsModelTests {
     /// part, and the answers of AT+CMGW, AT+CMSS, AT+CMGR and AT+CPMS's storage names.
     static func storedSending() {
         // A sent and an unsent message among received ones; the same text sent to the same number as two parts.
-        guard case .success(let pdus) = encodeSubmit(to: "+15555550100", text: String(repeating: "made-up ", count: 25),
+        guard case .success(let pdus) = encodeSubmit(to: "+12025550100", text: String(repeating: "made-up ", count: 25),
                                                      reference: 7), pdus.count == 2,
-              case .success(let one) = encodeSubmit(to: "+15555550199", text: "Made-up reply", reference: 1) else {
+              case .success(let one) = encodeSubmit(to: "+12025550199", text: "Made-up reply", reference: 1) else {
             check(false, "stored: the PDUs encode")
             return
         }
+        // A received one: 00 SMSC; 04 DELIVER; 0B 91 2120550521F0 sender +12025550120 (made up); 00 PID; 00 DCS;
+        // 62112201000000 2026-11-22 10:00:00 +00; 0A septets "hellohello".
         let delivered = "0004" + "0B912120550521F0" + "0000" + "62112201000000" + "0AE8329BFD4697D9EC37"
         let lines = ["+CMGL: 0,1,,\(delivered.count / 2 - 1)", delivered,
                      "+CMGL: 1,3,,\(one[0].tpduLength)", one[0].hex,
@@ -871,9 +874,10 @@ struct SmsModelTests {
         let messages = assemble(parsed.map(decodePart))
         equal(messages.count, 4, "stored: received, sent, a two-part message, and an unsent one")
         let received = messages.first { $0.indices == [0] }
-        check(received?.box == .received && received?.outgoing == false, "stored: received")
+        check(received?.box == .received && received?.outgoing == false && received?.sender == "+12025550120",
+              "stored: received")
         let sent = messages.first { $0.indices == [1] }
-        check(sent?.box == .sent && sent?.sender == "+15555550199" && sent?.text == "Made-up reply" && sent?.unread == false
+        check(sent?.box == .sent && sent?.sender == "+12025550199" && sent?.text == "Made-up reply" && sent?.unread == false
                 && sent?.timestamp == nil && sent?.unsentIndices == [], "stored: sent", "\(String(describing: sent))")
         let twoParts = messages.first { $0.indices == [2, 3] }
         check(twoParts?.box == .unsent && twoParts?.unsentIndices == [3] && twoParts?.missingParts == 0
@@ -900,15 +904,15 @@ struct SmsModelTests {
         // `sms list`: sent and unsent messages listed with their recipient; JSON's added status, the other keys kept.
         let listing = SmsListing(messages: messages, used: 5, total: 255)
         let printed = smsListLines(listing, time: { _ in "2026-11-22 10:00:00" })
-        check(printed.contains("[1] sent to +15555550199 no time") && printed.contains("[2,3] unsent to +15555550100 no time")
-                && printed.contains("[4] unsent to +15555550199 no time")
+        check(printed.contains("[1] sent to +12025550199 no time") && printed.contains("[2,3] unsent to +12025550100 no time")
+                && printed.contains("[4] unsent to +12025550199 no time")
                 && printed.contains("[0] read +12025550120 2026-11-22 10:00:00"),
               "sms list: the lines", printed.joined(separator: " | "))
         let json = smsListJSON(messages, time: { _ in "t" })
         check(JSONSerialization.isValidJSONObject(json), "sms list --json: valid")
         let sentJSON = json.first { ($0["indices"] as? [Int]) == [1] }
         equal(sentJSON?["status"] as? String, "sent", "sms list --json: status sent")
-        check(sentJSON?["time"] is NSNull && sentJSON?["sender"] as? String == "+15555550199", "sms list --json: no time, the recipient")
+        check(sentJSON?["time"] is NSNull && sentJSON?["sender"] as? String == "+12025550199", "sms list --json: no time, the recipient")
         equal(json.first { ($0["indices"] as? [Int]) == [0] }?["status"] as? String, "received", "sms list --json: status received")
         equal(Set(sentJSON?.keys.map { $0 } ?? []),
               ["indices", "unread", "sender", "time", "text", "missingParts", "readable", "status"], "sms list --json: the keys")

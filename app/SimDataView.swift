@@ -18,7 +18,7 @@ private enum SettingsAction {
     case apply
     case putBack
     case pin(attempts: Int)   // the attempts left the confirmation showed (ruling R13)
-    case imei(String, reboot: Bool)
+    case imei(String, reboot: Bool, module: String?)   // module: Change Back…'s, written only on that module
     case simSlot(Int)
 }
 
@@ -442,7 +442,8 @@ struct SimApnTab: View {
     private func askImeiChange() {
         guard imeiProblem(draftImei) == nil else { return }
         let q = imeiQuestion(before: controller.imei, after: draftImei, reboot: rebootImei)
-        imeiAsk = Question(action: .imei(draftImei, reboot: rebootImei), title: q.title, message: q.message,
+        imeiAsk = Question(action: .imei(draftImei, reboot: rebootImei, module: imeiBack?.module),
+                           title: q.title, message: q.message,
                            confirm: "Change IMEI", destructive: rebootImei, cancelIsDefault: true)
         controller.setConfirming(true)
     }
@@ -582,8 +583,8 @@ struct SimApnTab: View {
         case .pin(let attempts):
             controller.enterPin(pin, shownAttempts: attempts)
             unlocking = false
-        case let .imei(newImei, reboot):
-            controller.changeImei(newImei, reboot: reboot)
+        case let .imei(newImei, reboot, module):
+            controller.changeImei(newImei, reboot: reboot, onModule: module)
             editingImei = false
         case .simSlot(let slot):
             simWatcher.switchedByHand()
