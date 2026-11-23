@@ -1,14 +1,17 @@
 // The window's SIM & Data screen, a settings-style form: the SIM (its state, the PIN lock and the attempts left as
-// rows of dots; while it asks for its PIN, Unlock… opens a sheet with the PIN field), the profile the driver dials
-// (an editor with Revert and Apply…, and after a change Put Back… with the same in a terminal), and every data
-// profile in a disclosure group. ModemController (ModemController.swift) holds the state, reads the shown screen
-// and runs one call at a time; the rows, questions and sentences come from ModemSettings.swift. Apply…, the
-// profile's Put Back… and the sheet's Unlock… ask first, with words taken when their confirmation opens
+// rows of dots; while it asks for its PIN, Unlock… opens a sheet with the PIN field), the modem (its IMEI with Change…,
+// a sheet, and the module's USB serial number), the IMEI history (every change recorded on this Mac, with Change
+// Back… to the IMEI before a change), the profile the driver dials (an editor with Revert and Apply…, and after a
+// change Put Back… with the same in a terminal), and every data profile in a disclosure group. ModemController
+// (ModemController.swift) holds the state, reads the shown screen and runs one call at a time; the rows, questions and
+// sentences come from ModemSettings.swift and ImeiHistory.swift. Apply…, the profile's Put Back…, the Unlock sheet's
+// Unlock… and the IMEI sheet's Change… ask first, with words taken when their confirmation opens
 // (ModemViewParts.swift). Refresh is in the toolbar; the result of a change shows in the banner at the bottom.
 //
 // Nothing here logs, prints or stores what is typed. The PIN is only in this screen's own state and is cleared as
 // soon as its confirmation is confirmed or cancelled, the Unlock sheet closes, the SIM no longer asks for it or the
-// screen goes; the profile's password is only in the controller's form and is shown as dots.
+// screen goes; the profile's password is only in the controller's form and is shown as dots. An IMEI change is
+// recorded in the IMEI history by the controller, never by this screen.
 import SwiftUI
 
 private enum SettingsAction {
@@ -140,6 +143,7 @@ struct SimApnTab: View {
     @State private var editingImei = false
     @State private var draftImei = ""
     @State private var rebootImei = true
+    @State private var imeiBack: ImeiHistoryEntry? = nil       // the history's change that Change Back… undoes
     @State private var imeiAsk: Question<SettingsAction>? = nil
 
     private static let blockedSentence = "The SIM is blocked: it needs its PUK from the carrier, and RMNet does not enter PUKs."
@@ -163,7 +167,8 @@ struct SimApnTab: View {
             Divider()
             Form {
                 simSection
-                modemIdentitySection
+                modemSection
+                imeiHistorySection
                 profileSection
                 allProfilesSection
             }
@@ -189,7 +194,7 @@ struct SimApnTab: View {
                 .modifier(Confirmation(question: $pinAsk, controller: controller, perform: perform, closed: clearPin))
         }
         .sheet(isPresented: $editingImei, onDismiss: imeiSheetClosed) {
-            ImeiSheet(controller: controller, draft: $draftImei, rebootNow: $rebootImei,
+            ImeiSheet(controller: controller, draft: $draftImei, rebootNow: $rebootImei, back: imeiBack,
                       askChange: askImeiChange, cancel: { editingImei = false })
                 .modifier(Confirmation(question: $imeiAsk, controller: controller, perform: perform, closed: {}))
         }
@@ -297,18 +302,20 @@ struct SimApnTab: View {
         lastAttempt = false
     }
 
-    // MARK: Modem identity (IMEI)
+    // MARK: Modem (IMEI) and its history
 
-    @ViewBuilder private var modemIdentitySection: some View {
-        Section("Modem identity") {
+    /// The IMEI (selectable) with Change…, and the module's USB serial number, which tells modules apart in the history.
+    @ViewBuilder private var modemSection: some View {
+        Section("Modem") {
             LabeledContent("IMEI") {
-                HStack(spacing: Spacing.s) {
+                HStack(spacing: Spacing.m) {
                     Text(verbatim: controller.imei ?? "—")
                         .font(.body.monospacedDigit())
                         .textSelection(.enabled)
                         .foregroundStyle(controller.imei == nil ? .secondary : .primary)
-                    Button("Change IMEI…") { openImeiSheet() }
-                        .disabled(!controller.refreshEnabled)
+                    Button("Change…") { openImeiSheet(back: nil) }
+                        .disabled(!controller.refreshEnabled || controller.imei == nil)
+                        .accessibilityLabel(Text("Change the IMEI…"))
                 }
             }
             if let failure = controller.imeiFailure {
@@ -316,12 +323,61 @@ struct SimApnTab: View {
             } else if controller.imei == nil {
                 note(settingsRead ? "The IMEI has not been read." : "Reading the IMEI…")
             }
+            LabeledContent("Serial number") {
+                Text(verbatim: controller.moduleSerial ?? "—")
+                    .font(.body.monospacedDigit())
+                    .textSelection(.enabled)
+                    .foregroundStyle(controller.moduleSerial == nil ? .secondary : .primary)
+            }
+            .help("The module's USB serial number. Changing the IMEI does not change it, so the IMEI history uses it to "
+                  + "tell modules apart.")
         }
     }
 
-    private func openImeiSheet() {
+    /// Every IMEI change recorded on this Mac, newest first: the change, when, where it came from and on which module,
+    /// whether it succeeded (and RMNet's sentence), with Change Back… where the IMEI before can be set again.
+    @ViewBuilder private var imeiHistorySection: some View {
+        let rows = controller.imeiHistory.map {
+            imeiHistoryRows($0, currentImei: controller.imei, currentModule: controller.moduleSerial)
+        } ?? []
+        Section {
+            if let failure = controller.imeiHistoryFailure {
+                warning(failure)
+            } else if controller.imeiHistory == nil {
+                note(settingsRead ? "The IMEI history has not been read." : "Reading the IMEI history…")
+            } else if rows.isEmpty {
+                note("No IMEI changes recorded on this Mac yet.")
+            }
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                ImeiHistoryRowView(row: row, changeBackEnabled: controller.refreshEnabled && controller.imei != nil,
+                                   changeBack: { openImeiSheet(back: row.entry) })
+            }
+            if let skipped = controller.imeiHistory?.skippedLines, skipped > 0 {
+                warning("\(skipped) line\(skipped == 1 ? "" : "s") of the history could not be read.")
+            }
+        } header: {
+            HStack {
+                Text("IMEI history")
+                Spacer()
+                if !rows.isEmpty {
+                    Text(verbatim: "\(rows.count)")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } footer: {
+            Text("IMEI changes recorded on this Mac, newest first (RMNet imei history prints the same). Kept in "
+                 + "~/Library/Application Support/RMNet/imei-history.jsonl.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// The IMEI sheet, empty (Change…) or filled with the IMEI before a change of the history (Change Back…).
+    private func openImeiSheet(back: ImeiHistoryEntry?) {
         guard controller.refreshEnabled else { return }
-        draftImei = controller.imei ?? ""
+        imeiBack = back
+        draftImei = back?.before ?? ""
         rebootImei = true
         imeiAsk = nil
         editingImei = true
@@ -337,6 +393,7 @@ struct SimApnTab: View {
 
     private func imeiSheetClosed() {
         draftImei = ""
+        imeiBack = nil
         if imeiAsk != nil {
             imeiAsk = nil
             controller.setConfirming(false)
@@ -578,34 +635,111 @@ private struct UnlockSheet: View {
     }
 }
 
-/// Sheet for reading/writing the modem's IMEI (`AT+EGMR=1,7,"<imei>"`), with 15-digit + Luhn validation and
-/// optional restart (`AT+CFUN=1,1`).
-private struct ImeiSheet: View {
+/// One change of the IMEI history: a green check or a red cross, the IMEIs before and after, when (in full as its
+/// tooltip), where it came from and on which module, RMNet's sentence or the note of a change recorded afterwards, and
+/// Change Back… where it is offered (imeiHistoryRows).
+private struct ImeiHistoryRowView: View {
+    let row: ImeiHistoryRow
+    let changeBackEnabled: Bool
+    let changeBack: () -> Void
+
+    private static let when: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        f.doesRelativeDateFormatting = true
+        return f
+    }()
+
+    private static let full: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .full
+        f.timeStyle = .medium
+        return f
+    }()
+
+    var body: some View {
+        let e = row.entry
+        let ok = e.result == .succeeded
+        HStack(alignment: .firstTextBaseline, spacing: Spacing.m) {
+            Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                .foregroundStyle(ok ? Color.green : Color.red)
+                .accessibilityLabel(Text(ok ? "Succeeded" : "Failed"))
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
+                    Text(verbatim: e.before ?? "unknown")
+                        .foregroundStyle(e.before == nil ? .secondary : .primary)
+                    Image(systemName: "arrow.right")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel(Text("to"))
+                    Text(verbatim: e.after)
+                }
+                .font(.body.monospacedDigit())
+                .textSelection(.enabled)
+                Text(verbatim: details(e))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help(ImeiHistoryRowView.full.string(from: e.time))
+                ForEach([e.note, e.message].compactMap { $0 }.filter { !$0.isEmpty }, id: \.self) { text in
+                    Text(verbatim: text)
+                        .font(.caption)
+                        .foregroundStyle(ok ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.red))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: Spacing.s)
+            if row.canChangeBack {
+                Button("Change Back…", action: changeBack)
+                    .disabled(!changeBackEnabled)
+                    .help("Open Change IMEI with \(e.before ?? ""), the IMEI before this change")
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// "Today at 02:57 · Another tool · Module a1b2c3d4 (another module)".
+    private func details(_ e: ImeiHistoryEntry) -> String {
+        var parts = [ImeiHistoryRowView.when.string(from: e.time), e.source.words]
+        if e.restart == false && e.result == .succeeded { parts.append("takes effect at the next restart") }
+        if let m = e.module { parts.append("Module \(m)" + (row.otherModule ? " (not the one attached)" : "")) }
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// The sheet Change… (or a history row's Change Back…) opens: the IMEI now, the new one (15 digits; with 14 typed, a
+/// button adds the check digit), the rule it breaks, whether the modem restarts now (`AT+CFUN=1,1`) or the IMEI waits
+/// for the next restart, what that does to the connection, Cancel and Change…, which asks the IMEI question over the
+/// sheet (Cancel is its default button). The new IMEI and the switch are the screen's state, passed in.
+struct ImeiSheet: View {
     @ObservedObject var controller: ModemController
     @Binding var draft: String
     @Binding var rebootNow: Bool
+    let back: ImeiHistoryEntry?
     let askChange: () -> Void
     let cancel: () -> Void
 
+    private static let when: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
+
     private var canSubmit: Bool {
-        guard controller.refreshEnabled, imeiProblem(draft) == nil else { return false }
+        guard imeiProblem(draft) == nil, controller.imei != nil else { return false }
         return draft != controller.imei
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.l) {
-            HStack(spacing: Spacing.m) {
-                Image(systemName: "barcode.viewfinder")
-                    .font(.title2)
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-                Text("Change IMEI")
-                    .font(.title3.weight(.semibold))
-                    .accessibilityAddTraits(.isHeader)
-            }
+            SheetHeader(symbol: "barcode", title: back == nil ? "Change the IMEI" : "Change the IMEI back",
+                        subtitle: back.map { "Back to the IMEI before the change of \(ImeiSheet.when.string(from: $0.time))." }
+                            ?? "The modem keeps the new IMEI until it is changed again.")
             Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: Spacing.m, verticalSpacing: Spacing.m) {
                 GridRow {
-                    Text("Current").foregroundStyle(.secondary)
+                    Text("Now").foregroundStyle(.secondary)
                     Text(verbatim: controller.imei ?? "—")
                         .font(.body.monospacedDigit())
                         .textSelection(.enabled)
@@ -619,48 +753,39 @@ private struct ImeiSheet: View {
                             .autocorrectionDisabled()
                             .labelsHidden()
                         if draft.count == 14, let check = imeiCheckDigit(forFirst14: draft) {
-                            Button("+\(check)") { draft.append(String(check)) }
-                                .help("Append Luhn check digit \(check)")
+                            Button("Add Check Digit \(check)") { draft.append(String(check)) }
+                                .help("The 15th digit is a check digit (Luhn); for these 14 digits it is \(check).")
                         }
                     }
                 }
             }
-            if !draft.isEmpty, let problem = imeiProblem(draft) {
-                Label {
-                    Text(verbatim: problem)
-                } icon: {
-                    Image(systemName: "exclamationmark.circle.fill")
-                }
-                .font(.callout)
-                .foregroundStyle(.red)
-            } else if draft == controller.imei && !draft.isEmpty {
-                Text("Matches the modem's current IMEI.")
+            if !draft.isEmpty, imeiCheckDigit(forFirst14: draft) == nil, let problem = imeiProblem(draft) {
+                SheetProblem(text: problem)
+            } else if !draft.isEmpty && draft == controller.imei {
+                Text("This is the IMEI the modem has now.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            Toggle("Restart modem now to apply (~30 s)", isOn: $rebootNow)
-            Label {
-                Text(rebootNow
-                     ? "The modem leaves the network for about 30 seconds while it restarts so the carrier sees the new IMEI."
-                     : "Stored in non-volatile memory; takes effect after the next modem restart.")
-                    .fixedSize(horizontal: false, vertical: true)
-            } icon: {
-                Image(systemName: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-            }
-            .font(.callout)
-            .foregroundStyle(.secondary)
+            Toggle("Restart the modem now", isOn: $rebootNow)
+                .toggleStyle(.checkbox)
+            SheetWarning(text: rebootNow
+                         ? "The modem restarts at once so that the network sees the new IMEI: the connection and the "
+                            + "network port go away for about 30 seconds."
+                         : "The new IMEI takes effect when the modem next restarts (a replug, or RMNet at AT+CFUN=1,1).")
+            Text("The change is recorded in the IMEI history, also when it fails.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
             Divider()
             HStack {
                 Spacer()
                 Button("Cancel", action: cancel)
                     .keyboardShortcut(.cancelAction)
-                Button("Change IMEI…", action: askChange)
+                Button("Change…", action: askChange)
                     .keyboardShortcut(.defaultAction)
                     .disabled(!canSubmit)
             }
         }
         .padding(Spacing.xl)
-        .frame(width: 460)
+        .frame(width: 480)
     }
 }

@@ -80,7 +80,7 @@ check-driverkit:
 app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/nmea-tests build/gpsread-tests \
 		build/modemnet-tests build/modemset-tests build/modemsvc-tests build/modemcli-tests build/modemui-tests \
 		build/quit-tests build/menubar-tests build/window-tests build/signal-tests build/throughput-tests \
-		build/shell-tests build/networkview-tests build/overview-tests
+		build/shell-tests build/networkview-tests build/overview-tests build/imeihistory-tests
 	./build/app-tests
 	./build/sms-tests
 	./build/at-tests
@@ -100,6 +100,7 @@ app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build
 	./build/shell-tests
 	./build/networkview-tests
 	./build/overview-tests
+	./build/imeihistory-tests
 
 build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
 	@mkdir -p build
@@ -142,23 +143,24 @@ build/modemsvc-tests: app/AtPort.swift app/SmsModel.swift app/SmsService.swift a
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
-build/modemcli-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ModemCli.swift tests/app/ModemCliTests.swift
+build/modemcli-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift app/ModemCli.swift tests/app/ModemCliTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
-build/modemui-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ModemController.swift tests/app/ModemControllerTests.swift
+build/modemui-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift app/ModemController.swift tests/app/ModemControllerTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
-build/quit-tests: app/SmsModel.swift app/SmsController.swift app/ModemNetwork.swift app/ModemSettings.swift \
+build/quit-tests: app/SmsModel.swift app/SmsController.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift \
 		app/ModemController.swift app/QuitGate.swift tests/app/QuitGateTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 # The menu bar item's model: the status model for the headline, the AT port's and the modem's files for the
-# failures' wording (the real ModemService, behind a port that never opens). No port is opened.
+# failures' wording (the real ModemService, behind a port that never opens), the signal's bars for the signal bars
+# style (its setting in a user defaults suite of the test's own). No port is opened.
 build/menubar-tests: app/StatusModel.swift app/AtPort.swift app/SmsModel.swift app/SmsService.swift \
-		app/ModemNetwork.swift app/ModemSettings.swift app/ModemService.swift app/MenuBarStatus.swift \
+		app/ModemNetwork.swift app/ModemSettings.swift app/ModemService.swift app/SignalQuality.swift app/MenuBarStatus.swift \
 		tests/app/MenuBarStatusTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
@@ -176,14 +178,14 @@ build/throughput-tests: app/ThroughputSampler.swift tests/app/ThroughputSamplerT
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 # The screens map to the modem's reads (ModemTab), and every headline of StatusModel.swift has a pill.
-build/shell-tests: app/StatusModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/ModemController.swift \
+build/shell-tests: app/StatusModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift app/ModemController.swift \
 		app/ShellModel.swift tests/app/ShellModelTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 # The Network screen's cards (NetworkView.swift's NetworkCards); its views, and the files they use, are compiled
 # but never drawn.
-build/networkview-tests: app/StatusModel.swift app/Registry.swift app/ModemNetwork.swift app/ModemSettings.swift \
+build/networkview-tests: app/StatusModel.swift app/Registry.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift \
 		app/ModemController.swift app/ShellModel.swift app/SignalQuality.swift app/ThroughputSampler.swift \
 		app/ModemViewParts.swift app/DesignKit.swift app/Charts.swift app/NetworkView.swift \
 		tests/app/NetworkViewTests.swift
@@ -192,8 +194,14 @@ build/networkview-tests: app/StatusModel.swift app/Registry.swift app/ModemNetwo
 
 # What the Overview's cards say: the signal history and the SIM read (ModemController, ModemSettings), the
 # driver's status and advice (StatusModel), the pill the driver card agrees with (ShellModel), the quality zones.
-build/overview-tests: app/StatusModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/ModemController.swift \
+build/overview-tests: app/StatusModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift app/ModemController.swift \
 		app/ShellModel.swift app/SignalQuality.swift app/OverviewModel.swift tests/app/OverviewModelTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+# The IMEI history: its lines, the file (in a temporary folder), the entries made from changes, what `imei history`
+# prints and the SIM & Data screen's rows.
+build/imeihistory-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift tests/app/ImeiHistoryTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 

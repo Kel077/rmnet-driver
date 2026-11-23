@@ -102,6 +102,12 @@ final class ModemController: ObservableObject {
     @Published private(set) var sim: SimInfo? = nil               // the last SIM read that succeeded
     @Published private(set) var imei: String? = nil               // the last IMEI read that succeeded
     @Published private(set) var imeiFailure: String? = nil
+    /// The IMEI history (ImeiHistory.swift) as last read: with each SIM & Data read and after each IMEI change; nil
+    /// before the first read or without a history. Its failure is a sentence; nil after a read that succeeded.
+    @Published private(set) var imeiHistory: ImeiHistory? = nil
+    @Published private(set) var imeiHistoryFailure: String? = nil
+    /// The attached module's USB serial number, read with the history; nil when none is attached or it gives none.
+    @Published private(set) var moduleSerial: String? = nil
     @Published private(set) var settingsAt: Date? = nil           // the last settings read whose two parts succeeded
     @Published private(set) var settingsFailure: String? = nil    // the last settings read's failure; nil after a success
     @Published private(set) var running: ModemActivity? = nil
@@ -139,6 +145,7 @@ final class ModemController: ObservableObject {
     private let replyToQuit: (Bool) -> Void      // NSApp.reply(toApplicationShouldTerminate:)
     private let requestAttention: () -> Void     // NSApp.requestUserAttention(.criticalRequest)
     private let now: () -> Date                  // the time of a network read (infoAt, the signal history)
+    private let history: ImeiHistoryRecorder?    // where IMEI changes are recorded; nil: nowhere (the tests' default)
     private var timer: Timer?
     private var timerTab: ModemTab?              // the tab the timer reads
     private var tab: ModemTab?                   // the modem tab shown; nil: neither
@@ -156,13 +163,14 @@ final class ModemController: ObservableObject {
 
     init(service: ModemServing, queue: DispatchQueue, driverProfile: @escaping () -> Int?,
          replyToQuit: @escaping (Bool) -> Void, requestAttention: @escaping () -> Void,
-         now: @escaping () -> Date = { Date() }) {
+         now: @escaping () -> Date = { Date() }, imeiHistory: ImeiHistoryRecorder? = nil) {
         self.service = service
         self.queue = queue
         self.driverProfile = driverProfile
         self.replyToQuit = replyToQuit
         self.requestAttention = requestAttention
         self.now = now
+        self.history = imeiHistory
     }
 
     deinit { timer?.invalidate() }
@@ -338,11 +346,16 @@ final class ModemController: ObservableObject {
                 DispatchQueue.main.async { self.finishNetwork(info, antennaRead, sets, lockRead) }
             }
         case .simAndApn:
+            let history = self.history
             queue.async {
                 let listed = service.profiles()
                 let sim = service.sim()
                 let imei = service.imei()
-                DispatchQueue.main.async { self.finishSettings(listed, sim, imei) }
+                let kept = history.map { ($0.keeper.load(), $0.module()) }
+                DispatchQueue.main.async {
+                    self.finishSettings(listed, sim, imei)
+                    if let kept { self.finishHistory(kept.0, module: kept.1) }
+                }
             }
         }
     }
@@ -833,6 +846,17 @@ final class ModemController: ObservableObject {
 
     // MARK: Cell lock and IMEI
 
+    private func finishHistory(_ read: Result<ImeiHistory, ModemFailure>, module: String?) {
+        moduleSerial = module
+        switch read {
+        case .success(let h):
+            imeiHistory = h
+            imeiHistoryFailure = nil
+        case .failure(let f):
+            imeiHistoryFailure = f.message
+        }
+    }
+
     func setNrCellLock(_ lock: NrCellLock?) {
         guard !stopping else { return }
         if let problem = nrCellLockProblem(lock, supportedSaBands: bandSet(.sa)?.supported) {
@@ -932,21 +956,39 @@ final class ModemController: ObservableObject {
             return refuse("IMEI is already \(current). Nothing was changed.")
         }
         guard change == nil else { return refuse(ModemController.anotherChange) }
+        let before = imei
+        let history = self.history
+        // The change, then (whatever its outcome) its entry in the IMEI history and the history read again, all on
+        // the queue, so the window never waits for the file. The attempt itself always "succeeds": its outcome is in it.
         submit(.imei, line: "Setting IMEI to \(newImei)…", quitLine: ModemController.imeiQuitLine,
-               { $0.setImei(newImei, reboot: reboot) }) { outcome in
+               { (service: ModemServing) -> Result<ImeiAttempt, ModemFailure> in
+                   let outcome = service.setImei(newImei, reboot: reboot)
+                   guard let history else { return .success(ImeiAttempt(outcome: outcome)) }
+                   let module = history.module()
+                   var problem: String? = nil
+                   if let entry = imeiHistoryEntry(after: newImei, before: before, restart: reboot, outcome: outcome,
+                                                   source: .app, module: module, at: history.now()) {
+                       problem = history.keeper.append(entry)
+                   }
+                   return .success(ImeiAttempt(outcome: outcome, recordProblem: problem,
+                                               history: history.keeper.load(), module: module))
+               }) { attempt in
             self.changeEnded()
-            switch outcome {
+            guard case .success(let done) = attempt else { return }   // the closure never fails
+            if let read = done.history { self.finishHistory(read, module: done.module) }
+            let notRecorded = done.recordProblem.map { " The change was not recorded in the IMEI history: \($0)" } ?? ""
+            switch done.outcome {
             case .success(let ch):
                 switch ch {
                 case .unchanged(let current): self.imei = current
                 case .rebooting(_, let after): self.imei = after
                 case .setTakesEffectAfterRestart: break
                 }
-                self.setResult(imeiSentence(ch), failure: false)
+                self.setResult(imeiSentence(ch) + notRecorded, failure: false)
             case .failure(let failure):
-                self.setResult(failure.message, failure: true)
+                self.setResult(failure.message + notRecorded, failure: true)
             }
-            self.finished(succeeded: (try? outcome.get()) != nil, changed: true)
+            self.finished(succeeded: (try? done.outcome.get()) != nil, changed: true)
         }
     }
 
@@ -954,6 +996,15 @@ final class ModemController: ObservableObject {
         result = line
         resultIsFailure = failure
     }
+}
+
+/// An IMEI change as the queue hands it back: the service's outcome, and when a history is kept, why the change
+/// could not be recorded (nil: it was, or there was nothing to record), the history read again and the module.
+private struct ImeiAttempt {
+    let outcome: Result<ImeiChange, ModemFailure>
+    var recordProblem: String? = nil
+    var history: Result<ImeiHistory, ModemFailure>? = nil
+    var module: String? = nil
 }
 
 /// One RAT's part of a bands change: the bands it is set to, and those it supports (as last read).

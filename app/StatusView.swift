@@ -30,6 +30,10 @@ struct RMNetApp: App {
             MenuBarLabel(status: appDelegate.menuBar)
         }
         .menuBarExtraStyle(.window)
+        // Cmd-, and the gear in the item's panel: the menu bar icon's style (SettingsView.swift).
+        Settings {
+            SettingsView(menuBar: appDelegate.menuBar)
+        }
     }
 }
 
@@ -270,11 +274,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         queue: AppDelegate.modemQueue,
         driverProfile: driverProfileNumber,
         replyToQuit: { [unowned self] succeeded in self.quitGate.replied(AppDelegate.modemMember, succeeded) },
-        requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
+        requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) },
+        imeiHistory: ImeiHistoryRecorder(keeper: ImeiHistoryFile.standard, module: { readModemSerial() }))
 
     // The menu bar item's state, polled from launch (applicationDidFinishLaunching) for as long as the app runs.
     // Kept here rather than in the App, so that only the item's label and panel observe it.
-    private(set) lazy var menuBar: MenuBarStatus = MenuBarStatus.forApp(queue: AppDelegate.modemQueue)
+    // With the signal bars chosen, the window's network read (the Overview's and the Network screen's, every 5 s while
+    // shown) stands in for the bars' own read while it is under 15 s old.
+    private(set) lazy var menuBar: MenuBarStatus = MenuBarStatus.forApp(queue: AppDelegate.modemQueue, freshInfo: {
+        [unowned self] in
+        guard let info = self.modem.info, let at = self.modem.infoAt else { return nil }
+        return (info, at)
+    })
 
     // The driver's status, shared by the Overview and the Driver screen, and the throughput, shared by the Overview
     // and the Network screen; each polled by `windowPolls` only while one of its screens is shown and the window

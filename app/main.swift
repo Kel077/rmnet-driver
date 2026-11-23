@@ -12,7 +12,7 @@
 //        RMNet bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa]
 //        RMNet cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current
 //        RMNet cell lock lte <earfcn>:<pci>[,…] | cell unlock [sa|lte] | cell persist on|off
-//        RMNet imei [--json] | imei set <imei> [--no-reboot] [--yes]
+//        RMNet imei [--json] | imei set <imei> [--no-reboot] [--yes] | imei history [--json]
 //        RMNet (no argument, or opened from the Finder): the status window.
 // It must run from /Applications/RMNet.app for activate and deactivate (scripts/install-driver.sh).
 // With a verb it opens no window and exits by itself. `status --json` (scripts/soak.sh reads it) keeps
@@ -334,7 +334,8 @@ if let verb = verbs.first, modemVerbs.contains(verb) {
                             readSecret: { prompt in DispatchQueue.main.sync { readSecret(prompt: prompt) } },
                             ask: { question in DispatchQueue.main.sync { askOnTerminal(question) } },
                             output: { print($0); fflush(stdout) },
-                            errorOutput: { fputs("\($0)\n", stderr) })
+                            errorOutput: { fputs("\($0)\n", stderr) },
+                            imeiHistory: ImeiHistoryRecorder(keeper: ImeiHistoryFile.standard, module: { readModemSerial() }))
         fflush(stdout)
         exit(code)
     }

@@ -45,13 +45,15 @@ enum ModemCommand: Equatable {
     case cellPersist(Bool)
     case imeiShow(json: Bool)
     case imeiSet(String, reboot: Bool, yes: Bool)
+    case imeiHistory(json: Bool)               // reads only the history file; never the AT port
 
     /// Radio on or off, a mode set, apn set, sim unlock, usbmode set, bands set/reset, cell lock/persist
     /// and imei set: main.swift ignores the stopping signals for these. Not `at`: it sends what the owner
     /// typed, as an AT terminal would, and Ctrl-C stops it (the modem may still carry out a command already sent).
     var changesModem: Bool {
         switch self {
-        case .network, .antennas, .apnShow, .sim, .usbMode, .at, .atRefused, .bands, .cellShow, .imeiShow:
+        case .network, .antennas, .apnShow, .sim, .usbMode, .at, .atRefused, .bands, .cellShow, .imeiShow,
+             .imeiHistory:
             return false
         case .radio(let on): return on != nil
         case .mode(let mode): return mode != nil
@@ -75,7 +77,7 @@ let modemUsage = "network [--json] | antennas [--json] | radio [on|off] | mode [
     + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa] | "
     + "cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current | "
     + "cell lock lte <earfcn>:<pci>[,…] | cell unlock [sa|lte] | cell persist on|off | "
-    + "imei [--json] | imei set <imei> [--no-reboot] [--yes]"
+    + "imei [--json] | imei set <imei> [--no-reboot] [--yes] | imei history [--json]"
 
 // MARK: - Parsing
 
@@ -131,6 +133,7 @@ func parseModem(_ words: [String]) -> ModemCommand? {
         return parseCell(rest)
     case "imei":
         if rest.first == "set" { return parseImeiSet(Array(rest.dropFirst())) }
+        if rest.first == "history" { return jsonOption(Array(rest.dropFirst())).map { .imeiHistory(json: $0) } }
         return jsonOption(rest).map { .imeiShow(json: $0) }
     default:
         return nil
@@ -332,10 +335,11 @@ private func parseApnSet(_ words: [String]) -> ModemCommand? {
 /// driver's `RMNetProfile` (nil when the driver is not attached); `readSecret` reads a password or PIN without
 /// echo after showing its prompt (nil without a terminal); `ask` shows a question on the terminal and reads
 /// one line (nil without a terminal, see `askOnTerminal`); `output` prints one line on standard output,
-/// `errorOutput` one on standard error (only `at` uses it).
+/// `errorOutput` one on standard error (only `at` uses it). `imeiHistory`: where `imei set` records its change and
+/// `imei history` reads (main.swift gives ImeiHistoryFile.standard); nil records nothing, and `imei history` fails.
 func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int?,
               readSecret: (String) -> String?, ask: (String) -> String?, output: (String) -> Void,
-              errorOutput: (String) -> Void) -> Int32 {
+              errorOutput: (String) -> Void, imeiHistory: ImeiHistoryRecorder? = nil) -> Int32 {
     switch command {
     case .network(let json):
         return showNetwork(service, json: json, output)
@@ -423,7 +427,16 @@ func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int
             return 0
         }
     case let .imeiSet(value, reboot, yes):
-        return setImei(service, value, reboot: reboot, yes: yes, ask: ask, output)
+        return setImei(service, value, reboot: reboot, yes: yes, ask: ask, history: imeiHistory, output)
+    case .imeiHistory(let json):
+        guard let keeper = imeiHistory?.keeper else { return fail("imei", "No IMEI history is kept here.", output) }
+        switch keeper.load() {
+        case .failure(let failure): return fail("imei", failure.message, output)
+        case .success(let history):
+            if json { return outputJSON("imei", imeiHistoryJSON(history, location: keeper.location), output) }
+            for line in imeiHistoryLines(history, location: keeper.location) { output(line) }
+            return 0
+        }
     }
 }
 
@@ -549,9 +562,13 @@ private func unlockCell(_ service: ModemServing, scope: CellUnlockScope, _ outpu
     }
 }
 
+/// `imei set`. Once the change has been sent to the service (not when it is refused before, the IMEI is already the
+/// one asked or the question is cancelled), it is recorded in the IMEI history, succeeded or failed; a history that
+/// cannot be written adds a line saying so and does not change the exit code.
 private func setImei(_ service: ModemServing, _ value: String, reboot: Bool, yes: Bool,
-                     ask: (String) -> String?, _ output: (String) -> Void) -> Int32 {
+                     ask: (String) -> String?, history: ImeiHistoryRecorder?, _ output: (String) -> Void) -> Int32 {
     if let problem = imeiProblem(value) { return fail("imei", "\(problem) Nothing was changed.", output) }
+    let before: String
     switch service.imei() {
     case .failure(let failure): return fail("imei", failure.message, output)
     case .success(let current):
@@ -559,6 +576,7 @@ private func setImei(_ service: ModemServing, _ value: String, reboot: Bool, yes
             output("imei: already \(value); nothing changed")
             return 0
         }
+        before = current
     }
     if reboot && !yes {
         guard let answer = ask(restartQuestion) else {
@@ -571,7 +589,13 @@ private func setImei(_ service: ModemServing, _ value: String, reboot: Bool, yes
             return 1
         }
     }
-    switch service.setImei(value, reboot: reboot) {
+    let outcome = service.setImei(value, reboot: reboot)
+    if let history, let entry = imeiHistoryEntry(after: value, before: before, restart: reboot, outcome: outcome,
+                                                 source: .cli, module: history.module(), at: history.now()),
+       let problem = history.keeper.append(entry) {
+        output("imei: the change was not recorded in the IMEI history. \(problem)")
+    }
+    switch outcome {
     case .failure(let failure):
         return fail("imei", failure.message, output)
     case .success(let change):

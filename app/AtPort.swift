@@ -210,6 +210,10 @@ final class AtPort {
         }
     }
 
+    /// One try, no waiting: busy at once while another program holds the interface. For reads that are only worth
+    /// making when the port is free (the menu bar's signal bars), so that they never hold up the program that has it.
+    static func openWithoutWaiting() -> Result<AtPort, AtError> { openOnce() }
+
     private static func openOnce() -> Result<AtPort, AtError> {
         let device = matchingService("IOUSBHostDevice", ["idVendor": vendor, "idProduct": product])
         guard device != IO_OBJECT_NULL else { return .failure(.modemNotAttached) }

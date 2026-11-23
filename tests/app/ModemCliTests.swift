@@ -61,6 +61,10 @@ let listed = parseProfiles([
     "+CGDCONT: 5,\"IPV4V6\",\"SOS\",\"0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0\",0,0,0,1,,,,,,,,,,\"\",,,,0",
 ])
 
+func equal<T: Equatable>(_ got: T, _ want: T, _ name: String) {
+    check(got == want, name, "got \(got)\nwant \(want)")
+}
+
 func settings(_ apn: String, password: String = "") -> ProfileSettings {
     ProfileSettings(type: .ipv4v6, apn: apn, user: "", password: password, auth: .none)
 }
@@ -268,7 +272,7 @@ struct Run {
 /// the terminal's question `answer` (nil: no terminal).
 @discardableResult
 func run(_ words: [String], _ fake: FakeModem, driverProfile: Int? = 1, secretAnswer: String? = nil,
-         answer: String? = nil, _ name: String) -> Run {
+         answer: String? = nil, history: ImeiHistoryRecorder? = nil, _ name: String) -> Run {
     guard let command = parseModem(words) else {
         check(false, "\(name): \(words.joined(separator: " ")) parses")
         return Run(lines: [], code: -1, prompts: [])
@@ -295,7 +299,8 @@ func run(_ words: [String], _ fake: FakeModem, driverProfile: Int? = 1, secretAn
                         errorOutput: { line in
                             fake.events.append("error")
                             errors.append(line)
-                        })
+                        },
+                        imeiHistory: history)
     return Run(lines: lines, code: code, prompts: prompts, questions: questions, errors: errors)
 }
 
@@ -379,7 +384,7 @@ struct ModemCliTests {
               + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa] | "
               + "cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current | "
               + "cell lock lte <earfcn>:<pci>[,…] | cell unlock [sa|lte] | cell persist on|off | "
-              + "imei [--json] | imei set <imei> [--no-reboot] [--yes]",
+              + "imei [--json] | imei set <imei> [--no-reboot] [--yes] | imei history [--json]",
               "modemUsage: the brief's usage without the leading RMNet", modemUsage)
 
         // --- parseModem: every form --------------------------------------------------------------
@@ -400,6 +405,11 @@ struct ModemCliTests {
         expectParse(["cell", "persist", "on"], .cellPersist(true))
         expectParse(["cell", "persist", "off"], .cellPersist(false))
         expectParse(["imei"], .imeiShow(json: false))
+        expectParse(["imei", "history"], .imeiHistory(json: false))
+        expectParse(["imei", "history", "--json"], .imeiHistory(json: true))
+        for words in [["imei", "history", "x"], ["imei", "history", "--json", "--json"], ["imei", "history", "--yes"]] {
+            check(parseModem(words) == nil, "parseModem: \(words.joined(separator: " ")) is wrong usage")
+        }
         expectParse(["imei", "--json"], .imeiShow(json: true))
         expectParse(["imei", "set", "000000000000141"], .imeiSet("000000000000141", reboot: true, yes: false))
         expectParse(["imei", "set", "000000000000141", "--no-reboot", "--yes"],
@@ -501,7 +511,8 @@ struct ModemCliTests {
                                        .radio(on: nil), .mode(nil),
                                        .apnShow(json: false), .apnShow(json: true), .sim(json: false), .sim(json: true),
                                        .usbMode(json: false), .usbMode(json: true), .bands(json: false), .bands(json: true),
-                                       .cellShow(json: false), .imeiShow(json: false)]
+                                       .cellShow(json: false), .imeiShow(json: false),
+                                       .imeiHistory(json: false), .imeiHistory(json: true)]
         for c in changing { check(c.changesModem, "changesModem: \(c) changes the modem") }
         for c in reading { check(!c.changesModem, "changesModem: \(c) only reads") }
         // `at` sends what the owner typed, also a change such as AT+CFUN=1,1, and Ctrl-C stops it all the same.
@@ -1703,5 +1714,91 @@ struct ModemCliTests {
             "imei: IMEI set to 000000000000141; the modem is restarting.",
             "imei: to put it back: RMNet imei set 000000000000091",
         ], code: 0, "imei set --yes")
+
+        imeiHistoryVerbs()
+    }
+
+    /// `imei set` records each change it sends in the IMEI history (with the IMEI before, `cli`, the module and the
+    /// result), and nothing when it sends none; `imei history` prints the history, also as JSON, and never asks the
+    /// modem anything.
+    static func imeiHistoryVerbs() {
+        let when = Date(timeIntervalSince1970: 1_795_000_000)
+        let keeper = MemoryHistory()
+        let recorder = ImeiHistoryRecorder(keeper: keeper, module: { "f00dcafe" }, now: { when })
+
+        var fake = FakeModem()
+        _ = run(["imei", "set", "000000000000141", "--yes"], fake, history: recorder, "history: set")
+        equal(keeper.entries.count, 1, "history: one entry after a change")
+        equal(keeper.entries.first, ImeiHistoryEntry(time: when, before: "000000000000091", after: "000000000000141",
+                                                     source: .cli, result: .succeeded, restart: true, module: "f00dcafe",
+                                                     message: "IMEI set to 000000000000141; the modem is restarting.",
+                                                     note: nil), "history: the entry")
+
+        fake = FakeModem()
+        _ = run(["imei", "set", "000000000000091"], fake, history: recorder, "history: unchanged")
+        fake = FakeModem()
+        _ = run(["imei", "set", "000000000000141"], fake, answer: "n", history: recorder, "history: cancelled")
+        fake = FakeModem()
+        _ = run(["imei", "set", "000000000000142", "--yes"], fake, history: recorder, "history: bad check digit")
+        equal(keeper.entries.count, 1, "history: nothing recorded when nothing was sent")
+
+        fake = FakeModem()
+        fake.setImeiResult = .failure(ModemFailure(message: "The IMEI was not changed. ERROR"))
+        let failed = run(["imei", "set", "000000000000141", "--no-reboot"], fake, history: recorder, "history: failed")
+        equal(failed.code, 1, "history: a failure still exits 1")
+        equal(keeper.entries.last?.result, .failed, "history: a failure recorded as failed")
+        equal(keeper.entries.last?.restart, false, "history: --no-reboot recorded")
+        equal(keeper.entries.last?.message, "The IMEI was not changed. ERROR", "history: the failure's sentence")
+
+        // A history that cannot be written adds a line; the change's own result and exit code stand.
+        keeper.refuse = "The IMEI history could not be written (/x)."
+        fake = FakeModem()
+        expectLines(run(["imei", "set", "000000000000141", "--yes"], fake, history: recorder, "history: not written"), [
+            "imei: the change was not recorded in the IMEI history. The IMEI history could not be written (/x).",
+            "imei: IMEI set to 000000000000141; the modem is restarting.",
+            "imei: to put it back: RMNet imei set 000000000000091",
+        ], code: 0, "history: not written")
+        keeper.refuse = nil
+
+        fake = FakeModem()
+        let shown = run(["imei", "history"], fake, history: recorder, "history: show")
+        equal(shown.code, 0, "history: show exits 0")
+        equal(shown.lines.first, "imei: 2 IMEI changes recorded on this Mac, newest first", "history: headline")
+        equal(shown.lines.last, "imei: kept in /memory/imei-history.jsonl", "history: location")
+        check(fake.events.allSatisfy { $0 == "output" }, "history: the modem is not asked", "\(fake.events)")
+
+        fake = FakeModem()
+        let json = run(["imei", "history", "--json"], fake, history: recorder, "history: json")
+        equal(json.code, 0, "history json: exits 0")
+        let object = (try? JSONSerialization.jsonObject(with: Data(json.lines.joined(separator: "\n").utf8))) as? [String: Any]
+        equal((object?["entries"] as? [Any])?.count, 2, "history json: entries")
+        equal(object?["path"] as? String, "/memory/imei-history.jsonl", "history json: path")
+
+        fake = FakeModem()
+        expectLines(run(["imei", "history"], fake, "history: none kept"), ["imei: No IMEI history is kept here."], code: 1,
+                    "history: no recorder")
+        keeper.loadFailure = "The IMEI history could not be read (/x)."
+        fake = FakeModem()
+        expectLines(run(["imei", "history"], fake, history: recorder, "history: unreadable"),
+                    ["imei: The IMEI history could not be read (/x)."], code: 1, "history: unreadable")
+    }
+}
+
+/// An IMEI history in memory.
+final class MemoryHistory: ImeiHistoryKeeping {
+    var entries: [ImeiHistoryEntry] = []
+    var refuse: String? = nil
+    var loadFailure: String? = nil
+    var location: String { "/memory/imei-history.jsonl" }
+
+    func load() -> Result<ImeiHistory, ModemFailure> {
+        if let loadFailure { return .failure(ModemFailure(message: loadFailure)) }
+        return .success(ImeiHistory(entries: entries, skippedLines: 0))
+    }
+
+    func append(_ entry: ImeiHistoryEntry) -> String? {
+        if let refuse { return refuse }
+        entries.append(entry)
+        return nil
     }
 }

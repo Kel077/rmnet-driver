@@ -140,6 +140,22 @@ final class ModemService: ModemServing {
         }
     }
 
+    /// The menu bar's signal bars: one command (3 s at most) on a port of its own, closed at once: AT+QENG="servingcell"
+    /// (the serving cell, `serving`), or AT+CFUN? (`radio`) when `radio` is true. A refusal leaves its part unknown; a
+    /// port that did not open, a timeout or an I/O error fails, with describe(error).
+    func signalRead(radio: Bool) -> Result<NetworkInfo, ModemFailure> {
+        withPort({ describe($0) }) { link in
+            var info = NetworkInfo()
+            if radio {
+                info.radio = parseRadio(link.read("AT+CFUN?"))
+            } else {
+                info.serving = parseServingCell(link.read("AT+QENG=\"servingcell\""))
+            }
+            if let broken = link.broken { return failure(describe(broken)) }
+            return .success(info)
+        }
+    }
+
     /// AT+QRSRP, AT+QRSRQ, AT+QSINR (3 s each); refusals leave missing RATs empty, timeouts/I/O fail.
     func antennas() -> Result<[AntennaSignalSet], ModemFailure> {
         withPort({ describe($0) }) { link in

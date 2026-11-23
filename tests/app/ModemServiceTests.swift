@@ -395,6 +395,7 @@ struct ModemServiceTests {
         sim()
         pinEntry()
         antennas()
+        signalRead()
         cellLock()
         imei()
         print("modem service: \(checks) checks passed")
@@ -1905,6 +1906,33 @@ struct ModemServiceTests {
             let rig = Rig([("AT+QRSRP", timedOut), ("AT+QRSRQ", ok), ("AT+QSINR", ok)])
             _ = failureMessage(rig.service.antennas(), "antennas: timeout")
             expectLines(rig.port(1).lines, ["AT+QRSRP"], "antennas: stops after timeout")
+        }
+    }
+
+    /// The menu bar's signal read: one command on a port of its own, closed at once; a busy port fails with its words.
+    static func signalRead() {
+        do {
+            let rig = Rig([("AT+QENG=\"servingcell\"",
+                            .success(["+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",001,01,FEDCBA987,32,00F00D,504990,41,12,-95,-10,8,1,-"]))])
+            let info = success(rig.service.signalRead(radio: false), "signalRead: the serving cell")
+            check(info?.serving?.cells.first?.rsrp == -95 && info?.radio == nil, "signalRead: the serving cell only")
+            rig.finish("signalRead: the serving cell", opens: 1)
+        }
+        do {
+            let rig = Rig([("AT+CFUN?", .success(["+CFUN: 4"]))])
+            let info = success(rig.service.signalRead(radio: true), "signalRead: the radio")
+            check(info?.radio == .airplane && info?.serving == nil, "signalRead: the radio only")
+            rig.finish("signalRead: the radio", opens: 1)
+        }
+        do {
+            let rig = Rig([.failure(.busy)])
+            expectEqual(failureMessage(rig.service.signalRead(radio: false), "signalRead: busy"), describe(.busy), "signalRead: busy")
+            rig.finish("signalRead: busy", opens: 1)
+        }
+        do {
+            let rig = Rig([("AT+QENG=\"servingcell\"", timedOut)])
+            _ = failureMessage(rig.service.signalRead(radio: false), "signalRead: no answer")
+            rig.finish("signalRead: no answer", opens: 1)
         }
     }
 

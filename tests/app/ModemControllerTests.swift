@@ -337,6 +337,7 @@ final class Rig {
     var clock: Date? = nil   // the controller's clock when set; the real time otherwise
     var replies: [Bool] = []
     var attention = 0
+    var history: ImeiHistoryRecorder? = nil   // set before the controller is first used
     private var watchers: [AnyCancellable] = []
     lazy var controller: ModemController = makeController()
 
@@ -347,7 +348,8 @@ final class Rig {
                                 driverProfile: { [unowned self] in self.driver },
                                 replyToQuit: { [unowned self] in self.replies.append($0) },
                                 requestAttention: { [unowned self] in self.attention += 1 },
-                                now: { [unowned self] in self.clock ?? Date() })
+                                now: { [unowned self] in self.clock ?? Date() },
+                                imeiHistory: history)
         watchers.append(c.objectWillChange.sink { _ in onMainOnly("a published value of the controller") })
         watchers.append(c.quitNotice.objectWillChange.sink { _ in onMainOnly("the quit notice") })
         liveControllers.append { [weak c] in c }
@@ -486,6 +488,7 @@ struct ModemControllerTests {
         overviewReading()
         signalHistory()
         antennasCellLockAndImei()
+        imeiHistoryRecorded()
         check(changesSeen > 0, "main thread: the controllers' changes were watched")
         print("modem controller: \(checks) checks passed")
     }
@@ -2429,5 +2432,67 @@ struct ModemControllerTests {
         rig.answerSettings(14, .success(listing()), .success(ready), "settings refresh after setImei")
         check(c.imei == "000000000000141" && !c.resultIsFailure, "changeImei: updated and reported", c.result)
         c.setTabShown(nil)
+    }
+
+    /// The SIM & Data read also reads the IMEI history and the module's serial number; each IMEI change asked in the
+    /// window is recorded (`app`, the IMEI before as last read, succeeded or failed) and the history read again.
+    static func imeiHistoryRecorded() {
+        let rig = Rig()
+        let keeper = MemoryHistory()
+        let when = Date(timeIntervalSince1970: 1_795_000_000)
+        rig.history = ImeiHistoryRecorder(keeper: keeper, module: { "f00dcafe" }, now: { when })
+        let c = rig.controller
+
+        c.setTabShown(.simAndApn)
+        rig.answerSettings(1, .success(listing()), .success(ready), "history: first settings read")
+        check(c.imeiHistory == ImeiHistory(entries: [], skippedLines: 0) && c.moduleSerial == "f00dcafe",
+              "history: read with the settings", "\(String(describing: c.imeiHistory)) \(String(describing: c.moduleSerial))")
+
+        c.changeImei("000000000000141", reboot: true)
+        rig.waitForCall(3, "history: setImei runs")
+        rig.fake.releaseSetImei(.success(.rebooting(before: "000000000000091", after: "000000000000141")))
+        pump(until: { c.result.contains("restarting") }, "history: the change finishes")
+        check(keeper.entries == [ImeiHistoryEntry(time: when, before: "000000000000091", after: "000000000000141",
+                                                  source: .app, result: .succeeded, restart: true, module: "f00dcafe",
+                                                  message: "IMEI set to 000000000000141; the modem is restarting.",
+                                                  note: nil)],
+              "history: the change recorded", "\(keeper.entries)")
+        check(c.imeiHistory?.entries == keeper.entries, "history: read again after the change")
+        rig.fake.queueImei(.success("000000000000141"))
+        rig.answerSettings(4, .success(listing()), .success(ready), "history: the read after the change")
+
+        keeper.refuse = "The IMEI history could not be written (/x)."
+        c.changeImei("000000000000091", reboot: false)
+        rig.waitForCall(6, "history: second setImei runs")
+        rig.fake.releaseSetImei(.failure(ModemFailure(message: "The IMEI was not changed. ERROR")))
+        pump(until: { c.resultIsFailure }, "history: the failed change finishes")
+        check(c.resultIsFailure && c.result == "The IMEI was not changed. ERROR The change was not recorded in the "
+              + "IMEI history: The IMEI history could not be written (/x).", "history: not written is said", c.result)
+        check(keeper.entries.count == 1, "history: nothing appended when refused")
+        c.setTabShown(nil)
+    }
+}
+
+/// An IMEI history in memory, written from the controller's queue and read on the main thread.
+final class MemoryHistory: ImeiHistoryKeeping {
+    private let lock = NSLock()
+    private var stored: [ImeiHistoryEntry] = []
+    private var refusal: String? = nil
+    var entries: [ImeiHistoryEntry] { lock.lock(); defer { lock.unlock() }; return stored }
+    var refuse: String? {
+        get { lock.lock(); defer { lock.unlock() }; return refusal }
+        set { lock.lock(); refusal = newValue; lock.unlock() }
+    }
+    var location: String { "/memory/imei-history.jsonl" }
+
+    func load() -> Result<ImeiHistory, ModemFailure> {
+        .success(ImeiHistory(entries: entries, skippedLines: 0))
+    }
+
+    func append(_ entry: ImeiHistoryEntry) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        if let refusal { return refusal }
+        stored.append(entry)
+        return nil
     }
 }
