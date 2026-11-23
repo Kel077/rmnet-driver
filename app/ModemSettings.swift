@@ -148,9 +148,55 @@ struct BandSet: Equatable { let rat: BandRat; let allowed: [Int]; let supported:
 /// written (they were already the ones asked).
 struct BandChange: Equatable { let before: [Int]; let after: [Int] }
 
+/// One LTE cell in `AT+QNWLOCK="common/4g"`.
+struct LteLockedCell: Equatable {
+    let earfcn: Int
+    let pci: Int
+}
+
+/// 5G SA cell lock parameters in `AT+QNWLOCK="common/5g"`.
+struct NrCellLock: Equatable {
+    let pci: Int
+    let arfcn: Int
+    let scsKHz: Int
+    let band: Int
+}
+
+/// Parsed answer of `AT+QNWLOCK="common/5g"`.
+enum ParsedNrCellLock: Equatable {
+    case unlocked
+    case locked(NrCellLock)
+}
+
+/// Complete cell-lock and reboot-persistence state (`AT+QNWLOCK`) plus optional neighbour cells.
+struct CellLockState: Equatable {
+    let lte: [LteLockedCell]
+    let nr: NrCellLock?
+    let persistLte: Bool
+    let persistNr: Bool
+    var neighbours: [NeighbourCell] = []
+
+    var isLocked: Bool { !lte.isEmpty || nr != nil }
+    var persistsAcrossReboot: Bool { persistLte || persistNr }
+}
+
+/// Outcome of writing a cell lock or persistence setting.
+enum CellLockChange: Equatable {
+    case unchanged(CellLockState)
+    case changed(before: CellLockState, after: CellLockState)
+}
+
+/// Outcome of writing a new IMEI via `AT+EGMR=1,7,"<imei>"`.
+enum ImeiChange: Equatable {
+    case unchanged(String)
+    case rebooting(before: String, after: String)
+    case setTakesEffectAfterRestart(before: String, after: String)
+}
+
 /// The modem over its spare AT port. Each call blocks until done; callers keep it off the main thread.
 protocol ModemServing {
     func networkInfo() -> Result<NetworkInfo, ModemFailure>
+    func antennas() -> Result<[AntennaSignalSet], ModemFailure>
     func setRadio(on: Bool) -> Result<RadioChange, ModemFailure>
     func setMode(_ mode: String) -> Result<ModeChange, ModemFailure>          // one canonicalMode accepts (R8)
     func profiles() -> Result<[DataProfile], ModemFailure>
@@ -162,6 +208,12 @@ protocol ModemServing {
     func at(_ line: String, timeout: TimeInterval) -> Result<[String], ModemFailure>   // one atCommandProblem accepts
     func bands() -> Result<[BandSet], ModemFailure>                                  // in BandRat.allCases order
     func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure> // refuses what bandsProblem does
+    func cellLock() -> Result<CellLockState, ModemFailure>
+    func setNrCellLock(_ lock: NrCellLock?) -> Result<CellLockChange, ModemFailure>
+    func setLteCellLock(_ cells: [LteLockedCell]) -> Result<CellLockChange, ModemFailure>
+    func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure>
+    func imei() -> Result<String, ModemFailure>
+    func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure>
 }
 
 // MARK: - Answer lines
@@ -838,4 +890,250 @@ private func pinNotTakenSentence(_ o: PinOutcome) -> String {
     default:
         return "\(start) SIM: \(simStateWords(sim.state))."
     }
+}
+
+// MARK: - Cell lock (`AT+QNWLOCK`)
+
+let validNrScsKHz = [15, 30, 60, 120, 240]
+
+private func asciiDigitsInt(_ s: String) -> Int? {
+    guard !s.isEmpty, s.unicodeScalars.allSatisfy({ (0x30...0x39).contains($0.value) }) else { return nil }
+    return Int(s)
+}
+
+/// AT+QNWLOCK="common/4g": `+QNWLOCK: "common/4g",0` (unlocked) or
+/// `+QNWLOCK: "common/4g",<count>,<earfcn1>,<pci1>[,…]` (1 to 10 cells). nil when absent or malformed.
+func parseLteCellLock(_ lines: [String]) -> [LteLockedCell]? {
+    for line in lines {
+        guard let f = atFields(line, prefix: "+QNWLOCK"), answerField(f, 0) == "common/4g" else { continue }
+        guard let countStr = answerField(f, 1), let count = asciiDigitsInt(countStr) else { return nil }
+        if count == 0 { return f.count == 2 ? [] : nil }
+        guard (1...10).contains(count), f.count == 2 + 2 * count else { return nil }
+        var cells: [LteLockedCell] = []
+        for i in 0..<count {
+            guard let earfcn = answerField(f, 2 + 2 * i).flatMap(asciiDigitsInt),
+                  let pci = answerField(f, 3 + 2 * i).flatMap(asciiDigitsInt) else { return nil }
+            cells.append(LteLockedCell(earfcn: earfcn, pci: pci))
+        }
+        return cells
+    }
+    return nil
+}
+
+/// AT+QNWLOCK="common/5g": `+QNWLOCK: "common/5g",0` (unlocked) or
+/// `+QNWLOCK: "common/5g",<pci>,<arfcn>,<scs>,<band>`. nil when absent or malformed.
+func parseNrCellLock(_ lines: [String]) -> ParsedNrCellLock? {
+    for line in lines {
+        guard let f = atFields(line, prefix: "+QNWLOCK"), answerField(f, 0) == "common/5g" else { continue }
+        if f.count == 2 && f[1] == "0" { return .unlocked }
+        guard f.count >= 5,
+              let pci = answerField(f, 1).flatMap(asciiDigitsInt),
+              let arfcn = answerField(f, 2).flatMap(asciiDigitsInt),
+              let scs = answerField(f, 3).flatMap(asciiDigitsInt),
+              let band = answerField(f, 4).flatMap(asciiDigitsInt),
+              arfcn >= 1, scs >= 1, band >= 1 else { return nil }
+        return .locked(NrCellLock(pci: pci, arfcn: arfcn, scsKHz: scs, band: band))
+    }
+    return nil
+}
+
+/// AT+QNWLOCK="save_ctrl": `+QNWLOCK: "save_ctrl",<lte_persist>,<nr_persist>` (`0` or `1`).
+func parseCellLockPersist(_ lines: [String]) -> (lte: Bool, nr: Bool)? {
+    for line in lines {
+        guard let f = atFields(line, prefix: "+QNWLOCK"), answerField(f, 0) == "save_ctrl",
+              f.count >= 3,
+              let lte = answerField(f, 1).flatMap(asciiDigitsInt), (0...1).contains(lte),
+              let nr = answerField(f, 2).flatMap(asciiDigitsInt), (0...1).contains(nr) else { continue }
+        return (lte: lte == 1, nr: nr == 1)
+    }
+    return nil
+}
+
+func lteCellLockProblem(_ cells: [LteLockedCell]) -> String? {
+    if cells.count > 10 { return "At most 10 LTE cells may be locked." }
+    var seen = Set<String>()
+    for c in cells {
+        guard (0...262143).contains(c.earfcn) else { return "EARFCN \(c.earfcn) is out of range (0 to 262143)." }
+        guard (0...503).contains(c.pci) else { return "LTE PCI \(c.pci) is out of range (0 to 503)." }
+        let key = "\(c.earfcn):\(c.pci)"
+        if !seen.insert(key).inserted { return "Duplicate LTE cell (EARFCN \(c.earfcn), PCI \(c.pci))." }
+    }
+    return nil
+}
+
+func nrCellLockProblem(_ lock: NrCellLock?, supportedSaBands: [Int]? = nil) -> String? {
+    guard let lock else { return nil }
+    guard (0...1007).contains(lock.pci) else { return "5G NR PCI \(lock.pci) is out of range (0 to 1007)." }
+    guard (1...3279165).contains(lock.arfcn) else { return "5G NR ARFCN \(lock.arfcn) is out of range (1 to 3279165)." }
+    guard validNrScsKHz.contains(lock.scsKHz) else { return "Subcarrier spacing must be 15, 30, 60, 120 or 240 kHz." }
+    guard (1...999).contains(lock.band) else { return "5G NR band \(lock.band) is not valid." }
+    if let supportedSaBands, !supportedSaBands.isEmpty, !supportedSaBands.contains(lock.band) {
+        return "The modem does not support 5G SA band \(lock.band) (supported: \(bandListWords(supportedSaBands)))."
+    }
+    return nil
+}
+
+func lteCellLockCommand(_ cells: [LteLockedCell]) -> String {
+    guard !cells.isEmpty else { return "AT+QNWLOCK=\"common/4g\",0" }
+    let list = cells.map { "\($0.earfcn),\($0.pci)" }.joined(separator: ",")
+    return "AT+QNWLOCK=\"common/4g\",\(cells.count),\(list)"
+}
+
+func nrCellLockCommand(_ lock: NrCellLock?) -> String {
+    guard let lock else { return "AT+QNWLOCK=\"common/5g\",0" }
+    return "AT+QNWLOCK=\"common/5g\",\(lock.pci),\(lock.arfcn),\(lock.scsKHz),\(lock.band)"
+}
+
+func cellLockPersistCommand(lte: Bool, nr: Bool) -> String {
+    "AT+QNWLOCK=\"save_ctrl\",\(lte ? 1 : 0),\(nr ? 1 : 0)"
+}
+
+func nrCellLockWords(_ nr: NrCellLock?) -> String {
+    guard let nr else { return "unlocked" }
+    return "band n\(nr.band), PCI \(nr.pci), ARFCN \(nr.arfcn), SCS \(nr.scsKHz) kHz"
+}
+
+func lteCellLockWords(_ lte: [LteLockedCell]) -> String {
+    guard !lte.isEmpty else { return "unlocked" }
+    return lte.map { "EARFCN \($0.earfcn), PCI \($0.pci)" }.joined(separator: "; ")
+}
+
+func cellLockRows(_ state: CellLockState) -> [(label: String, value: String)] {
+    let persistWords: String
+    switch (state.persistLte, state.persistNr) {
+    case (false, false): persistWords = "off (temporary until restart)"
+    case (true, true): persistWords = "on (kept across restarts)"
+    case (true, false): persistWords = "LTE kept across restarts, 5G SA temporary"
+    case (false, true): persistWords = "5G SA kept across restarts, LTE temporary"
+    }
+    var rows: [(label: String, value: String)] = [
+        (label: "5G SA lock", value: nrCellLockWords(state.nr)),
+        (label: "LTE lock", value: lteCellLockWords(state.lte)),
+        (label: "Persist across restart", value: persistWords),
+    ]
+    for (index, n) in state.neighbours.enumerated() {
+        var parts: [String] = [n.rat]
+        if let k = n.kind { parts.append(k) }
+        if let p = n.pci { parts.append("PCI \(p)") }
+        if let c = n.channel { parts.append("\(n.rat == "LTE" ? "EARFCN" : "ARFCN") \(c)") }
+        if let r = n.rsrp { parts.append("RSRP \(r) dBm") }
+        rows.append((label: "Neighbour \(index + 1)", value: parts.joined(separator: ", ")))
+    }
+    return rows
+}
+
+func cellLockJSON(_ state: CellLockState) -> [String: Any] {
+    let nrObj: Any = state.nr.map {
+        ["pci": $0.pci, "arfcn": $0.arfcn, "scsKHz": $0.scsKHz, "band": $0.band]
+    } ?? NSNull()
+    let lteArr: [[String: Any]] = state.lte.map { ["earfcn": $0.earfcn, "pci": $0.pci] }
+    let nbArr: [[String: Any]] = state.neighbours.map {
+        ["rat": $0.rat, "kind": orNull($0.kind), "channel": orNull($0.channel),
+         "pci": orNull($0.pci), "rsrp": orNull($0.rsrp), "rsrq": orNull($0.rsrq), "sinr": orNull($0.sinr)]
+    }
+    return [
+        "nr5gSa": nrObj,
+        "lte": lteArr,
+        "persist": ["lte": state.persistLte, "nr5g": state.persistNr],
+        "neighbours": nbArr,
+    ]
+}
+
+func cellLockSentence(_ change: CellLockChange) -> String {
+    switch change {
+    case .unchanged(let state):
+        if !state.isLocked { return "Cell lock is already unlocked." }
+        return "Cell lock unchanged (5G SA: \(nrCellLockWords(state.nr)); LTE: \(lteCellLockWords(state.lte)))."
+    case .changed(let before, let after):
+        if after.nr != before.nr {
+            if let nr = after.nr {
+                return "Locked 5G SA cell to \(nrCellLockWords(nr))."
+            }
+            return "Unlocked 5G SA cell lock."
+        }
+        if after.lte != before.lte {
+            if !after.lte.isEmpty {
+                return "Locked LTE cell to \(lteCellLockWords(after.lte))."
+            }
+            return "Unlocked LTE cell lock."
+        }
+        return after.persistsAcrossReboot
+            ? "Cell lock now persists across modem restarts."
+            : "Cell lock is now temporary (cleared on modem restart)."
+    }
+}
+
+// MARK: - IMEI (`AT+EGMR`)
+
+/// Standard 3GPP TS 23.003 Luhn check digit for the first 14 ASCII digits of an IMEI.
+func imeiCheckDigit(forFirst14 prefix: String) -> Int? {
+    let scalars = Array(prefix.unicodeScalars)
+    guard scalars.count == 14, scalars.allSatisfy({ (0x30...0x39).contains($0.value) }) else { return nil }
+    var sum = 0
+    for (i, scalar) in scalars.enumerated() {
+        var digit = Int(scalar.value - 0x30)
+        if i % 2 == 1 {
+            digit *= 2
+            if digit > 9 { digit -= 9 }
+        }
+        sum += digit
+    }
+    return (10 - (sum % 10)) % 10
+}
+
+/// AT+EGMR=0,7: `+EGMR: "<15 digits>"`. nil without such a line or when not 15 ASCII digits.
+func parseImei(_ lines: [String]) -> String? {
+    for line in lines {
+        guard let f = atFields(line, prefix: "+EGMR"), let raw = answerField(f, 0) else { continue }
+        let scalars = raw.unicodeScalars
+        if scalars.count == 15 && scalars.allSatisfy({ (0x30...0x39).contains($0.value) }) {
+            return raw
+        }
+    }
+    return nil
+}
+
+/// nil when `imei` is 15 ASCII digits with a valid Luhn check digit; else the rule.
+func imeiProblem(_ imei: String) -> String? {
+    let scalars = Array(imei.unicodeScalars)
+    guard scalars.count == 15, scalars.allSatisfy({ (0x30...0x39).contains($0.value) }) else {
+        return "An IMEI is 15 ASCII digits (0 to 9)."
+    }
+    let prefix = String(imei.prefix(14))
+    guard let expected = imeiCheckDigit(forFirst14: prefix) else {
+        return "An IMEI is 15 ASCII digits (0 to 9)."
+    }
+    let lastDigit = Int(scalars[14].value - 0x30)
+    guard lastDigit == expected else {
+        return "The IMEI check digit is not valid (expected \(expected) as the 15th digit)."
+    }
+    return nil
+}
+
+func imeiCommand(_ imei: String) -> String {
+    "AT+EGMR=1,7,\"\(imei)\""
+}
+
+func imeiQuestion(before: String?, after: String, reboot: Bool) -> (title: String, message: String) {
+    let current = before.map { "Current IMEI: \($0)." } ?? "Current IMEI could not be read."
+    let effect = reboot
+        ? "RMNet restarts the modem right away so the network sees the new IMEI (~30 s without service)."
+        : "The new IMEI is stored and takes effect after the next modem restart."
+    return (title: "Change the modem's IMEI to \(after)?",
+            message: "\(current)\nNew IMEI: \(after).\n\(effect)")
+}
+
+func imeiSentence(_ change: ImeiChange) -> String {
+    switch change {
+    case .unchanged(let current):
+        return "IMEI is already \(current); nothing changed."
+    case .rebooting(_, let after):
+        return "IMEI set to \(after); the modem is restarting."
+    case .setTakesEffectAfterRestart(_, let after):
+        return "IMEI set to \(after); it takes effect at the next restart (AT+CFUN=1,1 or a replug)."
+    }
+}
+
+func imeiJSON(_ imei: String) -> [String: Any] {
+    ["imei": imei]
 }

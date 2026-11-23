@@ -31,6 +31,12 @@ private struct BandsEdit: Identifiable {
     var id: BandRat { opened.rat }
 }
 
+/// What the cell-lock sheet starts filled with (`nil` starts blank or from current serving cell).
+private struct CellLockDraft: Identifiable {
+    let id = UUID()
+    let target: NetworkCards.LockTarget?
+}
+
 /// The widest the cards (and the read line above them) get; the same as the Overview's.
 private let contentWidth: CGFloat = 760
 
@@ -42,6 +48,8 @@ struct NetworkTab: View {
     let throughput: ThroughputSampler
     @State private var question: Question<NetworkAction>? = nil
     @State private var editing: BandsEdit? = nil
+    @State private var cellLockDraft: CellLockDraft? = nil
+    @State private var persistClicks = 0
     // Counts the clicks on the radio's switch. Each click makes the switch anew from the modem's state as read, so
     // the switch never shows the click: it moves when a read (after the change, or after Switch Off) says so.
     @State private var radioClicks = 0
@@ -73,6 +81,7 @@ struct NetworkTab: View {
                     signalCard
                     ThroughputCard(throughput: throughput)
                     cellCard
+                    cellLockCard
                     radioAndModeCard
                     bandsCard
                 }
@@ -97,7 +106,7 @@ struct NetworkTab: View {
         .resultBanner(controller.result, isFailure: controller.resultIsFailure,
                       inProgress: controller.running != nil && controller.running != .reading)
         .modifier(Confirmation(question: $question, controller: controller, perform: perform, closed: {}))
-        // Reads pause while the sheet is open, as for a confirmation; however it closes, they go on.
+        // Reads pause while a sheet is open, as for a confirmation; however it closes, they go on.
         .sheet(item: $editing, onDismiss: { controller.setConfirming(false) }) { edit in
             BandsSheet(controller: controller, opened: edit.opened,
                        apply: { chosen in
@@ -109,6 +118,25 @@ struct NetworkTab: View {
                            editing = nil
                            controller.setConfirming(false)
                        })
+        }
+        .sheet(item: $cellLockDraft, onDismiss: { controller.setConfirming(false) }) { draft in
+            CellLockSheet(controller: controller,
+                          initialTarget: draft.target,
+                          quickTargets: NetworkCards.lockTargets(controller.info),
+                          lockNr: { nr in
+                              controller.setNrCellLock(nr)
+                              cellLockDraft = nil
+                              controller.setConfirming(false)
+                          },
+                          lockLte: { cells in
+                              controller.setLteCellLock(cells)
+                              cellLockDraft = nil
+                              controller.setConfirming(false)
+                          },
+                          cancel: {
+                              cellLockDraft = nil
+                              controller.setConfirming(false)
+                          })
         }
     }
 
@@ -189,6 +217,9 @@ struct NetworkTab: View {
                 } else {
                     GaugeRow(leg: legs.first)
                 }
+                if !controller.antennas.isEmpty {
+                    AntennaSignalStrip(sets: controller.antennas)
+                }
                 HStack(alignment: .top, spacing: Spacing.l) {
                     historyChart(.rsrp)
                     historyChart(.sinr)
@@ -234,8 +265,118 @@ struct NetworkTab: View {
                         }
                     }
                 }
+                let neighbours = controller.cellLock?.neighbours ?? []
+                if !neighbours.isEmpty {
+                    Divider()
+                    VStack(alignment: .leading, spacing: Spacing.s) {
+                        Text("Neighbour cells")
+                            .foregroundStyle(.secondary)
+                        ForEach(Array(neighbours.enumerated()), id: \.offset) { _, cell in
+                            NeighbourRowView(cell: cell)
+                        }
+                    }
+                }
             }
         }
+    }
+
+    // MARK: Cell lock
+
+    private var cellLockCard: some View {
+        let lock = controller.cellLock
+        let targets = NetworkCards.lockTargets(controller.info)
+        return Card("Cell lock", symbol: "lock.radiowaves.left.and.right", accessory: {
+            if let lock {
+                StatusPill(state: lock.isLocked ? .attention : .connected,
+                           text: lock.isLocked ? "Locked" : "Unlocked")
+            }
+        }) {
+            if let lock {
+                VStack(alignment: .leading, spacing: Spacing.m) {
+                    if let failure = controller.cellLockFailure {
+                        warning("\(failure) The cell lock below may be out of date.")
+                    }
+                    HStack(alignment: .firstTextBaseline, spacing: Spacing.m) {
+                        Text("5G SA lock")
+                            .foregroundStyle(.secondary)
+                            .frame(minWidth: 92, alignment: .leading)
+                        Text(verbatim: NetworkCards.capitalizedFirst(nrCellLockWords(lock.nr)))
+                            .monospacedDigit()
+                            .textSelection(.enabled)
+                        Spacer(minLength: Spacing.s)
+                        if lock.nr != nil {
+                            Button("Unlock") { controller.setNrCellLock(nil) }
+                                .disabled(!controller.refreshEnabled)
+                        }
+                    }
+                    HStack(alignment: .firstTextBaseline, spacing: Spacing.m) {
+                        Text("LTE lock")
+                            .foregroundStyle(.secondary)
+                            .frame(minWidth: 92, alignment: .leading)
+                        Text(verbatim: NetworkCards.capitalizedFirst(lteCellLockWords(lock.lte)))
+                            .monospacedDigit()
+                            .textSelection(.enabled)
+                        Spacer(minLength: Spacing.s)
+                        if !lock.lte.isEmpty {
+                            Button("Unlock") { controller.setLteCellLock([]) }
+                                .disabled(!controller.refreshEnabled)
+                        }
+                    }
+                    Toggle("Keep across modem restarts",
+                           isOn: Binding(get: { lock.persistsAcrossReboot }, set: { persist in
+                               persistClicks += 1
+                               controller.setCellLockPersist(lte: persist, nr: persist)
+                           }))
+                    .toggleStyle(.checkbox)
+                    .id(persistClicks)
+                    .disabled(!controller.refreshEnabled)
+                    if !targets.isEmpty {
+                        Divider()
+                        VStack(alignment: .leading, spacing: Spacing.s) {
+                            Text("Lock visible carrier")
+                                .foregroundStyle(.secondary)
+                            FlowLayout(spacing: Spacing.s) {
+                                ForEach(Array(targets.enumerated()), id: \.offset) { _, target in
+                                    Button {
+                                        openCellLockSheet(target)
+                                    } label: {
+                                        Text(verbatim: "\(target.detail): \(target.label)")
+                                            .font(.caption)
+                                            .monospacedDigit()
+                                    }
+                                    .disabled(!controller.refreshEnabled)
+                                }
+                            }
+                        }
+                    }
+                    Divider()
+                    HStack(alignment: .center, spacing: Spacing.m) {
+                        Text("Cell locking restricts the modem to the chosen cell until unlocked (or restarted unless kept).")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: Spacing.m)
+                        if lock.isLocked {
+                            Button("Unlock all") { controller.unlockAllCells() }
+                                .disabled(!controller.refreshEnabled)
+                        }
+                        Button("Lock Cell…") { openCellLockSheet(targets.first) }
+                            .disabled(!controller.refreshEnabled)
+                    }
+                }
+            } else if let failure = controller.cellLockFailure {
+                warning(failure)
+            } else {
+                Text("Not read yet.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func openCellLockSheet(_ target: NetworkCards.LockTarget?) {
+        guard controller.refreshEnabled else { return }
+        cellLockDraft = CellLockDraft(target: target)
+        controller.setConfirming(true)
     }
 
     // MARK: Radio and mode
@@ -514,35 +655,398 @@ private struct CellGrid: View {
     }
 }
 
-/// A carrier: its band over its bandwidth, as wide as the bandwidth (NetworkCards.carrierChipWidth), 5G blue and LTE
-/// teal (as the technology badge); the primary carrier's fill is stronger.
+/// A carrier: its band, bandwidth and optional PCI/channel, 5G blue and LTE teal; primary fill is stronger.
 private struct CarrierChipView: View {
     let chip: NetworkCards.CarrierChip
 
     var body: some View {
         let tint = techTint(chip.band.hasPrefix("n") ? "5G" : chip.band.hasPrefix("B") ? "LTE" : "")
         let shape = RoundedRectangle(cornerRadius: 8, style: .continuous)
+        let detail = NetworkCards.carrierDetailText(chip)
         VStack(alignment: .leading, spacing: 1) {
-            Text(verbatim: chip.band)
-                .font(.callout.weight(.semibold))
-                .monospacedDigit()
-            Text(verbatim: chip.bandwidthMHz.map(NetworkCards.bandwidthText) ?? "—")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
+            HStack(alignment: .firstTextBaseline, spacing: Spacing.xs) {
+                Text(verbatim: chip.band)
+                    .font(.callout.weight(.semibold))
+                    .monospacedDigit()
+                if let bw = chip.bandwidthMHz.map(NetworkCards.bandwidthText) {
+                    Text(verbatim: bw)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+            if let detail {
+                Text(verbatim: detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            } else if chip.bandwidthMHz == nil {
+                Text(verbatim: "—")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
         .lineLimit(1)
         .padding(.horizontal, Spacing.s + 2)
         .padding(.vertical, Spacing.xs + 1)
-        .frame(width: NetworkCards.carrierChipWidth(chip.bandwidthMHz), alignment: .leading)
+        .frame(minWidth: NetworkCards.carrierChipWidth(chip.bandwidthMHz), alignment: .leading)
         .background(shape.fill(tint.opacity(chip.primary ? 0.24 : 0.12)))
         .overlay(shape.strokeBorder(tint.opacity(chip.primary ? 0.7 : 0.4), lineWidth: chip.primary ? 1 : 0.5))
         .help(chip.primary ? "Primary carrier" : "Carrier")
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text(verbatim: "Carrier \(chip.band)"))
         .accessibilityValue(Text(verbatim: [chip.primary ? "primary" : nil,
-                                            chip.bandwidthMHz.map(NetworkCards.bandwidthText)]
+                                            chip.bandwidthMHz.map(NetworkCards.bandwidthText),
+                                            detail]
             .compactMap { $0 }.joined(separator: ", ")))
+    }
+}
+
+/// Per-antenna 4×4 MIMO tiles (PRX, DRX, RX2, RX3) beneath the serving-leg gauges.
+private struct AntennaSignalStrip: View {
+    let sets: [AntennaSignalSet]
+
+    var body: some View {
+        let tiles = NetworkCards.antennaTiles(sets)
+        if !tiles.isEmpty {
+            Divider()
+            VStack(alignment: .leading, spacing: Spacing.s) {
+                Text("Per-antenna signal")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                ForEach(sets, id: \.rat) { set in
+                    VStack(alignment: .leading, spacing: Spacing.xs) {
+                        if sets.count > 1 {
+                            Text(verbatim: set.rat)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        let rowTiles = NetworkCards.antennaTiles([set])
+                        HStack(spacing: Spacing.s) {
+                            ForEach(rowTiles, id: \.index) { tile in
+                                AntennaTileView(tile: tile)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct AntennaTileView: View {
+    let tile: NetworkCards.AntennaTile
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 8, style: .continuous)
+        let color = tile.active ? (tile.quality.map(signalTextTint) ?? .primary) : .secondary
+        VStack(alignment: .leading, spacing: 2) {
+            Text(verbatim: tile.title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(verbatim: tile.rsrpText)
+                .font(.callout.weight(.semibold))
+                .monospacedDigit()
+                .foregroundStyle(tile.active ? color : .secondary)
+            Text(verbatim: tile.detailText)
+                .font(.caption2)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, Spacing.s)
+        .padding(.vertical, Spacing.xs + 2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(shape.fill(.quaternary.opacity(tile.active ? 0.55 : 0.25)))
+        .overlay(shape.strokeBorder(.separator.opacity(tile.active ? 0.8 : 0.4), lineWidth: 0.5))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(verbatim: "\(tile.rat) \(tile.title)"))
+        .accessibilityValue(Text(verbatim: "\(tile.rsrpText), \(tile.detailText)"))
+    }
+}
+
+private struct NeighbourRowView: View {
+    let cell: NeighbourCell
+
+    var body: some View {
+        let chLabel = cell.rat == "LTE" ? "EARFCN" : cell.rat == "WCDMA" ? "UARFCN" : "ARFCN"
+        let parts = [
+            cell.rat,
+            cell.kind,
+            cell.pci.map { "PCI \($0)" },
+            cell.channel.map { "\(chLabel) \($0)" },
+            cell.rsrp.map { "RSRP \($0) dBm" },
+            cell.rsrq.map { "RSRQ \($0) dB" },
+            cell.sinr.map { "SINR \($0) dB" },
+        ].compactMap { $0 }
+        Text(verbatim: parts.joined(separator: " · "))
+            .font(.callout)
+            .monospacedDigit()
+            .textSelection(.enabled)
+    }
+}
+
+/// Sheet for locking a 5G SA cell (`AT+QNWLOCK="common/5g"`) or up to 10 LTE cells (`AT+QNWLOCK="common/4g"`).
+private struct CellLockSheet: View {
+    private enum Mode: String, CaseIterable {
+        case sa = "5G SA"
+        case lte = "LTE"
+    }
+
+    private struct LteRowDraft: Identifiable {
+        let id = UUID()
+        var earfcn: String
+        var pci: String
+    }
+
+    @ObservedObject var controller: ModemController
+    let quickTargets: [NetworkCards.LockTarget]
+    let lockNr: (NrCellLock) -> Void
+    let lockLte: ([LteLockedCell]) -> Void
+    let cancel: () -> Void
+
+    @State private var mode: Mode
+    @State private var nrBand: String
+    @State private var nrPci: String
+    @State private var nrArfcn: String
+    @State private var nrScs: Int
+    @State private var lteRows: [LteRowDraft]
+
+    init(controller: ModemController, initialTarget: NetworkCards.LockTarget?,
+         quickTargets: [NetworkCards.LockTarget], lockNr: @escaping (NrCellLock) -> Void,
+         lockLte: @escaping ([LteLockedCell]) -> Void, cancel: @escaping () -> Void) {
+        self.controller = controller
+        self.quickTargets = quickTargets
+        self.lockNr = lockNr
+        self.lockLte = lockLte
+        self.cancel = cancel
+
+        var startMode: Mode = .sa
+        var band = ""
+        var pci = ""
+        var arfcn = ""
+        var scs = 30
+        var lte: [LteRowDraft] = [LteRowDraft(earfcn: "", pci: "")]
+
+        if let target = initialTarget {
+            switch target.kind {
+            case .nr(let nr):
+                startMode = .sa
+                band = String(nr.band)
+                pci = String(nr.pci)
+                arfcn = String(nr.arfcn)
+                scs = nr.scsKHz
+            case .lte(let cell):
+                startMode = .lte
+                lte = [LteRowDraft(earfcn: String(cell.earfcn), pci: String(cell.pci))]
+            }
+        } else if let currentNr = controller.cellLock?.nr {
+            band = String(currentNr.band)
+            pci = String(currentNr.pci)
+            arfcn = String(currentNr.arfcn)
+            scs = currentNr.scsKHz
+        } else if let currentLte = controller.cellLock?.lte, !currentLte.isEmpty {
+            startMode = .lte
+            lte = currentLte.map { LteRowDraft(earfcn: String($0.earfcn), pci: String($0.pci)) }
+        }
+        _mode = State(initialValue: startMode)
+        _nrBand = State(initialValue: band)
+        _nrPci = State(initialValue: pci)
+        _nrArfcn = State(initialValue: arfcn)
+        _nrScs = State(initialValue: scs)
+        _lteRows = State(initialValue: lte)
+    }
+
+    private var parsedNr: NrCellLock? {
+        let bandClean = nrBand.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedBand = (bandClean.first == "n" || bandClean.first == "N") ? String(bandClean.dropFirst()) : bandClean
+        guard let pci = Int(nrPci.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let arfcn = Int(nrArfcn.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let band = Int(trimmedBand) else { return nil }
+        return NrCellLock(pci: pci, arfcn: arfcn, scsKHz: nrScs, band: band)
+    }
+
+    private var supportedSaBands: [Int]? {
+        controller.bands?.first(where: { $0.rat == .sa })?.supported
+    }
+
+    private var parsedLte: [LteLockedCell]? {
+        guard !lteRows.isEmpty else { return nil }
+        var out: [LteLockedCell] = []
+        for row in lteRows {
+            guard let earfcn = Int(row.earfcn.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  let pci = Int(row.pci.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
+            out.append(LteLockedCell(earfcn: earfcn, pci: pci))
+        }
+        return out
+    }
+
+    private var validationError: String? {
+        switch mode {
+        case .sa:
+            if nrBand.isEmpty && nrPci.isEmpty && nrArfcn.isEmpty { return nil }
+            guard let parsedNr else { return "Enter whole numbers for 5G SA band, PCI and ARFCN." }
+            return nrCellLockProblem(parsedNr, supportedSaBands: supportedSaBands)
+        case .lte:
+            if lteRows.allSatisfy({ $0.earfcn.isEmpty && $0.pci.isEmpty }) { return nil }
+            guard let parsedLte else { return "Enter whole numbers for each LTE cell's EARFCN and PCI." }
+            return lteCellLockProblem(parsedLte)
+        }
+    }
+
+    private var canApply: Bool {
+        switch mode {
+        case .sa:
+            guard let parsedNr else { return false }
+            return nrCellLockProblem(parsedNr, supportedSaBands: supportedSaBands) == nil
+        case .lte:
+            guard let parsedLte, !parsedLte.isEmpty else { return false }
+            return lteCellLockProblem(parsedLte) == nil
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.l) {
+            HStack {
+                Text("Lock to cell")
+                    .font(.title3.weight(.semibold))
+                    .accessibilityAddTraits(.isHeader)
+                Spacer()
+                Picker("RAT", selection: $mode) {
+                    ForEach(Mode.allCases, id: \.self) { m in Text(m.rawValue).tag(m) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 160)
+            }
+
+            if !quickTargets.isEmpty {
+                VStack(alignment: .leading, spacing: Spacing.xs) {
+                    Text("Fill from current carrier:")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    FlowLayout(spacing: Spacing.xs) {
+                        ForEach(Array(quickTargets.enumerated()), id: \.offset) { _, target in
+                            Button("\(target.detail): \(target.label)") { applyQuickTarget(target) }
+                                .font(.caption)
+                        }
+                    }
+                }
+            }
+
+            if mode == .sa {
+                Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: Spacing.m, verticalSpacing: Spacing.m) {
+                    GridRow {
+                        Text("5G SA band").foregroundStyle(.secondary)
+                        TextField("Band", text: $nrBand, prompt: Text("e.g. 41"))
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    GridRow {
+                        Text("PCI").foregroundStyle(.secondary)
+                        TextField("PCI", text: $nrPci, prompt: Text("0 to 1007"))
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    GridRow {
+                        Text("ARFCN").foregroundStyle(.secondary)
+                        TextField("ARFCN", text: $nrArfcn, prompt: Text("e.g. 520110"))
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    GridRow {
+                        Text("SCS").foregroundStyle(.secondary)
+                        Picker("SCS", selection: $nrScs) {
+                            ForEach(validNrScsKHz, id: \.self) { scs in
+                                Text("\(scs) kHz").tag(scs)
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+                }
+                .autocorrectionDisabled()
+            } else {
+                VStack(alignment: .leading, spacing: Spacing.s) {
+                    ForEach(Array(lteRows.enumerated()), id: \.element.id) { idx, _ in
+                        HStack(spacing: Spacing.s) {
+                            Text("Cell \(idx + 1)")
+                                .foregroundStyle(.secondary)
+                                .frame(width: 52, alignment: .leading)
+                            TextField("EARFCN", text: $lteRows[idx].earfcn, prompt: Text("EARFCN"))
+                                .textFieldStyle(.roundedBorder)
+                            TextField("PCI", text: $lteRows[idx].pci, prompt: Text("PCI (0–503)"))
+                                .textFieldStyle(.roundedBorder)
+                            if lteRows.count > 1 {
+                                Button {
+                                    lteRows.remove(at: idx)
+                                } label: {
+                                    Image(systemName: "minus.circle")
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                    if lteRows.count < 10 {
+                        Button("Add LTE cell") {
+                            lteRows.append(LteRowDraft(earfcn: "", pci: ""))
+                        }
+                        .font(.callout)
+                    }
+                }
+                .autocorrectionDisabled()
+            }
+
+            if let error = validationError {
+                Label {
+                    Text(verbatim: error)
+                } icon: {
+                    Image(systemName: "exclamationmark.circle.fill")
+                }
+                .font(.callout)
+                .foregroundStyle(.red)
+            }
+
+            Label {
+                Text("Locking forces the modem to stay on this cell until unlocked (or restarted unless persistence is enabled).")
+                    .fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel", action: cancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Lock Cell") {
+                    switch mode {
+                    case .sa:
+                        if let parsedNr { lockNr(parsedNr) }
+                    case .lte:
+                        if let parsedLte { lockLte(parsedLte) }
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canApply)
+            }
+        }
+        .padding(Spacing.xl)
+        .frame(width: 480)
+    }
+
+    private func applyQuickTarget(_ target: NetworkCards.LockTarget) {
+        switch target.kind {
+        case .nr(let nr):
+            mode = .sa
+            nrBand = String(nr.band)
+            nrPci = String(nr.pci)
+            nrArfcn = String(nr.arfcn)
+            nrScs = nr.scsKHz
+        case .lte(let cell):
+            mode = .lte
+            lteRows = [LteRowDraft(earfcn: String(cell.earfcn), pci: String(cell.pci))]
+        }
     }
 }
 
@@ -816,44 +1320,168 @@ enum NetworkCards {
     }
 
     /// The Cell card's rows, a value a leg: band (with the duplex), bandwidth, channel (ARFCN, EARFCN or UARFCN),
-    /// PCI, cell ID and TAC; PSC and LAC for a WCDMA cell on its own. With no leg, one column of "—".
+    /// SCS when reported by NR, PCI, cell ID and TAC; PSC and LAC for a WCDMA cell on its own. With no leg, one
+    /// column of "—".
     static func cellRows(_ legs: [CellLeg]) -> [CellRow] {
         let shown: [CellLeg?] = legs.isEmpty ? [nil] : legs
         let wcdma = legs.count == 1 && legs[0].rat == "WCDMA"
         func row(_ label: String, _ value: (CellLeg) -> String?) -> CellRow {
             CellRow(label: label, values: shown.map { $0.flatMap(value) ?? notReported })
         }
-        return [
+        var rows = [
             row("Band") { leg in leg.band.map { band in leg.duplex.map { "\(band) (\($0))" } ?? band } },
             row("Bandwidth") { $0.bandwidthMHz.map(bandwidthText) },
             row("Channel") { $0.channel.map { String($0) } },
+        ]
+        if legs.contains(where: { $0.scsKHz != nil }) {
+            rows.append(row("SCS") { $0.scsKHz.map { "\($0) kHz" } })
+        }
+        rows += [
             row(wcdma ? "PSC" : "PCI") { $0.pci.map { String($0) } },
             row("Cell ID") { $0.cellID },
             row(wcdma ? "LAC" : "TAC") { $0.tac },
         ]
+        return rows
     }
 
     struct CarrierChip: Equatable {
         let band: String
         let bandwidthMHz: Double?
         let primary: Bool
+        var channel: Int? = nil
+        var pci: Int? = nil
     }
 
-    /// The carriers in use: AT+QCAINFO's (primary first), then any serving leg's band they do not list (as
-    /// bandText); the first is the primary when AT+QCAINFO listed it. A serving leg's bandwidth goes to one chip
-    /// only, the first on its band (the primary when listed): with intra-band aggregation (n41 + n41) the other
-    /// carrier's bandwidth is not known (the modem reports a bandwidth for the serving legs only).
+    /// `"PCI 147 · ARFCN 520110"` (or `EARFCN` for `B…`) when PCI or channel is known; nil when neither is.
+    static func carrierDetailText(_ chip: CarrierChip) -> String? {
+        var parts: [String] = []
+        if let pci = chip.pci { parts.append("PCI \(pci)") }
+        if let ch = chip.channel {
+            let name = chip.band.hasPrefix("n") ? "ARFCN" : chip.band.hasPrefix("B") ? "EARFCN" : "CH"
+            parts.append("\(name) \(ch)")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// The carriers in use: AT+QCAINFO components first when parsed (preserving each PCC/SCC's own bandwidth,
+    /// channel and PCI), falling back to `info.carriers`, then any serving leg's band not listed yet.
     static func carrierChips(_ info: NetworkInfo) -> [CarrierChip] {
         let legs = info.serving?.cells ?? []
+        var unassigned = legs.filter { $0.band != nil }
+        if !info.carrierComponents.isEmpty {
+            var chips = info.carrierComponents.enumerated().map { i, comp in
+                let matchedLeg = unassigned.firstIndex(where: { $0.band == comp.band && $0.bandwidthMHz != nil })
+                    .map { unassigned.remove(at: $0) }
+                return CarrierChip(band: comp.band,
+                                   bandwidthMHz: comp.bandwidthMHz ?? matchedLeg?.bandwidthMHz,
+                                   primary: i == 0,
+                                   channel: comp.channel,
+                                   pci: comp.pci)
+            }
+            for leg in legs {
+                guard let b = leg.band, !chips.contains(where: { $0.band == b }) else { continue }
+                chips.append(CarrierChip(band: b, bandwidthMHz: leg.bandwidthMHz, primary: false,
+                                         channel: leg.channel, pci: leg.pci))
+            }
+            return chips
+        }
         var bands = info.carriers
         for leg in legs {
             if let band = leg.band, !bands.contains(band) { bands.append(band) }
         }
-        var unassigned = legs.filter { $0.band != nil && $0.bandwidthMHz != nil }
+        var bwUnassigned = legs.filter { $0.band != nil && $0.bandwidthMHz != nil }
         return bands.enumerated().map { i, band in
-            let leg = unassigned.firstIndex(where: { $0.band == band }).map { unassigned.remove(at: $0) }
+            let leg = bwUnassigned.firstIndex(where: { $0.band == band }).map { bwUnassigned.remove(at: $0) }
             return CarrierChip(band: band, bandwidthMHz: leg?.bandwidthMHz, primary: i == 0 && !info.carriers.isEmpty)
         }
+    }
+
+    struct AntennaTile: Equatable {
+        let rat: String
+        let index: Int
+        let title: String
+        let active: Bool
+        let rsrpText: String
+        let detailText: String
+        let quality: Int?
+    }
+
+    static func antennaTiles(_ sets: [AntennaSignalSet]) -> [AntennaTile] {
+        sets.flatMap { set in
+            set.ports.map { port in
+                let rsrpText = port.rsrp.map { "\($0) dBm" } ?? notReported
+                var parts: [String] = []
+                if let q = port.rsrq { parts.append("RSRQ \(q)") }
+                if let s = port.sinr { parts.append("SINR \(s) dB") }
+                let detail = port.isActive ? (parts.isEmpty ? "Active" : parts.joined(separator: " · ")) : "Inactive"
+                return AntennaTile(rat: set.rat, index: port.index, title: "\(port.name) (Ant \(port.index + 1))",
+                                   active: port.isActive, rsrpText: rsrpText, detailText: detail,
+                                   quality: port.rsrp.flatMap { metricQuality(.rsrp, Double($0), rat: set.rat) })
+            }
+        }
+    }
+
+    enum LockTargetKind: Equatable {
+        case nr(NrCellLock)
+        case lte(LteLockedCell)
+    }
+
+    struct LockTarget: Equatable {
+        let label: String
+        let detail: String
+        let kind: LockTargetKind
+    }
+
+    /// Lockable 5G SA / LTE targets built from current serving legs and AT+QCAINFO components, deduplicated.
+    static func lockTargets(_ info: NetworkInfo?) -> [LockTarget] {
+        guard let info else { return [] }
+        let legs = info.serving?.cells ?? []
+        let allowNrSa = legs.contains { $0.rat == "NR5G-SA" }
+        var targets: [LockTarget] = []
+        var seen = Set<String>()
+
+        func appendTarget(_ target: LockTarget, key: String) {
+            if seen.insert(key).inserted { targets.append(target) }
+        }
+
+        for comp in info.carrierComponents {
+            guard let channel = comp.channel, let pci = comp.pci else { continue }
+            if comp.rat == "NR5G", allowNrSa, comp.band.hasPrefix("n"), let bandNum = Int(comp.band.dropFirst()) {
+                let legMatch = legs.first { $0.rat == "NR5G-SA" && $0.band == comp.band && $0.pci == pci && $0.channel == channel }
+                let scs = legMatch?.scsKHz ?? defaultNrScsKHz(band: bandNum, duplex: legMatch?.duplex)
+                let lock = NrCellLock(pci: pci, arfcn: channel, scsKHz: scs, band: bandNum)
+                let bwPart = comp.bandwidthMHz.map { " · \(bandwidthText($0))" } ?? ""
+                appendTarget(LockTarget(label: "\(comp.band)\(bwPart) · PCI \(pci) · ARFCN \(channel)",
+                                        detail: comp.role, kind: .nr(lock)),
+                             key: "NR:\(bandNum):\(pci):\(channel):\(scs)")
+            } else if comp.rat == "LTE" {
+                let lock = LteLockedCell(earfcn: channel, pci: pci)
+                let bwPart = comp.bandwidthMHz.map { " · \(bandwidthText($0))" } ?? ""
+                appendTarget(LockTarget(label: "\(comp.band)\(bwPart) · PCI \(pci) · EARFCN \(channel)",
+                                        detail: comp.role, kind: .lte(lock)),
+                             key: "LTE:\(channel):\(pci)")
+            }
+        }
+
+        for leg in legs {
+            guard let channel = leg.channel, let pci = leg.pci else { continue }
+            if leg.rat == "NR5G-SA", let bandStr = leg.band, bandStr.hasPrefix("n"),
+               let bandNum = Int(bandStr.dropFirst()) {
+                let scs = leg.scsKHz ?? defaultNrScsKHz(band: bandNum, duplex: leg.duplex)
+                let lock = NrCellLock(pci: pci, arfcn: channel, scsKHz: scs, band: bandNum)
+                let bwPart = leg.bandwidthMHz.map { " · \(bandwidthText($0))" } ?? ""
+                appendTarget(LockTarget(label: "\(bandStr)\(bwPart) · PCI \(pci) · ARFCN \(channel)",
+                                        detail: "Serving", kind: .nr(lock)),
+                             key: "NR:\(bandNum):\(pci):\(channel):\(scs)")
+            } else if leg.rat == "LTE" {
+                let lock = LteLockedCell(earfcn: channel, pci: pci)
+                let bandPart = leg.band.map { "\($0) · " } ?? ""
+                appendTarget(LockTarget(label: "\(bandPart)PCI \(pci) · EARFCN \(channel)",
+                                        detail: "Serving", kind: .lte(lock)),
+                             key: "LTE:\(channel):\(pci)")
+            }
+        }
+        return targets
     }
 
     /// The radio switch's position: on while the modem says the radio is on, off for airplane mode, minimum

@@ -125,6 +125,8 @@ final class FakeModem: ModemServing {
         return calls.locked { infoOutcome }
     }
 
+    func antennas() -> Result<[AntennaSignalSet], ModemFailure> { .success([]) }
+
     func setRadio(on: Bool) -> Result<RadioChange, ModemFailure> {
         calls.enter("setRadio")
         return calls.locked { radioOutcome }
@@ -150,6 +152,13 @@ final class FakeModem: ModemServing {
     func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure> {
         .failure(ModemFailure(message: "not used"))
     }
+    func cellLock() -> Result<CellLockState, ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func setNrCellLock(_ lock: NrCellLock?) -> Result<CellLockChange, ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func setLteCellLock(_ cells: [LteLockedCell]) -> Result<CellLockChange, ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure> { .failure(failureOr("not used")) }
+    func imei() -> Result<String, ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    private func failureOr(_ s: String) -> ModemFailure { ModemFailure(message: s) }
 
     func releaseInfo(_ outcome: Result<NetworkInfo, ModemFailure>) {
         calls.locked { infoOutcome = outcome }

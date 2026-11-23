@@ -16,8 +16,11 @@
 // from readSecret to the service and nowhere else: no line printed holds one. Nothing here logs.
 import Foundation
 
+enum CellUnlockScope: Equatable { case both, sa, lte }
+
 enum ModemCommand: Equatable {
     case network(json: Bool)
+    case antennas(json: Bool)
     case radio(on: Bool?)                       // nil: show
     case mode(String?)                          // nil: show; else the mode as typed, upper-cased, the RATs in
                                                 // the order typed: one canonicalMode accepts, not its reordered
@@ -34,29 +37,45 @@ enum ModemCommand: Equatable {
     case bands(json: Bool)
     case bandsSet(BandRat, [Int])               // the bands sorted, each once (at least one)
     case bandsReset(BandRat?)                   // nil: lte, nsa and sa, in that order
+    case cellShow(json: Bool)
+    case cellLockNr(NrCellLock)
+    case cellLockCurrent
+    case cellLockLte([LteLockedCell])
+    case cellUnlock(CellUnlockScope)
+    case cellPersist(Bool)
+    case imeiShow(json: Bool)
+    case imeiSet(String, reboot: Bool, yes: Bool)
 
-    /// Radio on or off, a mode set, apn set, sim unlock, usbmode set, bands set and bands reset: main.swift
-    /// ignores the stopping signals for these. Not `at`: it sends what the owner typed, as an AT terminal would,
-    /// and Ctrl-C stops it (the modem may still carry out a command already sent).
+    /// Radio on or off, a mode set, apn set, sim unlock, usbmode set, bands set/reset, cell lock/persist
+    /// and imei set: main.swift ignores the stopping signals for these. Not `at`: it sends what the owner
+    /// typed, as an AT terminal would, and Ctrl-C stops it (the modem may still carry out a command already sent).
     var changesModem: Bool {
         switch self {
-        case .network, .apnShow, .sim, .usbMode, .at, .atRefused, .bands: return false
+        case .network, .antennas, .apnShow, .sim, .usbMode, .at, .atRefused, .bands, .cellShow, .imeiShow:
+            return false
         case .radio(let on): return on != nil
         case .mode(let mode): return mode != nil
-        case .apnSet, .simUnlock, .usbModeSet, .bandsSet, .bandsReset: return true
+        case .apnSet, .simUnlock, .usbModeSet, .bandsSet, .bandsReset,
+             .cellLockNr, .cellLockCurrent, .cellLockLte, .cellUnlock, .cellPersist, .imeiSet:
+            return true
         }
     }
 }
 
-let modemVerbs: Set<String> = ["network", "radio", "mode", "apn", "sim", "usbmode", "at", "bands"]
+let modemVerbs: Set<String> = ["network", "antennas", "radio", "mode", "apn", "sim", "usbmode", "at", "bands",
+                               "cell", "imei"]
 
 /// Appended to main.swift's usage line.
-let modemUsage = "network [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | apn [show] [--json] | "
-    + "apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] [--password | --no-password] "
-    + "[--auth none|pap|chap|pap-or-chap] [--no-redial] | sim [--json] | sim unlock [--last-attempt] | "
+let modemUsage = "network [--json] | antennas [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | "
+    + "apn [show] [--json] | apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] "
+    + "[--password | --no-password] [--auth none|pap|chap|pap-or-chap] [--no-redial] | "
+    + "sim [--json] | sim unlock [--last-attempt] | "
     + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes] | "
     + "at [--timeout <seconds>] <command> | "
-    + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa]"
+    + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa] | "
+    + "cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current | "
+    + "cell lock lte <earfcn>:<pci>[,…] | cell unlock [sa|lte] | cell persist on|off | "
+    + "imei [--json] | imei set <imei> [--no-reboot] [--yes]"
 
 // MARK: - Parsing
 
@@ -67,6 +86,8 @@ func parseModem(_ words: [String]) -> ModemCommand? {
     switch verb {
     case "network":
         return jsonOption(rest).map { .network(json: $0) }
+    case "antennas":
+        return jsonOption(rest).map { .antennas(json: $0) }
     case "radio":
         switch rest {
         case []: return .radio(on: nil)
@@ -106,9 +127,82 @@ func parseModem(_ words: [String]) -> ModemCommand? {
         default:
             return jsonOption(rest).map { .bands(json: $0) }
         }
+    case "cell":
+        return parseCell(rest)
+    case "imei":
+        if rest.first == "set" { return parseImeiSet(Array(rest.dropFirst())) }
+        return jsonOption(rest).map { .imeiShow(json: $0) }
     default:
         return nil
     }
+}
+
+private func parseAsciiInt(_ word: String) -> Int? {
+    guard !word.isEmpty, word.unicodeScalars.allSatisfy({ (0x30...0x39).contains($0.value) }) else { return nil }
+    return Int(word)
+}
+
+private func parseCell(_ words: [String]) -> ModemCommand? {
+    switch words.first {
+    case "lock":
+        let args = Array(words.dropFirst())
+        switch args {
+        case ["current"]:
+            return .cellLockCurrent
+        case _ where args.count == 5 && args[0] == "sa":
+            let bandRaw = (args[4].first == "n" || args[4].first == "N") ? String(args[4].dropFirst()) : args[4]
+            guard let pci = parseAsciiInt(args[1]),
+                  let arfcn = parseAsciiInt(args[2]),
+                  let scs = parseAsciiInt(args[3]),
+                  let band = parseBandNumber(bandRaw[...]) else { return nil }
+            return .cellLockNr(NrCellLock(pci: pci, arfcn: arfcn, scsKHz: scs, band: band))
+        case _ where args.count == 2 && args[0] == "lte":
+            let items = args[1].split(separator: ",", omittingEmptySubsequences: false)
+            guard !items.isEmpty else { return nil }
+            var cells: [LteLockedCell] = []
+            for item in items {
+                let parts = item.split(separator: ":", omittingEmptySubsequences: false)
+                guard parts.count == 2,
+                      let earfcn = parseAsciiInt(String(parts[0])),
+                      let pci = parseAsciiInt(String(parts[1])) else { return nil }
+                cells.append(LteLockedCell(earfcn: earfcn, pci: pci))
+            }
+            return .cellLockLte(cells)
+        default:
+            return nil
+        }
+    case "unlock":
+        switch words.dropFirst().map({ $0 }) {
+        case []: return .cellUnlock(.both)
+        case ["sa"]: return .cellUnlock(.sa)
+        case ["lte"]: return .cellUnlock(.lte)
+        default: return nil
+        }
+    case "persist":
+        switch words.dropFirst().map({ $0 }) {
+        case ["on"]: return .cellPersist(true)
+        case ["off"]: return .cellPersist(false)
+        default: return nil
+        }
+    default:
+        return jsonOption(words).map { .cellShow(json: $0) }
+    }
+}
+
+private func parseImeiSet(_ words: [String]) -> ModemCommand? {
+    guard let value = words.first, !value.hasPrefix("--") else { return nil }
+    var reboot = true
+    var yes = false
+    var seen = Set<String>()
+    for option in words.dropFirst() {
+        guard seen.insert(option).inserted else { return nil }
+        switch option {
+        case "--no-reboot": reboot = false
+        case "--yes": yes = true
+        default: return nil
+        }
+    }
+    return .imeiSet(value, reboot: reboot, yes: yes)
 }
 
 /// The words after `bands set`: the RAT (lower case, as printed in the usage), then one word of band numbers
@@ -245,6 +339,8 @@ func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int
     switch command {
     case .network(let json):
         return showNetwork(service, json: json, output)
+    case .antennas(let json):
+        return showAntennas(service, json: json, output)
     case .radio(let on):
         guard let on else { return showRadio(service, output) }
         switch service.setRadio(on: on) {
@@ -291,6 +387,43 @@ func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int
         return changeBands(service, [rat], output) { _ in bands }
     case .bandsReset(let rat):
         return changeBands(service, rat.map { [$0] } ?? BandRat.allCases, output) { $0.supported }
+    case .cellShow(let json):
+        return showCell(service, json: json, output)
+    case .cellLockNr(let lock):
+        switch service.setNrCellLock(lock) {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let ch):
+            output("cell: \(cellLockSentence(ch))")
+            return 0
+        }
+    case .cellLockCurrent:
+        return lockCurrentCell(service, output)
+    case .cellLockLte(let cells):
+        switch service.setLteCellLock(cells) {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let ch):
+            output("cell: \(cellLockSentence(ch))")
+            return 0
+        }
+    case .cellUnlock(let scope):
+        return unlockCell(service, scope: scope, output)
+    case .cellPersist(let persist):
+        switch service.setCellLockPersist(lte: persist, nr: persist) {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let ch):
+            output("cell: \(cellLockSentence(ch))")
+            return 0
+        }
+    case .imeiShow(let json):
+        switch service.imei() {
+        case .failure(let failure): return fail("imei", failure.message, output)
+        case .success(let value):
+            if json { return outputJSON("imei", imeiJSON(value), output) }
+            output("imei: \(value)")
+            return 0
+        }
+    case let .imeiSet(value, reboot, yes):
+        return setImei(service, value, reboot: reboot, yes: yes, ask: ask, output)
     }
 }
 
@@ -317,6 +450,138 @@ private func showNetwork(_ service: ModemServing, json: Bool, _ output: (String)
     case .success(let info):
         if json { return outputJSON("network", networkJSON(info), output) }
         for row in networkRows(info) { output("\(row.label.lowercased()): \(row.value)") }
+        return 0
+    }
+}
+
+private func showAntennas(_ service: ModemServing, json: Bool, _ output: (String) -> Void) -> Int32 {
+    switch service.antennas() {
+    case .failure(let failure): return fail("antennas", failure.message, output)
+    case .success(let sets):
+        if json { return outputJSON("antennas", antennasJSON(sets), output) }
+        if sets.isEmpty {
+            output("antennas: none reported")
+            return 0
+        }
+        for row in antennaRows(sets) { output("\(row.label.lowercased()): \(row.value)") }
+        return 0
+    }
+}
+
+private func showCell(_ service: ModemServing, json: Bool, _ output: (String) -> Void) -> Int32 {
+    switch service.cellLock() {
+    case .failure(let failure): return fail("cell", failure.message, output)
+    case .success(let state):
+        if json { return outputJSON("cell", cellLockJSON(state), output) }
+        for row in cellLockRows(state) { output("\(row.label.lowercased()): \(row.value)") }
+        return 0
+    }
+}
+
+private func lockCurrentCell(_ service: ModemServing, _ output: (String) -> Void) -> Int32 {
+    let info: NetworkInfo
+    switch service.networkInfo() {
+    case .failure(let failure): return fail("cell", failure.message, output)
+    case .success(let read): info = read
+    }
+    let legs = info.serving?.cells ?? []
+    if let sa = legs.first(where: { $0.rat == "NR5G-SA" }),
+       let pci = sa.pci, let arfcn = sa.channel, let bandStr = sa.band,
+       bandStr.hasPrefix("n"), let band = Int(bandStr.dropFirst()) {
+        let scs = sa.scsKHz ?? defaultNrScsKHz(band: band, duplex: sa.duplex)
+        switch service.setNrCellLock(NrCellLock(pci: pci, arfcn: arfcn, scsKHz: scs, band: band)) {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let ch):
+            output("cell: \(cellLockSentence(ch))")
+            return 0
+        }
+    }
+    if let lte = legs.first(where: { $0.rat == "LTE" }), let earfcn = lte.channel, let pci = lte.pci {
+        switch service.setLteCellLock([LteLockedCell(earfcn: earfcn, pci: pci)]) {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let ch):
+            output("cell: \(cellLockSentence(ch))")
+            return 0
+        }
+    }
+    return fail("cell", "No lockable 5G SA or LTE serving cell is currently active.", output)
+}
+
+private func unlockCell(_ service: ModemServing, scope: CellUnlockScope, _ output: (String) -> Void) -> Int32 {
+    switch scope {
+    case .sa:
+        switch service.setNrCellLock(nil) {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let ch):
+            output("cell: \(cellLockSentence(ch))")
+            return 0
+        }
+    case .lte:
+        switch service.setLteCellLock([]) {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let ch):
+            output("cell: \(cellLockSentence(ch))")
+            return 0
+        }
+    case .both:
+        let state: CellLockState
+        switch service.cellLock() {
+        case .failure(let failure): return fail("cell", failure.message, output)
+        case .success(let read): state = read
+        }
+        if !state.isLocked {
+            output("cell: already unlocked")
+            return 0
+        }
+        if state.nr != nil {
+            switch service.setNrCellLock(nil) {
+            case .failure(let failure): return fail("cell", failure.message, output)
+            case .success(let ch): output("cell: \(cellLockSentence(ch))")
+            }
+        }
+        if !state.lte.isEmpty {
+            switch service.setLteCellLock([]) {
+            case .failure(let failure): return fail("cell", failure.message, output)
+            case .success(let ch): output("cell: \(cellLockSentence(ch))")
+            }
+        }
+        return 0
+    }
+}
+
+private func setImei(_ service: ModemServing, _ value: String, reboot: Bool, yes: Bool,
+                     ask: (String) -> String?, _ output: (String) -> Void) -> Int32 {
+    if let problem = imeiProblem(value) { return fail("imei", "\(problem) Nothing was changed.", output) }
+    switch service.imei() {
+    case .failure(let failure): return fail("imei", failure.message, output)
+    case .success(let current):
+        if current == value {
+            output("imei: already \(value); nothing changed")
+            return 0
+        }
+    }
+    if reboot && !yes {
+        guard let answer = ask(restartQuestion) else {
+            output("imei: no terminal to ask on, so nothing changed; run again with --yes to restart the modem "
+                   + "without asking")
+            return 2
+        }
+        guard ["y", "yes"].contains(answer.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
+            output("cancelled; nothing changed")
+            return 1
+        }
+    }
+    switch service.setImei(value, reboot: reboot) {
+    case .failure(let failure):
+        return fail("imei", failure.message, output)
+    case .success(let change):
+        output("imei: \(imeiSentence(change))")
+        switch change {
+        case .unchanged:
+            break
+        case .rebooting(let before, _), .setTakesEffectAfterRestart(let before, _):
+            output("imei: to put it back: RMNet imei set \(before)")
+        }
         return 0
     }
 }

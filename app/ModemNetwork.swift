@@ -21,9 +21,70 @@ struct CellLeg: Equatable {
     let band: String?               // "n41", "B3"; nil for WCDMA
     let bandwidthMHz: Double?       // downlink
     let rsrp: Int?; let rsrq: Int?; let sinr: Double?    // dBm, dB, dB (LTE SINR converted); WCDMA: rsrp = RSCP
+    let scsKHz: Int?                // NR subcarrier spacing in kHz (15, 30, 60, 120, 240); nil outside NR or when unread
+
+    init(rat: String, duplex: String?, mcc: String?, mnc: String?, cellID: String?, pci: Int?, tac: String?,
+         channel: Int?, band: String?, bandwidthMHz: Double?, rsrp: Int?, rsrq: Int?, sinr: Double?, scsKHz: Int? = nil) {
+        self.rat = rat
+        self.duplex = duplex
+        self.mcc = mcc
+        self.mnc = mnc
+        self.cellID = cellID
+        self.pci = pci
+        self.tac = tac
+        self.channel = channel
+        self.band = band
+        self.bandwidthMHz = bandwidthMHz
+        self.rsrp = rsrp
+        self.rsrq = rsrq
+        self.sinr = sinr
+        self.scsKHz = scsKHz
+    }
 }
 
 struct ServingCell: Equatable { let state: String; let cells: [CellLeg] }   // state as given: "NOCONN", …
+
+/// One component carrier from AT+QCAINFO (`"PCC"` or `"SCC"`).
+struct CarrierComponent: Equatable {
+    let role: String                // "PCC" or "SCC"
+    let rat: String                 // "LTE", "NR5G", or ""
+    let band: String                // "n41", "B3", or raw band text (display-safe)
+    let channel: Int?               // ARFCN or EARFCN
+    let bandwidthMHz: Double?
+    let pci: Int?
+}
+
+/// Physical receive paths reported by AT+QRSRP / AT+QRSRQ / AT+QSINR.
+let antennaPortNames = ["PRX", "DRX", "RX2", "RX3"]
+
+/// Signal measurements for one antenna path (0...3). All three values are nil when the path is inactive or
+/// filtered as a sentinel.
+struct AntennaPort: Equatable {
+    let index: Int                  // 0...3
+    let name: String                // "PRX", "DRX", "RX2", "RX3"
+    let rsrp: Int?                  // dBm
+    let rsrq: Int?                  // dB
+    let sinr: Int?                  // dB
+
+    var isActive: Bool { rsrp != nil || rsrq != nil || sinr != nil }
+}
+
+/// Four-antenna signal set for one RAT (`"LTE"` or `"NR5G"`).
+struct AntennaSignalSet: Equatable {
+    let rat: String                 // "LTE" or "NR5G"
+    let ports: [AntennaPort]        // always 4 ports (PRX, DRX, RX2, RX3)
+}
+
+/// One neighbour cell returned by AT+QENG="neighbourcell".
+struct NeighbourCell: Equatable {
+    let rat: String                 // "LTE", "NR5G", "WCDMA", …
+    let kind: String?               // "intra", "inter", or nil
+    let channel: Int?
+    let pci: Int?
+    let rsrp: Int?
+    let rsrq: Int?
+    let sinr: Int?
+}
 
 struct NetworkInfo: Equatable {
     var radio: RadioState? = nil
@@ -34,6 +95,7 @@ struct NetworkInfo: Equatable {
     var accessTechnology: Int? = nil     // AT+COPS? <AcT>
     var serving: ServingCell? = nil
     var carriers: [String] = []          // AT+QCAINFO bands, primary first
+    var carrierComponents: [CarrierComponent] = []
     var mode: String? = nil              // mode_pref exactly as the modem gave it ("AUTO", "LTE:NR5G")
     var nr5gDisable: Int? = nil
 }
@@ -231,10 +293,26 @@ private func hexDigitValue(_ c: UInt8) -> UInt8? {
 // NR <NR_DL_bandwidth> codes 0…16 and LTE <DL_bandwidth> codes 0…5, in MHz (Quectel's manual, 5.20).
 private let nrBandwidthsMHz: [Double] = [5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100, 200, 400, 35, 45]
 private let lteBandwidthsMHz: [Double] = [1.4, 3, 5, 10, 15, 20]
+private let lteCaBandwidthByRb: [Int: Double] = [6: 1.4, 15: 3, 25: 5, 50: 10, 75: 15, 100: 20]
+private let nrScsKHzTable: [Int] = [15, 30, 60, 120, 240]
 
 private func bandwidth(_ table: [Double], _ code: Int?) -> Double? {
     guard let c = code, c >= 0, c < table.count else { return nil }
     return table[c]
+}
+
+private func intCodeValue(_ fields: [String], _ index: Int, in table: [Int]) -> Int? {
+    guard let c = intField(fields, index), c >= 0, c < table.count else { return nil }
+    return table[c]
+}
+
+/// Default NR subcarrier spacing in kHz when Quectel omits `<scs>` (e.g. an SCC in AT+QCAINFO).
+func defaultNrScsKHz(band: Int, duplex: String? = nil) -> Int {
+    if duplex == "TDD" { return 30 }
+    if duplex == "FDD" { return 15 }
+    if band >= 257 { return 120 }
+    if [34, 38, 39, 40, 41, 46, 48, 50, 51, 53, 77, 78, 79, 90].contains(band) { return 30 }
+    return 15
 }
 
 /// A band number with its RAT's mark: NR 41 → "n41", LTE 3 → "B3"; nil unless a positive number.
@@ -246,7 +324,7 @@ private func band(_ mark: String, _ number: Int?) -> String? {
 /// A leg whose RAT is not one of the four formats known here: its name, and no field guessed.
 private func legWithoutFields(_ rat: String) -> CellLeg {
     CellLeg(rat: rat, duplex: nil, mcc: nil, mnc: nil, cellID: nil, pci: nil, tac: nil, channel: nil, band: nil,
-            bandwidthMHz: nil, rsrp: nil, rsrq: nil, sinr: nil)
+            bandwidthMHz: nil, rsrp: nil, rsrq: nil, sinr: nil, scsKHz: nil)
 }
 
 /// The leg whose RAT is field `r`; its other fields are taken by position after it (manual, 5.20).
@@ -254,12 +332,13 @@ private func cellLeg(_ f: [String], rat r: Int) -> CellLeg? {
     guard let rat = textField(f, r) else { return nil }
     switch rat {
     case "NR5G-SA":
-        // <duplex>,<MCC>,<MNC>,<cellID>,<PCID>,<TAC>,<ARFCN>,<band>,<NR_DL_bandwidth>,<RSRP>,<RSRQ>,<SINR>,…
+        // <duplex>,<MCC>,<MNC>,<cellID>,<PCID>,<TAC>,<ARFCN>,<band>,<NR_DL_bandwidth>,<RSRP>,<RSRQ>,<SINR>,<scs>,…
         return CellLeg(rat: rat, duplex: textField(f, r + 1), mcc: textField(f, r + 2), mnc: textField(f, r + 3),
                        cellID: textField(f, r + 4), pci: intField(f, r + 5), tac: textField(f, r + 6),
                        channel: intField(f, r + 7), band: band("n", intField(f, r + 8)),
                        bandwidthMHz: bandwidth(nrBandwidthsMHz, intField(f, r + 9)),
-                       rsrp: intField(f, r + 10), rsrq: intField(f, r + 11), sinr: decimalField(f, r + 12))
+                       rsrp: intField(f, r + 10), rsrq: intField(f, r + 11), sinr: decimalField(f, r + 12),
+                       scsKHz: intCodeValue(f, r + 13, in: nrScsKHzTable))
     case "LTE":
         // <is_tdd>,<MCC>,<MNC>,<cellID>,<PCID>,<earfcn>,<freq_band_ind>,<UL_bandwidth>,<DL_bandwidth>,<TAC>,
         // <RSRP>,<RSRQ>,<RSSI>,<SINR>,… ; the SINR is raw: dB = raw × 2 − 20 (nil unless finite).
@@ -270,11 +349,12 @@ private func cellLeg(_ f: [String], rat r: Int) -> CellLeg? {
                        rsrp: intField(f, r + 11), rsrq: intField(f, r + 12),
                        sinr: decimalField(f, r + 14).flatMap { finite($0 * 2 - 20) })
     case "NR5G-NSA":
-        // <MCC>,<MNC>,<PCID>,<RSRP>,<SINR>,<RSRQ>,<ARFCN>,<band>,<NR_DL_bandwidth>,… (SINR before RSRQ)
+        // <MCC>,<MNC>,<PCID>,<RSRP>,<SINR>,<RSRQ>,<ARFCN>,<band>,<NR_DL_bandwidth>,<scs>,… (SINR before RSRQ)
         return CellLeg(rat: rat, duplex: nil, mcc: textField(f, r + 1), mnc: textField(f, r + 2), cellID: nil,
                        pci: intField(f, r + 3), tac: nil, channel: intField(f, r + 7), band: band("n", intField(f, r + 8)),
                        bandwidthMHz: bandwidth(nrBandwidthsMHz, intField(f, r + 9)),
-                       rsrp: intField(f, r + 4), rsrq: intField(f, r + 6), sinr: decimalField(f, r + 5))
+                       rsrp: intField(f, r + 4), rsrq: intField(f, r + 6), sinr: decimalField(f, r + 5),
+                       scsKHz: intCodeValue(f, r + 10, in: nrScsKHzTable))
     case "WCDMA":
         // <MCC>,<MNC>,<LAC>,<cellID>,<uarfcn>,<PSC>,<RAC>,<RSCP>,<ecio>,…
         return CellLeg(rat: rat, duplex: nil, mcc: textField(f, r + 1), mnc: textField(f, r + 2),
@@ -305,27 +385,134 @@ func parseServingCell(_ lines: [String]) -> ServingCell? {
     return answered ? ServingCell(state: state ?? "", cells: cells) : nil
 }
 
-/// AT+QCAINFO: the band of each carrier, `"PCC"` lines first, then `"SCC"` lines in order.
-/// "NR5G BAND 41" → "n41", "LTE BAND 3" → "B3"; another text is kept as given (display-safe).
-func parseCarriers(_ lines: [String]) -> [String] {
-    var primary: [String] = []
-    var secondary: [String] = []
+/// AT+QCAINFO: full component carrier details (role, RAT, band, ARFCN/EARFCN, bandwidth in MHz, PCI),
+/// `"PCC"` lines first, then `"SCC"` lines in order.
+func parseCarrierComponents(_ lines: [String]) -> [CarrierComponent] {
+    var primary: [CarrierComponent] = []
+    var secondary: [CarrierComponent] = []
     for line in lines {
-        guard let f = atFields(line, prefix: "+QCAINFO"), let text = textField(f, 3) else { continue }
-        switch field(f, 0) {
-        case "PCC": primary.append(carrierBand(text))
-        case "SCC": secondary.append(carrierBand(text))
-        default: continue
+        guard let f = atFields(line, prefix: "+QCAINFO"), let role = field(f, 0),
+              role == "PCC" || role == "SCC", let rawBand = textField(f, 3) else { continue }
+        let channel = intField(f, 1).flatMap { $0 >= 0 ? $0 : nil }
+        let component: CarrierComponent
+        if rawBand.hasPrefix("LTE BAND "), let b = band("B", Int(rawBand.dropFirst("LTE BAND ".count))) {
+            let bw = intField(f, 2).flatMap { lteCaBandwidthByRb[$0] }
+            let rawPci = f.count >= 6 ? intField(f, 5) : nil
+            let pci = rawPci.flatMap { (0...503).contains($0) ? $0 : nil }
+            component = CarrierComponent(role: role, rat: "LTE", band: b, channel: channel, bandwidthMHz: bw, pci: pci)
+        } else if let nrBand = nrCarrierBand(rawBand) {
+            let bw = bandwidth(nrBandwidthsMHz, intField(f, 2))
+            // Short NR lines (PCC or EN-DC SCC, 5–8 fields) carry PCI at field 4; longer SCC lines (9+ fields)
+            // carry state at field 4 and PCI at field 5.
+            let rawPci = f.count >= 9 ? intField(f, 5) : intField(f, 4)
+            let pci = rawPci.flatMap { (0...1007).contains($0) ? $0 : nil }
+            component = CarrierComponent(role: role, rat: "NR5G", band: nrBand, channel: channel, bandwidthMHz: bw, pci: pci)
+        } else {
+            component = CarrierComponent(role: role, rat: "", band: rawBand, channel: channel, bandwidthMHz: nil, pci: nil)
         }
+        if role == "PCC" { primary.append(component) } else { secondary.append(component) }
     }
     return primary + secondary
 }
 
-private func carrierBand(_ text: String) -> String {
-    for (head, mark) in [("NR5G BAND ", "n"), ("LTE BAND ", "B")] where text.hasPrefix(head) {
-        if let b = band(mark, Int(text.dropFirst(head.count))) { return b }
+private func nrCarrierBand(_ text: String) -> String? {
+    for head in ["NR5G BAND ", "NRDC BAND "] where text.hasPrefix(head) {
+        if let b = band("n", Int(text.dropFirst(head.count))) { return b }
     }
-    return text
+    return nil
+}
+
+/// AT+QCAINFO: the band of each carrier, `"PCC"` lines first, then `"SCC"` lines in order.
+/// "NR5G BAND 41" → "n41", "LTE BAND 3" → "B3"; another text is kept as given (display-safe).
+func parseCarriers(_ lines: [String]) -> [String] {
+    parseCarrierComponents(lines).map { $0.band }
+}
+
+/// AT+QRSRP, AT+QRSRQ, AT+QSINR: `<p0>,<p1>,<p2>,<p3>,<sysmode>`.
+/// Filters `-32768`, empty/`-`, out-of-range metrics, and correlated inactive floor sentinels (`RSRP == -140`
+/// when RSRQ is absent, SINR is absent, or SINR == -20).
+func parseAntennaSignals(rsrp rsrpLines: [String], rsrq rsrqLines: [String],
+                        sinr sinrLines: [String]) -> [AntennaSignalSet] {
+    func mapByRat(_ lines: [String], prefix: String, range: ClosedRange<Int>) -> (order: [String], values: [String: [Int?]]) {
+        var order: [String] = []
+        var values: [String: [Int?]] = [:]
+        for line in lines {
+            guard let f = atFields(line, prefix: prefix), f.count >= 5,
+                  let rat = textField(f, 4), values[rat] == nil else { continue }
+            order.append(rat)
+            values[rat] = (0..<4).map { i in
+                guard let v = intField(f, i), v != -32768, range.contains(v) else { return nil }
+                return v
+            }
+        }
+        return (order, values)
+    }
+
+    let rsrpMap = mapByRat(rsrpLines, prefix: "+QRSRP", range: -150 ... -30)
+    let rsrqMap = mapByRat(rsrqLines, prefix: "+QRSRQ", range: -30 ... 0)
+    let sinrMap = mapByRat(sinrLines, prefix: "+QSINR", range: -30 ... 50)
+
+    var allRats: [String] = []
+    for rat in rsrpMap.order + rsrqMap.order + sinrMap.order where !allRats.contains(rat) {
+        allRats.append(rat)
+    }
+    let preferred = ["LTE", "NR5G"]
+    let orderedRats = preferred.filter { allRats.contains($0) } + allRats.filter { !preferred.contains($0) }
+
+    return orderedRats.map { rat in
+        let rsrps = rsrpMap.values[rat] ?? [nil, nil, nil, nil]
+        let rsrqs = rsrqMap.values[rat] ?? [nil, nil, nil, nil]
+        let sinrs = sinrMap.values[rat] ?? [nil, nil, nil, nil]
+        let ports = (0..<4).map { i -> AntennaPort in
+            var p = rsrps[i]
+            var q = rsrqs[i]
+            var s = sinrs[i]
+            if p == -140 && (q == nil || s == nil || s == -20) {
+                p = nil; q = nil; s = nil
+            } else if s == -20 && p == nil && q == nil {
+                s = nil
+            }
+            return AntennaPort(index: i, name: antennaPortNames[i], rsrp: p, rsrq: q, sinr: s)
+        }
+        return AntennaSignalSet(rat: rat, ports: ports)
+    }
+}
+
+/// AT+QENG="neighbourcell": `+QENG: "neighbourcell intra","LTE",<earfcn>,<pcid>,<rsrq>,<rsrp>,<rssi>,<sinr>,…`
+/// or `"neighbourcell","WCDMA",…` or `"neighbourcell…","NR5G",…`.
+func parseNeighbourCells(_ lines: [String]) -> [NeighbourCell] {
+    var out: [NeighbourCell] = []
+    for line in lines {
+        guard let f = atFields(line, prefix: "+QENG"), let tag = textField(f, 0),
+              tag.hasPrefix("neighbourcell"), let rat = textField(f, 1) else { continue }
+        let kind: String?
+        if tag == "neighbourcell intra" {
+            kind = "intra"
+        } else if tag == "neighbourcell inter" {
+            kind = "inter"
+        } else {
+            let suffix = tag.dropFirst("neighbourcell".count).trimmingCharacters(in: .whitespaces)
+            kind = suffix.isEmpty ? nil : suffix
+        }
+        switch rat {
+        case "LTE":
+            let rsrp = intField(f, 5)
+            let rsrq = intField(f, 4)
+            let sinr = intField(f, 7)
+            out.append(NeighbourCell(rat: rat, kind: kind, channel: intField(f, 2), pci: intField(f, 3),
+                                     rsrp: rsrp, rsrq: rsrq, sinr: sinr))
+        case "NR5G", "NR5G-SA", "NR5G-NSA":
+            out.append(NeighbourCell(rat: "NR5G", kind: kind, channel: intField(f, 2), pci: intField(f, 3),
+                                     rsrp: intField(f, 4), rsrq: intField(f, 5), sinr: intField(f, 6)))
+        case "WCDMA":
+            out.append(NeighbourCell(rat: rat, kind: kind, channel: intField(f, 2), pci: intField(f, 4),
+                                     rsrp: intField(f, 5), rsrq: nil, sinr: nil))
+        default:
+            out.append(NeighbourCell(rat: rat, kind: kind, channel: intField(f, 2), pci: intField(f, 3),
+                                     rsrp: nil, rsrq: nil, sinr: nil))
+        }
+    }
+    return out
 }
 
 /// The value of one AT+QNWPREFCFG setting: `+QNWPREFCFG: "<name>",<value>`.
@@ -504,7 +691,29 @@ private func channelWords(_ leg: CellLeg) -> String {
         parts.append("\(name) \(v)")
     }
     if let v = leg.bandwidthMHz { parts.append("\(decimalWords(v)) MHz") }
+    if let scs = leg.scsKHz { parts.append("SCS \(scs) kHz") }
     return parts.joined(separator: ", ")
+}
+
+/// Rows for `RMNet antennas`: one line per receive antenna path (`PRX`, `DRX`, `RX2`, `RX3`) for each RAT.
+func antennaRows(_ sets: [AntennaSignalSet]) -> [(label: String, value: String)] {
+    var rows: [(label: String, value: String)] = []
+    for set in sets {
+        let ratPrefix = sets.count > 1 ? "\(set.rat) " : ""
+        for port in set.ports {
+            let label = "\(ratPrefix)\(port.name)"
+            if !port.isActive {
+                rows.append((label: label, value: "inactive"))
+                continue
+            }
+            var parts: [String] = []
+            if let v = port.rsrp { parts.append("RSRP \(v) dBm") }
+            if let v = port.rsrq { parts.append("RSRQ \(v) dB") }
+            if let v = port.sinr { parts.append("SINR \(v) dB") }
+            rows.append((label: label, value: parts.joined(separator: ", ")))
+        }
+    }
+    return rows
 }
 
 private func connectionWords(_ state: String) -> String {
@@ -593,8 +802,25 @@ private func statusKey(_ status: RegistrationStatus) -> String {
 private func legJSON(_ leg: CellLeg) -> [String: Any] {
     ["rat": leg.rat, "duplex": orNull(leg.duplex), "mcc": orNull(leg.mcc), "mnc": orNull(leg.mnc),
      "cellId": orNull(leg.cellID), "pci": orNull(leg.pci), "tac": orNull(leg.tac), "channel": orNull(leg.channel),
-     "band": orNull(leg.band), "bandwidthMHz": orNull(leg.bandwidthMHz), "rsrp": orNull(leg.rsrp),
-     "rsrq": orNull(leg.rsrq), "sinr": orNull(leg.sinr)]
+     "band": orNull(leg.band), "bandwidthMHz": orNull(leg.bandwidthMHz), "scsKHz": orNull(leg.scsKHz),
+     "rsrp": orNull(leg.rsrp), "rsrq": orNull(leg.rsrq), "sinr": orNull(leg.sinr)]
+}
+
+private func carrierComponentJSON(_ c: CarrierComponent) -> [String: Any] {
+    ["role": c.role, "rat": c.rat, "band": c.band, "channel": orNull(c.channel),
+     "bandwidthMHz": orNull(c.bandwidthMHz), "pci": orNull(c.pci)]
+}
+
+/// `RMNet antennas --json`.
+func antennasJSON(_ sets: [AntennaSignalSet]) -> [String: Any] {
+    let rats: [[String: Any]] = sets.map { set in
+        let ports: [[String: Any]] = set.ports.map { p in
+            ["index": p.index, "name": p.name, "active": p.isActive,
+             "rsrp": orNull(p.rsrp), "rsrq": orNull(p.rsrq), "sinr": orNull(p.sinr)]
+        }
+        return ["rat": set.rat, "ports": ports]
+    }
+    return ["rats": rats]
 }
 
 /// `RMNet network --json`: every key is always there; a value not read is null (also `state` when the
@@ -612,6 +838,7 @@ func networkJSON(_ info: NetworkInfo) -> [String: Any] {
         "state": orNull(info.serving.flatMap { $0.state.isEmpty ? nil : $0.state }),
         "cells": orNull(info.serving.map { $0.cells.map(legJSON) }),
         "carriers": info.carriers,
+        "carrierComponents": info.carrierComponents.map(carrierComponentJSON),
         "mode": orNull(info.mode),
         "nr5gDisableMode": orNull(info.nr5gDisable),
     ]

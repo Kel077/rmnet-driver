@@ -242,7 +242,8 @@ func networkScript(qcainfo qca: Answer = .success(qcainfo)) -> [(String, Answer)
 }
 
 let saLeg = CellLeg(rat: "NR5G-SA", duplex: "TDD", mcc: "460", mnc: "00", cellID: "123456789", pci: 32,
-                    tac: "1A2B3C", channel: 504990, band: "n41", bandwidthMHz: 100, rsrp: -95, rsrq: -10, sinr: 8)
+                    tac: "1A2B3C", channel: 504990, band: "n41", bandwidthMHz: 100, rsrp: -95, rsrq: -10, sinr: 8,
+                    scsKHz: 30)
 let homeSA = Registration(status: .home, domain: "5GS")
 let searchingSA = Registration(status: .searching, domain: "5GS")
 
@@ -256,6 +257,7 @@ let saInfo: NetworkInfo = {
     info.accessTechnology = 11
     info.serving = ServingCell(state: "NOCONN", cells: [saLeg])
     info.carriers = ["n41", "n28"]
+    info.carrierComponents = parseCarrierComponents(qcainfo)
     info.mode = "AUTO"
     info.nr5gDisable = 0
     return info
@@ -392,6 +394,9 @@ struct ModemServiceTests {
         profileWayBack()
         sim()
         pinEntry()
+        antennas()
+        cellLock()
+        imei()
         print("modem service: \(checks) checks passed")
     }
 
@@ -425,6 +430,7 @@ struct ModemServiceTests {
             let info = success(rig.service.networkInfo(), "networkInfo, QCAINFO refused")
             var want = saInfo
             want.carriers = []
+            want.carrierComponents = []
             check(info == want, "networkInfo: +CME ERROR: 3 for AT+QCAINFO leaves carriers [] and reads on",
                   "\(String(describing: info))")
             expectLines(rig.port(1).lines, networkLines, "networkInfo, QCAINFO refused: all eleven reads")
@@ -1879,5 +1885,127 @@ struct ModemServiceTests {
         }
         check(allSent.filter { $0.contains(pin) }.allSatisfy { $0 == pinLine } && allSent.contains(pinLine),
               "enterPin: the PIN is in no line sent but AT+CPIN=\"…\"", linesText(allSent.filter { $0.contains(pin) }))
+    }
+
+    // MARK: antennas, cellLock, imei
+
+    static func antennas() {
+        do {
+            let rig = Rig([
+                ("AT+QRSRP", .success(["+QRSRP: -93,-110,-32768,-103,NR5G"])),
+                ("AT+QRSRQ", .success(["+QRSRQ: -11,-16,-32768,-11,NR5G"])),
+                ("AT+QSINR", .success(["+QSINR: 20,10,-32768,11,NR5G"])),
+            ])
+            let sets = success(rig.service.antennas(), "antennas: normal")
+            check(sets?.count == 1 && sets?[0].ports[0].rsrp == -93 && sets?[0].ports[2].rsrp == nil,
+                  "antennas: parsed 4 ports with sentinel filtering")
+            rig.finish("antennas: normal", opens: 1)
+        }
+        do {
+            let rig = Rig([("AT+QRSRP", timedOut), ("AT+QRSRQ", ok), ("AT+QSINR", ok)])
+            _ = failureMessage(rig.service.antennas(), "antennas: timeout")
+            expectLines(rig.port(1).lines, ["AT+QRSRP"], "antennas: stops after timeout")
+        }
+    }
+
+    static func cellLock() {
+        let unlocked4g: Answer = .success(["+QNWLOCK: \"common/4g\",0"])
+        let unlocked5g: Answer = .success(["+QNWLOCK: \"common/5g\",0"])
+        let persistOff: Answer = .success(["+QNWLOCK: \"save_ctrl\",0,0"])
+        let nr = NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41)
+        let locked5g: Answer = .success(["+QNWLOCK: \"common/5g\",147,520110,30,41"])
+
+        do {
+            let rig = Rig([
+                ("AT+QNWLOCK=\"common/4g\"", unlocked4g),
+                ("AT+QNWLOCK=\"common/5g\"", locked5g),
+                ("AT+QNWLOCK=\"save_ctrl\"", persistOff),
+                ("AT+QENG=\"neighbourcell\"", ok),
+            ])
+            let got = success(rig.service.cellLock(), "cellLock: read")
+            check(got == CellLockState(lte: [], nr: nr, persistLte: false, persistNr: false, neighbours: []),
+                  "cellLock: parsed", "\(String(describing: got))")
+            rig.finish("cellLock: read", opens: 1)
+        }
+        do {
+            let rig = Rig()
+            _ = failureMessage(rig.service.setNrCellLock(NrCellLock(pci: 1008, arfcn: 520110, scsKHz: 30, band: 41)),
+                               "setNrCellLock: invalid pci")
+            rig.finish("setNrCellLock: invalid pci", opens: 0)
+        }
+        do {
+            let rig = Rig([
+                ("AT+QNWLOCK=\"common/4g\"", unlocked4g),
+                ("AT+QNWLOCK=\"common/5g\"", unlocked5g),
+                ("AT+QNWLOCK=\"save_ctrl\"", persistOff),
+                ("AT+QNWPREFCFG=\"rf_band\"", .success(rfBandLines)),
+                ("AT+QNWLOCK=\"common/5g\",147,520110,30,41", ok),
+                ("AT+QNWLOCK=\"common/4g\"", unlocked4g),
+                ("AT+QNWLOCK=\"common/5g\"", locked5g),
+                ("AT+QNWLOCK=\"save_ctrl\"", persistOff),
+            ])
+            let ch = success(rig.service.setNrCellLock(nr), "setNrCellLock: lock")
+            check(ch == .changed(before: CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false),
+                                 after: CellLockState(lte: [], nr: nr, persistLte: false, persistNr: false)),
+                  "setNrCellLock: locked and verified")
+            rig.finish("setNrCellLock: lock", opens: 1)
+        }
+        do {
+            let rig = Rig([
+                ("AT+QNWLOCK=\"common/4g\"", unlocked4g),
+                ("AT+QNWLOCK=\"common/5g\"", unlocked5g),
+                ("AT+QNWLOCK=\"save_ctrl\"", persistOff),
+            ])
+            let ch = success(rig.service.setNrCellLock(nil), "setNrCellLock: already unlocked")
+            check(ch == .unchanged(CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false)),
+                  "setNrCellLock: already unlocked writes nothing")
+            rig.finish("setNrCellLock: already unlocked", opens: 1)
+        }
+    }
+
+    static func imei() {
+        let first = "000000000000091"
+        let next = "000000000000141"
+        let readFirst: Answer = .success(["+EGMR: \"\(first)\""])
+        let readNext: Answer = .success(["+EGMR: \"\(next)\""])
+
+        do {
+            let rig = Rig([("AT+EGMR=0,7", readFirst)])
+            check(success(rig.service.imei(), "imei: read") == first, "imei: reads 15 digits")
+            rig.finish("imei: read", opens: 1)
+        }
+        do {
+            let rig = Rig()
+            let msg = failureMessage(rig.service.setImei("000000000000142", reboot: true), "imei: invalid luhn")
+            check(msg.contains("check digit"), "imei: invalid luhn opens no port", msg)
+            rig.finish("imei: invalid luhn", opens: 0)
+        }
+        do {
+            let rig = Rig([("AT+EGMR=0,7", readFirst)])
+            check(success(rig.service.setImei(first, reboot: true), "imei: unchanged") == .unchanged(first),
+                  "imei: unchanged short-circuits")
+            rig.finish("imei: unchanged", opens: 1)
+        }
+        do {
+            let rig = Rig([
+                ("AT+EGMR=0,7", readFirst),
+                ("AT+EGMR=1,7,\"\(next)\"", ok),
+                ("AT+EGMR=0,7", readNext),
+            ])
+            let ch = success(rig.service.setImei(next, reboot: false), "imei: no reboot")
+            check(ch == .setTakesEffectAfterRestart(before: first, after: next), "imei: set without reboot")
+            rig.finish("imei: no reboot", opens: 1)
+        }
+        do {
+            let rig = Rig([
+                ("AT+EGMR=0,7", readFirst),
+                ("AT+EGMR=1,7,\"\(next)\"", ok),
+                ("AT+EGMR=0,7", readNext),
+                ("AT+CFUN=1,1", ok),
+            ])
+            let ch = success(rig.service.setImei(next, reboot: true), "imei: with reboot")
+            check(ch == .rebooting(before: first, after: next), "imei: set with reboot")
+            rig.finish("imei: with reboot", opens: 1)
+        }
     }
 }

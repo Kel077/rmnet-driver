@@ -36,8 +36,10 @@ let saInfo: NetworkInfo = {
                                               cs: parseRegistrationStat(["+CREG: 0,0"], prefix: "+CREG"))
     info.serving = parseServingCell(
         ["+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",460,00,123456789,32,1A2B3C,504990,41,12,-95,-10,8,1,-"])
-    info.carriers = parseCarriers(["+QCAINFO: \"PCC\",504990,12,\"NR5G BAND 41\",32",
-                                   "+QCAINFO: \"SCC\",155770,3,\"NR5G BAND 28\",1,6,0,-,-"])
+    let qca = ["+QCAINFO: \"PCC\",504990,12,\"NR5G BAND 41\",32",
+               "+QCAINFO: \"SCC\",155770,3,\"NR5G BAND 28\",1,6,0,-,-"]
+    info.carriers = parseCarriers(qca)
+    info.carrierComponents = parseCarrierComponents(qca)
     info.mode = parseModePreference(["+QNWPREFCFG: \"mode_pref\",AUTO"])
     info.nr5gDisable = parseNr5gDisable(["+QNWPREFCFG: \"nr5g_disable_mode\",0"])
     return info
@@ -118,6 +120,21 @@ final class FakeModem: ModemServing {
     var atResult: Result<[String], ModemFailure> = .success([])
     var bandsResult: Result<[BandSet], ModemFailure> = .success(bandSets())
     var setBandsResults: [BandRat: Result<BandChange, ModemFailure>] = [:]   // none: from the allowed list to the one asked
+    var antennasResult: Result<[AntennaSignalSet], ModemFailure> = .success([
+        AntennaSignalSet(rat: "NR5G", ports: [
+            AntennaPort(index: 0, name: "PRX", rsrp: -93, rsrq: -11, sinr: 20),
+            AntennaPort(index: 1, name: "DRX", rsrp: -110, rsrq: -16, sinr: 10),
+            AntennaPort(index: 2, name: "RX2", rsrp: nil, rsrq: nil, sinr: nil),
+            AntennaPort(index: 3, name: "RX3", rsrp: nil, rsrq: nil, sinr: nil),
+        ])
+    ])
+    var cellLockResult: Result<CellLockState, ModemFailure> = .success(
+        CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false))
+    var setNrLockResult: Result<CellLockChange, ModemFailure>? = nil
+    var setLteLockResult: Result<CellLockChange, ModemFailure>? = nil
+    var setPersistResult: Result<CellLockChange, ModemFailure>? = nil
+    var imeiResult: Result<String, ModemFailure> = .success("000000000000091")
+    var setImeiResult: Result<ImeiChange, ModemFailure>? = nil
 
     var radioAsked: [Bool] = []
     var modesAsked: [String] = []
@@ -126,10 +143,18 @@ final class FakeModem: ModemServing {
     var usbModesSet: [String] = []                                    // "<mode> reboot" or "<mode> no reboot"
     var atSent: [String] = []                                         // "<line> <timeout>"
     var bandsAsked: [String] = []                                     // "<rat> <bands joined by :>"
+    var nrLockSet: [NrCellLock?] = []
+    var lteLockSet: [[LteLockedCell]] = []
+    var persistSet: [(Bool, Bool)] = []
+    var imeiSetAsked: [(imei: String, reboot: Bool)] = []
 
     func networkInfo() -> Result<NetworkInfo, ModemFailure> {
         events.append("networkInfo")
         return networkResult
+    }
+    func antennas() -> Result<[AntennaSignalSet], ModemFailure> {
+        events.append("antennas")
+        return antennasResult
     }
     func setRadio(on: Bool) -> Result<RadioChange, ModemFailure> {
         events.append("setRadio")
@@ -185,6 +210,47 @@ final class FakeModem: ModemServing {
         if let result = setBandsResults[rat] { return result }
         let before = (try? bandsResult.get())?.first(where: { $0.rat == rat })?.allowed ?? []
         return .success(BandChange(before: before, after: bands))
+    }
+    func cellLock() -> Result<CellLockState, ModemFailure> {
+        events.append("cellLock")
+        return cellLockResult
+    }
+    func setNrCellLock(_ lock: NrCellLock?) -> Result<CellLockChange, ModemFailure> {
+        events.append("setNrCellLock")
+        nrLockSet.append(lock)
+        if let r = setNrLockResult { return r }
+        let before = (try? cellLockResult.get()) ?? CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false)
+        let after = CellLockState(lte: before.lte, nr: lock, persistLte: before.persistLte, persistNr: before.persistNr)
+        return .success(before == after ? .unchanged(after) : .changed(before: before, after: after))
+    }
+    func setLteCellLock(_ cells: [LteLockedCell]) -> Result<CellLockChange, ModemFailure> {
+        events.append("setLteCellLock")
+        lteLockSet.append(cells)
+        if let r = setLteLockResult { return r }
+        let before = (try? cellLockResult.get()) ?? CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false)
+        let after = CellLockState(lte: cells, nr: before.nr, persistLte: before.persistLte, persistNr: before.persistNr)
+        return .success(before == after ? .unchanged(after) : .changed(before: before, after: after))
+    }
+    func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure> {
+        events.append("setCellLockPersist")
+        persistSet.append((lte, nr))
+        if let r = setPersistResult { return r }
+        let before = (try? cellLockResult.get()) ?? CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false)
+        let after = CellLockState(lte: before.lte, nr: before.nr, persistLte: lte, persistNr: nr)
+        return .success(before == after ? .unchanged(after) : .changed(before: before, after: after))
+    }
+    func imei() -> Result<String, ModemFailure> {
+        events.append("imei")
+        return imeiResult
+    }
+    func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure> {
+        events.append("setImei")
+        imeiSetAsked.append((imei: imei, reboot: reboot))
+        if let r = setImeiResult { return r }
+        let before = (try? imeiResult.get()) ?? "000000000000091"
+        if before == imei { return .success(.unchanged(before)) }
+        return .success(reboot ? .rebooting(before: before, after: imei)
+                               : .setTakesEffectAfterRestart(before: before, after: imei))
     }
 }
 
@@ -302,19 +368,42 @@ let restoreProfile1 = "apn: to put it back: RMNet apn set --apn '' --type ipv4v6
 struct ModemCliTests {
     static func main() {
         // --- the verbs and the usage -------------------------------------------------------------
-        check(modemVerbs == ["network", "radio", "mode", "apn", "sim", "usbmode", "at", "bands"], "modemVerbs",
-              "\(modemVerbs.sorted())")
-        check(modemUsage == "network [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | apn [show] [--json] | "
-              + "apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] [--password | --no-password] "
-              + "[--auth none|pap|chap|pap-or-chap] [--no-redial] | sim [--json] | sim unlock [--last-attempt] | "
+        check(modemVerbs == ["network", "antennas", "radio", "mode", "apn", "sim", "usbmode", "at", "bands",
+                             "cell", "imei"], "modemVerbs", "\(modemVerbs.sorted())")
+        check(modemUsage == "network [--json] | antennas [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | "
+              + "apn [show] [--json] | apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] "
+              + "[--password | --no-password] [--auth none|pap|chap|pap-or-chap] [--no-redial] | "
+              + "sim [--json] | sim unlock [--last-attempt] | "
               + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes] | "
               + "at [--timeout <seconds>] <command> | "
-              + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa]",
+              + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa] | "
+              + "cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current | "
+              + "cell lock lte <earfcn>:<pci>[,…] | cell unlock [sa|lte] | cell persist on|off | "
+              + "imei [--json] | imei set <imei> [--no-reboot] [--yes]",
               "modemUsage: the brief's usage without the leading RMNet", modemUsage)
 
         // --- parseModem: every form --------------------------------------------------------------
         expectParse(["network"], .network(json: false))
         expectParse(["network", "--json"], .network(json: true))
+        expectParse(["antennas"], .antennas(json: false))
+        expectParse(["antennas", "--json"], .antennas(json: true))
+        expectParse(["cell"], .cellShow(json: false))
+        expectParse(["cell", "--json"], .cellShow(json: true))
+        expectParse(["cell", "lock", "current"], .cellLockCurrent)
+        expectParse(["cell", "lock", "sa", "147", "520110", "30", "n41"],
+                    .cellLockNr(NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41)))
+        expectParse(["cell", "lock", "lte", "1300:128,100:45"],
+                    .cellLockLte([LteLockedCell(earfcn: 1300, pci: 128), LteLockedCell(earfcn: 100, pci: 45)]))
+        expectParse(["cell", "unlock"], .cellUnlock(.both))
+        expectParse(["cell", "unlock", "sa"], .cellUnlock(.sa))
+        expectParse(["cell", "unlock", "lte"], .cellUnlock(.lte))
+        expectParse(["cell", "persist", "on"], .cellPersist(true))
+        expectParse(["cell", "persist", "off"], .cellPersist(false))
+        expectParse(["imei"], .imeiShow(json: false))
+        expectParse(["imei", "--json"], .imeiShow(json: true))
+        expectParse(["imei", "set", "000000000000141"], .imeiSet("000000000000141", reboot: true, yes: false))
+        expectParse(["imei", "set", "000000000000141", "--no-reboot", "--yes"],
+                    .imeiSet("000000000000141", reboot: false, yes: true))
         expectParse(["radio"], .radio(on: nil))
         expectParse(["radio", "on"], .radio(on: true))
         expectParse(["radio", "off"], .radio(on: false))
@@ -405,10 +494,14 @@ struct ModemCliTests {
         let changing: [ModemCommand] = [.radio(on: true), .radio(on: false), .mode("LTE"), apnSet(apn: "x"),
                                         .simUnlock(lastAttempt: false), .simUnlock(lastAttempt: true),
                                         .usbModeSet(.qmi, reboot: true, yes: false), .usbModeSet(.ecm, reboot: false, yes: true),
-                                        .bandsSet(.sa, [41]), .bandsSet(.lte, [3, 41]), .bandsReset(nil), .bandsReset(.nsa)]
-        let reading: [ModemCommand] = [.network(json: false), .network(json: true), .radio(on: nil), .mode(nil),
+                                        .bandsSet(.sa, [41]), .bandsSet(.lte, [3, 41]), .bandsReset(nil), .bandsReset(.nsa),
+                                        .cellLockCurrent, .cellUnlock(.both), .cellPersist(true),
+                                        .imeiSet("000000000000141", reboot: true, yes: false)]
+        let reading: [ModemCommand] = [.network(json: false), .network(json: true), .antennas(json: false),
+                                       .radio(on: nil), .mode(nil),
                                        .apnShow(json: false), .apnShow(json: true), .sim(json: false), .sim(json: true),
-                                       .usbMode(json: false), .usbMode(json: true), .bands(json: false), .bands(json: true)]
+                                       .usbMode(json: false), .usbMode(json: true), .bands(json: false), .bands(json: true),
+                                       .cellShow(json: false), .imeiShow(json: false)]
         for c in changing { check(c.changesModem, "changesModem: \(c) changes the modem") }
         for c in reading { check(!c.changesModem, "changesModem: \(c) only reads") }
         // `at` sends what the owner typed, also a change such as AT+CFUN=1,1, and Ctrl-C stops it all the same.
@@ -424,7 +517,7 @@ struct ModemCliTests {
             "band: n41 + n28 (carrier aggregation)",
             "signal: RSRP -95 dBm, RSRQ -10 dB, SINR 8 dB",
             "cell: PCI 32, cell ID 123456789, TAC 1A2B3C",
-            "channel: ARFCN 504990, 100 MHz",
+            "channel: ARFCN 504990, 100 MHz, SCS 30 kHz",
             "connection: idle",
             "radio: on",
             "network mode: automatic (5G, LTE and WCDMA)",
@@ -1548,5 +1641,67 @@ struct ModemCliTests {
         expectLines(run(["bands", "reset"], fake, "bands reset, read failed"),
                     ["bands: Fake: no modem. Nothing was changed."], code: 1, "bands reset: the read failed")
         check(fake.bandsAsked.isEmpty, "bands reset: the read failed, nothing set")
+
+        // --- antennas, cell & imei ---------------------------------------------------------------
+        fake = FakeModem()
+        expectLines(run(["antennas"], fake, "antennas"), [
+            "prx: RSRP -93 dBm, RSRQ -11 dB, SINR 20 dB",
+            "drx: RSRP -110 dBm, RSRQ -16 dB, SINR 10 dB",
+            "rx2: inactive",
+            "rx3: inactive",
+        ], code: 0, "antennas: prints 4 paths")
+
+        fake = FakeModem()
+        expectLines(run(["cell"], fake, "cell"), [
+            "5g sa lock: unlocked",
+            "lte lock: unlocked",
+            "persist across restart: off (temporary until restart)",
+        ], code: 0, "cell: unlocked")
+
+        fake = FakeModem()
+        expectLines(run(["cell", "lock", "current"], fake, "cell lock current"), [
+            "cell: Locked 5G SA cell to band n41, PCI 32, ARFCN 504990, SCS 30 kHz.",
+        ], code: 0, "cell lock current: locks SA leg")
+        check(fake.nrLockSet == [NrCellLock(pci: 32, arfcn: 504990, scsKHz: 30, band: 41)],
+              "cell lock current: passed right NR parameters")
+
+        fake = FakeModem()
+        expectLines(run(["cell", "lock", "sa", "147", "520110", "30", "n41"], fake, "cell lock sa"), [
+            "cell: Locked 5G SA cell to band n41, PCI 147, ARFCN 520110, SCS 30 kHz.",
+        ], code: 0, "cell lock sa")
+
+        fake = FakeModem()
+        fake.cellLockResult = .success(CellLockState(lte: [],
+                                                     nr: NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41),
+                                                     persistLte: false, persistNr: false))
+        expectLines(run(["cell", "unlock"], fake, "cell unlock"), [
+            "cell: Unlocked 5G SA cell lock.",
+        ], code: 0, "cell unlock: unlocks active lock")
+
+        fake = FakeModem()
+        expectLines(run(["imei"], fake, "imei"), ["imei: 000000000000091"], code: 0, "imei")
+
+        fake = FakeModem()
+        let badImeiRun = run(["imei", "set", "000000000000142"], fake, "imei bad luhn")
+        expectLines(badImeiRun, [
+            "imei: The IMEI check digit is not valid (expected 1 as the 15th digit). Nothing was changed.",
+        ], code: 1, "imei set: rejects invalid Luhn without opening modem")
+        check(fake.events.filter { $0 != "output" }.isEmpty, "imei set: bad Luhn touched nothing")
+
+        fake = FakeModem()
+        expectLines(run(["imei", "set", "000000000000091"], fake, "imei unchanged"), [
+            "imei: already 000000000000091; nothing changed",
+        ], code: 0, "imei set: unchanged")
+
+        fake = FakeModem()
+        expectLines(run(["imei", "set", "000000000000141"], fake, answer: nil, "imei no tty"), [
+            "imei: no terminal to ask on, so nothing changed; run again with --yes to restart the modem without asking",
+        ], code: 2, "imei set: refuses restart without terminal")
+
+        fake = FakeModem()
+        expectLines(run(["imei", "set", "000000000000141", "--yes"], fake, "imei --yes"), [
+            "imei: IMEI set to 000000000000141; the modem is restarting.",
+            "imei: to put it back: RMNet imei set 000000000000091",
+        ], code: 0, "imei set --yes")
     }
 }

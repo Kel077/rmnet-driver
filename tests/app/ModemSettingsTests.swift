@@ -86,6 +86,7 @@ func expectNoSecret(_ text: String, _ name: String) {
 struct NoModem: ModemServing {
     let failure = ModemFailure(message: "The modem is not attached.")
     func networkInfo() -> Result<NetworkInfo, ModemFailure> { .failure(failure) }
+    func antennas() -> Result<[AntennaSignalSet], ModemFailure> { .failure(failure) }
     func setRadio(on: Bool) -> Result<RadioChange, ModemFailure> { .failure(failure) }
     func setMode(_ mode: String) -> Result<ModeChange, ModemFailure> { .failure(failure) }
     func profiles() -> Result<[DataProfile], ModemFailure> { .failure(failure) }
@@ -99,6 +100,12 @@ struct NoModem: ModemServing {
     func at(_ line: String, timeout: TimeInterval) -> Result<[String], ModemFailure> { .failure(failure) }
     func bands() -> Result<[BandSet], ModemFailure> { .failure(failure) }
     func setBands(_ rat: BandRat, to bands: [Int]) -> Result<BandChange, ModemFailure> { .failure(failure) }
+    func cellLock() -> Result<CellLockState, ModemFailure> { .failure(failure) }
+    func setNrCellLock(_ lock: NrCellLock?) -> Result<CellLockChange, ModemFailure> { .failure(failure) }
+    func setLteCellLock(_ cells: [LteLockedCell]) -> Result<CellLockChange, ModemFailure> { .failure(failure) }
+    func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure> { .failure(failure) }
+    func imei() -> Result<String, ModemFailure> { .failure(failure) }
+    func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure> { .failure(failure) }
 }
 
 @main
@@ -746,6 +753,67 @@ struct ModemSettingsTests {
         expectEqual(pinSentence(PinOutcome(accepted: true, sim: nil)), "The SIM accepted the PIN.", "pinSentence: accepted, unread")
         expectEqual(pinSentence(PinOutcome(accepted: true, sim: SimInfo(state: .pin2, pinLock: true, pinAttempts: 3, pukAttempts: 10))),
                     "The SIM accepted the PIN (SIM: asks for PIN2).", "pinSentence: accepted, another state")
+
+        // --- cell lock (AT+QNWLOCK) ------------------------------------------------------------
+        check(parseLteCellLock(["+QNWLOCK: \"common/4g\",0"]) == [], "parseLteCellLock: unlocked")
+        check(parseLteCellLock(["+QNWLOCK: \"common/4g\",2,1300,128,100,45"]) == [
+            LteLockedCell(earfcn: 1300, pci: 128), LteLockedCell(earfcn: 100, pci: 45),
+        ], "parseLteCellLock: 2 cells")
+        check(parseLteCellLock(["+QNWLOCK: \"common/4g\",2,1300,128"]) == nil, "parseLteCellLock: count mismatch")
+        check(parseLteCellLock([]) == nil, "parseLteCellLock: empty")
+
+        check(parseNrCellLock(["+QNWLOCK: \"common/5g\",0"]) == .unlocked, "parseNrCellLock: unlocked")
+        check(parseNrCellLock(["+QNWLOCK: \"common/5g\",147,520110,30,41"]) == .locked(
+            NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41)), "parseNrCellLock: locked")
+        check(parseNrCellLock(["+QNWLOCK: \"common/5g\",147,520110,30"]) == nil, "parseNrCellLock: missing band")
+
+        check(parseCellLockPersist(["+QNWLOCK: \"save_ctrl\",0,0"])! == (lte: false, nr: false), "parseCellLockPersist: 0,0")
+        check(parseCellLockPersist(["+QNWLOCK: \"save_ctrl\",1,1"])! == (lte: true, nr: true), "parseCellLockPersist: 1,1")
+        check(parseCellLockPersist(["+QNWLOCK: \"save_ctrl\",2,0"]) == nil, "parseCellLockPersist: invalid 2")
+
+        check(nrCellLockProblem(NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41), supportedSaBands: [25, 41, 71]) == nil,
+              "nrCellLockProblem: valid")
+        check(nrCellLockProblem(NrCellLock(pci: 1008, arfcn: 520110, scsKHz: 30, band: 41)) != nil, "nrCellLockProblem: pci > 1007")
+        check(nrCellLockProblem(NrCellLock(pci: 147, arfcn: 0, scsKHz: 30, band: 41)) != nil, "nrCellLockProblem: arfcn 0")
+        check(nrCellLockProblem(NrCellLock(pci: 147, arfcn: 520110, scsKHz: 25, band: 41)) != nil, "nrCellLockProblem: bad scs")
+        check(nrCellLockProblem(NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 78), supportedSaBands: [25, 41]) != nil,
+              "nrCellLockProblem: unsupported band")
+
+        check(lteCellLockProblem([LteLockedCell(earfcn: 1300, pci: 128)]) == nil, "lteCellLockProblem: valid")
+        check(lteCellLockProblem([LteLockedCell(earfcn: 1300, pci: 504)]) != nil, "lteCellLockProblem: pci > 503")
+        check(lteCellLockProblem([LteLockedCell(earfcn: 1300, pci: 1), LteLockedCell(earfcn: 1300, pci: 1)]) != nil,
+              "lteCellLockProblem: duplicate")
+        check(lteCellLockProblem((0...10).map { LteLockedCell(earfcn: 100, pci: $0) }) != nil,
+              "lteCellLockProblem: > 10 cells")
+
+        expectEqual(nrCellLockCommand(nil), "AT+QNWLOCK=\"common/5g\",0", "nrCellLockCommand: unlock")
+        expectEqual(nrCellLockCommand(NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41)),
+                    "AT+QNWLOCK=\"common/5g\",147,520110,30,41", "nrCellLockCommand: lock")
+        expectEqual(lteCellLockCommand([]), "AT+QNWLOCK=\"common/4g\",0", "lteCellLockCommand: unlock")
+        expectEqual(lteCellLockCommand([LteLockedCell(earfcn: 1300, pci: 128), LteLockedCell(earfcn: 100, pci: 45)]),
+                    "AT+QNWLOCK=\"common/4g\",2,1300,128,100,45", "lteCellLockCommand: lock")
+        expectEqual(cellLockPersistCommand(lte: true, nr: false), "AT+QNWLOCK=\"save_ctrl\",1,0", "cellLockPersistCommand")
+
+        let lockState = CellLockState(lte: [], nr: NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41),
+                                      persistLte: false, persistNr: false)
+        check(JSONSerialization.isValidJSONObject(cellLockJSON(lockState)), "cellLockJSON: valid")
+        expectEqual(cellLockSentence(.changed(before: CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false),
+                                              after: lockState)),
+                    "Locked 5G SA cell to band n41, PCI 147, ARFCN 520110, SCS 30 kHz.", "cellLockSentence: locked NR")
+
+        // --- IMEI (AT+EGMR) --------------------------------------------------------------------
+        check(parseImei(["+EGMR: \"000000000000141\""]) == "000000000000141", "parseImei: fixture")
+        check(parseImei(["+EGMR: \"123\""]) == nil, "parseImei: short gives nil")
+        check(parseImei([]) == nil, "parseImei: empty gives nil")
+        check(imeiCheckDigit(forFirst14: "00000000000014") == 1, "imeiCheckDigit: active IMEI")
+        check(imeiCheckDigit(forFirst14: "00000000000009") == 1, "imeiCheckDigit: factory IMEI")
+        check(imeiProblem("000000000000141") == nil, "imeiProblem: valid active")
+        check(imeiProblem("000000000000091") == nil, "imeiProblem: valid factory")
+        expectEqual(imeiProblem("000000000000142") ?? "",
+                    "The IMEI check digit is not valid (expected 1 as the 15th digit).", "imeiProblem: bad check digit")
+        expectEqual(imeiProblem("12345") ?? "", "An IMEI is 15 ASCII digits (0 to 9).", "imeiProblem: too short")
+        expectEqual(imeiCommand("000000000000141"), "AT+EGMR=1,7,\"000000000000141\"", "imeiCommand")
+        check(JSONSerialization.isValidJSONObject(imeiJSON("000000000000141")), "imeiJSON: valid")
 
         print("modem settings: \(checks) checks passed")
     }

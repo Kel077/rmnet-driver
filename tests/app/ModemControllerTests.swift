@@ -33,6 +33,10 @@ enum Call: Equatable {
     case enterPin(String, shownAttempts: Int)
     case bands                       // in `allCalls` only (it does not block: see bands())
     case setBands(BandRat, [Int])
+    case setNrCellLock(NrCellLock?)
+    case setLteCellLock([LteLockedCell])
+    case setCellLockPersist(Bool, Bool)
+    case setImei(String, reboot: Bool)
 }
 
 let queueKey = DispatchSpecificKey<String>()
@@ -60,6 +64,20 @@ final class FakeService: ModemServing, CustomReflectable {
     private var profileResults: [Result<ProfileChange, ModemFailure>] = []
     private var simResults: [Result<SimInfo, ModemFailure>] = []
     private var pinResults: [Result<PinOutcome, ModemFailure>] = []
+    private var antennasQueued: [Result<[AntennaSignalSet], ModemFailure>] = []
+    private var antennasDefault: Result<[AntennaSignalSet], ModemFailure> = .success([])
+    private var cellLockQueued: [Result<CellLockState, ModemFailure>] = []
+    private var cellLockDefault: Result<CellLockState, ModemFailure> = .success(
+        CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false))
+    private var imeiQueued: [Result<String, ModemFailure>] = []
+    private var imeiDefault: Result<String, ModemFailure> = .success("000000000000091")
+    private var setNrCellLockResults: [Result<CellLockChange, ModemFailure>] = []
+    private var setLteCellLockResults: [Result<CellLockChange, ModemFailure>] = []
+    private var setCellLockPersistResults: [Result<CellLockChange, ModemFailure>] = []
+    private var setImeiResults: [Result<ImeiChange, ModemFailure>] = []
+    private var antennasCount = 0
+    private var cellLockCount = 0
+    private var imeiCount = 0
     private var inside = 0   // calls entered and not yet returned
     private var mostInside = 0
     private var misplaced = 0  // calls made on the main thread or on another queue than the controller's
@@ -68,10 +86,25 @@ final class FakeService: ModemServing, CustomReflectable {
     var calls: [Call] { locked { log } }
     var allCalls: [Call] { locked { everything } }
     var bandsReads: Int { locked { everything.filter { $0 == .bands }.count } }
+    var antennasReads: Int { locked { antennasCount } }
+    var cellLockReads: Int { locked { cellLockCount } }
+    var imeiReads: Int { locked { imeiCount } }
     /// What a bands read answers when nothing is queued.
     var bandsAnswer: Result<[BandSet], ModemFailure> {
         get { locked { bandsDefault } }
         set { locked { bandsDefault = newValue } }
+    }
+    var antennasAnswer: Result<[AntennaSignalSet], ModemFailure> {
+        get { locked { antennasDefault } }
+        set { locked { antennasDefault = newValue } }
+    }
+    var cellLockAnswer: Result<CellLockState, ModemFailure> {
+        get { locked { cellLockDefault } }
+        set { locked { cellLockDefault = newValue } }
+    }
+    var imeiAnswer: Result<String, ModemFailure> {
+        get { locked { imeiDefault } }
+        set { locked { imeiDefault = newValue } }
     }
     var blocked: Int { locked { inside } }
     var mostAtOnce: Int { locked { mostInside } }
@@ -158,8 +191,67 @@ final class FakeService: ModemServing, CustomReflectable {
         return locked { setBandsResults.removeFirst() }
     }
 
+    func antennas() -> Result<[AntennaSignalSet], ModemFailure> {
+        let placed = !Thread.isMainThread && DispatchQueue.getSpecific(key: queueKey) == queueName
+        return locked {
+            antennasCount += 1
+            if !placed { misplaced += 1 }
+            inside += 1
+            mostInside = max(mostInside, inside)
+            inside -= 1
+            return antennasQueued.isEmpty ? antennasDefault : antennasQueued.removeFirst()
+        }
+    }
+
+    func cellLock() -> Result<CellLockState, ModemFailure> {
+        let placed = !Thread.isMainThread && DispatchQueue.getSpecific(key: queueKey) == queueName
+        return locked {
+            cellLockCount += 1
+            if !placed { misplaced += 1 }
+            inside += 1
+            mostInside = max(mostInside, inside)
+            inside -= 1
+            return cellLockQueued.isEmpty ? cellLockDefault : cellLockQueued.removeFirst()
+        }
+    }
+
+    func imei() -> Result<String, ModemFailure> {
+        let placed = !Thread.isMainThread && DispatchQueue.getSpecific(key: queueKey) == queueName
+        return locked {
+            imeiCount += 1
+            if !placed { misplaced += 1 }
+            inside += 1
+            mostInside = max(mostInside, inside)
+            inside -= 1
+            return imeiQueued.isEmpty ? imeiDefault : imeiQueued.removeFirst()
+        }
+    }
+
+    func setNrCellLock(_ lock: NrCellLock?) -> Result<CellLockChange, ModemFailure> {
+        enter(.setNrCellLock(lock))
+        return locked { setNrCellLockResults.removeFirst() }
+    }
+
+    func setLteCellLock(_ cells: [LteLockedCell]) -> Result<CellLockChange, ModemFailure> {
+        enter(.setLteCellLock(cells))
+        return locked { setLteCellLockResults.removeFirst() }
+    }
+
+    func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure> {
+        enter(.setCellLockPersist(lte, nr))
+        return locked { setCellLockPersistResults.removeFirst() }
+    }
+
+    func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure> {
+        enter(.setImei(imei, reboot: reboot))
+        return locked { setImeiResults.removeFirst() }
+    }
+
     /// The answer of the next bands read (then `bandsAnswer` again).
     func queueBands(_ r: Result<[BandSet], ModemFailure>) { locked { bandsQueued.append(r) } }
+    func queueAntennas(_ r: Result<[AntennaSignalSet], ModemFailure>) { locked { antennasQueued.append(r) } }
+    func queueCellLock(_ r: Result<CellLockState, ModemFailure>) { locked { cellLockQueued.append(r) } }
+    func queueImei(_ r: Result<String, ModemFailure>) { locked { imeiQueued.append(r) } }
 
     func releaseInfo(_ r: Result<NetworkInfo, ModemFailure>) { locked { infoResults.append(r) }; gate.signal() }
     func releaseRadio(_ r: Result<RadioChange, ModemFailure>) { locked { radioResults.append(r) }; gate.signal() }
@@ -169,6 +261,10 @@ final class FakeService: ModemServing, CustomReflectable {
     func releaseSim(_ r: Result<SimInfo, ModemFailure>) { locked { simResults.append(r) }; gate.signal() }
     func releasePin(_ r: Result<PinOutcome, ModemFailure>) { locked { pinResults.append(r) }; gate.signal() }
     func releaseSetBands(_ r: Result<BandChange, ModemFailure>) { locked { setBandsResults.append(r) }; gate.signal() }
+    func releaseSetNrCellLock(_ r: Result<CellLockChange, ModemFailure>) { locked { setNrCellLockResults.append(r) }; gate.signal() }
+    func releaseSetLteCellLock(_ r: Result<CellLockChange, ModemFailure>) { locked { setLteCellLockResults.append(r) }; gate.signal() }
+    func releaseSetCellLockPersist(_ r: Result<CellLockChange, ModemFailure>) { locked { setCellLockPersistResults.append(r) }; gate.signal() }
+    func releaseSetImei(_ r: Result<ImeiChange, ModemFailure>) { locked { setImeiResults.append(r) }; gate.signal() }
 }
 
 // MARK: - Helpers
@@ -389,6 +485,7 @@ struct ModemControllerTests {
         resuming()
         overviewReading()
         signalHistory()
+        antennasCellLockAndImei()
         check(changesSeen > 0, "main thread: the controllers' changes were watched")
         print("modem controller: \(checks) checks passed")
     }
@@ -2246,6 +2343,91 @@ struct ModemControllerTests {
                   "\(c.signalHistory.count) samples, first \(String(describing: c.signalHistory.first?.leg))")
         }
         check(c.signalHistory.last?.at == t0.addingTimeInterval(1_015), "history: the newest sample is last")
+        c.setTabShown(nil)
+    }
+
+    static func antennasCellLockAndImei() {
+        let rig = Rig()
+        let c = rig.controller
+
+        // Overview does NOT read antennas or cellLock.
+        c.setTabShown(.overview)
+        rig.answerInfo(1, .success(served([saLeg])), "overview read")
+        check(rig.fake.antennasReads == 0 && rig.fake.cellLockReads == 0,
+              "overview: skips antennas and cellLock reads")
+
+        // Network tab reads antennas when radio is on, and reads cellLock when due (cleared on success).
+        let antSample = [AntennaSignalSet(rat: "NR5G", ports: [
+            AntennaPort(index: 0, name: "PRX", rsrp: -90, rsrq: -10, sinr: 22),
+            AntennaPort(index: 1, name: "DRX", rsrp: nil, rsrq: nil, sinr: nil),
+            AntennaPort(index: 2, name: "RX2", rsrp: nil, rsrq: nil, sinr: nil),
+            AntennaPort(index: 3, name: "RX3", rsrp: nil, rsrq: nil, sinr: nil),
+        ])]
+        let nr = NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41)
+        let unlocked = CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false)
+        let lockedNr = CellLockState(lte: [], nr: nr, persistLte: false, persistNr: false)
+
+        rig.fake.queueAntennas(.success(antSample))
+        rig.fake.queueCellLock(.failure(portBusy))
+        c.setTabShown(.network)
+        rig.answerInfo(2, .success(served([saLeg])), "network first read with cellLock failure")
+        check(c.antennas == antSample && c.cellLock == nil && c.cellLockFailure == portBusy.message && c.cellLockDue,
+              "network: failed cellLock read keeps cellLockDue true", "\(c.cellLockFailure ?? "")")
+
+        // Next turn retries due cellLock; when radio is airplane, antennas are cleared without calling antennas().
+        rig.fake.queueCellLock(.success(unlocked))
+        c.tick()
+        rig.answerInfo(3, .success(NetworkInfo(radio: .airplane)), "network read in airplane mode")
+        check(c.antennas.isEmpty && rig.fake.antennasReads == 1 && rig.fake.cellLockReads == 2
+                && c.cellLock == unlocked && c.cellLockFailure == nil && !c.cellLockDue,
+              "network: airplane clears antennas without reading; successful cellLock clears failure and cellLockDue")
+
+        // Validation refusal before submitting change.
+        c.setNrCellLock(NrCellLock(pci: 2000, arfcn: 520110, scsKHz: 30, band: 41))
+        check(c.resultIsFailure && rig.fake.calls.count == 3, "cellLock: invalid PCI refused without calling service")
+
+        // Locking NR cell updates state and reads again; QuitGate wait works with cellLock quitLine.
+        c.setNrCellLock(nr)
+        rig.waitForCall(4, "setNrCellLock runs")
+        check(c.quitWhenFinished() && c.quitNotice.line == "RMNet quits when the cell lock has been changed.",
+              "cellLock: quit notice while locking")
+        rig.fake.releaseSetNrCellLock(.success(.changed(before: unlocked, after: lockedNr)))
+        pump(until: { rig.replies == [true] }, "quit answers true after cellLock")
+        c.resumeAfterCancelledQuit()
+        rig.answerInfo(5, .success(served([saLeg])), "read after resume")
+
+        // Unlock all runs both unlocks and updates cellLock.
+        c.unlockAllCells()
+        rig.waitForCall(6, "unlockAllCells: setNrCellLock(nil)")
+        rig.fake.releaseSetNrCellLock(.success(.changed(before: lockedNr, after: unlocked)))
+        rig.waitForCall(7, "unlockAllCells: setLteCellLock([])")
+        rig.fake.releaseSetLteCellLock(.success(.unchanged(unlocked)))
+        rig.answerInfo(8, .success(served([saLeg])), "read after unlockAllCells")
+        check(!c.resultIsFailure && c.cellLock == unlocked, "unlockAllCells: result updated", c.result)
+
+        // SIM & Data reads IMEI independently of profiles/sim; invalid Luhn rejected before queueing.
+        rig.fake.queueImei(.failure(portBusy))
+        c.setTabShown(.simAndApn)
+        rig.answerSettings(9, .success(listing()), .success(ready), "sim&apn first read with imei failure")
+        check(c.imei == nil && c.imeiFailure == portBusy.message && c.settingsFailure == nil,
+              "sim&apn: imei failure does not break settingsAt/settingsFailure")
+
+        rig.fake.queueImei(.success("000000000000091"))
+        c.refresh()
+        rig.answerSettings(11, .success(listing()), .success(ready), "sim&apn refresh imei")
+        check(c.imei == "000000000000091" && c.imeiFailure == nil, "sim&apn: imei read and failure cleared")
+
+        c.changeImei("000000000000142", reboot: true)
+        check(c.resultIsFailure && c.result.contains("check digit"), "changeImei: rejects invalid Luhn")
+
+        c.changeImei("000000000000141", reboot: true)
+        rig.waitForCall(13, "setImei runs")
+        rig.fake.releaseSetImei(.success(.rebooting(before: "000000000000091", after: "000000000000141")))
+        pump(until: { c.imei == "000000000000141" && !c.resultIsFailure && c.result.contains("restarting") },
+             "setImei finishes")
+        rig.fake.queueImei(.success("000000000000141"))
+        rig.answerSettings(14, .success(listing()), .success(ready), "settings refresh after setImei")
+        check(c.imei == "000000000000141" && !c.resultIsFailure, "changeImei: updated and reported", c.result)
         c.setTabShown(nil)
     }
 }

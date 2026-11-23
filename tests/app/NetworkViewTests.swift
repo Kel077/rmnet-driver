@@ -297,5 +297,41 @@ struct NetworkViewTests {
         // Duplicates count once.
         equal(NetworkCards.bandsCount(set(.lte, allowed: [3, 3], supported: [3, 7, 7])), "1 of 2 allowed",
               "bands: count as sets")
+
+        // --- SCS row, carrierComponents chips, antenna tiles & quick lock targets --------------
+        let scsLeg = CellLeg(rat: "NR5G-SA", duplex: "TDD", mcc: "310", mnc: "260", cellID: "123", pci: 683, tac: "1F",
+                             channel: 396250, band: "n25", bandwidthMHz: 20, rsrp: -92, rsrq: -11, sinr: 20, scsKHz: 15)
+        check(NetworkCards.cellRows([scsLeg]).contains(NetworkCards.CellRow(label: "SCS", values: ["15 kHz"])),
+              "cellRows: includes SCS when reported")
+
+        var richInfo = info([scsLeg], carriers: ["n25", "n41"])
+        richInfo.carrierComponents = [
+            CarrierComponent(role: "PCC", rat: "NR5G", band: "n25", channel: 396250, bandwidthMHz: 20, pci: 683),
+            CarrierComponent(role: "SCC", rat: "NR5G", band: "n41", channel: 520110, bandwidthMHz: 100, pci: 147),
+        ]
+        equal(NetworkCards.carrierChips(richInfo), [
+            NetworkCards.CarrierChip(band: "n25", bandwidthMHz: 20, primary: true, channel: 396250, pci: 683),
+            NetworkCards.CarrierChip(band: "n41", bandwidthMHz: 100, primary: false, channel: 520110, pci: 147),
+        ], "carrierChips: carries SCC bandwidth, channel and PCI from carrierComponents")
+
+        let tiles = NetworkCards.antennaTiles([
+            AntennaSignalSet(rat: "NR5G", ports: [
+                AntennaPort(index: 0, name: "PRX", rsrp: -93, rsrq: -11, sinr: 20),
+                AntennaPort(index: 1, name: "DRX", rsrp: -110, rsrq: -16, sinr: 10),
+                AntennaPort(index: 2, name: "RX2", rsrp: nil, rsrq: nil, sinr: nil),
+                AntennaPort(index: 3, name: "RX3", rsrp: nil, rsrq: nil, sinr: nil),
+            ])
+        ])
+        check(tiles.count == 4 && tiles[0].active && tiles[0].rsrpText == "-93 dBm"
+                && !tiles[2].active && tiles[2].detailText == "Inactive",
+              "antennaTiles: formats active and inactive paths", "\(tiles)")
+
+        let targets = NetworkCards.lockTargets(richInfo)
+        equal(targets, [
+            NetworkCards.LockTarget(label: "n25 · 20 MHz · PCI 683 · ARFCN 396250", detail: "PCC",
+                                    kind: .nr(NrCellLock(pci: 683, arfcn: 396250, scsKHz: 15, band: 25))),
+            NetworkCards.LockTarget(label: "n41 · 100 MHz · PCI 147 · ARFCN 520110", detail: "SCC",
+                                    kind: .nr(NrCellLock(pci: 147, arfcn: 520110, scsKHz: 30, band: 41))),
+        ], "lockTargets: builds quick-lock entries for PCC and SCC")
     }
 }

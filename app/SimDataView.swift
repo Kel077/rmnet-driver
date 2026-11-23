@@ -15,6 +15,7 @@ private enum SettingsAction {
     case apply
     case putBack
     case pin(attempts: Int)   // the attempts left the confirmation showed (ruling R13)
+    case imei(String, reboot: Bool)
 }
 
 private func typeLabel(_ t: PdpType) -> String {
@@ -136,6 +137,10 @@ struct SimApnTab: View {
     // (after every Unlock… or cancel), the sheet closes or the screen goes.
     @State private var lastAttempt = false
     @State private var allProfilesShown = false
+    @State private var editingImei = false
+    @State private var draftImei = ""
+    @State private var rebootImei = true
+    @State private var imeiAsk: Question<SettingsAction>? = nil
 
     private static let blockedSentence = "The SIM is blocked: it needs its PUK from the carrier, and RMNet does not enter PUKs."
     private static let applyWarning = "A wrong APN breaks the connection. Apply switches the radio off and on again "
@@ -158,6 +163,7 @@ struct SimApnTab: View {
             Divider()
             Form {
                 simSection
+                modemIdentitySection
                 profileSection
                 allProfilesSection
             }
@@ -181,6 +187,11 @@ struct SimApnTab: View {
             UnlockSheet(controller: controller, pin: $pin, lastAttempt: $lastAttempt, unlock: askPin,
                         cancel: { unlocking = false })
                 .modifier(Confirmation(question: $pinAsk, controller: controller, perform: perform, closed: clearPin))
+        }
+        .sheet(isPresented: $editingImei, onDismiss: imeiSheetClosed) {
+            ImeiSheet(controller: controller, draft: $draftImei, rebootNow: $rebootImei,
+                      askChange: askImeiChange, cancel: { editingImei = false })
+                .modifier(Confirmation(question: $imeiAsk, controller: controller, perform: perform, closed: {}))
         }
         .onChange(of: controller.sim?.state == .pin) { _, asks in
             if !asks {
@@ -284,6 +295,52 @@ struct SimApnTab: View {
     private func clearPin() {
         pin = ""
         lastAttempt = false
+    }
+
+    // MARK: Modem identity (IMEI)
+
+    @ViewBuilder private var modemIdentitySection: some View {
+        Section("Modem identity") {
+            LabeledContent("IMEI") {
+                HStack(spacing: Spacing.s) {
+                    Text(verbatim: controller.imei ?? "—")
+                        .font(.body.monospacedDigit())
+                        .textSelection(.enabled)
+                        .foregroundStyle(controller.imei == nil ? .secondary : .primary)
+                    Button("Change IMEI…") { openImeiSheet() }
+                        .disabled(!controller.refreshEnabled)
+                }
+            }
+            if let failure = controller.imeiFailure {
+                warning(failure)
+            } else if controller.imei == nil {
+                note(settingsRead ? "The IMEI has not been read." : "Reading the IMEI…")
+            }
+        }
+    }
+
+    private func openImeiSheet() {
+        guard controller.refreshEnabled else { return }
+        draftImei = controller.imei ?? ""
+        rebootImei = true
+        imeiAsk = nil
+        editingImei = true
+    }
+
+    private func askImeiChange() {
+        guard imeiProblem(draftImei) == nil else { return }
+        let q = imeiQuestion(before: controller.imei, after: draftImei, reboot: rebootImei)
+        imeiAsk = Question(action: .imei(draftImei, reboot: rebootImei), title: q.title, message: q.message,
+                           confirm: "Change IMEI", destructive: rebootImei, cancelIsDefault: true)
+        controller.setConfirming(true)
+    }
+
+    private func imeiSheetClosed() {
+        draftImei = ""
+        if imeiAsk != nil {
+            imeiAsk = nil
+            controller.setConfirming(false)
+        }
     }
 
     // MARK: The driver's profile
@@ -412,6 +469,9 @@ struct SimApnTab: View {
         case .pin(let attempts):
             controller.enterPin(pin, shownAttempts: attempts)
             unlocking = false
+        case let .imei(newImei, reboot):
+            controller.changeImei(newImei, reboot: reboot)
+            editingImei = false
         }
     }
 
@@ -515,5 +575,92 @@ private struct UnlockSheet: View {
         Text(verbatim: text)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// Sheet for reading/writing the modem's IMEI (`AT+EGMR=1,7,"<imei>"`), with 15-digit + Luhn validation and
+/// optional restart (`AT+CFUN=1,1`).
+private struct ImeiSheet: View {
+    @ObservedObject var controller: ModemController
+    @Binding var draft: String
+    @Binding var rebootNow: Bool
+    let askChange: () -> Void
+    let cancel: () -> Void
+
+    private var canSubmit: Bool {
+        guard controller.refreshEnabled, imeiProblem(draft) == nil else { return false }
+        return draft != controller.imei
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.l) {
+            HStack(spacing: Spacing.m) {
+                Image(systemName: "barcode.viewfinder")
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                Text("Change IMEI")
+                    .font(.title3.weight(.semibold))
+                    .accessibilityAddTraits(.isHeader)
+            }
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: Spacing.m, verticalSpacing: Spacing.m) {
+                GridRow {
+                    Text("Current").foregroundStyle(.secondary)
+                    Text(verbatim: controller.imei ?? "—")
+                        .font(.body.monospacedDigit())
+                        .textSelection(.enabled)
+                }
+                GridRow {
+                    Text("New IMEI").foregroundStyle(.secondary)
+                    HStack(spacing: Spacing.s) {
+                        TextField("New IMEI", text: $draft, prompt: Text("15 digits"))
+                            .textFieldStyle(.roundedBorder)
+                            .font(.body.monospacedDigit())
+                            .autocorrectionDisabled()
+                            .labelsHidden()
+                        if draft.count == 14, let check = imeiCheckDigit(forFirst14: draft) {
+                            Button("+\(check)") { draft.append(String(check)) }
+                                .help("Append Luhn check digit \(check)")
+                        }
+                    }
+                }
+            }
+            if !draft.isEmpty, let problem = imeiProblem(draft) {
+                Label {
+                    Text(verbatim: problem)
+                } icon: {
+                    Image(systemName: "exclamationmark.circle.fill")
+                }
+                .font(.callout)
+                .foregroundStyle(.red)
+            } else if draft == controller.imei && !draft.isEmpty {
+                Text("Matches the modem's current IMEI.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            Toggle("Restart modem now to apply (~30 s)", isOn: $rebootNow)
+            Label {
+                Text(rebootNow
+                     ? "The modem leaves the network for about 30 seconds while it restarts so the carrier sees the new IMEI."
+                     : "Stored in non-volatile memory; takes effect after the next modem restart.")
+                    .fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel", action: cancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Change IMEI…", action: askChange)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canSubmit)
+            }
+        }
+        .padding(Spacing.xl)
+        .frame(width: 460)
     }
 }

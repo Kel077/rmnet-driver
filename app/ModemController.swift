@@ -32,7 +32,7 @@ struct SignalSample: Equatable {
 }
 
 /// What is running on the service's queue; at most one call at a time.
-enum ModemActivity: Equatable { case reading, radio, mode, profile, pin, bands }
+enum ModemActivity: Equatable { case reading, radio, mode, profile, pin, bands, cellLock, imei }
 
 /// The way back from the last mode or profile change: the mode before (as the modem gave it, ruling R8), or
 /// the profile's settings before, password included (in memory only).
@@ -95,8 +95,13 @@ final class ModemController: ObservableObject {
     // read back. Read with a network read only while `bandsDue`.
     @Published private(set) var bands: [BandSet]? = nil
     @Published private(set) var bandsFailure: String? = nil      // the last bands read's failure; nil after a success
+    @Published private(set) var antennas: [AntennaSignalSet] = []
+    @Published private(set) var cellLock: CellLockState? = nil
+    @Published private(set) var cellLockFailure: String? = nil
     @Published private(set) var profiles: [DataProfile] = []     // the last profiles() that succeeded
     @Published private(set) var sim: SimInfo? = nil               // the last SIM read that succeeded
+    @Published private(set) var imei: String? = nil               // the last IMEI read that succeeded
+    @Published private(set) var imeiFailure: String? = nil
     @Published private(set) var settingsAt: Date? = nil           // the last settings read whose two parts succeeded
     @Published private(set) var settingsFailure: String? = nil    // the last settings read's failure; nil after a success
     @Published private(set) var running: ModemActivity? = nil
@@ -110,12 +115,10 @@ final class ModemController: ObservableObject {
     /// One sample a serving leg from each of the last `signalHistoryReads` network reads that succeeded (the
     /// Overview's and the Network screen's), oldest first; a read with no leg adds none but counts.
     @Published private(set) var signalHistory: [SignalSample] = []
-    /// The next Network read also reads the bands: set when the Network screen comes into view (shown, or its
-    /// window seen again), on Refresh there and after every bands change; cleared only by a bands read that
-    /// succeeded, so a turn whose network read failed (the bands are then not read) or whose bands read failed
-    /// leaves them due for the next turn. Not on every 5 s turn: the bands take a port open and four reads of
-    /// their own, and change only when set.
+    /// The next Network read also reads the bands / cell lock: set when the Network screen comes into view,
+    /// on Refresh there and after every change; cleared only by a read that succeeded.
     private(set) var bandsDue = false
+    private(set) var cellLockDue = false
 
     let quitNotice = ModemQuitNotice()
 
@@ -126,6 +129,8 @@ final class ModemController: ObservableObject {
     private static let readingQuitLine = "RMNet quits when the current request to the modem has finished."
     private static let radioOnQuitLine = "RMNet quits when the radio has been switched back on."
     private static let bandsQuitLine = "RMNet quits when the bands have been changed."
+    private static let cellLockQuitLine = "RMNet quits when the cell lock has been changed."
+    private static let imeiQuitLine = "RMNet quits when the IMEI change has finished."
     private static let anotherChange = "Another change to the modem has not finished yet. Nothing was changed; try again when it has."
 
     private let service: ModemServing
@@ -262,7 +267,10 @@ final class ModemController: ObservableObject {
             return
         }
         if timer != nil, timerTab == tab { return }
-        if tab == .network { bandsDue = true }
+        if tab == .network {
+            bandsDue = true
+            cellLockDue = true
+        }
         timer?.invalidate()
         let interval = tab == .simAndApn ? ModemController.settingsInterval : ModemController.networkInterval
         let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
@@ -309,24 +317,41 @@ final class ModemController: ObservableObject {
         let service = self.service
         switch tab {
         case .network, .overview:
-            if refreshing, tab == .network { bandsDue = true }
-            let withBands = tab == .network && bandsDue
+            if refreshing, tab == .network {
+                bandsDue = true
+                cellLockDue = true
+            }
+            let onNetworkTab = tab == .network
+            let withBands = onNetworkTab && bandsDue
+            let withCellLock = onNetworkTab && cellLockDue
             queue.async {
                 let info = service.networkInfo()
-                let sets = withBands && (try? info.get()) != nil ? service.bands() : nil
-                DispatchQueue.main.async { self.finishNetwork(info, sets) }
+                let readInfo = try? info.get()
+                let antennaRead: Result<[AntennaSignalSet], ModemFailure>?
+                if onNetworkTab, let readInfo {
+                    antennaRead = readInfo.radio == .on ? service.antennas() : .success([])
+                } else {
+                    antennaRead = nil
+                }
+                let sets = withBands && readInfo != nil ? service.bands() : nil
+                let lockRead = withCellLock && readInfo != nil ? service.cellLock() : nil
+                DispatchQueue.main.async { self.finishNetwork(info, antennaRead, sets, lockRead) }
             }
         case .simAndApn:
             queue.async {
                 let listed = service.profiles()
                 let sim = service.sim()
-                DispatchQueue.main.async { self.finishSettings(listed, sim) }
+                let imei = service.imei()
+                DispatchQueue.main.async { self.finishSettings(listed, sim, imei) }
             }
         }
     }
 
-    // `sets` nil: the bands were not read in this turn (not due, or the network read failed).
-    private func finishNetwork(_ outcome: Result<NetworkInfo, ModemFailure>, _ sets: Result<[BandSet], ModemFailure>?) {
+    // `sets` / `lockRead` nil: not read in this turn (not due, Overview tab, or networkInfo() failed).
+    private func finishNetwork(_ outcome: Result<NetworkInfo, ModemFailure>,
+                               _ antennaRead: Result<[AntennaSignalSet], ModemFailure>?,
+                               _ sets: Result<[BandSet], ModemFailure>?,
+                               _ lockRead: Result<CellLockState, ModemFailure>?) {
         running = nil
         readingTab = nil
         switch sets {
@@ -338,6 +363,19 @@ final class ModemController: ObservableObject {
             bandsFailure = failure.message
         case nil:
             break
+        }
+        switch lockRead {
+        case .success(let read)?:
+            cellLock = read
+            cellLockFailure = nil
+            cellLockDue = false
+        case .failure(let failure)?:
+            cellLockFailure = failure.message
+        case nil:
+            break
+        }
+        if case .success(let readAntennas) = antennaRead {
+            antennas = readAntennas
         }
         switch outcome {
         case .success(let read):
@@ -373,7 +411,9 @@ final class ModemController: ObservableObject {
         signalHistory = history
     }
 
-    private func finishSettings(_ listed: Result<[DataProfile], ModemFailure>, _ read: Result<SimInfo, ModemFailure>) {
+    private func finishSettings(_ listed: Result<[DataProfile], ModemFailure>,
+                                _ read: Result<SimInfo, ModemFailure>,
+                                _ readImei: Result<String, ModemFailure>) {
         running = nil
         readingTab = nil
         let earlierProfile = profileID
@@ -386,6 +426,13 @@ final class ModemController: ObservableObject {
         switch read {
         case .success(let found): sim = found
         case .failure(let f): failure = failure ?? f.message
+        }
+        switch readImei {
+        case .success(let found):
+            imei = found
+            imeiFailure = nil
+        case .failure(let f):
+            imeiFailure = f.message
         }
         settingsFailure = failure
         if failure == nil { settingsAt = Date() }
@@ -782,6 +829,125 @@ final class ModemController: ObservableObject {
         }
         setResult(line, failure: outcome.failed != nil)
         finished(succeeded: outcome.failed == nil, changed: true)
+    }
+
+    // MARK: Cell lock and IMEI
+
+    func setNrCellLock(_ lock: NrCellLock?) {
+        guard !stopping else { return }
+        if let problem = nrCellLockProblem(lock, supportedSaBands: bandSet(.sa)?.supported) {
+            return refuse("\(problem) Nothing was changed.")
+        }
+        guard change == nil else { return refuse(ModemController.anotherChange) }
+        let line = lock.map { "Locking 5G SA cell to PCI \($0.pci), ARFCN \($0.arfcn)…" }
+            ?? "Unlocking 5G SA cell lock…"
+        submit(.cellLock, line: line, quitLine: ModemController.cellLockQuitLine,
+               { $0.setNrCellLock(lock) }) { outcome in
+            self.finishCellLock(outcome)
+        }
+    }
+
+    func setLteCellLock(_ cells: [LteLockedCell]) {
+        guard !stopping else { return }
+        if let problem = lteCellLockProblem(cells) { return refuse("\(problem) Nothing was changed.") }
+        guard change == nil else { return refuse(ModemController.anotherChange) }
+        let line = cells.isEmpty ? "Unlocking LTE cell lock…" : "Locking LTE \(cells.count == 1 ? "cell" : "cells")…"
+        submit(.cellLock, line: line, quitLine: ModemController.cellLockQuitLine,
+               { $0.setLteCellLock(cells) }) { outcome in
+            self.finishCellLock(outcome)
+        }
+    }
+
+    func unlockAllCells() {
+        guard !stopping else { return }
+        guard change == nil else { return refuse(ModemController.anotherChange) }
+        submit(.cellLock, line: "Unlocking cell locks…", quitLine: ModemController.cellLockQuitLine,
+               { (service: ModemServing) -> Result<CellLockChange, ModemFailure> in
+                   switch service.setNrCellLock(nil) {
+                   case .failure(let f): return .failure(f)
+                   case .success(let nrChange):
+                       switch service.setLteCellLock([]) {
+                       case .failure(let f): return .failure(f)
+                       case .success(let lteChange):
+                           let beforeState: CellLockState
+                           switch nrChange {
+                           case .unchanged(let s), .changed(let s, _): beforeState = s
+                           }
+                           let afterState: CellLockState
+                           switch lteChange {
+                           case .unchanged(let s), .changed(_, let s): afterState = s
+                           }
+                           return .success(beforeState == afterState
+                               ? .unchanged(afterState)
+                               : .changed(before: beforeState, after: afterState))
+                       }
+                   }
+               }) { outcome in
+            self.changeEnded()
+            self.cellLockDue = true
+            switch outcome {
+            case .success(let ch):
+                switch ch {
+                case .unchanged(let s), .changed(_, let s): self.cellLock = s
+                }
+                let line = ch == .unchanged(self.cellLock ?? CellLockState(lte: [], nr: nil, persistLte: false, persistNr: false))
+                    ? "Cell locks are already unlocked."
+                    : "Unlocked 5G SA and LTE cell locks."
+                self.setResult(line, failure: false)
+            case .failure(let failure):
+                self.setResult(failure.message, failure: true)
+            }
+            self.finished(succeeded: (try? outcome.get()) != nil, changed: true)
+        }
+    }
+
+    func setCellLockPersist(lte: Bool, nr: Bool) {
+        guard !stopping else { return }
+        guard change == nil else { return refuse(ModemController.anotherChange) }
+        submit(.cellLock, line: "Updating cell-lock persistence…", quitLine: ModemController.cellLockQuitLine,
+               { $0.setCellLockPersist(lte: lte, nr: nr) }) { outcome in
+            self.finishCellLock(outcome)
+        }
+    }
+
+    private func finishCellLock(_ outcome: Result<CellLockChange, ModemFailure>) {
+        changeEnded()
+        cellLockDue = true
+        switch outcome {
+        case .success(let ch):
+            switch ch {
+            case .unchanged(let s), .changed(_, let s): cellLock = s
+            }
+            setResult(cellLockSentence(ch), failure: false)
+        case .failure(let failure):
+            setResult(failure.message, failure: true)
+        }
+        finished(succeeded: (try? outcome.get()) != nil, changed: true)
+    }
+
+    func changeImei(_ newImei: String, reboot: Bool) {
+        guard !stopping else { return }
+        if let problem = imeiProblem(newImei) { return refuse("\(problem) Nothing was changed.") }
+        if let current = imei, current == newImei {
+            return refuse("IMEI is already \(current). Nothing was changed.")
+        }
+        guard change == nil else { return refuse(ModemController.anotherChange) }
+        submit(.imei, line: "Setting IMEI to \(newImei)…", quitLine: ModemController.imeiQuitLine,
+               { $0.setImei(newImei, reboot: reboot) }) { outcome in
+            self.changeEnded()
+            switch outcome {
+            case .success(let ch):
+                switch ch {
+                case .unchanged(let current): self.imei = current
+                case .rebooting(_, let after): self.imei = after
+                case .setTakesEffectAfterRestart: break
+                }
+                self.setResult(imeiSentence(ch), failure: false)
+            case .failure(let failure):
+                self.setResult(failure.message, failure: true)
+            }
+            self.finished(succeeded: (try? outcome.get()) != nil, changed: true)
+        }
     }
 
     private func setResult(_ line: String, failure: Bool) {

@@ -3,13 +3,16 @@
 // Usage: RMNet activate | deactivate | status [--json]
 //        RMNet sms list [--json] | sms send <number> <text> | sms delete <index>...
 //        RMNet gps [seconds] [--keep-on]
-//        RMNet network [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…]
+//        RMNet network [--json] | antennas [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…]
 //        RMNet apn [show] [--json] | apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>]
 //                  [--password | --no-password] [--auth none|pap|chap|pap-or-chap] [--no-redial]
 //        RMNet sim [--json] | sim unlock [--last-attempt]
 //        RMNet usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes]
 //        RMNet at [--timeout <seconds>] <command>
 //        RMNet bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa]
+//        RMNet cell [--json] | cell lock sa <pci> <arfcn> <scs> <band> | cell lock current
+//        RMNet cell lock lte <earfcn>:<pci>[,…] | cell unlock [sa|lte] | cell persist on|off
+//        RMNet imei [--json] | imei set <imei> [--no-reboot] [--yes]
 //        RMNet (no argument, or opened from the Finder): the status window.
 // It must run from /Applications/RMNet.app for activate and deactivate (scripts/install-driver.sh).
 // With a verb it opens no window and exits by itself. `status --json` (scripts/soak.sh reads it) keeps
