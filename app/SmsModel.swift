@@ -853,6 +853,47 @@ func rowNote(_ m: SmsMessage) -> String {
     return ""
 }
 
+/// The list's heading: "3 messages · 1 unread", "1 message"; "" with none.
+func messageCountLine(count: Int, unread: Int) -> String {
+    guard count > 0 else { return "" }
+    return "\(count) \(count == 1 ? "message" : "messages")" + (unread > 0 ? " · \(unread) unread" : "")
+}
+
+/// Words that name a one-time code, in the languages such texts come in (lower case). The CJK ones are written as
+/// escapes so the source stays ASCII: "verification code" in simplified and traditional Chinese, Japanese and Korean.
+private let codeWords = ["code", "otp", "pin", "passcode", "password", "verification", "verify",
+                         "\u{9A8C}\u{8BC1}\u{7801}", "\u{6821}\u{9A8C}\u{7801}", "\u{52A8}\u{6001}\u{7801}", "\u{9A57}\u{8B49}\u{78BC}",
+                         "\u{8A8D}\u{8B49}\u{78BC}", "\u{8A8D}\u{8A3C}", "\u{C778}\u{C99D}"]
+
+/// The one-time code in a message, for the reading pane's Copy Code: the one group of 4 to 8 ASCII digits standing
+/// alone (not part of a longer number, after `+`, a currency sign, `#` or a digit and `-`, or before a decimal point), in a text
+/// that names a code (codeWords); nil when there is no such word, no such group, or more than one group.
+func verificationCode(in text: String) -> String? {
+    let lower = text.lowercased()
+    guard codeWords.contains(where: { lower.contains($0) }) else { return nil }
+    let scalars = Array(text.unicodeScalars)
+    func isDigit(_ i: Int) -> Bool { i >= 0 && i < scalars.count && (0x30...0x39).contains(scalars[i].value) }
+    var groups: [String] = []
+    var i = 0
+    while i < scalars.count {
+        guard isDigit(i) else { i += 1; continue }
+        var end = i
+        while isDigit(end) { end += 1 }
+        let before: Unicode.Scalar? = i > 0 ? scalars[i - 1] : nil
+        let after: Unicode.Scalar? = end < scalars.count ? scalars[end] : nil
+        // "+1555…", "$1500", "#123456" and "555-1234" are not codes; "G-482913" is.
+        let joinedBefore = (before.map { "+$€£¥#".unicodeScalars.contains($0) } ?? false)
+            || (before == "-" && isDigit(i - 2))
+        let decimalAfter = after.map { $0 == "." || $0 == "," } == true && isDigit(end + 1)
+        let length = end - i
+        if (4...8).contains(length) && !joinedBefore && !decimalAfter {
+            groups.append(String(String.UnicodeScalarView(scalars[i..<end])))
+        }
+        i = end
+    }
+    return groups.count == 1 ? groups[0] : nil
+}
+
 /// The confirmation before a delete: the sender, and how many stored parts go.
 func deleteQuestion(_ m: SmsMessage) -> (title: String, message: String) {
     let sender = m.sender.isEmpty ? "an unknown sender" : m.sender

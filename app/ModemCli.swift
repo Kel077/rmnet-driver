@@ -30,6 +30,8 @@ enum ModemCommand: Equatable {
                 redial: Bool)
     case sim(json: Bool)
     case simUnlock(lastAttempt: Bool)
+    case simSlot(json: Bool)                    // the slot in use
+    case simSlotSet(Int, yes: Bool)             // 1 or 2
     case usbMode(json: Bool)
     case usbModeSet(UsbNetMode, reboot: Bool, yes: Bool)    // reboot: no --no-reboot; yes: --yes
     case at(String, timeout: Int)               // one line atCommandProblem accepts; seconds, 1 to 300
@@ -53,12 +55,12 @@ enum ModemCommand: Equatable {
     var changesModem: Bool {
         switch self {
         case .network, .antennas, .apnShow, .sim, .usbMode, .at, .atRefused, .bands, .cellShow, .imeiShow,
-             .imeiHistory:
+             .imeiHistory, .simSlot:
             return false
         case .radio(let on): return on != nil
         case .mode(let mode): return mode != nil
         case .apnSet, .simUnlock, .usbModeSet, .bandsSet, .bandsReset,
-             .cellLockNr, .cellLockCurrent, .cellLockLte, .cellUnlock, .cellPersist, .imeiSet:
+             .cellLockNr, .cellLockCurrent, .cellLockLte, .cellUnlock, .cellPersist, .imeiSet, .simSlotSet:
             return true
         }
     }
@@ -71,7 +73,7 @@ let modemVerbs: Set<String> = ["network", "antennas", "radio", "mode", "apn", "s
 let modemUsage = "network [--json] | antennas [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | "
     + "apn [show] [--json] | apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] "
     + "[--password | --no-password] [--auth none|pap|chap|pap-or-chap] [--no-redial] | "
-    + "sim [--json] | sim unlock [--last-attempt] | "
+    + "sim [--json] | sim unlock [--last-attempt] | sim slot [--json] | sim slot set 1|2 [--yes] | "
     + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes] | "
     + "at [--timeout <seconds>] <command> | "
     + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa] | "
@@ -105,6 +107,7 @@ func parseModem(_ words: [String]) -> ModemCommand? {
         if rest.first == "set" { return parseApnSet(Array(rest.dropFirst())) }
         return jsonOption(rest.first == "show" ? Array(rest.dropFirst()) : rest).map { .apnShow(json: $0) }
     case "sim":
+        if rest.first == "slot" { return parseSimSlotWords(Array(rest.dropFirst())) }
         guard rest.first == "unlock" else { return jsonOption(rest).map { .sim(json: $0) } }
         switch Array(rest.dropFirst()) {
         case []: return .simUnlock(lastAttempt: false)
@@ -189,6 +192,18 @@ private func parseCell(_ words: [String]) -> ModemCommand? {
         }
     default:
         return jsonOption(words).map { .cellShow(json: $0) }
+    }
+}
+
+/// The words after `sim slot`: nothing or `--json` (show), or `set` and the slot (`1` or `2`) with `--yes` at most once.
+private func parseSimSlotWords(_ words: [String]) -> ModemCommand? {
+    guard words.first == "set" else { return jsonOption(words).map { .simSlot(json: $0) } }
+    let rest = Array(words.dropFirst())
+    guard let slotWord = rest.first, let slot = Int(slotWord), simSlots.contains(slot), slotWord.count == 1 else { return nil }
+    switch Array(rest.dropFirst()) {
+    case []: return .simSlotSet(slot, yes: false)
+    case ["--yes"]: return .simSlotSet(slot, yes: true)
+    default: return nil
     }
 }
 
@@ -375,6 +390,16 @@ func runModem(_ command: ModemCommand, service: ModemServing, driverProfile: Int
         }
     case .simUnlock(let lastAttempt):
         return unlockSim(service, lastAttempt: lastAttempt, readSecret: readSecret, output)
+    case .simSlot(let json):
+        switch service.simSlot() {
+        case .failure(let failure): return fail("sim", failure.message, output)
+        case .success(let slot):
+            if json { return outputJSON("sim", ["activeSlot": slot], output) }
+            output("sim: slot \(slot)")
+            return 0
+        }
+    case let .simSlotSet(slot, yes):
+        return setSimSlot(service, slot, yes: yes, ask: ask, output)
     case .usbMode(let json):
         return showUsbMode(service, json: json, output)
     case let .usbModeSet(mode, reboot, yes):
@@ -606,6 +631,42 @@ private func setImei(_ service: ModemServing, _ value: String, reboot: Bool, yes
         case .rebooting(let before, _), .setTakesEffectAfterRestart(let before, _):
             output("imei: to put it back: RMNet imei set \(before)")
         }
+        return 0
+    }
+}
+
+/// `sim slot set`: reads the slot first (nothing asked or sent when it is already that one), asks (unless --yes; without a
+/// terminal it changes nothing and exits 2), then switches and waits for the new slot's SIM and the registration, and
+/// prints what came of it and the way back. A new slot without a usable SIM is still a switch made: exit 0.
+private func setSimSlot(_ service: ModemServing, _ slot: Int, yes: Bool, ask: (String) -> String?,
+                        _ output: (String) -> Void) -> Int32 {
+    let before: Int
+    switch service.simSlot() {
+    case .failure(let failure): return fail("sim", failure.message, output)
+    case .success(let current):
+        if current == slot {
+            output("sim: already on SIM \(slot); nothing changed")
+            return 0
+        }
+        before = current
+    }
+    if !yes {
+        let q = simSlotQuestion(from: before, to: slot)
+        guard let answer = ask("\(q.message) \(q.title) [y/N] ") else {
+            output("sim: no terminal to ask on, so nothing changed; run again with --yes to switch without asking")
+            return 2
+        }
+        guard ["y", "yes"].contains(answer.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
+            output("cancelled; nothing changed")
+            return 1
+        }
+    }
+    switch service.setSimSlot(slot, wait: .registration) {
+    case .failure(let failure):
+        return fail("sim", failure.message, output)
+    case .success(let change):
+        output("sim: \(simSlotSentence(change))")
+        if change.changed { output("sim: to switch back: RMNet sim slot set \(change.before)") }
         return 0
     }
 }

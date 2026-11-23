@@ -158,6 +158,10 @@ final class FakeModem: ModemServing {
     func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure> { .failure(failureOr("not used")) }
     func imei() -> Result<String, ModemFailure> { .failure(ModemFailure(message: "not used")) }
     func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func simSlot() -> Result<Int, ModemFailure> { .failure(ModemFailure(message: "not used")) }
+    func setSimSlot(_ slot: Int, wait: SimSlotWait) -> Result<SimSlotChange, ModemFailure> {
+        .failure(ModemFailure(message: "not used"))
+    }
     private func failureOr(_ s: String) -> ModemFailure { ModemFailure(message: s) }
 
     func releaseInfo(_ outcome: Result<NetworkInfo, ModemFailure>) {

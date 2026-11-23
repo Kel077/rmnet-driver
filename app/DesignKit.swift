@@ -1,7 +1,7 @@
 // The window's visual language, shared by every screen: cards (and the headings of their parts), the status pill,
 // the state badge, the technology badge, the signal bars, the metric gauge, key and value rows, the result banner
-// (and the slot at the bottom of a screen it shows in), the quit notice, empty states, the sheets' header and warning
-// line, and the spacing scale. The charts are in Charts.swift. The values drawn come
+// (and the slot at the bottom of a screen it shows in), the quit notice, empty states, the sheets' header, the warning
+// and problem lines, and the spacing scale. The charts are in Charts.swift. The values drawn come
 // from the pure models (SignalQuality.swift, ShellModel.swift); nothing here reads anything.
 import AppKit
 import SwiftUI
@@ -591,8 +591,9 @@ struct SheetHeader: View {
     }
 }
 
-/// What a change in a sheet does to the connection, above its buttons: an orange triangle and the words.
-struct SheetWarning: View {
+/// A caution (what a change does to the connection, above a sheet's buttons; what not to do, under a screen's
+/// buttons): an orange triangle and the words in secondary.
+struct WarningNote: View {
     let text: String
 
     var body: some View {
@@ -608,8 +609,8 @@ struct SheetWarning: View {
     }
 }
 
-/// A rule that what is typed in a sheet breaks: a red exclamation and the words.
-struct SheetProblem: View {
+/// A rule that what is typed breaks, or a request that failed: a red exclamation and the words.
+struct ProblemNote: View {
     let text: String
 
     var body: some View {

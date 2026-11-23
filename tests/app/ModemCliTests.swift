@@ -139,6 +139,9 @@ final class FakeModem: ModemServing {
     var setPersistResult: Result<CellLockChange, ModemFailure>? = nil
     var imeiResult: Result<String, ModemFailure> = .success("000000000000091")
     var setImeiResult: Result<ImeiChange, ModemFailure>? = nil
+    var simSlotResult: Result<Int, ModemFailure> = .success(1)
+    var setSimSlotResult: Result<SimSlotChange, ModemFailure>? = nil
+    var simSlotsAsked: [(slot: Int, wait: SimSlotWait)] = []
 
     var radioAsked: [Bool] = []
     var modesAsked: [String] = []
@@ -246,6 +249,19 @@ final class FakeModem: ModemServing {
     func imei() -> Result<String, ModemFailure> {
         events.append("imei")
         return imeiResult
+    }
+    func simSlot() -> Result<Int, ModemFailure> {
+        events.append("simSlot")
+        return simSlotResult
+    }
+    func setSimSlot(_ slot: Int, wait: SimSlotWait) -> Result<SimSlotChange, ModemFailure> {
+        events.append("setSimSlot")
+        simSlotsAsked.append((slot: slot, wait: wait))
+        if let r = setSimSlotResult { return r }
+        let before = (try? simSlotResult.get()) ?? 1
+        if before == slot { return .success(SimSlotChange(before: slot, after: slot)) }
+        return .success(SimSlotChange(before: before, after: slot, sim: .ready, secondsToSim: 2,
+                                      registration: Registration(status: .home, domain: "5GS"), secondsToRegister: 5))
     }
     func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure> {
         events.append("setImei")
@@ -378,7 +394,7 @@ struct ModemCliTests {
         check(modemUsage == "network [--json] | antennas [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…] | "
               + "apn [show] [--json] | apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>] "
               + "[--password | --no-password] [--auth none|pap|chap|pap-or-chap] [--no-redial] | "
-              + "sim [--json] | sim unlock [--last-attempt] | "
+              + "sim [--json] | sim unlock [--last-attempt] | sim slot [--json] | sim slot set 1|2 [--yes] | "
               + "usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes] | "
               + "at [--timeout <seconds>] <command> | "
               + "bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa] | "
@@ -458,6 +474,17 @@ struct ModemCliTests {
         expectParse(["sim", "--json"], .sim(json: true))
         expectParse(["sim", "unlock"], .simUnlock(lastAttempt: false))
         expectParse(["sim", "unlock", "--last-attempt"], .simUnlock(lastAttempt: true))
+        expectParse(["sim", "slot"], .simSlot(json: false))
+        expectParse(["sim", "slot", "--json"], .simSlot(json: true))
+        expectParse(["sim", "slot", "set", "2"], .simSlotSet(2, yes: false))
+        expectParse(["sim", "slot", "set", "1", "--yes"], .simSlotSet(1, yes: true))
+        for words in [["sim", "slot", "set"], ["sim", "slot", "set", "3"], ["sim", "slot", "set", "0"],
+                      ["sim", "slot", "set", "02"], ["sim", "slot", "set", "+1"], ["sim", "slot", "set", "1", "--yes", "--yes"],
+                      ["sim", "slot", "set", "1", "--json"], ["sim", "slot", "2"], ["sim", "slot", "--yes"]] {
+            check(parseModem(words) == nil, "parseModem: \(words.joined(separator: " ")) is wrong usage")
+        }
+        check(ModemCommand.simSlotSet(2, yes: true).changesModem, "changesModem: sim slot set")
+        check(!ModemCommand.simSlot(json: false).changesModem, "changesModem: sim slot only reads")
         expectParse(["usbmode"], .usbMode(json: false))
         expectParse(["usbmode", "--json"], .usbMode(json: true))
         expectParse(["usbmode", "set", "qmi"], .usbModeSet(.qmi, reboot: true, yes: false))
@@ -922,6 +949,7 @@ struct ModemCliTests {
 
         // --- sim ---------------------------------------------------------------------------------
         fake = FakeModem()
+        simSlotVerbs()
         expectLines(run(["sim"], fake, "sim"), ["sim: ready", "sim: pin lock: off", "sim: attempts left: PIN 3, PUK 10"],
                     code: 0, "sim: the READY fixture")
         fake = FakeModem()
@@ -1782,6 +1810,86 @@ struct ModemCliTests {
         expectLines(run(["imei", "history"], fake, history: recorder, "history: unreadable"),
                     ["imei: The IMEI history could not be read (/x)."], code: 1, "history: unreadable")
     }
+}
+
+/// `sim slot` and `sim slot set`, and the slot in `sim` and `sim --json` (a field added, none changed).
+func simSlotVerbs() {
+    var fake = FakeModem()
+    var withSlot = readySim
+    withSlot.activeSlot = 2
+    fake.simResult = .success(withSlot)
+    expectLines(run(["sim"], fake, "sim with slot"),
+                ["sim: ready", "sim: pin lock: off", "sim: attempts left: PIN 3, PUK 10", "sim: slot: 2"], code: 0,
+                "sim: the slot as its last line")
+    let json = simJSON(withSlot)
+    check(json["activeSlot"] as? Int == 2 && json["state"] as? String == "ready" && json["pinLock"] as? Bool == false
+            && json["pinAttempts"] as? Int == 3 && json["pukAttempts"] as? Int == 10,
+          "sim --json: activeSlot added, the other keys kept", "\(json)")
+    check(simJSON(readySim)["activeSlot"] is NSNull, "sim --json: activeSlot null when not read")
+
+    fake = FakeModem()
+    fake.simSlotResult = .success(2)
+    expectLines(run(["sim", "slot"], fake, "sim slot"), ["sim: slot 2"], code: 0, "sim slot")
+    let shown = run(["sim", "slot", "--json"], fake, "sim slot --json")
+    let object = (try? JSONSerialization.jsonObject(with: Data(shown.lines.joined(separator: "\n").utf8))) as? [String: Any]
+    check(shown.code == 0 && object?["activeSlot"] as? Int == 2, "sim slot --json", "\(shown.lines)")
+    fake.simSlotResult = .failure(ModemFailure(message: "The modem does not switch SIM slots. ERROR"))
+    expectLines(run(["sim", "slot"], fake, "sim slot refused"), ["sim: The modem does not switch SIM slots. ERROR"],
+                code: 1, "sim slot: refused")
+
+    // Already there: nothing asked or sent.
+    fake = FakeModem()
+    expectLines(run(["sim", "slot", "set", "1"], fake, "slot already"), ["sim: already on SIM 1; nothing changed"],
+                code: 0, "sim slot set: already")
+    check(fake.simSlotsAsked.isEmpty && !fake.events.contains("ask"), "sim slot set: already, nothing sent or asked")
+
+    // No terminal, or a no: nothing changed.
+    fake = FakeModem()
+    let noTerminal = run(["sim", "slot", "set", "2"], fake, answer: nil, "slot no terminal")
+    expectLines(noTerminal, ["sim: no terminal to ask on, so nothing changed; run again with --yes to switch without asking"],
+                code: 2, "sim slot set: no terminal")
+    check(fake.simSlotsAsked.isEmpty, "sim slot set: no terminal, nothing sent")
+    fake = FakeModem()
+    expectLines(run(["sim", "slot", "set", "2"], fake, answer: "n", "slot cancelled"), ["cancelled; nothing changed"],
+                code: 1, "sim slot set: cancelled")
+    check(fake.simSlotsAsked.isEmpty, "sim slot set: cancelled, nothing sent")
+
+    // Asked, then switched: the question says the connection drops; the result waits for the registration.
+    fake = FakeModem()
+    let asked = run(["sim", "slot", "set", "2"], fake, answer: "y", "slot asked")
+    check(asked.questions.count == 1 && asked.questions[0].contains("The connection drops")
+            && asked.questions[0].hasSuffix("Switch to SIM 2? [y/N] "), "sim slot set: the question", "\(asked.questions)")
+    expectLines(asked, ["sim: Switched to SIM 2. SIM ready; registered, home network (5GS) after 5 s.",
+                        "sim: to switch back: RMNet sim slot set 1"], code: 0, "sim slot set: switched")
+    check(fake.simSlotsAsked.count == 1 && fake.simSlotsAsked[0].slot == 2 && fake.simSlotsAsked[0].wait == .registration,
+          "sim slot set: waits for the registration")
+
+    // --yes; a new slot with no SIM is still a switch made.
+    fake = FakeModem()
+    fake.setSimSlotResult = .success(SimSlotChange(before: 1, after: 2, sim: .notInserted))
+    expectLines(run(["sim", "slot", "set", "2", "--yes"], fake, "slot empty"),
+                ["sim: Switched to SIM 2, but it has no usable SIM (not inserted).", "sim: to switch back: RMNet sim slot set 1"],
+                code: 0, "sim slot set: an empty slot")
+    check(!fake.events.contains("ask"), "sim slot set --yes: not asked")
+
+    fake = FakeModem()
+    fake.setSimSlotResult = .failure(ModemFailure(message: "The SIM slot was not changed. ERROR"))
+    expectLines(run(["sim", "slot", "set", "2", "--yes"], fake, "slot refused"),
+                ["sim: The SIM slot was not changed. ERROR"], code: 1, "sim slot set: refused")
+
+    // The sentences.
+    check(simSlotSentence(SimSlotChange(before: 2, after: 2)) == "Already on SIM 2; nothing changed.", "sentence: same")
+    check(simSlotSentence(SimSlotChange(before: 1, after: 2, sim: .ready, secondsToSim: 2))
+            == "Switched to SIM 2. SIM ready.", "sentence: ready, no registration waited for")
+    check(simSlotSentence(SimSlotChange(before: 1, after: 2, sim: .ready, registration: Registration(status: .searching, domain: "5GS")))
+            == "Switched to SIM 2. SIM ready; searching (not registered yet).", "sentence: not registered yet",
+          simSlotSentence(SimSlotChange(before: 1, after: 2, sim: .ready, registration: Registration(status: .searching, domain: "5GS"))))
+    check(simSlotSentence(SimSlotChange(before: 1, after: 2, sim: .pin)) == "Switched to SIM 2. SIM: asks for its PIN.",
+          "sentence: PIN")
+    check(simSlotSentence(SimSlotChange(before: 1, after: 2, sim: .failure))
+            == "Switched to SIM 2, but it has no usable SIM (SIM failure).", "sentence: failure")
+    check(simSlotSentence(SimSlotChange(before: 1, after: 2)) == "Switched to SIM 2; its SIM state could not be read.",
+          "sentence: not read")
 }
 
 /// An IMEI history in memory.

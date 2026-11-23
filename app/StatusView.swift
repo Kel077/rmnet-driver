@@ -6,6 +6,7 @@
 import AppKit
 import Combine
 import SwiftUI
+import UserNotifications
 
 struct RMNetApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -15,7 +16,8 @@ struct RMNetApp: App {
             RMNetWindow(messages: appDelegate.messages, quitNotice: appDelegate.messages.quitNotice,
                         modem: appDelegate.modem, modemQuitNotice: appDelegate.modem.quitNotice,
                         driverStatus: appDelegate.driverStatus, throughput: appDelegate.throughput,
-                        menuBar: appDelegate.menuBar, polls: appDelegate.windowPolls)
+                        menuBar: appDelegate.menuBar, polls: appDelegate.windowPolls,
+                        router: appDelegate.router, simWatcher: appDelegate.simWatcher)
         }
         .defaultSize(width: 920, height: 640)
         .windowResizability(.contentMinSize)
@@ -23,16 +25,17 @@ struct RMNetApp: App {
         // delegate), so a change of the icon redraws only the label.
         MenuBarExtra {
             MenuBarPanel(status: appDelegate.menuBar, quitNotice: appDelegate.messages.quitNotice,
-                         modemQuitNotice: appDelegate.modem.quitNotice,
-                         showWindow: { open in _ = AppDelegate.showStatusWindow(using: open) })
+                         modemQuitNotice: appDelegate.modem.quitNotice, unread: appDelegate.messages.unreadNotice,
+                         showWindow: { open in _ = AppDelegate.showStatusWindow(using: open) },
+                         showMessages: { appDelegate.router.request = .messages })
                 .background(OpenWindowKeeper())
         } label: {
             MenuBarLabel(status: appDelegate.menuBar)
         }
         .menuBarExtraStyle(.window)
-        // Cmd-, and the gear in the item's panel: the menu bar icon's style (SettingsView.swift).
+        // Cmd-, and the gear in the item's panel: the menu bar icon, the SIM slots, the notifications (SettingsView.swift).
         Settings {
-            SettingsView(menuBar: appDelegate.menuBar)
+            SettingsView(menuBar: appDelegate.menuBar, settings: appDelegate.settings)
         }
     }
 }
@@ -55,6 +58,8 @@ struct RMNetWindow: View {
     let throughput: ThroughputSampler
     let menuBar: MenuBarStatus
     let polls: WindowPolls
+    @ObservedObject var router: WindowRouter
+    let simWatcher: SimSlotWatcher
     @SceneStorage("screen") private var screen = Screen.overview
 
     var body: some View {
@@ -80,8 +85,13 @@ struct RMNetWindow: View {
         }
         // The window's minimum is 760 × 520 with its toolbar (about 52 pt): this frame is below the toolbar.
         .frame(minWidth: 760, minHeight: 468)
-        .onAppear { show(screen) }
+        .onAppear {
+            takeRequest()
+            show(screen)
+        }
         .onChange(of: screen) { _, shown in show(shown) }
+        // A notification's click (or the panel's unread line) asks for a screen.
+        .onChange(of: router.request) { _, _ in takeRequest() }
         .onDisappear {
             messages.setTabShown(false)
             modem.setTabShown(nil)
@@ -98,6 +108,12 @@ struct RMNetWindow: View {
         .background(OpenWindowKeeper())
     }
 
+    private func takeRequest() {
+        guard let wanted = router.request else { return }
+        router.request = nil
+        screen = wanted
+    }
+
     /// Tells the controllers and the polls what the screen shown reads.
     private func show(_ shown: Screen) {
         messages.setTabShown(shown.listsMessages)
@@ -109,13 +125,13 @@ struct RMNetWindow: View {
         switch shown {
         case .overview:
             OverviewView(driverStatus: driverStatus, modem: modem, messages: messages, throughput: throughput,
-                         navigate: { screen = $0 })
+                         simWatcher: simWatcher, navigate: { screen = $0 })
         case .messages:
             SmsView(controller: messages)
         case .network:
             NetworkTab(controller: modem, throughput: throughput)
         case .simData:
-            SimApnTab(controller: modem)
+            SimApnTab(controller: modem, simWatcher: simWatcher)
         case .driver:
             StatusView(controller: driverStatus)
         }
@@ -266,7 +282,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         service: SmsService(),
         queue: AppDelegate.modemQueue,
         replyToQuit: { [unowned self] succeeded in self.quitGate.replied(AppDelegate.messagesMember, succeeded) },
-        requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) })
+        requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) },
+        backgroundService: SmsService(waitForPort: false),
+        notifyEnabled: { [unowned self] in self.settings.notifyMessages },
+        alert: { [unowned self] alert in self.notifier.post(alert, showText: self.settings.notificationShowsText) })
+
+    // The settings besides the menu bar icon's (AppSettings.swift), the screen a click asks the window for, and the
+    // notifications for new messages (MessageNotifier.swift).
+    private(set) lazy var settings = AppSettings(defaults: .standard)
+    private(set) lazy var router = WindowRouter()
+    private lazy var notifier = MessageNotifier()
+
+    // Switching SIM slots by itself (SimSlotWatch.swift), with the modem screens' controller.
+    private(set) lazy var simWatcher = SimSlotWatcher(
+        enabled: { [unowned self] in self.settings.simAutoSwitch },
+        switchSlot: { [unowned self] slot, done in self.modem.changeSimSlot(slot, automatic: true, completion: done) })
+
+    // The background turn over the AT port, every 15 s while the app runs (ModemPulse.swift): the signal bars, the
+    // check for new messages and the SIM slot watcher, in one port open that does not wait for another program.
+    private lazy var pulse: ModemPulse = {
+        let service = ModemService(open: { AtPort.openWithoutWaiting().map { $0 as AtCommanding } })
+        let p = ModemPulse(queue: AppDelegate.modemQueue, read: { service.shortReads($0) })
+        p.add(ModemPulse.Rider(commands: { [unowned self] _ in self.menuBar.pulseSignalCommands() },
+                               deliver: { [unowned self] in self.menuBar.pulseSignalAnswers($0) }))
+        p.add(ModemPulse.Rider(commands: { [unowned self] turn in
+                                   self.menuBar.modemOnUsb ? self.messages.pulseCommands(turn: turn) : [] },
+                               deliver: { [unowned self] in self.messages.pulseAnswers($0) }))
+        p.add(ModemPulse.Rider(commands: { [unowned self] _ in self.simWatcher.pulseCommands() },
+                               deliver: { [unowned self] in self.simWatcher.pulseAnswers($0) }))
+        return p
+    }()
+    private var watchers: [AnyCancellable] = []
 
     // The process's one ModemController, for the Overview, Network and SIM & Data screens, kept the same way.
     private(set) lazy var modem: ModemController = ModemController(
@@ -299,6 +345,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         menuBar.start()
+        // A modem that comes onto USB (or is there now) is watched for an empty SIM slot.
+        watchers.append(menuBar.$modemOnUsb.sink { [unowned self] present in self.simWatcher.modemPresent(present) })
+        UNUserNotificationCenter.current().delegate = notifier
+        notifier.open = { [unowned self] identity in
+            self.router.request = .messages
+            if let identity { self.messages.select(identity) }
+            _ = AppDelegate.showStatusWindow(using: AppDelegate.openStatusWindow)
+        }
+        pulse.start()
     }
 
     // Both controllers are asked at once when the app is to quit, since a call of one can wait behind a call
@@ -373,6 +428,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+/// The screen asked for from outside the window (a notification's click, the menu bar panel's unread line): the window
+/// shows it and clears the request, also when it opens later.
+final class WindowRouter: ObservableObject {
+    @Published var request: Screen? = nil
+}
+
 // What the window knows of the system's listing.
 enum ListingState {
     case asking            // no answer yet since the window opened
@@ -390,7 +451,7 @@ final class StatusController: ObservableObject {
     @Published private(set) var busy = false
     @Published private(set) var progress = ""
 
-    let bundledVersion = bundledDriverVersion() ?? ""
+    private(set) var bundledVersion = bundledDriverVersion() ?? ""
     private let manager = ExtensionManager()
     private var entries: [ExtensionEntry] = []
     private var asking = false  // a properties request is in flight (at most 10 s)

@@ -37,6 +37,7 @@ enum Call: Equatable {
     case setLteCellLock([LteLockedCell])
     case setCellLockPersist(Bool, Bool)
     case setImei(String, reboot: Bool)
+    case setSimSlot(Int, SimSlotWait)
 }
 
 let queueKey = DispatchSpecificKey<String>()
@@ -75,6 +76,7 @@ final class FakeService: ModemServing, CustomReflectable {
     private var setLteCellLockResults: [Result<CellLockChange, ModemFailure>] = []
     private var setCellLockPersistResults: [Result<CellLockChange, ModemFailure>] = []
     private var setImeiResults: [Result<ImeiChange, ModemFailure>] = []
+    private var setSimSlotResults: [Result<SimSlotChange, ModemFailure>] = []
     private var antennasCount = 0
     private var cellLockCount = 0
     private var imeiCount = 0
@@ -247,6 +249,13 @@ final class FakeService: ModemServing, CustomReflectable {
         return locked { setImeiResults.removeFirst() }
     }
 
+    func simSlot() -> Result<Int, ModemFailure> { .success(1) }
+
+    func setSimSlot(_ slot: Int, wait: SimSlotWait) -> Result<SimSlotChange, ModemFailure> {
+        enter(.setSimSlot(slot, wait))
+        return locked { setSimSlotResults.removeFirst() }
+    }
+
     /// The answer of the next bands read (then `bandsAnswer` again).
     func queueBands(_ r: Result<[BandSet], ModemFailure>) { locked { bandsQueued.append(r) } }
     func queueAntennas(_ r: Result<[AntennaSignalSet], ModemFailure>) { locked { antennasQueued.append(r) } }
@@ -265,6 +274,7 @@ final class FakeService: ModemServing, CustomReflectable {
     func releaseSetLteCellLock(_ r: Result<CellLockChange, ModemFailure>) { locked { setLteCellLockResults.append(r) }; gate.signal() }
     func releaseSetCellLockPersist(_ r: Result<CellLockChange, ModemFailure>) { locked { setCellLockPersistResults.append(r) }; gate.signal() }
     func releaseSetImei(_ r: Result<ImeiChange, ModemFailure>) { locked { setImeiResults.append(r) }; gate.signal() }
+    func releaseSetSimSlot(_ r: Result<SimSlotChange, ModemFailure>) { locked { setSimSlotResults.append(r) }; gate.signal() }
 }
 
 // MARK: - Helpers
@@ -489,6 +499,7 @@ struct ModemControllerTests {
         signalHistory()
         antennasCellLockAndImei()
         imeiHistoryRecorded()
+        simSlotChanges()
         check(changesSeen > 0, "main thread: the controllers' changes were watched")
         print("modem controller: \(checks) checks passed")
     }
@@ -2470,6 +2481,40 @@ struct ModemControllerTests {
               + "IMEI history: The IMEI history could not be written (/x).", "history: not written is said", c.result)
         check(keeper.entries.count == 1, "history: nothing appended when refused")
         c.setTabShown(nil)
+    }
+}
+
+func equal<T: Equatable>(_ got: T, _ want: T, _ name: String) {
+    check(got == want, name, "got \(got)\nwant \(want)")
+}
+
+extension ModemControllerTests {
+    /// The SIM slot: by hand it waits for the registration and leaves its sentence; automatic it waits for the SIM only,
+    /// leaves no line, and is refused silently (false) while another change runs; both report their outcome.
+    static func simSlotChanges() {
+        let rig = Rig()
+        let c = rig.controller
+        var outcomes: [Result<SimSlotChange, ModemFailure>] = []
+        check(c.changeSimSlot(2) { outcomes.append($0) }, "slot by hand: started")
+        rig.waitForCall(1, "slot by hand: setSimSlot")
+        equal(rig.fake.allCalls.last, .setSimSlot(2, .registration), "slot by hand: waits for the registration")
+        rig.fake.releaseSetSimSlot(.success(SimSlotChange(before: 1, after: 2, sim: .ready, secondsToSim: 2,
+                                                          registration: Registration(status: .home, domain: "5GS"),
+                                                          secondsToRegister: 4)))
+        pump(until: { outcomes.count == 1 }, "slot by hand: finished")
+        equal(c.result, "Switched to SIM 2. SIM ready; registered, home network (5GS) after 4 s.", "slot by hand: the sentence")
+        check(!c.resultIsFailure, "slot by hand: not a failure")
+
+        check(c.changeSimSlot(1, automatic: true) { outcomes.append($0) }, "automatic: started")
+        rig.waitForCall(2, "automatic: setSimSlot")
+        equal(rig.fake.allCalls.last, .setSimSlot(1, .sim), "automatic: waits for the SIM only")
+        // Another change asked meanwhile: refused (by hand, with a line); an automatic one silently.
+        check(!c.changeSimSlot(2, automatic: true), "automatic: refused while a change runs")
+        rig.fake.releaseSetSimSlot(.success(SimSlotChange(before: 2, after: 1, sim: .notInserted)))
+        pump(until: { outcomes.count == 2 }, "automatic: finished")
+        equal(c.result, "", "automatic: no result line")
+        check(!c.changeSimSlot(3), "slot 3: refused")
+        equal(c.result, "The modem has SIM slots 1 and 2. Nothing was changed.", "slot 3: the line")
     }
 }
 

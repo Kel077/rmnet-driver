@@ -32,7 +32,7 @@ struct SignalSample: Equatable {
 }
 
 /// What is running on the service's queue; at most one call at a time.
-enum ModemActivity: Equatable { case reading, radio, mode, profile, pin, bands, cellLock, imei }
+enum ModemActivity: Equatable { case reading, radio, mode, profile, pin, bands, cellLock, imei, simSlot }
 
 /// The way back from the last mode or profile change: the mode before (as the modem gave it, ruling R8), or
 /// the profile's settings before, password included (in memory only).
@@ -137,6 +137,7 @@ final class ModemController: ObservableObject {
     private static let bandsQuitLine = "RMNet quits when the bands have been changed."
     private static let cellLockQuitLine = "RMNet quits when the cell lock has been changed."
     private static let imeiQuitLine = "RMNet quits when the IMEI change has finished."
+    private static let simSlotQuitLine = "RMNet quits when the SIM slot has been switched."
     private static let anotherChange = "Another change to the modem has not finished yet. Nothing was changed; try again when it has."
 
     private let service: ModemServing
@@ -990,6 +991,40 @@ final class ModemController: ObservableObject {
             }
             self.finished(succeeded: (try? done.outcome.get()) != nil, changed: true)
         }
+    }
+
+    // MARK: The SIM slot
+
+    /// Switches the SIM slot (AT+QUIMSLOT=, ModemService.setSimSlot), as one change. Asked in the window (the SIM &
+    /// Data screen's confirmation): it waits for the new slot's SIM and the registration, and its sentence is the
+    /// result line. `automatic` (the SIM slot watcher, SimSlotWatch.swift): it waits for the SIM only, is refused
+    /// silently (false: nothing started) while another change runs or the app quits, and leaves no result line; the
+    /// watcher says what came of it. Either way `completion` gets the outcome, and the SIM is read again.
+    @discardableResult
+    func changeSimSlot(_ slot: Int, automatic: Bool = false,
+                       completion: ((Result<SimSlotChange, ModemFailure>) -> Void)? = nil) -> Bool {
+        guard !stopping else { return false }
+        guard simSlots.contains(slot) else {
+            if !automatic { refuse("The modem has SIM slots 1 and 2. Nothing was changed.") }
+            return false
+        }
+        guard change == nil else {
+            if !automatic { refuse(ModemController.anotherChange) }
+            return false
+        }
+        submit(.simSlot, line: "Switching to SIM \(slot)…", quitLine: ModemController.simSlotQuitLine,
+               { $0.setSimSlot(slot, wait: automatic ? .sim : .registration) }) { outcome in
+            self.changeEnded()
+            switch outcome {
+            case .success(let c):
+                self.setResult(automatic ? "" : simSlotSentence(c), failure: false)
+            case .failure(let failure):
+                self.setResult(automatic ? "" : failure.message, failure: !automatic)
+            }
+            self.finished(succeeded: (try? outcome.get()) != nil, changed: true)
+            completion?(outcome)
+        }
+        return true
     }
 
     private func setResult(_ line: String, failure: Bool) {

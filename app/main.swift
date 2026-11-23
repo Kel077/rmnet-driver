@@ -6,7 +6,7 @@
 //        RMNet network [--json] | antennas [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…]
 //        RMNet apn [show] [--json] | apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>]
 //                  [--password | --no-password] [--auth none|pap|chap|pap-or-chap] [--no-redial]
-//        RMNet sim [--json] | sim unlock [--last-attempt]
+//        RMNet sim [--json] | sim unlock [--last-attempt] | sim slot [--json] | sim slot set 1|2 [--yes]
 //        RMNet usbmode [--json] | usbmode set qmi|ecm|mbim|rndis [--no-reboot] [--yes]
 //        RMNet at [--timeout <seconds>] <command>
 //        RMNet bands [--json] | bands set lte|nsa|sa <bands> | bands reset [lte|nsa|sa]

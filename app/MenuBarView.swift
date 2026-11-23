@@ -2,7 +2,8 @@
 // signal bars drawn by menuBarSignalImage, as chosen in Settings), and the panel it opens, the connection at a glance
 // as the Overview shows it: the state's pill from the Driver screen's headline, the technology's badge, the bars with
 // their word, the operator and the band from the network read over the AT port when the panel opens (with its time,
-// or why it failed), the IPv4 address while the link is up, the window's quit lines while a quit waits, `Open RMNet`,
+// or why it failed), the IPv4 address while the link is up, how many messages are unread (a click opens Messages), the
+// window's quit lines while a quit waits, `Open RMNet`,
 // a gear that opens Settings, and `Quit RMNet`. MenuBarStatus (MenuBarStatus.swift) holds the state and decides when
 // the port is read; this file only shows it, with DesignKit's pieces.
 import AppKit
@@ -141,12 +142,16 @@ struct MenuBarPanel: View {
     // pressed while a send or a change runs says why RMNet has not quit yet.
     @ObservedObject var quitNotice: SmsQuitNotice
     @ObservedObject var modemQuitNotice: ModemQuitNotice
+    // How many messages are unread (the window's marks, kept up to date by the background check for new messages).
+    @ObservedObject var unread: SmsUnreadNotice
     /// Shows the RMNet window, given the panel's own way of opening it (for when it is not open). The app
     /// passes AppDelegate.showStatusWindow, which brings an open window forward first.
     var showWindow: (_ open: @escaping () -> Void) -> Void = { open in
         open()
         NSApp.activate()
     }
+    /// Asks the window for the Messages screen (WindowRouter), before showWindow opens it.
+    var showMessages: () -> Void = {}
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
 
@@ -167,6 +172,27 @@ struct MenuBarPanel: View {
             readLine
             if let ipv4 {
                 KeyValueRow(label: "IPv4", value: ipv4, copyable: true)
+            }
+            if unread.count > 0 {
+                Button {
+                    showMessages()
+                    let open = openWindow
+                    showWindow { open(id: "status") }
+                } label: {
+                    HStack(spacing: Spacing.s) {
+                        Image(systemName: "envelope.badge.fill")
+                            .foregroundStyle(.blue)
+                        Text(verbatim: unreadLine(unread.count))
+                            .foregroundStyle(.primary)
+                        Spacer(minLength: Spacing.s)
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Open Messages")
             }
             let quitLines = quitNoticeLines(messages: quitNotice.line, modem: modemQuitNotice.line)
             if quitLines.isEmpty {

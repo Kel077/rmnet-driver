@@ -10,13 +10,19 @@ final class SmsService: SmsServing {
     private static let deleteTimeout: TimeInterval = 10
     private static let sendTimeout: TimeInterval = 60     // per part: the network's answer
 
-    init() {}
+    private let openPort: () -> Result<AtPort, AtError>
+
+    /// `waitForPort` false: a port another program holds fails as busy at once (AtPort.openWithoutWaiting), for the
+    /// app's background listing of new messages, which then tries again on a later turn.
+    init(waitForPort: Bool = true) {
+        openPort = waitForPort ? { AtPort.open() } : { AtPort.openWithoutWaiting() }
+    }
 
     // The listing, then the store's use (AT+CPMS?) in the same session; if that answer cannot be read the
     // listing still succeeds, without it.
     func list() -> Result<SmsListing, SmsFailure> {
         let port: AtPort
-        switch AtPort.open() {
+        switch openPort() {
         case .success(let p): port = p
         case .failure(let error): return .failure(SmsFailure(message: describe(error)))
         }
@@ -42,7 +48,7 @@ final class SmsService: SmsServing {
             return .failure(SmsFailure(message: "A stored index is negative. Nothing was deleted."))
         }
         let port: AtPort
-        switch AtPort.open() {
+        switch openPort() {
         case .success(let p): port = p
         case .failure(let error): return .failure(SmsFailure(message: "\(describe(error)) Nothing was deleted."))
         }
@@ -72,7 +78,7 @@ final class SmsService: SmsServing {
         case .failure(let failure): return .failure(failure)
         }
         let port: AtPort
-        switch AtPort.open() {
+        switch openPort() {
         case .success(let p): port = p
         case .failure(let error): return .failure(SmsFailure(message: "\(describe(error)) Nothing was sent."))
         }

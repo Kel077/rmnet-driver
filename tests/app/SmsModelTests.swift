@@ -805,7 +805,40 @@ struct SmsModelTests {
         check(parseStorage(["OK"]) == nil && parseStorage([]) == nil, "parseStorage: no +CPMS line")
 
         windowHelperChecks()
+        readingPaneHelpers()
 
         print("sms-test: \(checks) checks passed")
+    }
+
+    /// The list's heading and the reading pane's Copy Code.
+    static func readingPaneHelpers() {
+        check(messageCountLine(count: 0, unread: 0) == "", "count line: none")
+        check(messageCountLine(count: 1, unread: 0) == "1 message", "count line: one")
+        check(messageCountLine(count: 3, unread: 1) == "3 messages · 1 unread", "count line: with unread")
+
+        let found: [(String, String)] = [
+            ("Your verification code is 482913. It expires in 10 minutes.", "482913"),
+            ("Code 1234", "1234"),
+            ("\u{9A8C}\u{8BC1}\u{7801}\u{FF1A}384920\u{FF0C}5\u{5206}\u{949F}\u{5185}\u{6709}\u{6548}\u{3002}", "384920"),  // a Chinese code message, as escapes
+            ("Your OTP: 00112233", "00112233"),
+            ("G-482913 is your Google verification code.", "482913"),
+        ]
+        for (text, code) in found {
+            check(verificationCode(in: text) == code, "code: \(text)", "got \(String(describing: verificationCode(in: text)))")
+        }
+        let none = [
+            "T-Mobile: You have used 75% of your high-speed data for this bill cycle.",   // no code word
+            "Running late, see you at the station around six.",
+            "Your code is 1234, reference 5678.",                                           // two groups
+            "Call +15555550123 about your code.",                                           // a phone number
+            "Pay $1500 with code word",                                                     // an amount
+            "Your balance 1234.56; PIN unchanged",                                          // a decimal
+            "Your code is 123.",                                                            // too short
+            "Order #123456 code",                                                           // an order number
+            "Call 555-1234 for a new PIN",                                                  // a phone number
+        ]
+        for text in none {
+            check(verificationCode(in: text) == nil, "no code: \(text)", "got \(String(describing: verificationCode(in: text)))")
+        }
     }
 }

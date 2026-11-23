@@ -80,7 +80,8 @@ check-driverkit:
 app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build/nmea-tests build/gpsread-tests \
 		build/modemnet-tests build/modemset-tests build/modemsvc-tests build/modemcli-tests build/modemui-tests \
 		build/quit-tests build/menubar-tests build/window-tests build/signal-tests build/throughput-tests \
-		build/shell-tests build/networkview-tests build/overview-tests build/imeihistory-tests
+		build/shell-tests build/networkview-tests build/overview-tests build/imeihistory-tests build/simslot-tests \
+		build/messagealerts-tests
 	./build/app-tests
 	./build/sms-tests
 	./build/at-tests
@@ -101,6 +102,8 @@ app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build
 	./build/networkview-tests
 	./build/overview-tests
 	./build/imeihistory-tests
+	./build/simslot-tests
+	./build/messagealerts-tests
 
 build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
 	@mkdir -p build
@@ -114,7 +117,8 @@ build/at-tests: app/AtPort.swift tests/app/AtPortTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
-build/smsui-tests: app/SmsModel.swift app/SmsController.swift tests/app/SmsControllerTests.swift
+build/smsui-tests: app/SmsModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/MessageAlerts.swift \
+		app/SmsController.swift tests/app/SmsControllerTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
@@ -151,7 +155,7 @@ build/modemui-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHist
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
-build/quit-tests: app/SmsModel.swift app/SmsController.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift \
+build/quit-tests: app/SmsModel.swift app/MessageAlerts.swift app/SmsController.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift \
 		app/ModemController.swift app/QuitGate.swift tests/app/QuitGateTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
@@ -202,6 +206,19 @@ build/overview-tests: app/StatusModel.swift app/ModemNetwork.swift app/ModemSett
 # The IMEI history: its lines, the file (in a temporary folder), the entries made from changes, what `imei history`
 # prints and the SIM & Data screen's rows.
 build/imeihistory-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift tests/app/ImeiHistoryTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+# Switching SIM slots by itself (when, and never back and forth) and the app's settings.
+build/simslot-tests: app/ModemNetwork.swift app/ModemSettings.swift app/SimSlotWatch.swift app/AppSettings.swift \
+		tests/app/SimSlotWatchTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+# New messages in the background: the count, the baseline, what is new and what a notification says; the background
+# turn shared over the AT port; the Messages controller's part, against a fake service.
+build/messagealerts-tests: app/SmsModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/MessageAlerts.swift \
+		app/ModemPulse.swift app/SmsController.swift tests/app/MessageAlertsTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 

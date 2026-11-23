@@ -106,6 +106,8 @@ struct NoModem: ModemServing {
     func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure> { .failure(failure) }
     func imei() -> Result<String, ModemFailure> { .failure(failure) }
     func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure> { .failure(failure) }
+    func simSlot() -> Result<Int, ModemFailure> { .failure(failure) }
+    func setSimSlot(_ slot: Int, wait: SimSlotWait) -> Result<SimSlotChange, ModemFailure> { .failure(failure) }
 }
 
 @main
@@ -505,9 +507,33 @@ struct ModemSettingsTests {
                    [("SIM", "blocked: needs its PUK from the carrier"), ("PIN lock", "on"), ("Attempts left", "PIN 0, PUK 10")],
                    "blocked")
         expectEqual(jsonText(simJSON(readySim), "simJSON"),
-                    "{\"pinAttempts\":3,\"pinLock\":false,\"pukAttempts\":10,\"state\":\"ready\"}", "simJSON: ready")
+                    "{\"activeSlot\":null,\"pinAttempts\":3,\"pinLock\":false,\"pukAttempts\":10,\"state\":\"ready\"}",
+                    "simJSON: ready (activeSlot added, null when not read)")
+        var slotted = readySim
+        slotted.activeSlot = 2
+        expectEqual(jsonText(simJSON(slotted), "simJSON slot"),
+                    "{\"activeSlot\":2,\"pinAttempts\":3,\"pinLock\":false,\"pukAttempts\":10,\"state\":\"ready\"}",
+                    "simJSON: with the slot")
+        expectRows(simRows(slotted), [("SIM", "ready"), ("PIN lock", "off"), ("Attempts left", "PIN 3, PUK 10"), ("Slot", "2")],
+                   "the slot as the last row")
+        // AT+QUIMSLOT? and the SIM states.
+        check(parseSimSlot(["+QUIMSLOT: 1"]) == 1 && parseSimSlot(["+QUIMSLOT: 2"]) == 2, "parseSimSlot: 1 and 2")
+        check(parseSimSlot(["+QUIMSLOT: 3"]) == nil && parseSimSlot(["+QUIMSLOT: x"]) == nil && parseSimSlot([]) == nil
+                && parseSimSlot(["+QUIMSLOT:"]) == nil, "parseSimSlot: another value, none")
+        expectEqual(simSlotCommand(2), "AT+QUIMSLOT=2", "simSlotCommand")
+        check(otherSimSlot(1) == 2 && otherSimSlot(2) == 1, "otherSimSlot")
+        check(simUnusable(simState(fromError: "+CME ERROR: 10")) && simUnusable(simState(fromError: "+CME ERROR: 13")),
+              "simUnusable: CME 10 (not inserted) and 13 (SIM failure)")
+        check(!simUnusable(simState(fromError: "+CME ERROR: 14")) && !simUnusable(.ready) && !simUnusable(.pin)
+                && !simUnusable(.other("+CME ERROR: 15")), "simUnusable: not busy, ready, a PIN or another answer")
+        check(simState(PulseAnswer.refused("+CME ERROR: 10")) == .notInserted
+                && simState(PulseAnswer.lines(["+CPIN: READY"])) == .ready && simState(PulseAnswer.lines([])) == nil,
+              "simState of a short read")
+        let q = simSlotQuestion(from: 1, to: 2)
+        check(q.title == "Switch to SIM 2?" && q.message.hasPrefix("The modem uses SIM 1 now. The connection drops"),
+              "simSlotQuestion", q.message)
         expectEqual(jsonText(simJSON(SimInfo(state: .notInserted, pinLock: nil, pinAttempts: nil, pukAttempts: nil)), "simJSON"),
-                    "{\"pinAttempts\":null,\"pinLock\":null,\"pukAttempts\":null,\"state\":\"not inserted\"}",
+                    "{\"activeSlot\":null,\"pinAttempts\":null,\"pinLock\":null,\"pukAttempts\":null,\"state\":\"not inserted\"}",
                     "simJSON: nulls where unknown")
         for (state, word) in [
             (SimState.ready, "ready"), (.pin, "pin"), (.puk, "puk"), (.pin2, "pin2"), (.puk2, "puk2"),

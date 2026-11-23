@@ -67,7 +67,10 @@ enum SimState: Equatable { case ready, pin, puk, pin2, puk2, notInserted, failur
 
 /// The SIM: its state, the PIN lock (AT+CLCK="SC",2) and the attempts left (AT+QPINC? "SC"); nil where
 /// not read.
-struct SimInfo: Equatable { let state: SimState; let pinLock: Bool?; let pinAttempts: Int?; let pukAttempts: Int? }
+struct SimInfo: Equatable {
+    let state: SimState; let pinLock: Bool?; let pinAttempts: Int?; let pukAttempts: Int?
+    var activeSlot: Int? = nil      // AT+QUIMSLOT?: the slot in use (1 or 2); nil when not read
+}
 
 /// After AT+CFUN=1 or =4. Switched on: the registration last read, and the whole seconds until it was
 /// registered (nil when it was not, within the wait). Switched off: both nil.
@@ -214,6 +217,8 @@ protocol ModemServing {
     func setCellLockPersist(lte: Bool, nr: Bool) -> Result<CellLockChange, ModemFailure>
     func imei() -> Result<String, ModemFailure>
     func setImei(_ imei: String, reboot: Bool) -> Result<ImeiChange, ModemFailure>
+    func simSlot() -> Result<Int, ModemFailure>                                       // AT+QUIMSLOT?
+    func setSimSlot(_ slot: Int, wait: SimSlotWait) -> Result<SimSlotChange, ModemFailure>
 }
 
 // MARK: - Answer lines
@@ -716,13 +721,106 @@ func simRows(_ sim: SimInfo) -> [(label: String, value: String)] {
     if let lock = sim.pinLock { rows.append((label: "PIN lock", value: lock ? "on" : "off")) }
     let attempts = [sim.pinAttempts.map { "PIN \($0)" }, sim.pukAttempts.map { "PUK \($0)" }].compactMap { $0 }
     if !attempts.isEmpty { rows.append((label: "Attempts left", value: attempts.joined(separator: ", "))) }
+    if let slot = sim.activeSlot { rows.append((label: "Slot", value: String(slot))) }
     return rows
 }
 
 /// `RMNet sim --json`: every key is always there; a value not read is null.
 func simJSON(_ sim: SimInfo) -> [String: Any] {
     ["state": simStateKey(sim.state), "pinLock": orNull(sim.pinLock), "pinAttempts": orNull(sim.pinAttempts),
-     "pukAttempts": orNull(sim.pukAttempts)]
+     "pukAttempts": orNull(sim.pukAttempts), "activeSlot": orNull(sim.activeSlot)]
+}
+
+// MARK: - The SIM slot (AT+QUIMSLOT)
+//
+// The RM520N-GL has two SIM slots and uses one at a time (dual SIM, single standby): AT+QUIMSLOT? gives
+// `+QUIMSLOT: <1|2>` and AT+QUIMSLOT=<1|2> switches. The modem reads the other SIM and registers again within
+// seconds, with no restart, and keeps the slot across restarts.
+
+let simSlots = [1, 2]
+
+/// One command's answer in a short read (ModemService.shortReads): its lines, or the modem's error line.
+enum PulseAnswer: Equatable {
+    case lines([String])
+    case refused(String)
+
+    /// The lines, none for a refusal (as a read whose refusal only leaves its part unknown).
+    var lines: [String] {
+        if case .lines(let l) = self { return l }
+        return []
+    }
+}
+
+/// AT+CPIN? as a short read gave it: a state (the error line is one too: simState(fromError:)); nil when it said
+/// neither.
+func simState(_ answer: PulseAnswer) -> SimState? {
+    switch answer {
+    case .lines(let lines): return parseSimState(lines)
+    case .refused(let line): return simState(fromError: line)
+    }
+}
+
+/// AT+QUIMSLOT?: `+QUIMSLOT: 1` → 1; nil without such a line or for another value.
+func parseSimSlot(_ lines: [String]) -> Int? {
+    guard let slot = firstAnswer(lines, "+QUIMSLOT").flatMap({ answerInt($0, 0) }), simSlots.contains(slot) else {
+        return nil
+    }
+    return slot
+}
+
+func simSlotCommand(_ slot: Int) -> String { "AT+QUIMSLOT=\(slot)" }
+
+/// The slot that is not `slot`.
+func otherSimSlot(_ slot: Int) -> Int { slot == 1 ? 2 : 1 }
+
+/// A SIM state no SIM in the slot can be used in: none there (`+CME ERROR: 10`, SIM not inserted) or one the
+/// modem cannot use (`+CME ERROR: 13`, SIM failure), as 3GPP TS 27.007 (9.2.1) numbers them. Not `busy`
+/// (`+CME ERROR: 14`): the SIM is there and still starting.
+func simUnusable(_ state: SimState) -> Bool {
+    state == .notInserted || state == .failure
+}
+
+/// How long a slot change waits: for the new slot's SIM only (`sim`), or also for the registration (`registration`).
+enum SimSlotWait: Equatable { case sim, registration }
+
+/// What a slot change did: the slots before and after (the same: nothing was changed), the new slot's SIM state as
+/// read until it settled (nil: not read), after how many whole seconds it was ready, and the registration with its
+/// seconds (only when waited for, and the SIM was ready).
+struct SimSlotChange: Equatable {
+    let before: Int
+    let after: Int
+    var sim: SimState? = nil
+    var secondsToSim: Int? = nil
+    var registration: Registration? = nil
+    var secondsToRegister: Int? = nil
+
+    var changed: Bool { before != after }
+}
+
+/// The result line of a slot change.
+func simSlotSentence(_ c: SimSlotChange) -> String {
+    guard c.changed else { return "Already on SIM \(c.after); nothing changed." }
+    guard let sim = c.sim else { return "Switched to SIM \(c.after); its SIM state could not be read." }
+    if simUnusable(sim) {
+        return "Switched to SIM \(c.after), but it has no usable SIM (\(simStateWords(sim)))."
+    }
+    guard sim == .ready else { return "Switched to SIM \(c.after). SIM: \(simStateWords(sim))." }
+    var line = "Switched to SIM \(c.after). SIM ready"
+    if let seconds = c.secondsToRegister, let r = c.registration {
+        line += "; \(registrationWords(r)) after \(seconds) s"
+    } else if let r = c.registration {
+        line += "; \(registrationWords(r)) (not registered yet)"
+    }
+    return line + "."
+}
+
+/// The question before a slot change (the window's confirmation; `RMNet sim slot set` asks the same on the terminal).
+func simSlotQuestion(from: Int?, to: Int) -> (title: String, message: String) {
+    (title: "Switch to SIM \(to)?",
+     message: (from.map { "The modem uses SIM \($0) now. " } ?? "")
+        + "The connection drops while the modem reads the SIM in slot \(to) and registers again, usually for a few "
+        + "seconds; with no SIM in slot \(to) there is no service until it is switched back. The modem keeps the slot "
+        + "after a restart.")
 }
 
 /// "1 attempt left", "3 attempts left".

@@ -1,8 +1,9 @@
-// The window's Messages screen: the modem's text messages, newest first, as a list (sender, a one-line preview, how
-// long ago, an unread dot) beside a reading pane (sender, time, the full text), with the store's use in the list's
-// footer; Refresh, Delete… and New Message in the toolbar, and a sheet to write and send a message. SmsController
+// The window's Messages screen: the modem's text messages, newest first, as a list (how many and how many unread
+// above it; each row the sender, a one-line preview, how long ago, an unread dot) beside a reading pane (sender, time,
+// Copy Code for a one-time code, Copy Text, Delete…, the full text), with the store's use in the list's footer; Refresh, Delete… and New Message in the toolbar, and a sheet to write and send a message. SmsController
 // (SmsController.swift) holds the state and runs the service; every decision that is a pure function of values lives in
 // SmsModel.swift. Nothing here logs or stores message text or numbers.
+import AppKit
 import SwiftUI
 
 extension SmsMessage: Identifiable {
@@ -59,6 +60,7 @@ struct SmsView: View {
                     if let failure = controller.listFailure {
                         StaleListNotice(text: listLine(updated: controller.listedAt, failure: failure))
                     }
+                    ListHeading(count: controller.messages.count, unread: controller.unread.count)
                     // Ages are counted from a clock that turns every 15 s, so they stay right between listings.
                     TimelineView(.periodic(from: .now, by: 15)) { context in
                         List(controller.messages, selection: $controller.selection) { m in
@@ -70,7 +72,8 @@ struct SmsView: View {
                 }
                 .frame(minWidth: 230, idealWidth: 280, maxWidth: 320)
                 Divider()
-                ReadingPane(message: controller.selectedMessage)
+                ReadingPane(message: controller.selectedMessage, deleteEnabled: controller.deleteEnabled,
+                            delete: { confirming = controller.selectedMessage })
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
@@ -185,6 +188,30 @@ private struct MessageRow: View {
     }
 }
 
+/// Above the list: how many messages it has, and how many are unread (blue).
+private struct ListHeading: View {
+    let count: Int
+    let unread: Int
+
+    var body: some View {
+        HStack(spacing: Spacing.xs) {
+            Text(verbatim: "\(count) \(count == 1 ? "message" : "messages")")
+                .foregroundStyle(.secondary)
+            if unread > 0 {
+                Text(verbatim: "·").foregroundStyle(.tertiary)
+                Text(verbatim: "\(unread) unread").foregroundStyle(.blue)
+            }
+            Spacer(minLength: 0)
+        }
+        .font(.callout.weight(.semibold))
+        .padding(.horizontal, Spacing.l)
+        .padding(.top, Spacing.m)
+        .padding(.bottom, Spacing.xs)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(verbatim: messageCountLine(count: count, unread: unread)))
+    }
+}
+
 /// Above the list when the last listing failed and the list shown is an older one.
 private struct StaleListNotice: View {
     let text: String
@@ -237,10 +264,13 @@ private struct ListFooter: View {
 
 // MARK: - The reading pane
 
-/// The selected message: who sent it and when, a note when it is not readable or incomplete, and its full text
-/// (selectable, to copy a code).
+/// The selected message: who sent it and when, Copy Code (the one-time code in it, verificationCode), Copy Text and
+/// Delete… (the toolbar's), a note when it is not readable or incomplete, and its full text (selectable). With none
+/// selected, an empty state that says what to do.
 private struct ReadingPane: View {
     let message: SmsMessage?
+    let deleteEnabled: Bool
+    let delete: () -> Void
 
     var body: some View {
         if let m = message {
@@ -260,12 +290,24 @@ private struct ReadingPane: View {
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                         }
+                        Spacer(minLength: Spacing.s)
+                        Button(role: .destructive, action: delete) {
+                            Label("Delete…", systemImage: "trash")
+                        }
+                        .disabled(!deleteEnabled)
+                        .help("Delete this message from the modem")
+                    }
+                    if !m.text.isEmpty {
+                        HStack(spacing: Spacing.s) {
+                            if let code = verificationCode(in: m.text) {
+                                CopyButton(title: "Copy Code \(code)", symbol: "number", value: code, prominent: true)
+                            }
+                            CopyButton(title: "Copy Text", symbol: "doc.on.doc", value: m.text, prominent: false)
+                        }
                     }
                     Divider()
                     if !note.isEmpty {
-                        Label(sentence(note), systemImage: "exclamationmark.triangle.fill")
-                            .font(.callout)
-                            .foregroundStyle(.orange)
+                        WarningNote(text: sentence(note))
                     }
                     if !m.text.isEmpty {
                         Text(verbatim: m.text)
@@ -281,7 +323,34 @@ private struct ReadingPane: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         } else {
-            EmptyState(symbol: "text.bubble", title: "No message selected")
+            EmptyState(symbol: "text.bubble", title: "No message selected",
+                       message: "Select a message in the list to read it.")
+        }
+    }
+}
+
+/// Copies `value` to the pasteboard; says Copied for a moment.
+private struct CopyButton: View {
+    let title: String
+    let symbol: String
+    let value: String
+    let prominent: Bool
+    @State private var copied = false
+
+    var body: some View {
+        let button = Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(value, forType: .string)
+            copied = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+        } label: {
+            Label(copied ? "Copied" : title, systemImage: copied ? "checkmark" : symbol)
+                .monospacedDigit()
+        }
+        if prominent {
+            button.buttonStyle(.borderedProminent)
+        } else {
+            button.buttonStyle(.bordered)
         }
     }
 }
@@ -294,7 +363,7 @@ private struct ReadingPane: View {
 /// a success it closes, and the screen's banner shows the result. Send is the default button (Return) only while the
 /// controller allows sending and the To field is not being edited, so Return in To never sends; in the text, Return is
 /// a new line. While an input method composes, Send waits (the controller's sendEnabled and composeText).
-private struct ComposeSheet: View {
+struct ComposeSheet: View {
     @ObservedObject var controller: SmsController
     @Environment(\.dismiss) private var dismiss
     @FocusState private var editingNumber: Bool
@@ -303,9 +372,9 @@ private struct ComposeSheet: View {
     var body: some View {
         let sending = controller.running == .sending
         VStack(alignment: .leading, spacing: Spacing.m) {
-            Text("New Message")
-                .font(.title3.weight(.semibold))
-                .accessibilityAddTraits(.isHeader)
+            SheetHeader(symbol: "square.and.pencil", title: "New Message",
+                        subtitle: "Sent from the modem's SIM; each message sent costs a carrier fee.")
+                .padding(.bottom, Spacing.xs)
             HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
                 Text("To")
                     .foregroundStyle(.secondary)
@@ -318,9 +387,7 @@ private struct ComposeSheet: View {
             }
             let badNumber = numberNote(controller.to)
             if !badNumber.isEmpty {
-                Text(verbatim: badNumber)
-                    .font(.caption)
-                    .foregroundStyle(.red)
+                ProblemNote(text: badNumber)
             }
             // It scrolls inside its frame, so a long text is never clipped. Its square bezel is drawn over with the
             // rounded edge of the To field.
@@ -342,14 +409,8 @@ private struct ComposeSheet: View {
                         .font(.callout)
                 }
             } else if sentHere && controller.resultIsFailure && !controller.result.isEmpty {
-                HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
-                    Image(systemName: "exclamationmark.circle.fill")
-                        .foregroundStyle(.red)
-                        .accessibilityLabel(Text("Failed"))
-                    Text(verbatim: controller.result)
-                        .font(.callout)
-                        .textSelection(.enabled)
-                }
+                ProblemNote(text: controller.result)
+                    .textSelection(.enabled)
             }
             HStack {
                 Spacer()

@@ -173,6 +173,7 @@ struct MenuBarStatusTests {
         signalModel()
         signalIcons()
         signalPolling()
+        pulseSignal()
         print("menu bar status: \(checks) checks passed")
     }
 
@@ -788,6 +789,12 @@ struct MenuBarStatusTests {
         defaults.set("rainbow", forKey: "menuBarIconStyle")
         equal(preference.load(), .antenna, "style: an unknown value is the antenna")
         equal(MenuBarIconStyle.allCases.map { $0.title }, ["Antenna", "Signal bars"], "style: titles")
+        check(preference.loadShowsTechnology(), "technology: unset shows it")
+        preference.saveShowsTechnology(false)
+        equal(defaults.object(forKey: "menuBarShowsTechnology") as? Bool, false, "technology: kept under menuBarShowsTechnology")
+        check(!preference.loadShowsTechnology(), "technology: read back off")
+        defaults.set("maybe", forKey: "menuBarShowsTechnology")
+        check(preference.loadShowsTechnology(), "technology: a value not a Bool shows it")
 
         // The model reads it at once, and setIconStyle keeps it.
         preference.save(.signal)
@@ -798,6 +805,13 @@ struct MenuBarStatusTests {
         s.setIconStyle(.antenna)
         equal(s.iconStyle, .antenna, "style: set")
         equal(preference.load(), .antenna, "style: set is kept")
+        preference.saveShowsTechnology(false)
+        let off = MenuBarStatus(properties: { nil }, modem: { (.absent, nil) }, listing: { $0([]) },
+                                network: { .failure(ModemFailure(message: "x")) }, queue: DispatchQueue(label: queueName),
+                                preference: preference)
+        check(!off.showsTechnology, "technology: read when the model is made")
+        off.setShowsTechnology(true)
+        check(off.showsTechnology && preference.loadShowsTechnology(), "technology: set and kept")
         let none = MenuBarStatus(properties: { nil }, modem: { (.absent, nil) }, listing: { $0([]) },
                                  network: { .failure(ModemFailure(message: "x")) }, queue: DispatchQueue(label: queueName))
         equal(none.iconStyle, .antenna, "style: without a preference, the antenna")
@@ -891,6 +905,14 @@ struct MenuBarStatusTests {
         equal(dimmed.accessibilityLabel, "RMNet: connected, 3 of 4 bars, 5G, not current", "icon: stale is said")
         check(!menuBarSignalIcon(.up, good, now: t.addingTimeInterval(44)).dimmed, "icon: 44 s old is current")
         check(menuBarSignalIcon(.up, good, now: t.addingTimeInterval(46)).dimmed, "icon: 46 s old is dimmed")
+        // Without the technology: the bars alone, and VoiceOver still hears it.
+        equal(menuBarSignalIcon(.up, good, now: t, showsTechnology: false),
+              MenuBarSignalIcon(bars: .filled(3), text: nil, accessibilityLabel: "RMNet: connected, 3 of 4 bars, 5G"),
+              "icon: connected, technology hidden")
+        equal(menuBarSignalIcon(.waitingForApproval, nil, now: t, showsTechnology: false).mark, .exclamation,
+              "icon: the marks stay without the technology")
+        equal(menuBarSignalIcon(.down, MenuBarSignal(level: 0, technology: nil, service: .searching, at: t), now: t,
+                                showsTechnology: false).mark, .ellipsis, "icon: searching keeps its ellipsis")
         // The antenna's labels are unchanged.
         equal(MenuBarIcon.up.accessibilityLabel, "RMNet: connected", "antenna: label kept")
     }
@@ -940,6 +962,11 @@ struct MenuBarStatusTests {
         equal(offQueue, 0, "poll: on the model's queue")
         equal(s.signal, MenuBarSignal(level: 3, technology: "5G", service: .normal, at: clock), "poll: the bars")
         equal(s.signalIcon.bars, .filled(3), "poll: drawn")
+        equal(s.signalIcon.text, "5G", "poll: with the technology")
+        s.setShowsTechnology(false)
+        check(s.signalIcon.text == nil && s.signalIcon.bars == .filled(3), "poll: the technology turned off at once")
+        equal(readsMade(), 1, "poll: turning it off reads nothing")
+        s.setShowsTechnology(true)
 
         // A busy port: the bars kept, stale.
         answer(.failure(ModemFailure(message: describe(AtError.busy))))
@@ -985,5 +1012,30 @@ struct MenuBarStatusTests {
         s.pollSignal()
         settle()
         equal(readsMade(), quiet, "poll: the antenna again, no read")
+    }
+
+    /// In the app the signal bars ride the background turn: the command pollSignal would send, then its answers.
+    static func pulseSignal() {
+        var clock = Date(timeIntervalSince1970: 1_800_000_000)
+        let suite = "io.rmnetdriver.RMNet.tests.pulse.\(getpid())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let queue = DispatchQueue(label: queueName)
+        let s = MenuBarStatus(properties: { upProperties }, modem: { (.qmi(interface: 4), rm520) }, listing: { $0([enabled]) },
+                              network: { .success(saInfo) }, now: { clock }, queue: queue,
+                              preference: MenuBarIconPreference(defaults: defaults))
+        s.poll()
+        equal(s.pulseSignalCommands(), [], "pulse: the antenna wants nothing")
+        check(s.modemOnUsb, "pulse: the modem on USB, from the registry")
+        s.setIconStyle(.signal)
+        equal(s.pulseSignalCommands(), ["AT+QENG=\"servingcell\""], "pulse: the serving cell")
+        equal(s.pulseSignalCommands(), [], "pulse: not again while one runs")
+        s.pulseSignalAnswers(.success(["AT+QENG=\"servingcell\"": .lines([
+            "+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",001,01,FEDCBA987,32,00F00D,504990,41,12,-86,-10,10,1,-"])]))
+        equal(s.signal?.level, 3, "pulse: the answer read")
+        clock = clock.addingTimeInterval(15)
+        _ = s.pulseSignalCommands()
+        s.pulseSignalAnswers(.failure(ModemFailure(message: describe(AtError.busy))))
+        check(s.signal?.stale == true && s.signal?.level == 3, "pulse: a busy turn keeps the bars, stale")
     }
 }

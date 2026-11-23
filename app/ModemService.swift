@@ -91,6 +91,8 @@ final class ModemService: ModemServing {
     private static let nrLockRead = "AT+QNWLOCK=\"common/5g\""
     private static let lockPersistRead = "AT+QNWLOCK=\"save_ctrl\""
     private static let imeiRead = "AT+EGMR=0,7"
+    private static let simSlotRead = "AT+QUIMSLOT?"
+    private static let simWait: TimeInterval = 15             // after AT+QUIMSLOT=: the new slot's SIM to settle
 
     private let open: () -> Result<AtCommanding, AtError>
     private let sleep: (TimeInterval) -> Void
@@ -647,11 +649,105 @@ final class ModemService: ModemServing {
         }
     }
 
-    /// AT+QPINC? and AT+CLCK="SC",2 after the state; one that is refused or fails is nil.
+    /// AT+QPINC?, AT+CLCK="SC",2 and AT+QUIMSLOT? after the state; one that is refused or fails is nil.
     private func readSimDetails(_ link: Link, _ state: SimState) -> SimInfo {
         let attempts = parsePinAttempts(link.read(ModemService.pinAttemptsRead))
         let lock = parsePinLock(link.read(ModemService.pinLockRead))
-        return SimInfo(state: state, pinLock: lock, pinAttempts: attempts.pin, pukAttempts: attempts.puk)
+        let slot = parseSimSlot(link.read(ModemService.simSlotRead))
+        return SimInfo(state: state, pinLock: lock, pinAttempts: attempts.pin, pukAttempts: attempts.puk, activeSlot: slot)
+    }
+
+    // MARK: The SIM slot
+
+    func simSlot() -> Result<Int, ModemFailure> {
+        withPort({ describe($0) }) { readSimSlot($0, nothingChanged: false) }
+    }
+
+    private func readSimSlot(_ link: Link, nothingChanged: Bool) -> Result<Int, ModemFailure> {
+        let tail = nothingChanged ? " Nothing was changed." : ""
+        switch link.command(ModemService.simSlotRead, timeout: ModemService.readTimeout) {
+        case .success(let lines):
+            guard let slot = parseSimSlot(lines) else { return failure("The modem did not say which SIM slot it uses.\(tail)") }
+            return .success(slot)
+        case .failure(let error) where isRefusal(error):
+            return failure("The modem does not switch SIM slots. \(describe(error))\(tail)")
+        case .failure(let error):
+            return failure("The SIM slot could not be read. \(describe(error))\(tail)")
+        }
+    }
+
+    /// Reads the slot (nothing is sent when it is already `slot`), sends AT+QUIMSLOT=<slot> (5 s) and reads it back;
+    /// then reads AT+CPIN? every second until the new slot's SIM settles (ready, or asking for a PIN or PUK) or 15 s
+    /// have passed (an empty slot stays `not inserted`); with `wait` .registration and the SIM ready, the registration
+    /// every second for up to 30 s, as the radio switched on does. All on one port open.
+    func setSimSlot(_ slot: Int, wait: SimSlotWait) -> Result<SimSlotChange, ModemFailure> {
+        guard simSlots.contains(slot) else {
+            return failure("The modem has SIM slots 1 and 2. Nothing was changed.")
+        }
+        return withPort({ "\(describe($0)) Nothing was changed." }) { link in
+            let before: Int
+            switch readSimSlot(link, nothingChanged: true) {
+            case .success(let s): before = s
+            case .failure(let f): return .failure(f)
+            }
+            if before == slot { return .success(SimSlotChange(before: slot, after: slot)) }
+            switch link.command(simSlotCommand(slot), timeout: ModemService.writeTimeout) {
+            case .success:
+                break
+            case .failure(let error) where isRefusal(error):
+                return failure("The SIM slot was not changed. \(describe(error))")
+            case .failure(let error):
+                return failure("It is not known whether the SIM slot changed. \(describe(error))")
+            }
+            switch readSimSlot(link, nothingChanged: false) {
+            case .success(let now) where now == slot:
+                break
+            case .success(let now):
+                return failure("The modem answered OK, but still uses SIM slot \(now).")
+            case .failure(let f):
+                return failure("The modem answered OK, but its SIM slot could not be read back. \(f.message)")
+            }
+            let start = now()
+            var state: SimState? = nil
+            var secondsToSim: Int? = nil
+            for n in 0... {
+                if n > 0 { sleep(ModemService.registrationInterval) }
+                guard case .success(let read) = readSimState(link) else { break }
+                state = read
+                let elapsed = now().timeIntervalSince(start)
+                if read != .busy && !simUnusable(read) {
+                    secondsToSim = Int(max(0, elapsed))
+                    break
+                }
+                if elapsed >= ModemService.simWait { break }
+            }
+            var change = SimSlotChange(before: before, after: slot, sim: state, secondsToSim: secondsToSim)
+            if wait == .registration, state == .ready {
+                let registered = waitForRegistration(link, since: start)
+                change.registration = registered.registration
+                change.secondsToRegister = registered.secondsToRegister
+            }
+            return .success(change)
+        }
+    }
+
+    // MARK: Short reads (the app's background turn)
+
+    /// Sends each command (3 s each) on one port, in order: its lines, or the modem's error line for a command the
+    /// modem refuses (a state for AT+CPIN?); a port that does not open, a timeout or an I/O error fails the whole turn.
+    /// For the app's background turn (ModemPulse.swift), on a service whose port opens without waiting.
+    func shortReads(_ commands: [String]) -> Result<[PulseAnswer], ModemFailure> {
+        withPort({ describe($0) }) { link in
+            var answers: [PulseAnswer] = []
+            for command in commands {
+                switch link.command(command, timeout: ModemService.readTimeout) {
+                case .success(let lines): answers.append(.lines(lines))
+                case .failure(.modem(let line)): answers.append(.refused(line))
+                case .failure(let error): return failure(describe(error))
+                }
+            }
+            return .success(answers)
+        }
     }
 
     /// Sends the PIN only when the SIM, read again now, asks for it and has the attempts left that the owner was

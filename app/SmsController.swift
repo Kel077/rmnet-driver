@@ -20,6 +20,11 @@ final class SmsQuitNotice: ObservableObject {
     @Published fileprivate(set) var line = ""
 }
 
+/// How many messages are unread (the window's marks), for the menu bar item's panel; its own object for the same reason.
+final class SmsUnreadNotice: ObservableObject {
+    @Published fileprivate(set) var count = 0
+}
+
 /// The app has exactly one, owned by the app delegate (StatusView.swift), so that quitting can wait for a
 /// running call. Its methods are called on the main thread; every service call runs on `queue`, one at a
 /// time, with the result handed back to the main thread.
@@ -29,7 +34,9 @@ final class SmsController: ObservableObject {
     @Published private(set) var listFailure: String? = nil   // the last listing's failure; nil after a success
     @Published private(set) var storeUsed: Int? = nil        // the store's use at the last successful listing
     @Published private(set) var storeTotal: Int? = nil
-    @Published private(set) var unread: Set<SmsMessageKey> = []
+    @Published private(set) var unread: Set<SmsMessageKey> = [] {
+        didSet { if unreadNotice.count != unread.count { unreadNotice.count = unread.count } }
+    }
     @Published private(set) var running: SmsActivity? = nil
     // The result of the last send or delete (or what runs now). A listing never writes here.
     @Published private(set) var result = ""
@@ -51,8 +58,13 @@ final class SmsController: ObservableObject {
     @Published var composing = false  // an input method has text in the field that is not committed yet
 
     let quitNotice = SmsQuitNotice()
+    let unreadNotice = SmsUnreadNotice()
 
     private let service: SmsServing
+    private let backgroundService: SmsServing    // the background listing's: a busy port fails at once
+    private let notifyEnabled: () -> Bool        // Settings' Notify about new messages
+    private let alert: (MessageAlert) -> Void    // posts a notification (MessageNotifier.swift)
+    private var watch = NewMessageWatch()
     private let queue: DispatchQueue
     private let replyToQuit: (Bool) -> Void      // NSApp.reply(toApplicationShouldTerminate:)
     private let requestAttention: () -> Void     // NSApp.requestUserAttention(.criticalRequest)
@@ -66,14 +78,22 @@ final class SmsController: ObservableObject {
 
     static let refreshInterval: TimeInterval = 15
 
+    /// `backgroundService`: the background listing's service (nil: `service`). `notifyEnabled` and `alert`: whether
+    /// to check for new messages in the background and announce them, and how (the tests' defaults: never).
     init(service: SmsServing,
          queue: DispatchQueue = DispatchQueue(label: "io.rmnetdriver.RMNet.sms", qos: .userInitiated),
          replyToQuit: @escaping (Bool) -> Void,
-         requestAttention: @escaping () -> Void) {
+         requestAttention: @escaping () -> Void,
+         backgroundService: SmsServing? = nil,
+         notifyEnabled: @escaping () -> Bool = { false },
+         alert: @escaping (MessageAlert) -> Void = { _ in }) {
         self.service = service
         self.queue = queue
         self.replyToQuit = replyToQuit
         self.requestAttention = requestAttention
+        self.backgroundService = backgroundService ?? service
+        self.notifyEnabled = notifyEnabled
+        self.alert = alert
     }
 
     deinit { timer?.invalidate() }
@@ -189,19 +209,76 @@ final class SmsController: ObservableObject {
         running = nil
         switch outcome {
         case .success(let listing):
-            let found = listing.messages
-            messages = found
-            listedAt = Date()
-            listFailure = nil
-            storeUsed = listing.used
-            storeTotal = listing.total
-            unread = unreadMarks(listed: found, kept: unread)
-            if let s = selection, !found.contains(where: { $0.key == s }) { selection = nil }
-            if let s = selection { unread.remove(s) }
+            apply(listing)
         case .failure(let failure):
             listFailure = failure.message
         }
         _ = answeredQuit(succeeded: true)
+    }
+
+    /// A listing that succeeded, the screen's or the background's: the messages, the store, the unread marks; then what
+    /// is new in it, announced.
+    private func apply(_ listing: SmsListing) {
+        let found = listing.messages
+        messages = found
+        listedAt = Date()
+        listFailure = nil
+        storeUsed = listing.used
+        storeTotal = listing.total
+        unread = unreadMarks(listed: found, kept: unread)
+        if let s = selection, !found.contains(where: { $0.key == s }) { selection = nil }
+        if let s = selection { unread.remove(s) }
+        announce(watch.listed(found, used: listing.used))
+    }
+
+    /// Each alert as a notification, while Notify about new messages is on; a new message not while the Messages
+    /// screen is shown and seen (it is in the list there).
+    private func announce(_ alerts: [MessageAlert]) {
+        guard notifyEnabled() else { return }
+        for a in alerts {
+            if case .message = a, active { continue }
+            alert(a)
+        }
+    }
+
+    // MARK: New messages in the background
+
+    /// The background turn's part (ModemPulse.swift): AT+CPMS? every other turn (about every 30 s, from the first),
+    /// while Notify about new messages is on, nothing runs, the app does not quit, and the Messages screen does not list
+    /// by itself (shown and seen: it lists every 15 s).
+    func pulseCommands(turn: Int) -> [String] {
+        guard notifyEnabled(), !stopping, running == nil, !active, turn % 2 == 1 else { return [] }
+        return ["AT+CPMS?"]
+    }
+
+    /// The count read (or why the port could not be used: the turn is skipped): a count that went up, or the first,
+    /// lists the messages, on a port that does not wait either.
+    func pulseAnswers(_ answers: Result<[String: PulseAnswer], ModemFailure>) {
+        guard case .success(let a) = answers, let store = a["AT+CPMS?"] else { return }
+        if watch.storeCount(parseStorage(store.lines)?.used) { listInBackground() }
+    }
+
+    /// As refresh, with the background service; a listing that fails is not shown (it is tried again on a later turn:
+    /// the count it is compared with changes only with a listing).
+    private func listInBackground() {
+        guard running == nil, !stopping else { return }
+        running = .listing
+        let service = self.backgroundService
+        queue.async {
+            let result = service.list()
+            DispatchQueue.main.async { self.finishBackgroundListing(result) }
+        }
+    }
+
+    private func finishBackgroundListing(_ outcome: Result<SmsListing, SmsFailure>) {
+        running = nil
+        if case .success(let listing) = outcome { apply(listing) }
+        _ = answeredQuit(succeeded: true)
+    }
+
+    /// Shows the message a notification was about, if it is still listed (its parts may have changed since).
+    func select(_ identity: SmsIdentity) {
+        if let m = messages.first(where: { SmsIdentity($0) == identity }) { selection = m.key }
     }
 
     /// Deletes every stored part of `message`, if it is still listed and nothing else runs.

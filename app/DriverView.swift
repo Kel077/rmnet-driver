@@ -1,7 +1,8 @@
-// The window's Driver screen, a settings-style form: the driver's status (the headline's pill, the version
-// installed and the one this app carries, whether it is enabled, the modem and its USB mode), what to do (the advice,
-// Install or Update and Remove…, and System Settings while the driver waits for approval), and, on request, the
-// details: the system's entries for the extension and the driver's own properties. Refreshed every 2 seconds while it
+// The window's Driver screen, a settings-style form: the driver's status (the headline's pill, with a badge when this
+// app carries an update; the version installed and the one this app carries, whether it is enabled, the modem and its
+// USB mode), what to do under "Install and remove" (the advice, or what this app carries beside the buttons; Install
+// or Update and Remove…, and System Settings while the driver waits for approval; the caution under them), and, on
+// request, the details: the system's entries for the extension and the driver's own properties. Refreshed every 2 seconds while it
 // is shown and the window can be seen (the window's poll, WindowPolls in ShellModel.swift). StatusController
 // (StatusView.swift; the app delegate's driverStatus) holds the status and runs the requests; the headline, the advice
 // and the progress and result words come from StatusModel.swift and the controller unchanged.
@@ -49,12 +50,12 @@ struct StatusView: View {
         let lines = controller.known ? advice(status, bundledVersion: controller.bundledVersion) : []
         let warning = lines.last.flatMap { $0 == removalUnderWayLine ? nil : $0 }
         let guidance = warning == nil ? lines : Array(lines.dropLast())
+        let updateReady = controller.installEnabled && controller.installButtonTitle == "Update"
         Form {
             Section {
-                DriverHeadline(state: pill.state, text: pill.text)
+                DriverHeadline(state: pill.state, text: pill.text, updateReady: updateReady)
                 if case .unknown(let why) = controller.listing {
-                    Text(verbatim: why)
-                        .foregroundStyle(.red)
+                    ProblemNote(text: why)
                         .textSelection(.enabled)
                 }
                 LabeledContent("Installed version") { ValueText(installedText(status)) }
@@ -75,12 +76,14 @@ struct StatusView: View {
                 if !controller.progress.isEmpty {
                     ProgressLine(text: controller.progress, busy: controller.busy)
                 }
-                actions
+                // With no advice above them, the buttons have what this app carries beside them.
+                actions(note: guidance.isEmpty && controller.known
+                        ? driverActionNote(status, bundledVersion: controller.bundledVersion) : nil)
+            } header: {
+                Text("Install and remove")
             } footer: {
                 if let warning {
-                    Text(verbatim: warning)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                    WarningNote(text: warning)
                 }
             }
 
@@ -116,12 +119,19 @@ struct StatusView: View {
     }
 
     /// Open System Settings while the driver waits for approval (then the one to press), Install or Update (the one
-    /// to press when nothing waits for approval and the title is one of those two), and Remove….
-    private var actions: some View {
+    /// to press when nothing waits for approval and the title is one of those two), and Remove…; `note` before them.
+    private func actions(note: String?) -> some View {
         let title = controller.installButtonTitle
         let installIsNext = !waitingForApproval && (title == "Install" || title == "Update")
         return HStack(spacing: Spacing.s) {
-            Spacer(minLength: 0)
+            if let note {
+                Text(verbatim: note)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: Spacing.s)
             if waitingForApproval {
                 Button("Open System Settings") {
                     if let url = extensionsSettingsURL { NSWorkspace.shared.open(url) }
@@ -172,6 +182,7 @@ struct StatusView: View {
 private struct DriverHeadline: View {
     let state: ConnectionState
     let text: String
+    var updateReady = false   // this app carries a newer version, which Update installs
 
     var body: some View {
         HStack(spacing: Spacing.m) {
@@ -187,6 +198,9 @@ private struct DriverHeadline: View {
                 StatusPill(state: state, text: text)
             }
             Spacer(minLength: 0)
+            if updateReady {
+                StateBadge(text: "Update available", symbol: "arrow.down.circle.fill", tint: .blue)
+            }
         }
         .padding(.vertical, Spacing.xs)
     }
@@ -287,14 +301,13 @@ private struct EntriesTable: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.s) {
-            Text("Extension entries")
-                .font(.headline)
+            CardSectionHeading("Extension entries", note: "As the system lists them")
             if let entries, !entries.isEmpty {
                 Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: Spacing.xl, verticalSpacing: Spacing.xs) {
                     GridRow {
                         ForEach(["Version", "Enabled", "Awaiting approval", "Uninstalling"], id: \.self) { title in
                             Text(verbatim: title)
-                                .font(.callout)
+                                .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -330,8 +343,7 @@ private struct PropertiesList: View {
         let rest = properties.keys.sorted().filter { !fixedProperties.contains($0) && properties[$0] != "0" }
         let atZero = properties.count - first.count - rest.count
         VStack(alignment: .leading, spacing: Spacing.s) {
-            Text("Driver properties")
-                .font(.headline)
+            CardSectionHeading("Driver properties", note: "RMNet* in the I/O registry")
             if !attached {
                 Text("None: the driver is not attached to the modem.")
                     .foregroundStyle(.secondary)

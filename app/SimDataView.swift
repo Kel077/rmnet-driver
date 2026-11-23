@@ -19,7 +19,15 @@ private enum SettingsAction {
     case putBack
     case pin(attempts: Int)   // the attempts left the confirmation showed (ruling R13)
     case imei(String, reboot: Bool)
+    case simSlot(Int)
 }
+
+private let slotNoteTime: DateFormatter = {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "HH:mm"
+    return f
+}()
 
 private func typeLabel(_ t: PdpType) -> String {
     switch t {
@@ -132,7 +140,10 @@ private struct ProfilesTable: View {
 struct SimApnTab: View {
     // The process's one controller, owned by the app delegate.
     @ObservedObject var controller: ModemController
-    @State private var question: Question<SettingsAction>? = nil   // Apply…, Put Back…
+    // Switching SIM slots by itself (SimSlotWatch.swift): what it last did, and whether it is about to.
+    @ObservedObject var simWatcher: SimSlotWatcher
+    @State private var slotClicks = 0
+    @State private var question: Question<SettingsAction>? = nil   // Apply…, Put Back…, a slot switch
     @State private var pinAsk: Question<SettingsAction>? = nil     // the Unlock sheet's Unlock…, shown over the sheet
     @State private var unlocking = false                          // the Unlock sheet is open
     @State private var pin = ""   // only here; cleared when the confirmation or the sheet closes, or the screen goes
@@ -258,6 +269,26 @@ struct SimApnTab: View {
                 } else if sim.state == .pin, let attempts = sim.pinAttempts, attempts < 1 {
                     warning(pinQuestion(attempts: 0).message)
                 }
+                LabeledContent("Slot") {
+                    if let slot = sim.activeSlot {
+                        // The modem's slot as read: a click asks first, and the control moves when a read says so.
+                        Picker("Slot", selection: Binding(get: { slot }, set: { askSlot(from: slot, to: $0) })) {
+                            ForEach(simSlots, id: \.self) { Text(verbatim: "SIM \($0)").tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .fixedSize()
+                        .id(slotClicks)
+                        .disabled(!controller.refreshEnabled)
+                    } else {
+                        Text(verbatim: "—").foregroundStyle(.secondary)
+                    }
+                }
+                if let next = simWatcher.aboutToTry, simUnusable(sim.state) {
+                    slotNote("No SIM in slot \(next.empty); trying SIM \(next.other) shortly.", symbol: "clock")
+                } else if let line = simWatcher.line {
+                    slotNote(line, symbol: "arrow.triangle.swap", at: simWatcher.lineAt)
+                }
                 LabeledContent("PIN lock", value: sim.pinLock.map { $0 ? "On" : "Off" } ?? "—")
                 LabeledContent("PIN attempts") {
                     AttemptDots(code: "PIN", left: sim.pinAttempts, full: 3)
@@ -269,6 +300,31 @@ struct SimApnTab: View {
                 note(settingsRead ? "The SIM has not been read." : "Reading the SIM…")
             }
         }
+    }
+
+    /// What the SIM slot watcher did or is about to do, with when.
+    private func slotNote(_ text: String, symbol: String, at: Date? = nil) -> some View {
+        Label {
+            HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
+                Text(verbatim: text)
+                if let at {
+                    Text(verbatim: slotNoteTime.string(from: at))
+                        .foregroundStyle(.tertiary)
+                        .monospacedDigit()
+                }
+            }
+        } icon: {
+            Image(systemName: symbol)
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
+    }
+
+    private func askSlot(from: Int, to: Int) {
+        slotClicks += 1
+        guard to != from, controller.refreshEnabled else { return }
+        let q = simSlotQuestion(from: from, to: to)
+        ask(Question(action: .simSlot(to), title: q.title, message: q.message, confirm: "Switch to SIM \(to)"))
     }
 
     private func openUnlock() {
@@ -529,6 +585,9 @@ struct SimApnTab: View {
         case let .imei(newImei, reboot):
             controller.changeImei(newImei, reboot: reboot)
             editingImei = false
+        case .simSlot(let slot):
+            simWatcher.switchedByHand()
+            controller.changeSimSlot(slot)
         }
     }
 
@@ -760,7 +819,7 @@ struct ImeiSheet: View {
                 }
             }
             if !draft.isEmpty, imeiCheckDigit(forFirst14: draft) == nil, let problem = imeiProblem(draft) {
-                SheetProblem(text: problem)
+                ProblemNote(text: problem)
             } else if !draft.isEmpty && draft == controller.imei {
                 Text("This is the IMEI the modem has now.")
                     .font(.callout)
@@ -768,7 +827,7 @@ struct ImeiSheet: View {
             }
             Toggle("Restart the modem now", isOn: $rebootNow)
                 .toggleStyle(.checkbox)
-            SheetWarning(text: rebootNow
+            WarningNote(text: rebootNow
                          ? "The modem restarts at once so that the network sees the new IMEI: the connection and the "
                             + "network port go away for about 30 seconds."
                          : "The new IMEI takes effect when the modem next restarts (a replug, or RMNet at AT+CFUN=1,1).")

@@ -298,7 +298,8 @@ let cpinPin: Answer = .success(["+CPIN: SIM PIN"])
 func qpinc(_ pin: Int, _ puk: Int = 10) -> Answer { .success(["+QPINC: \"SC\",\(pin),\(puk)", "+QPINC: \"P2\",3,10"]) }
 let clckOff: Answer = .success(["+CLCK: 0"])
 let clckOn: Answer = .success(["+CLCK: 1"])
-let simLines = ["AT+CPIN?", "AT+QPINC?", "AT+CLCK=\"SC\",2"]
+let simLines = ["AT+CPIN?", "AT+QPINC?", "AT+CLCK=\"SC\",2", "AT+QUIMSLOT?"]
+let slot1: Answer = .success(["+QUIMSLOT: 1"])
 
 // A PIN that no failure sentence and no line other than AT+CPIN="…" may hold.
 let pin = "73519"
@@ -396,6 +397,7 @@ struct ModemServiceTests {
         pinEntry()
         antennas()
         signalRead()
+        simSlotChanges()
         cellLock()
         imei()
         print("modem service: \(checks) checks passed")
@@ -1712,19 +1714,19 @@ struct ModemServiceTests {
 
     static func sim() {
         do {
-            let rig = Rig([("AT+CPIN?", cpinReady), ("AT+QPINC?", qpinc(3)), ("AT+CLCK=\"SC\",2", clckOff)])
+            let rig = Rig([("AT+CPIN?", cpinReady), ("AT+QPINC?", qpinc(3)), ("AT+CLCK=\"SC\",2", clckOff), ("AT+QUIMSLOT?", slot1)])
             let got = success(rig.service.sim(), "sim")
-            check(got == SimInfo(state: .ready, pinLock: false, pinAttempts: 3, pukAttempts: 10), "sim: the READY fixture",
+            check(got == SimInfo(state: .ready, pinLock: false, pinAttempts: 3, pukAttempts: 10, activeSlot: 1), "sim: the READY fixture",
                   "\(String(describing: got))")
-            expectLines(rig.port(1).lines, simLines, "sim: the three reads")
+            expectLines(rig.port(1).lines, simLines, "sim: the four reads")
             check(rig.port(1).sent.allSatisfy { $0.timeout == 3 }, "sim: each read has 3 s")
             rig.finish("sim", opens: 1)
         }
         do {
             // AT+CPIN?'s error line is a state.
-            let rig = Rig([("AT+CPIN?", cme(10)), ("AT+QPINC?", cme(10)), ("AT+CLCK=\"SC\",2", cme(10))])
+            let rig = Rig([("AT+CPIN?", cme(10)), ("AT+QPINC?", cme(10)), ("AT+CLCK=\"SC\",2", cme(10)), ("AT+QUIMSLOT?", slot1)])
             let got = success(rig.service.sim(), "sim, no SIM")
-            check(got == SimInfo(state: .notInserted, pinLock: nil, pinAttempts: nil, pukAttempts: nil),
+            check(got == SimInfo(state: .notInserted, pinLock: nil, pinAttempts: nil, pukAttempts: nil, activeSlot: 1),
                   "sim: +CME ERROR: 10 is not inserted; the refused reads are nil", "\(String(describing: got))")
             rig.finish("sim, no SIM", opens: 1)
         }
@@ -1822,9 +1824,9 @@ struct ModemServiceTests {
         }
         do {
             let rig = Rig([("AT+CPIN?", cpinPin), ("AT+QPINC?", qpinc(3)), (pinLine, ok),
-                           ("AT+CPIN?", cpinReady), ("AT+QPINC?", qpinc(3)), ("AT+CLCK=\"SC\",2", clckOn)])
+                           ("AT+CPIN?", cpinReady), ("AT+QPINC?", qpinc(3)), ("AT+CLCK=\"SC\",2", clckOn), ("AT+QUIMSLOT?", slot1)])
             let outcome = success(rig.service.enterPin(pin, shownAttempts: 3), "pin accepted")
-            check(outcome == PinOutcome(accepted: true, sim: SimInfo(state: .ready, pinLock: true, pinAttempts: 3, pukAttempts: 10)),
+            check(outcome == PinOutcome(accepted: true, sim: SimInfo(state: .ready, pinLock: true, pinAttempts: 3, pukAttempts: 10, activeSlot: 1)),
                   "enterPin: OK is accepted, and the SIM is read again", "\(String(describing: outcome))")
             expectLines(rig.port(1).lines, ["AT+CPIN?", "AT+QPINC?", pinLine] + simLines, "enterPin: the reads, the PIN, the three SIM reads")
             check(rig.port(1).timeout(of: pinLine) == 10, "enterPin: AT+CPIN=\"…\" has 10 s")
@@ -1834,9 +1836,9 @@ struct ModemServiceTests {
         }
         do {
             let rig = Rig([("AT+CPIN?", cpinPin), ("AT+QPINC?", qpinc(3)), (pinLine, cme(16)),
-                           ("AT+CPIN?", cpinPin), ("AT+QPINC?", qpinc(2)), ("AT+CLCK=\"SC\",2", clckOn)])
+                           ("AT+CPIN?", cpinPin), ("AT+QPINC?", qpinc(2)), ("AT+CLCK=\"SC\",2", clckOn), ("AT+QUIMSLOT?", slot1)])
             let outcome = success(rig.service.enterPin(pin, shownAttempts: 3), "pin refused")
-            check(outcome == PinOutcome(accepted: false, sim: SimInfo(state: .pin, pinLock: true, pinAttempts: 2, pukAttempts: 10),
+            check(outcome == PinOutcome(accepted: false, sim: SimInfo(state: .pin, pinLock: true, pinAttempts: 2, pukAttempts: 10, activeSlot: 1),
                                         refusal: "+CME ERROR: 16"),
                   "enterPin: +CME ERROR: 16 is not accepted, with the new attempts and the modem's line", "\(String(describing: outcome))")
             done(rig, "pin refused", opens: 1)
@@ -1844,9 +1846,9 @@ struct ModemServiceTests {
         do {
             // Another error line (14: SIM busy) is kept as it is, for pinSentence (F10).
             let rig = Rig([("AT+CPIN?", cpinPin), ("AT+QPINC?", qpinc(3)), (pinLine, cme(14)),
-                           ("AT+CPIN?", cpinPin), ("AT+QPINC?", qpinc(3)), ("AT+CLCK=\"SC\",2", clckOn)])
+                           ("AT+CPIN?", cpinPin), ("AT+QPINC?", qpinc(3)), ("AT+CLCK=\"SC\",2", clckOn), ("AT+QUIMSLOT?", slot1)])
             let outcome = success(rig.service.enterPin(pin, shownAttempts: 3), "pin, SIM busy")
-            check(outcome == PinOutcome(accepted: false, sim: SimInfo(state: .pin, pinLock: true, pinAttempts: 3, pukAttempts: 10),
+            check(outcome == PinOutcome(accepted: false, sim: SimInfo(state: .pin, pinLock: true, pinAttempts: 3, pukAttempts: 10, activeSlot: 1),
                                         refusal: "+CME ERROR: 14"),
                   "enterPin: +CME ERROR: 14 is not accepted, with the modem's line", "\(String(describing: outcome))")
             if let outcome {
@@ -1906,6 +1908,97 @@ struct ModemServiceTests {
             let rig = Rig([("AT+QRSRP", timedOut), ("AT+QRSRQ", ok), ("AT+QSINR", ok)])
             _ = failureMessage(rig.service.antennas(), "antennas: timeout")
             expectLines(rig.port(1).lines, ["AT+QRSRP"], "antennas: stops after timeout")
+        }
+    }
+
+    /// The SIM slot: read; changed with its read-back, the SIM read until it settles, and the registration when asked;
+    /// nothing sent when it is already the slot; the background turn's short reads.
+    static func simSlotChanges() {
+        let slot2: Answer = .success(["+QUIMSLOT: 2"])
+        do {
+            let rig = Rig([("AT+QUIMSLOT?", slot2)])
+            check(success(rig.service.simSlot(), "simSlot") == 2, "simSlot: read")
+            rig.finish("simSlot", opens: 1)
+        }
+        do {
+            let rig = Rig([("AT+QUIMSLOT?", .failure(.modem("ERROR")))])
+            expectEqual(failureMessage(rig.service.simSlot(), "simSlot refused"),
+                        "The modem does not switch SIM slots. The modem refused the command (ERROR).", "simSlot: refused")
+            rig.finish("simSlot refused", opens: 1)
+        }
+        do {
+            // Already on slot 2: nothing sent.
+            let rig = Rig([("AT+QUIMSLOT?", slot2)])
+            check(success(rig.service.setSimSlot(2, wait: .registration), "setSimSlot same") == SimSlotChange(before: 2, after: 2),
+                  "setSimSlot: the same slot changes nothing")
+            rig.finish("setSimSlot same", opens: 1)
+        }
+        do {
+            // Switched; the SIM is busy, then ready; then registered.
+            let rig = Rig([("AT+QUIMSLOT?", slot1), ("AT+QUIMSLOT=2", ok), ("AT+QUIMSLOT?", slot2),
+                           ("AT+CPIN?", cme(14)), ("AT+CPIN?", cme(10)), ("AT+CPIN?", cpinReady)] + searching + registered)
+            let change = success(rig.service.setSimSlot(2, wait: .registration), "setSimSlot")
+            check(change == SimSlotChange(before: 1, after: 2, sim: .ready, secondsToSim: 2, registration: homeSA,
+                                          secondsToRegister: 3), "setSimSlot: switched, the SIM ready, registered",
+                  "\(String(describing: change))")
+            check(rig.port(1).timeout(of: "AT+QUIMSLOT=2") == 5, "setSimSlot: the write has 5 s")
+            rig.finish("setSimSlot", opens: 1)
+        }
+        do {
+            // Waiting for the SIM only: no registration read.
+            let rig = Rig([("AT+QUIMSLOT?", slot1), ("AT+QUIMSLOT=2", ok), ("AT+QUIMSLOT?", slot2), ("AT+CPIN?", cpinReady)])
+            let change = success(rig.service.setSimSlot(2, wait: .sim), "setSimSlot sim only")
+            check(change == SimSlotChange(before: 1, after: 2, sim: .ready, secondsToSim: 0), "setSimSlot: the SIM only",
+                  "\(String(describing: change))")
+            rig.finish("setSimSlot sim only", opens: 1)
+        }
+        do {
+            // An empty slot: the SIM read for 15 s, then the change reported with it; no registration read.
+            var script: [(String, Answer)] = [("AT+QUIMSLOT?", slot1), ("AT+QUIMSLOT=2", ok), ("AT+QUIMSLOT?", slot2)]
+            script += Array(repeating: ("AT+CPIN?", cme(10)), count: 16)
+            let rig = Rig(script)
+            let change = success(rig.service.setSimSlot(2, wait: .registration), "setSimSlot empty")
+            check(change?.sim == .notInserted && change?.secondsToSim == nil && change?.registration == nil
+                    && change?.after == 2, "setSimSlot: an empty slot", "\(String(describing: change))")
+            check(rig.elapsed >= 15 && rig.elapsed < 18, "setSimSlot: an empty slot is read for about 15 s", "\(rig.elapsed)")
+            rig.finish("setSimSlot empty", opens: 1)
+        }
+        do {
+            let rig = Rig([("AT+QUIMSLOT?", slot1), ("AT+QUIMSLOT=2", .failure(.modem("ERROR")))])
+            expectEqual(failureMessage(rig.service.setSimSlot(2, wait: .sim), "setSimSlot refused"),
+                        "The SIM slot was not changed. The modem refused the command (ERROR).", "setSimSlot: the write refused")
+            rig.finish("setSimSlot refused", opens: 1)
+        }
+        do {
+            let rig = Rig([("AT+QUIMSLOT?", slot1), ("AT+QUIMSLOT=2", ok), ("AT+QUIMSLOT?", slot1)])
+            expectEqual(failureMessage(rig.service.setSimSlot(2, wait: .sim), "setSimSlot not taken"),
+                        "The modem answered OK, but still uses SIM slot 1.", "setSimSlot: a read-back that differs")
+            rig.finish("setSimSlot not taken", opens: 1)
+        }
+        do {
+            let rig = Rig([.failure(.busy)])
+            expectEqual(failureMessage(rig.service.setSimSlot(2, wait: .sim), "setSimSlot busy"),
+                        "\(describe(.busy)) Nothing was changed.", "setSimSlot: busy")
+            rig.finish("setSimSlot busy", opens: 1)
+        }
+        do {
+            check(failureMessage(Rig().service.setSimSlot(3, wait: .sim), "slot 3")
+                    == "The modem has SIM slots 1 and 2. Nothing was changed.", "setSimSlot: slot 3 refused before the port")
+        }
+        // The background turn: each command's lines, or the error line; one port.
+        do {
+            let rig = Rig([("AT+CPMS?", .success(["+CPMS: \"ME\",3,255,\"ME\",3,255,\"ME\",3,255"])), ("AT+CPIN?", cme(10)),
+                           ("AT+CFUN?", .success(["+CFUN: 1"]))])
+            let answers = success(rig.service.shortReads(["AT+CPMS?", "AT+CPIN?", "AT+CFUN?"]), "shortReads")
+            check(answers == [.lines(["+CPMS: \"ME\",3,255,\"ME\",3,255,\"ME\",3,255"]), .refused("+CME ERROR: 10"),
+                              .lines(["+CFUN: 1"])], "shortReads: lines and the error line", "\(String(describing: answers))")
+            check(answers.map { $0[1] }.flatMap(simState) == .notInserted, "shortReads: the error line as a SIM state")
+            rig.finish("shortReads", opens: 1)
+        }
+        do {
+            let rig = Rig([("AT+CPMS?", timedOut)])
+            _ = failureMessage(rig.service.shortReads(["AT+CPMS?", "AT+CPIN?"]), "shortReads timeout")
+            expectLines(rig.port(1).lines, ["AT+CPMS?"], "shortReads: stops at a timeout")
         }
     }
 

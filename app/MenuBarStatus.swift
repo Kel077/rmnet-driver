@@ -119,10 +119,12 @@ enum MenuBarIconStyle: String, CaseIterable, Identifiable {
     }
 }
 
-/// The style chosen, kept in the app's user defaults under `menuBarIconStyle`; unset or anything else reads as the
-/// antenna.
+/// The style chosen, kept in the app's user defaults under `menuBarIconStyle` (unset or anything else reads as the
+/// antenna), and whether the signal bars show the technology beside them, under `menuBarShowsTechnology` (unset reads
+/// as yes).
 struct MenuBarIconPreference {
     static let key = "menuBarIconStyle"
+    static let technologyKey = "menuBarShowsTechnology"
     let defaults: UserDefaults
 
     func load() -> MenuBarIconStyle {
@@ -131,6 +133,14 @@ struct MenuBarIconPreference {
 
     func save(_ style: MenuBarIconStyle) {
         defaults.set(style.rawValue, forKey: MenuBarIconPreference.key)
+    }
+
+    func loadShowsTechnology() -> Bool {
+        (defaults.object(forKey: MenuBarIconPreference.technologyKey) as? Bool) ?? true
+    }
+
+    func saveShowsTechnology(_ shows: Bool) {
+        defaults.set(shows, forKey: MenuBarIconPreference.technologyKey)
     }
 }
 
@@ -211,9 +221,11 @@ let menuBarSignalStaleAfter: TimeInterval = 45
 /// The bars for the icon's state and the signal:
 /// - no driver: outlined bars, struck through; waiting for approval: outlined bars and "!";
 /// - the radio off: an airplane; searching (or limited service): empty bars and "…";
-/// - connected: the level's bars and the technology; not connected: the level's bars (empty when not known),
-///   struck through; a level not known while connected: outlined bars.
-func menuBarSignalIcon(_ icon: MenuBarIcon, _ signal: MenuBarSignal?, now: Date) -> MenuBarSignalIcon {
+/// - connected: the level's bars and the technology (unless `showsTechnology` is off: Settings' Show 5G/LTE next to
+///   the bars; VoiceOver still hears it); not connected: the level's bars (empty when not known), struck through; a
+///   level not known while connected: outlined bars.
+func menuBarSignalIcon(_ icon: MenuBarIcon, _ signal: MenuBarSignal?, now: Date,
+                       showsTechnology: Bool = true) -> MenuBarSignalIcon {
     let label = icon.accessibilityLabel
     switch icon {
     case .noDriver:
@@ -240,7 +252,7 @@ func menuBarSignalIcon(_ icon: MenuBarIcon, _ signal: MenuBarSignal?, now: Date)
             let bars = signal.level.map { "\(max(0, min(4, $0))) of 4 bars" } ?? "signal not known"
             let technology = up ? signal.technology : nil
             return MenuBarSignalIcon(bars: signal.level.map { .filled(max(0, min(4, $0))) } ?? (up ? .outlined : .filled(0)),
-                                     text: technology, mark: up ? .none : .slash, dimmed: dimmed,
+                                     text: showsTechnology ? technology : nil, mark: up ? .none : .slash, dimmed: dimmed,
                                      accessibilityLabel: label + ", " + bars + (technology.map { ", \($0)" } ?? "") + old)
         }
     }
@@ -331,7 +343,9 @@ final class MenuBarStatus: ObservableObject {
     @Published private(set) var networkNote: String? = nil      // why the last read failed; nil after a success
     @Published private(set) var reading = false                 // a network read runs
     @Published private(set) var iconStyle: MenuBarIconStyle     // Settings' choice (MenuBarIconPreference)
+    @Published private(set) var showsTechnology: Bool           // the bars' "5G"/"LTE" (Settings; on unless turned off)
     @Published private(set) var signal: MenuBarSignal? = nil    // what the signal bars show; nil: not known
+    @Published private(set) var modemOnUsb = false              // a modem of quectelModels is on USB (any mode)
 
     static let pollInterval: TimeInterval = 5
     static let pollTolerance: TimeInterval = 1   // the system may fire a poll up to 1 s late, to save power
@@ -388,6 +402,7 @@ final class MenuBarStatus: ObservableObject {
         self.freshInfo = freshInfo
         self.preference = preference
         self.iconStyle = preference?.load() ?? .antenna
+        self.showsTechnology = preference?.loadShowsTechnology() ?? true
     }
 
     deinit {
@@ -396,7 +411,16 @@ final class MenuBarStatus: ObservableObject {
     }
 
     /// The signal bars as the item draws them now.
-    var signalIcon: MenuBarSignalIcon { menuBarSignalIcon(icon, signal, now: now()) }
+    var signalIcon: MenuBarSignalIcon {
+        menuBarSignalIcon(icon, signal, now: now(), showsTechnology: showsTechnology)
+    }
+
+    /// Settings' Show 5G/LTE next to the bars: kept, and drawn at once. Reads nothing. On the main thread only.
+    func setShowsTechnology(_ shows: Bool) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        preference?.saveShowsTechnology(shows)
+        if showsTechnology != shows { showsTechnology = shows }
+    }
 
     /// Settings' choice: kept, drawn at once, and the signal reads started (at once, then every 15 s) or stopped.
     /// On the main thread only.
@@ -409,7 +433,8 @@ final class MenuBarStatus: ObservableObject {
 
     /// The signal reads run only while the bars are chosen and the polls run (start).
     private func updateSignalTimer() {
-        guard iconStyle == .signal, timer != nil else {
+        // Without a read of its own (the app's), the background turn (ModemPulse.swift) asks pulseSignalCommands.
+        guard iconStyle == .signal, timer != nil, signalRead != nil else {
             signalTimer?.invalidate()
             signalTimer = nil
             return
@@ -428,23 +453,54 @@ final class MenuBarStatus: ObservableObject {
     /// opened without waiting for another program: a busy port keeps the last level, marked stale. On the main thread.
     func pollSignal() {
         dispatchPrecondition(condition: .onQueue(.main))
-        guard iconStyle == .signal, driver != nil, !signalReading, !reading else { return }
-        let at = now()
-        if let fresh = freshInfo() {
-            let age = at.timeIntervalSince(fresh.at)
-            if age >= 0 && age < MenuBarStatus.signalInterval {
-                setSignal(menuBarSignal(from: fresh.info, at: fresh.at))
-                return
-            }
-        }
-        guard let signalRead else { return }
-        let query = nextSignalQuery(previous: signal, lastQuery: lastSignalQuery)
-        lastSignalQuery = query
+        guard let signalRead, let query = wantedSignalQuery() else { return }
         signalReading = true
         queue.async { [weak self] in
             let result = signalRead(query)
             DispatchQueue.main.async { self?.finishSignalRead(result) }
         }
+    }
+
+    /// The read this turn needs, if any (pollSignal's rule; the window's fresh read is taken here, with no read).
+    private func wantedSignalQuery() -> MenuBarSignalQuery? {
+        guard iconStyle == .signal, driver != nil, !signalReading, !reading else { return nil }
+        let at = now()
+        if let fresh = freshInfo() {
+            let age = at.timeIntervalSince(fresh.at)
+            if age >= 0 && age < MenuBarStatus.signalInterval {
+                setSignal(menuBarSignal(from: fresh.info, at: fresh.at))
+                return nil
+            }
+        }
+        let query = nextSignalQuery(previous: signal, lastQuery: lastSignalQuery)
+        lastSignalQuery = query
+        return query
+    }
+
+    /// The background turn's part (ModemPulse.swift), in the app: the command pollSignal would send (AT+QENG="servingcell"
+    /// or AT+CFUN?), none when no read is wanted. Its answers come back to pulseSignalAnswers.
+    func pulseSignalCommands() -> [String] {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let query = wantedSignalQuery() else { return [] }
+        signalReading = true
+        return [MenuBarStatus.command(query)]
+    }
+
+    /// The background turn's answers (keyed by command), or why the port could not be used: as pollSignal's read.
+    func pulseSignalAnswers(_ answers: Result<[String: PulseAnswer], ModemFailure>) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard signalReading else { return }
+        let query = lastSignalQuery ?? .servingCell
+        finishSignalRead(answers.map { a in
+            var info = NetworkInfo()
+            let lines = a[MenuBarStatus.command(query)]?.lines ?? []
+            if query == .radio { info.radio = parseRadio(lines) } else { info.serving = parseServingCell(lines) }
+            return info
+        })
+    }
+
+    static func command(_ query: MenuBarSignalQuery) -> String {
+        query == .radio ? "AT+CFUN?" : "AT+QENG=\"servingcell\""
     }
 
     private func finishSignalRead(_ result: Result<NetworkInfo, ModemFailure>) {
@@ -562,5 +618,8 @@ final class MenuBarStatus: ObservableObject {
         if icon != newIcon { icon = newIcon }
         if headline != newHeadline { headline = newHeadline }
         if addressLines != newAddresses { addressLines = newAddresses }
+        let onUsb: Bool
+        if case .absent = usb.state { onUsb = false } else { onUsb = true }
+        if modemOnUsb != onUsb { modemOnUsb = onUsb }
     }
 }

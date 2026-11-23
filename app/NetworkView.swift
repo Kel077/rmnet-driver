@@ -1119,13 +1119,13 @@ struct CellLockSheet: View {
             }
 
             if let error = validationError {
-                SheetProblem(text: error)
+                ProblemNote(text: error)
             } else if isCurrentLock {
                 Text("This is the lock in place.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            SheetWarning(text: "If this cell goes away, the modem has no service until it is unlocked. "
+            WarningNote(text: "If this cell goes away, the modem has no service until it is unlocked. "
                          + "The connection can drop for a few seconds. \(persistWords)")
             Divider()
             HStack {
