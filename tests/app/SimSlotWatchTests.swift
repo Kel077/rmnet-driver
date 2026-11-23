@@ -591,14 +591,18 @@ struct SimSlotWatchTests {
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let s = AppSettings(defaults: defaults)
-        check(s.simAutoSwitch && s.notifyMessages, "settings: on by default")
+        check(s.simAutoSwitch && s.notifyMessages && s.smsAutoUnblock, "settings: on by default")
         s.simAutoSwitch = false
         s.notifyMessages = false
+        s.smsAutoUnblock = false
         equal(defaults.object(forKey: "simAutoSwitch") as? Bool, false, "settings: kept under simAutoSwitch")
         equal(defaults.object(forKey: "notifyNewMessages") as? Bool, false, "settings: kept under notifyNewMessages")
+        equal(defaults.object(forKey: "smsAutoUnblock") as? Bool, false, "settings: kept under smsAutoUnblock")
         let again = AppSettings(defaults: defaults)
-        check(!again.simAutoSwitch && !again.notifyMessages, "settings: read back")
+        check(!again.simAutoSwitch && !again.notifyMessages && !again.smsAutoUnblock, "settings: read back")
         defaults.set("yes", forKey: "notifyNewMessages")
-        check(AppSettings(defaults: defaults).notifyMessages, "settings: a value not a Bool is on")
+        defaults.set("yes", forKey: "smsAutoUnblock")
+        check(AppSettings(defaults: defaults).notifyMessages && AppSettings(defaults: defaults).smsAutoUnblock,
+              "settings: a value not a Bool is on")
     }
 }

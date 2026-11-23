@@ -5,6 +5,7 @@
 // is closed. Started by main.swift when the app gets no command-line verb.
 import AppKit
 import Combine
+import notify
 import SwiftUI
 import UserNotifications
 
@@ -285,6 +286,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         requestAttention: { _ = NSApp.requestUserAttention(.criticalRequest) },
         backgroundService: SmsService(waitForPort: false),
         notifyEnabled: { [unowned self] in self.settings.notifyMessages },
+        autoUnblockEnabled: { [unowned self] in self.settings.smsAutoUnblock },
+        hasRescued: { AtPort.hasRescuedDeliveries },
         alert: { [unowned self] alert in self.notifier.post(alert) })
 
     // The settings besides the menu bar icon's (AppSettings.swift), the screen a click asks the window for, and the
@@ -316,6 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return p
     }()
     private var watchers: [AnyCancellable] = []
+    private var blockedNotifyToken: Int32 = -1
 
     // The process's one ModemController, for the Overview, Network and SIM & Data screens, kept the same way.
     private(set) lazy var modem: ModemController = ModemController(
@@ -348,8 +352,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         menuBar.start()
-        // A modem that comes onto USB (or is there now) is watched for an empty SIM slot.
-        watchers.append(menuBar.$modemOnUsb.sink { [unowned self] present in self.simWatcher.modemPresent(present) })
+        // A modem that comes onto USB (or is there now) is watched for an empty SIM slot, and checked once for CNMI.
+        watchers.append(menuBar.$modemOnUsb.sink { [unowned self] present in
+            self.simWatcher.modemPresent(present)
+            self.messages.modemPresent(present)
+        })
+        watchers.append(settings.$smsAutoUnblock.sink { [unowned self] enabled in
+            self.messages.autoUnblockSettingChanged(enabled)
+        })
+        AtPort.setBlockedSmsHandler { [weak self] in
+            DispatchQueue.main.async { self?.messages.blockedSmsSeen() }
+        }
+        DistributedNotificationCenter.default().addObserver(
+            forName: AtPort.blockedSmsNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.messages.blockedSmsSeen()
+        }
+        var token: Int32 = -1
+        if notify_register_dispatch(AtPort.blockedSmsNotifyKey, &token, .main, { [weak self] _ in
+            self?.messages.blockedSmsSeen()
+        }) == NOTIFY_STATUS_OK {
+            blockedNotifyToken = token
+        }
         UNUserNotificationCenter.current().delegate = notifier
         notifier.open = { [unowned self] in
             self.router.request = .messages

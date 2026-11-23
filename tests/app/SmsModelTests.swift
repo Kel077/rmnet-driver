@@ -815,6 +815,7 @@ struct SmsModelTests {
         windowHelperChecks()
         readingPaneHelpers()
         storedSending()
+        mmsNotificationsAndUnblock()
 
         print("sms-test: \(checks) checks passed")
     }
@@ -916,5 +917,102 @@ struct SmsModelTests {
         equal(json.first { ($0["indices"] as? [Int]) == [0] }?["status"] as? String, "received", "sms list --json: status received")
         equal(Set(sentJSON?.keys.map { $0 } ?? []),
               ["indices", "unread", "sender", "time", "text", "missingParts", "readable", "status"], "sms list --json: the keys")
+    }
+
+    /// WAP Push MMS notifications (single-part and multi-part) and `sms unblock` parsing and output.
+    static func mmsNotificationsAndUnblock() {
+        func hexBytes(_ bytes: [UInt8]) -> String {
+            bytes.map { String(format: "%02X", $0) }.joined()
+        }
+        func deliverWapPush(outerSenderHex: String = "04813200", udh: [UInt8], payload: [UInt8],
+                            timeHex: String = "62112201510000") -> String {
+            let ud = udh + payload
+            return "0044" + outerSenderHex + "0004" + timeHex + String(format: "%02X", ud.count) + hexBytes(ud)
+        }
+
+        let portUdh: [UInt8] = [0x06, 0x05, 0x04, 0x0B, 0x84, 0x23, 0xF0]
+        let wspHead: [UInt8] = [0x01, 0x06, 0x03, 0xBE, 0xAF, 0x84]
+
+        // 1. Single-part MMS notification with address-present token (0x80) and PLMN suffix.
+        let fromPlmn = [UInt8(0x80)] + Array("12025550144/TYPE=PLMN".utf8) + [0x00]
+        let mmsBody1: [UInt8] = [0x8C, 0x82, 0x98] + Array("tx1".utf8) + [0x00, 0x8D, 0x90,
+                                 0x89, UInt8(fromPlmn.count)] + fromPlmn
+            + [0x83] + Array("http://mmsc.example.invalid/m1".utf8) + [0x00]
+        let singleHex = deliverWapPush(udh: portUdh, payload: wspHead + mmsBody1)
+        let singleMsg = assemble([decodePart(StoredPdu(index: 7, status: .unread, hex: singleHex))])
+        equal(singleMsg.count, 1, "mms single: one message")
+        check(singleMsg.first?.readable == true && singleMsg.first?.unread == true
+                && singleMsg.first?.sender == "12025550144"
+                && singleMsg.first?.text == mmsNotificationText && singleMsg.first?.timestamp != nil,
+              "mms single: decoded sender, text and time", "\(String(describing: singleMsg.first))")
+
+        // 2. MMS From encoded with Value-length + Well-known-charset UTF-8 (0xEA).
+        let utf8Addr = [UInt8(0xEA)] + Array("+12025550177/TYPE=PLMN".utf8) + [0x00]
+        let fromCharset = [UInt8(0x80), UInt8(utf8Addr.count)] + utf8Addr
+        let mmsBody2: [UInt8] = [0x8C, 0x82, 0x8D, 0x90, 0x89, UInt8(fromCharset.count)] + fromCharset
+        let charsetHex = deliverWapPush(udh: portUdh, payload: wspHead + mmsBody2)
+        let charsetMsg = assemble([decodePart(StoredPdu(index: 8, status: .unread, hex: charsetHex))])
+        equal(charsetMsg.first?.sender, "+12025550177", "mms charset From: sender")
+
+        // 3. Insert-address-token (0x81) in From falls back to the outer TP-OA ("2300").
+        let mmsBodyAnon: [UInt8] = [0x8C, 0x82, 0x8D, 0x90, 0x89, 0x01, 0x81]
+        let anonHex = deliverWapPush(udh: portUdh, payload: wspHead + mmsBodyAnon)
+        let anonMsg = assemble([decodePart(StoredPdu(index: 9, status: .unread, hex: anonHex))])
+        check(anonMsg.first?.sender == "2300" && anonMsg.first?.text == mmsNotificationText,
+              "mms anonymous From: outer sender kept", "\(String(describing: anonMsg.first))")
+
+        // 4. Non-MMS WAP Push on port 2948 (for example text/vnd.wap.si, 0xB5) stays unreadable.
+        let nonMmsHex = deliverWapPush(udh: portUdh, payload: [0x01, 0x06, 0x01, 0xB5, 0x02, 0x05, 0x6A, 0x00])
+        let nonMmsMsg = assemble([decodePart(StoredPdu(index: 12, status: .unread, hex: nonMmsHex))])
+        check(nonMmsMsg.first?.readable == false, "non-MMS WAP Push: not readable")
+
+        // 5. Two-part concatenated WAP Push MMS notification reassembles across parts 1 and 2.
+        let fullPush = wspHead + mmsBody2
+        let splitAt = fullPush.count / 2
+        let concatUdh1: [UInt8] = [0x0B, 0x00, 0x03, 0x42, 0x02, 0x01, 0x05, 0x04, 0x0B, 0x84, 0x23, 0xF0]
+        let concatUdh2: [UInt8] = [0x0B, 0x00, 0x03, 0x42, 0x02, 0x02, 0x05, 0x04, 0x0B, 0x84, 0x23, 0xF0]
+        let part1 = StoredPdu(index: 10, status: .unread,
+                              hex: deliverWapPush(udh: concatUdh1, payload: Array(fullPush[..<splitAt])))
+        let part2 = StoredPdu(index: 11, status: .unread,
+                              hex: deliverWapPush(udh: concatUdh2, payload: Array(fullPush[splitAt...])))
+        let joined = assemble([decodePart(part2), decodePart(part1)])
+        equal(joined.count, 1, "mms two-part: assembled into one message")
+        check(joined.first?.indices == [10, 11] && joined.first?.missingParts == 0
+                && joined.first?.sender == "+12025550177" && joined.first?.text == mmsNotificationText,
+              "mms two-part: indices, sender and text", "\(String(describing: joined.first))")
+
+        // 6. parseCnmi, parseSms("unblock"), assembleUnblocked, sentences and JSON.
+        check(parseCnmi(["+CNMI: 2,1,0,0,0", "OK"])?.mode == 2 && parseCnmi(["+CNMI: 2,1,0,0,0"])?.mt == 1,
+              "parseCnmi: 2,1")
+        check(parseCnmi(["+CNMI: 2,2,0,0,0"])?.mt == 2 && parseCnmi(["OK"]) == nil && parseCnmi(["+CNMI: x,1"]) == nil,
+              "parseCnmi: 2,2 and invalid")
+
+        equal(parseSms(["unblock"]), .unblock(seconds: 95, json: false), "parseSms: unblock default")
+        equal(parseSms(["unblock", "--json"]), .unblock(seconds: 95, json: true), "parseSms: unblock --json")
+        equal(parseSms(["unblock", "30", "--json"]), .unblock(seconds: 30, json: true), "parseSms: unblock 30 --json")
+        equal(parseSms(["unblock", "--json", "180"]), .unblock(seconds: 180, json: true), "parseSms: unblock --json 180")
+        check(parseSms(["unblock", "0"]) == nil && parseSms(["unblock", "181"]) == nil
+                && parseSms(["unblock", "--json", "--json"]) == nil && parseSms(["unblock", "10", "20"]) == nil,
+              "parseSms: unblock wrong usage")
+
+        let ordinaryHex = "0004" + "0B912120550561F1" + "0000" + "62112201610000" + "02C834"
+        let unblocked = assembleUnblocked([StoredPdu(index: 7, status: .unread, hex: singleHex),
+                                           StoredPdu(index: 8, status: .unread, hex: ordinaryHex)], restoredCnmi: false)
+        check(unblocked.stored == 2 && unblocked.mmsNotifications == 1 && unblocked.indices == [7, 8]
+                && unblocked.messages.allSatisfy { $0.unread }, "assembleUnblocked: counts and unread")
+        equal(smsUnblockSentence(unblocked), "Unblocked incoming messages: stored 2 part(s) (1 MMS notification).",
+              "smsUnblockSentence: stored with MMS")
+        let quietHealed = assembleUnblocked([], restoredCnmi: true)
+        equal(smsUnblockSentence(quietHealed),
+              "Restored incoming message storage (AT+CNMI=2,1,0,0,0); no queued messages arrived.",
+              "smsUnblockSentence: healed CNMI")
+        let cliLines = smsUnblockLines(unblocked, seconds: 75, time: { _ in "2026-11-22 10:15:00" })
+        check(cliLines.first == "sms: unblocked: stored 2 part(s), 2 message(s) (1 MMS notification)"
+                && cliLines.contains("  \(mmsNotificationText)"), "smsUnblockLines: summary and MMS text",
+              cliLines.joined(separator: " | "))
+        let ujson = smsUnblockJSON(unblocked, time: { _ in "2026-11-22T10:15:00Z" })
+        check(JSONSerialization.isValidJSONObject(ujson) && ujson["storedParts"] as? Int == 2
+                && ujson["mmsNotifications"] as? Int == 1 && ujson["indices"] as? [Int] == [7, 8]
+                && ujson["restoredCnmi"] as? Bool == false, "smsUnblockJSON: valid and keys")
     }
 }

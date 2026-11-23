@@ -38,10 +38,17 @@ final class ScriptedPort: SmsPort {
     private(set) var problems: [String] = []
     private(set) var closed = false
     private var dead = false
+    var listenDeliveries: [[AtDeliveredPdu]] = []
+    var listenError: AtError? = nil
+    private var pendingDeliveries: [AtDeliveredPdu] = []
+    private(set) var listens = 0
     let deviceSerial: String?
 
-    init(_ script: [(String, Result<[String], AtError>)], device: String? = "TESTMODULE1") {
+    init(_ script: [(String, Result<[String], AtError>)], device: String? = "TESTMODULE1",
+         deliveries: [[AtDeliveredPdu]] = [], initialDeliveries: [AtDeliveredPdu] = []) {
         self.script = script.map { (line: $0.0, answer: $0.1) }
+        self.listenDeliveries = deliveries
+        self.pendingDeliveries = initialDeliveries
         deviceSerial = device
     }
 
@@ -68,6 +75,28 @@ final class ScriptedPort: SmsPort {
     func send(_ line: String, afterPrompt payload: String, timeout: TimeInterval) -> Result<[String], AtError> {
         payloads.append(payload)
         return answer(line, timeout)
+    }
+
+    func listen(duration: TimeInterval, extendOnDelivery: TimeInterval, maxDuration: TimeInterval) -> Result<Void, AtError> {
+        listens += 1
+        if dead {
+            problems.append("listen on a closed port")
+            return .failure(.io(-536870195))
+        }
+        if !listenDeliveries.isEmpty {
+            pendingDeliveries.append(contentsOf: listenDeliveries.removeFirst())
+        }
+        if let err = listenError {
+            dead = true
+            return .failure(err)
+        }
+        return .success(())
+    }
+
+    func takeDeliveries() -> [AtDeliveredPdu] {
+        let taken = pendingDeliveries
+        pendingDeliveries = []
+        return taken
     }
 
     func close() { closed = true }
@@ -155,6 +184,7 @@ struct SmsServiceTests {
         retry()
         deleting()
         counting()
+        unblockingAndHealing()
         print("sms service: \(checks) checks passed")
     }
 
@@ -499,5 +529,91 @@ struct SmsServiceTests {
                                  ("AT+CMGL=1", listed([])), ("AT+CMGL=2", listed([])), ("AT+CMGL=3", listed([])), sameStorage])
         equal((try? service(text).countUnread().get())?.unread, 3, "count: text mode switched to PDU mode first")
         finished(text, "count text mode")
+    }
+
+    // Unblocking queued incoming messages (MMS WAP Push + ordinary SMS), storing them as REC UNREAD (AT+CMGW=<len>,0),
+    // stopping once the queue flushes, refusing a full store without losing messages, and healing a crashed AT+CNMI=2,2.
+    static func unblockingAndHealing() {
+        _ = AtPort.takeRescuedDeliveries()
+        let cnmiNormal: Step = ("AT+CNMI?", .success(["+CNMI: 2,1,0,0,0"]))
+        let cnmiCrashed: Step = ("AT+CNMI?", .success(["+CNMI: 2,2,0,0,0"]))
+        let cnmiStream: Step = ("AT+CNMI=2,2,0,0,0", ok)
+        let cnmiRestore: Step = ("AT+CNMI=2,1,0,0,0", ok)
+
+        // Synthetic MMS notification + synthetic text SMS delivered in slice 1; slice 2 is quiet -> stops early.
+        let mmsHex = "07912120550501F04404C9320000046211220292942B2C0605040B8423F0010601BE8C82987478008D9089178031323032353535303134342F545950453D504C4D4E00"
+        let smsHex = "07912120550501F0040B912120550561F400006211220293002B05C8329BFD06"
+        let mmsDelivered = AtDeliveredPdu(tpduLength: mmsHex.count / 2 - 8, hex: mmsHex)
+        let smsDelivered = AtDeliveredPdu(tpduLength: smsHex.count / 2 - 8, hex: smsHex)
+
+        let slice1 = ScriptedPort([pduMode, cnmiNormal, sameStorage, cnmiStream,
+                                   ("AT+CMGW=\(mmsDelivered.tpduLength),0", .success(["+CMGW: 10"])),
+                                   ("AT+CMGW=\(smsDelivered.tpduLength),0", .success(["+CMGW: 11"]))],
+                                  deliveries: [[mmsDelivered, smsDelivered]])
+        let slice2 = ScriptedPort([], deliveries: [[]])
+        let slice3 = ScriptedPort([pduMode, cnmiRestore], deliveries: [[]])
+        var clock = Date(timeIntervalSince1970: 1_800_000_000)
+        var pauses: [TimeInterval] = []
+        var queue = [slice1, slice2, slice3]
+        let svc = SmsService(open: { queue.isEmpty ? .failure(.busy) : .success(queue.removeFirst()) },
+                             sleep: { pauses.append($0); clock = clock.addingTimeInterval($0) },
+                             now: { clock })
+        let unblockOutcome = svc.unblock(seconds: 95, shouldStop: { false })
+        guard case .success(let unblocked) = unblockOutcome else {
+            return check(false, "unblock: succeeds", "\(unblockOutcome) s1:\(slice1.problems) s2:\(slice2.problems) s3:\(slice3.problems)")
+        }
+        equal(unblocked.stored, 2, "unblock: both PDUs stored as unread")
+        equal(unblocked.mmsNotifications, 1, "unblock: MMS notification counted")
+        equal(unblocked.indices, [10, 11], "unblock: stored indices")
+        check(unblocked.messages.allSatisfy { $0.unread && $0.box == .received }, "unblock: every recovered message unread")
+        equal(unblocked.messages.map { $0.text }.sorted(), ["Hello", "MMS notification (not supported)"],
+              "unblock: MMS notice and SMS text")
+        equal(pauses, [0.35], "unblock: paused 0.35 s between slices and stopped early once flushed")
+        readsNoUnread(slice1, "unblock slice 1")
+        readsNoUnread(slice2, "unblock slice 2")
+        readsNoUnread(slice3, "unblock slice 3")
+        finished(slice1, "unblock slice 1")
+        finished(slice2, "unblock slice 2")
+        finished(slice3, "unblock slice 3")
+
+        // Store full (255 of 255): refuses before AT+CNMI=2,2,0,0,0 so the carrier keeps the messages.
+        let fullStore = ScriptedPort([pduMode, cnmiNormal,
+                                      ("AT+CPMS?", .success(["+CPMS: \"ME\",255,255,\"ME\",255,255,\"ME\",255,255"]))])
+        let fullMsg = failureMessage(service(fullStore).unblockSlice(start: true, finish: true), "unblock full store")
+        check(fullMsg.contains("message store is full (255 of 255)"), "unblock: full store refused", fullMsg)
+        check(!fullStore.lines.contains("AT+CNMI=2,2,0,0,0"), "unblock: CNMI=2,2 not sent when full")
+        finished(fullStore, "unblock full store")
+
+        // Restoring AT+CNMI=2,1,0,0,0 when the first port times out on restore: opens a second port to put 2,1 back
+        // and stores the captured message there, so nothing is lost.
+        let brokenFirst = ScriptedPort([pduMode, cnmiNormal, sameStorage, cnmiStream,
+                                        ("AT+CNMI=2,1,0,0,0", .failure(.timeout))],
+                                       deliveries: [[smsDelivered]])
+        let reopenSecond = ScriptedPort([pduMode, cnmiRestore,
+                                         ("AT+CMGW=\(smsDelivered.tpduLength),0", .success(["+CMGW: 12"]))])
+        let recovered = try? service([brokenFirst, reopenSecond]).unblockSlice(start: true, finish: true).get()
+        equal(recovered?.parts.map { $0.index }, [12], "unblock: timeout on restore reopens to put CNMI=2,1 back and store PDU")
+        finished(brokenFirst, "broken first port")
+        finished(reopenSecond, "reopened second port")
+
+        // Crash recovery: an earlier process died leaving AT+CNMI=2,2,0,0,0 and a rescued +CMT PDU in memory.
+        AtPort.keepRescuedDeliveries([smsDelivered])
+        let healPort = ScriptedPort([pduMode, cnmiCrashed, cnmiRestore, sameStorage,
+                                     ("AT+CMGW=\(smsDelivered.tpduLength),0", .success(["+CMGW: 14"]))])
+        let healed = try? service(healPort).healCnmi().get()
+        check(healed?.restoredCnmi == true && healed?.parts.map { $0.index } == [14],
+              "healCnmi: restores AT+CNMI=2,1,0,0,0 and writes rescued PDU as unread")
+        finished(healPort, "healCnmi")
+
+        // Crash recovery on regular `list()` when healCnmiOnOpen is enabled (as on real AtPort).
+        AtPort.keepRescuedDeliveries([smsDelivered])
+        let listHeal = ScriptedPort([pduMode, cnmiCrashed, cnmiRestore, sameStorage,
+                                     ("AT+CMGW=\(smsDelivered.tpduLength),0", .success(["+CMGW: 15"])),
+                                     ("AT+CMGL=4", listed([StoredPdu(index: 15, status: .unread, hex: smsHex)])),
+                                     sameStorage, simRead])
+        let healSvc = SmsService(open: { .success(listHeal) }, healCnmiOnOpen: true)
+        let listedAfterCrash = try? healSvc.list().get()
+        equal(listedAfterCrash?.messages.first?.text, "Hello", "list with healCnmiOnOpen: rescued PDU stored and listed")
+        finished(listHeal, "list healCnmiOnOpen")
     }
 }

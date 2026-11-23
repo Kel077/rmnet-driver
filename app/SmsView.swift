@@ -30,6 +30,11 @@ struct SmsView: View {
                         .disabled(!controller.refreshEnabled)
                 }
                 ToolbarItem(placement: .primaryAction) {
+                    Button { controller.unblock() } label: { Label("Unblock", systemImage: "tray.and.arrow.down") }
+                        .help("Receive queued incoming messages held up by an MMS notification")
+                        .disabled(!controller.changeEnabled)
+                }
+                ToolbarItem(placement: .primaryAction) {
                     Button { confirmingConversation = controller.shownConversation } label: {
                         Label("Delete Conversation…", systemImage: "trash")
                     }
@@ -41,7 +46,7 @@ struct SmsView: View {
                         .help("New Message")
                 }
             }
-            // The last send's, retry's or delete's result, until the next one, its X, or (a success) 8 s.
+            // The last send's, retry's, delete's or unblock's result, until the next one, its X, or (a success) 8 s.
             .resultBanner(controller.result, kind: controller.resultKind, dismiss: controller.dismissResult,
                           hover: controller.hoverResult)
             .sheet(isPresented: $writing) { ComposeSheet(controller: controller) }
@@ -70,11 +75,20 @@ struct SmsView: View {
 
     @ViewBuilder private var content: some View {
         if controller.messages.isEmpty {
-            emptyState
+            VStack(spacing: 0) {
+                if controller.incomingBlocked {
+                    BlockedIncomingNotice(enabled: controller.changeEnabled) { controller.unblock() }
+                }
+                emptyState
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         } else {
             let list = controller.conversations
             HStack(spacing: 0) {
                 VStack(spacing: 0) {
+                    if controller.incomingBlocked {
+                        BlockedIncomingNotice(enabled: controller.changeEnabled) { controller.unblock() }
+                    }
                     if let failure = controller.listFailure {
                         StaleListNotice(text: listLine(updated: controller.listedAt, failure: failure))
                     }
@@ -261,6 +275,29 @@ private struct Avatar: View {
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)
+    }
+}
+
+/// Above the list when automatic unblocking is off and the modem reported an unstored incoming message (`+CMTI: ,3`).
+private struct BlockedIncomingNotice: View {
+    let enabled: Bool
+    let unblock: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: Spacing.s) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            Text("Incoming messages appear blocked by an MMS notification.")
+                .font(.caption)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Unblock", action: unblock)
+                .controlSize(.small)
+                .disabled(!enabled)
+        }
+        .padding(Spacing.m)
+        .background(Color.orange.opacity(0.12), ignoresSafeAreaEdges: [])
+        .overlay(alignment: .bottom) { Divider() }
     }
 }
 

@@ -50,13 +50,18 @@ struct SettingsView: View {
             }
             Section {
                 Toggle("Notify about new messages", isOn: $settings.notifyMessages)
+                Toggle("Unblock incoming messages automatically", isOn: $settings.smsAutoUnblock)
             } header: {
                 Text("Messages")
             } footer: {
                 Text(verbatim: "While RMNet runs, also with its window closed, it checks the modem's message count about "
                      + "every 30 seconds (one short command, skipped while another program uses the modem's AT port). "
                      + "A notification says only that new messages came in: reading one on the modem marks it read, so "
-                     + "RMNet reads them only when Messages is opened.")
+                     + "RMNet reads them only when Messages is opened.\n\n"
+                     + "The modem cannot store an incoming MMS notification by itself, which holds up later text messages "
+                     + "at the carrier. When RMNet sees that happen, it receives the waiting messages in short windows "
+                     + "and stores them on the modem as unread (an MMS notification is saved as a note with its sender "
+                     + "and time). With this turned off, Messages offers an Unblock button instead.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

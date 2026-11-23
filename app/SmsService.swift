@@ -26,9 +26,18 @@ import Foundation
 protocol SmsPort: AnyObject {
     func command(_ line: String, timeout: TimeInterval) -> Result<[String], AtError>
     func send(_ line: String, afterPrompt payload: String, timeout: TimeInterval) -> Result<[String], AtError>
+    func listen(duration: TimeInterval, extendOnDelivery: TimeInterval, maxDuration: TimeInterval) -> Result<Void, AtError>
+    func takeDeliveries() -> [AtDeliveredPdu]
     func close()
     /// The module the port is open on (AtPort.deviceSerial).
     var deviceSerial: String? { get }
+}
+
+extension SmsPort {
+    func listen(duration: TimeInterval, extendOnDelivery: TimeInterval, maxDuration: TimeInterval) -> Result<Void, AtError> {
+        .success(())
+    }
+    func takeDeliveries() -> [AtDeliveredPdu] { [] }
 }
 
 extension AtPort: SmsPort {}
@@ -69,18 +78,32 @@ final class SmsService: SmsServing {
     private static let deleteTimeout: TimeInterval = 10
     private static let writeTimeout: TimeInterval = 10   // AT+CMGW: the manual says 300 ms
     private static let sendTimeout: TimeInterval = 120   // per part: AT+CMGS and AT+CMSS, "120 s, determined by network"
+    private static let sliceFirstDuration: TimeInterval = 0.55
+    private static let sliceDuration: TimeInterval = 0.70 // keeps every port open under 1 s (< AtPort.busyLimit 2 s)
+    private static let sliceExtend: TimeInterval = 0.5
+    private static let sliceMaxDuration: TimeInterval = 1.4
+    private static let slicePause: TimeInterval = 0.35
 
     private let openPort: () -> Result<SmsPort, AtError>
+    private let healCnmiOnOpen: Bool
+    private let sleep: (TimeInterval) -> Void
+    private let now: () -> Date
 
     /// `waitForPort` false: a port another program holds fails as busy at once (AtPort.openWithoutWaiting), for the
     /// app's background count of new messages, which then tries again on a later turn.
     convenience init(waitForPort: Bool = true) {
         self.init(open: waitForPort ? { AtPort.open().map { $0 as SmsPort } }
-                                    : { AtPort.openWithoutWaiting().map { $0 as SmsPort } })
+                                    : { AtPort.openWithoutWaiting().map { $0 as SmsPort } },
+                  healCnmiOnOpen: true)
     }
 
-    init(open: @escaping () -> Result<SmsPort, AtError>) {
+    init(open: @escaping () -> Result<SmsPort, AtError>, healCnmiOnOpen: Bool = false,
+         sleep: @escaping (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+         now: @escaping () -> Date = { Date() }) {
         openPort = open
+        self.healCnmiOnOpen = healCnmiOnOpen
+        self.sleep = sleep
+        self.now = now
     }
 
     // The listing, then the store's use and storages (AT+CPMS?) and the SIM (AT+CIMI) in the same session; if those
@@ -95,6 +118,7 @@ final class SmsService: SmsServing {
         defer { port.close() }
         let session = SmsSession(port)
         if let failure = usePduMode(session) { return .failure(failure) }
+        if healCnmiOnOpen { healCnmiIfNeeded(on: session) }
         switch session.command("AT+CMGL=4", timeout: SmsService.listTimeout) {
         case .success(let lines):
             let parts = parseListing(lines)
@@ -347,6 +371,7 @@ final class SmsService: SmsServing {
         defer { port.close() }
         let session = SmsSession(port)
         if let failure = usePduMode(session) { return .failure(failure) }
+        if healCnmiOnOpen { healCnmiIfNeeded(on: session) }
         func used() -> Result<Int, SmsFailure> {
             switch session.command("AT+CPMS?", timeout: SmsService.readTimeout) {
             case .success(let lines):
@@ -484,6 +509,319 @@ final class SmsService: SmsServing {
             return SmsFailure(message: "The modem did not say which message format it uses.")
         }
     }
+
+    // MARK: Unblocking incoming messages and healing AT+CNMI
+
+    /// Streams queued incoming messages across short port opens: the first checks `AT+CPMS?` and sets `AT+CNMI=2,2,0,0,0`
+    /// (left on across the 0.35 s pauses so the carrier's retry never meets `2,1`, while any `+CMT` read during a pause is
+    /// buffered by the modem or written to the store on close by `AtPort`), middle opens listen for 0.70 s (~0.85 s port
+    /// hold, well under `AtPort.busyLimit`), and the final open puts `AT+CNMI=2,1,0,0,0` back. Stops early once a pass has
+    /// received messages and the following pass is quiet.
+    func unblock(seconds: Int, shouldStop: () -> Bool) -> Result<SmsUnblocked, SmsFailure> {
+        let totalSeconds = max(1, seconds)
+        if totalSeconds == 1 {
+            return runUnblockSlice(listenDuration: SmsService.sliceFirstDuration, start: true, finish: true)
+                .map { assembleUnblocked($0.parts, restoredCnmi: $0.restoredCnmi) }
+        }
+        let deadline = now().addingTimeInterval(TimeInterval(totalSeconds))
+        var written: [StoredPdu] = []
+        var restored = false
+        var lastHadParts = false
+
+        switch runUnblockSlice(listenDuration: SmsService.sliceFirstDuration, start: true, finish: false) {
+        case .failure(let failure):
+            return .failure(failure)
+        case .success(let first):
+            lastHadParts = !first.parts.isEmpty
+            written.append(contentsOf: first.parts)
+            if first.restoredCnmi { restored = true }
+        }
+
+        loop: while !shouldStop() {
+            if now() >= deadline && !lastHadParts { break loop }
+            sleep(SmsService.slicePause)
+            if shouldStop() { break loop }
+            let left = deadline.timeIntervalSince(now())
+            let duration = min(SmsService.sliceDuration, max(0.2, left))
+            switch runUnblockSlice(listenDuration: duration, start: false, finish: false) {
+            case .failure(let failure):
+                return .failure(failure)
+            case .success(let slice):
+                lastHadParts = !slice.parts.isEmpty
+                written.append(contentsOf: slice.parts)
+                // Once queued messages have arrived and a follow-up window sees no more, the queue has flushed.
+                if !written.isEmpty && !lastHadParts { break loop }
+            }
+        }
+
+        switch runUnblockSlice(listenDuration: 0, start: false, finish: true) {
+        case .failure(let failure):
+            return .failure(failure)
+        case .success(let tail):
+            written.append(contentsOf: tail.parts)
+            return .success(assembleUnblocked(written, restoredCnmi: restored))
+        }
+    }
+
+    func unblockSlice(start: Bool, finish: Bool) -> Result<SmsUnblockSlice, SmsFailure> {
+        let duration: TimeInterval = (finish && !start)
+            ? 0
+            : (start ? SmsService.sliceFirstDuration : SmsService.sliceDuration)
+        return runUnblockSlice(listenDuration: duration, start: start, finish: finish)
+    }
+
+    /// Checks `AT+CNMI?` without enabling `2,2`, restoring `2,1,0,0,0` if an earlier crashed process left it otherwise
+    /// and storing any rescued `+CMT` PDUs as unread.
+    func healCnmi() -> Result<SmsUnblockSlice, SmsFailure> {
+        let port: SmsPort
+        switch openPort() {
+        case .success(let p): port = p
+        case .failure(let error): return .failure(SmsFailure(message: describe(error)))
+        }
+        defer { port.close() }
+        let session = SmsSession(port)
+        let rescued = AtPort.takeRescuedDeliveries() + port.takeDeliveries()
+        if let failure = usePduMode(session) {
+            AtPort.keepRescuedDeliveries(rescued)
+            return .failure(failure)
+        }
+        var wasNot21 = false
+        switch session.command("AT+CNMI?", timeout: SmsService.readTimeout) {
+        case .success(let lines):
+            if let cnmi = parseCnmi(lines), cnmi != (2, 1) { wasNot21 = true }
+        case .failure(let error):
+            AtPort.keepRescuedDeliveries(rescued + port.takeDeliveries())
+            return .failure(SmsFailure(message: "The incoming message setting could not be read. \(describe(error))"))
+        }
+        var restoreError: AtError? = nil
+        if wasNot21 {
+            if case .failure(let error) = session.command("AT+CNMI=2,1,0,0,0", timeout: SmsService.readTimeout) {
+                restoreError = error
+            }
+        }
+        let all = rescued + port.takeDeliveries()
+        var written: [StoredPdu] = []
+        if !all.isEmpty {
+            switch storeDeliveries(all, on: session, checkRoom: true) {
+            case .success(let stored): written = stored
+            case .failure(let failure): return .failure(failure)
+            }
+        }
+        if let restoreError {
+            return .failure(SmsFailure(message: "Incoming message storage (AT+CNMI=2,1,0,0,0) could not be restored. "
+                                       + describe(restoreError)))
+        }
+        return .success(SmsUnblockSlice(parts: written, restoredCnmi: wasNot21))
+    }
+
+    /// Best-effort check used on regular `list` and `countUnread` opens: restores `AT+CNMI=2,1,0,0,0` if an earlier
+    /// crashed run left it otherwise, and stores any rescued `+CMT` PDUs while the store has room.
+    private func healCnmiIfNeeded(on session: SmsSession) {
+        let rescued = AtPort.takeRescuedDeliveries() + session.port.takeDeliveries()
+        var wasNot21 = false
+        if case .success(let lines) = session.command("AT+CNMI?", timeout: SmsService.readTimeout),
+           let cnmi = parseCnmi(lines), cnmi != (2, 1) {
+            wasNot21 = true
+            _ = session.command("AT+CNMI=2,1,0,0,0", timeout: SmsService.readTimeout)
+        }
+        let all = rescued + session.port.takeDeliveries()
+        guard !all.isEmpty else { return }
+        if case .failure = storeDeliveries(all, on: session, checkRoom: true) {
+            // Unwritten items were already put back into AtPort.keepRescuedDeliveries by storeDeliveries.
+        }
+        _ = wasNot21
+    }
+
+    private func runUnblockSlice(listenDuration: TimeInterval, start: Bool, finish: Bool) -> Result<SmsUnblockSlice, SmsFailure> {
+        var port: SmsPort
+        switch openPort() {
+        case .success(let p): port = p
+        case .failure(let error):
+            return .failure(SmsFailure(message: describe(error)))
+        }
+        defer { port.close() }
+        var session = SmsSession(port)
+        let rescued = AtPort.takeRescuedDeliveries() + port.takeDeliveries()
+        var pduReady = false
+
+        func ensurePduMode() -> SmsFailure? {
+            if pduReady { return nil }
+            if let failure = usePduMode(session) { return failure }
+            pduReady = true
+            return nil
+        }
+
+        func restoreCnmi() -> AtError? {
+            if session.usable {
+                switch session.command("AT+CNMI=2,1,0,0,0", timeout: SmsService.readTimeout) {
+                case .success: return nil
+                case .failure(let error) where isModemRefusal(error): return error
+                case .failure: break
+                }
+            }
+            // The port closed on a timeout or broke on I/O: open one new port to put AT+CNMI=2,1,0,0,0 back.
+            let mid = port.takeDeliveries()
+            port.close()
+            switch openPort() {
+            case .failure(let error):
+                AtPort.keepRescuedDeliveries(mid)
+                return error
+            case .success(let fresh):
+                port = fresh
+                session = SmsSession(fresh)
+                pduReady = false
+                AtPort.keepRescuedDeliveries(mid)
+                _ = ensurePduMode()
+                if case .failure(let error) = session.command("AT+CNMI=2,1,0,0,0", timeout: SmsService.readTimeout) {
+                    return error
+                }
+                return nil
+            }
+        }
+
+        var wasNot21 = false
+        var streamingActive = !start
+
+        if start {
+            if let failure = ensurePduMode() {
+                AtPort.keepRescuedDeliveries(rescued + port.takeDeliveries())
+                return .failure(failure)
+            }
+            switch session.command("AT+CNMI?", timeout: SmsService.readTimeout) {
+            case .success(let lines):
+                if let cnmi = parseCnmi(lines), cnmi != (2, 1) { wasNot21 = true }
+            case .failure(let error) where !isModemRefusal(error):
+                AtPort.keepRescuedDeliveries(rescued + port.takeDeliveries())
+                return .failure(SmsFailure(message: "The incoming message setting could not be read. \(describe(error))"))
+            case .failure:
+                break
+            }
+
+            // Check that the store lists what it writes and has room before acknowledging anything from the network.
+            switch session.command("AT+CPMS?", timeout: SmsService.readTimeout) {
+            case .success(let lines):
+                guard let names = parseStorageNames(lines), names.read == names.write else {
+                    if wasNot21 { _ = restoreCnmi() }
+                    AtPort.keepRescuedDeliveries(rescued + port.takeDeliveries())
+                    return .failure(SmsFailure(message: "Incoming messages cannot be unblocked while the modem lists one "
+                                               + "storage and writes to another (AT+CPMS)."))
+                }
+                guard let store = parseStorage(lines) else {
+                    if wasNot21 { _ = restoreCnmi() }
+                    AtPort.keepRescuedDeliveries(rescued + port.takeDeliveries())
+                    return .failure(SmsFailure(message: "The modem did not say how full its message store is."))
+                }
+                if store.used + rescued.count >= store.total && rescued.isEmpty {
+                    if wasNot21 { _ = restoreCnmi() }
+                    return .failure(SmsFailure(message: "The modem's message store is full (\(store.used) of \(store.total)). "
+                                               + "Delete old messages before unblocking incoming ones."))
+                }
+            case .failure(let error):
+                if wasNot21 { _ = restoreCnmi() }
+                AtPort.keepRescuedDeliveries(rescued + port.takeDeliveries())
+                return .failure(SmsFailure(message: "The message store could not be read. \(describe(error))"))
+            }
+
+            if case .failure(let error) = session.command("AT+CNMI=2,2,0,0,0", timeout: SmsService.readTimeout) {
+                if wasNot21 { _ = restoreCnmi() }
+                AtPort.keepRescuedDeliveries(rescued + port.takeDeliveries())
+                return .failure(SmsFailure(message: "Incoming message streaming could not be enabled. \(describe(error))"))
+            }
+            streamingActive = true
+        }
+
+        var listenOutcome: Result<Void, AtError> = .success(())
+        if listenDuration > 0 {
+            listenOutcome = port.listen(duration: listenDuration, extendOnDelivery: SmsService.sliceExtend,
+                                        maxDuration: SmsService.sliceMaxDuration)
+        }
+        var preRestore: [AtDeliveredPdu] = []
+        if case .failure = listenOutcome {
+            preRestore = port.takeDeliveries()
+            session = SmsSession(BrokenSmsPort())
+            pduReady = false
+        }
+
+        let mustRestore: Bool
+        if case .failure = listenOutcome {
+            mustRestore = streamingActive || wasNot21
+        } else {
+            mustRestore = finish
+        }
+        var restoreError: AtError? = nil
+        if mustRestore {
+            if session.usable { _ = ensurePduMode() }
+            restoreError = restoreCnmi()
+            if restoreError == nil { streamingActive = false }
+        }
+
+        let all = AtPort.takeRescuedDeliveries() + rescued + preRestore + port.takeDeliveries()
+        var written: [StoredPdu] = []
+        if !all.isEmpty {
+            if let failure = ensurePduMode() {
+                AtPort.keepRescuedDeliveries(all)
+                if streamingActive { _ = restoreCnmi() }
+                return .failure(failure)
+            }
+            switch storeDeliveries(all, on: session, checkRoom: false) {
+            case .success(let stored):
+                written = stored
+            case .failure(let failure):
+                if streamingActive { _ = restoreCnmi() }
+                return .failure(failure)
+            }
+        }
+        if let restoreError {
+            return .failure(SmsFailure(message: "Incoming message storage (AT+CNMI=2,1,0,0,0) could not be restored. "
+                                       + describe(restoreError)))
+        }
+        if case .failure(let error) = listenOutcome, written.isEmpty {
+            return .failure(SmsFailure(message: "Listening for incoming messages failed. \(describe(error))"))
+        }
+        return .success(SmsUnblockSlice(parts: written, restoredCnmi: wasNot21))
+    }
+
+    /// Writes each `+CMT` PDU to the modem's store as unread (`AT+CMGW=<length>,0`). Any PDUs not confirmed written are
+    /// kept in `AtPort.keepRescuedDeliveries` (in memory only) so a later pass can still store them.
+    private func storeDeliveries(_ deliveries: [AtDeliveredPdu], on session: SmsSession,
+                                 checkRoom: Bool) -> Result<[StoredPdu], SmsFailure> {
+        if checkRoom {
+            guard case .success(let lines) = session.command("AT+CPMS?", timeout: SmsService.readTimeout),
+                  let names = parseStorageNames(lines), names.read == names.write,
+                  let store = parseStorage(lines), store.used < store.total else {
+                AtPort.keepRescuedDeliveries(deliveries)
+                return .failure(SmsFailure(message: "Received message(s) could not be stored on the modem."))
+            }
+        }
+        var written: [StoredPdu] = []
+        for (i, item) in deliveries.enumerated() {
+            let length = submitLength(item.hex) ?? item.tpduLength
+            let reason: String
+            switch session.send("AT+CMGW=\(length),0", afterPrompt: item.hex, timeout: SmsService.writeTimeout) {
+            case .success(let lines):
+                if let index = parseStoreIndex(lines) {
+                    written.append(StoredPdu(index: index, status: .unread, hex: item.hex))
+                    continue
+                }
+                reason = "The modem did not say where it stored it (no +CMGW line)."
+            case .failure(let error):
+                reason = describe(error)
+            }
+            AtPort.keepRescuedDeliveries(Array(deliveries[i...]))
+            let before = written.isEmpty ? "" : " \(written.count) of \(deliveries.count) part(s) were stored before it."
+            return .failure(SmsFailure(message: "A received message could not be stored on the modem. \(reason)\(before)"))
+        }
+        return .success(written)
+    }
+}
+
+private final class BrokenSmsPort: SmsPort {
+    let deviceSerial: String? = nil
+    func command(_ line: String, timeout: TimeInterval) -> Result<[String], AtError> { .failure(.io(kIOReturnNotOpen)) }
+    func send(_ line: String, afterPrompt payload: String, timeout: TimeInterval) -> Result<[String], AtError> {
+        .failure(.io(kIOReturnNotOpen))
+    }
+    func close() {}
 }
 
 private extension SmsFailure {

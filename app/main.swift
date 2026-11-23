@@ -1,7 +1,7 @@
 // RMNet host app: installs, removes and reports on the RMNet driver extension, reads and sends the
 // modem's text messages, and shows and changes the modem's network and settings.
 // Usage: RMNet activate | deactivate | status [--json]
-//        RMNet sms list [--json] | sms send <number> <text> | sms delete <index>...
+//        RMNet sms list [--json] | sms send <number> <text> | sms delete <index>... | sms unblock [seconds] [--json]
 //        RMNet gps [seconds] [--keep-on]
 //        RMNet network [--json] | antennas [--json] | radio [on|off] | mode [auto|nr5g|lte|lte:nr5g|…]
 //        RMNet apn [show] [--json] | apn set [--apn <name>] [--type ipv4|ipv6|ipv4v6] [--user <name>]
@@ -148,33 +148,6 @@ func runStatus(_ manager: ExtensionManager, json: Bool) {
 // The sms verbs take no part in the system-extension machinery: they talk to the modem's spare AT
 // port off the main thread, print, and exit. Message text and numbers go only to standard output.
 
-enum SmsCommand {
-    case list(json: Bool)
-    case send(number: String, text: String)
-    case delete(indices: [Int])
-}
-
-// The words after "sms"; nil for wrong usage.
-func parseSms(_ words: [String]) -> SmsCommand? {
-    guard let verb = words.first else { return nil }
-    let rest = Array(words.dropFirst())
-    switch verb {
-    case "list":
-        if rest.isEmpty { return .list(json: false) }
-        return rest == ["--json"] ? .list(json: true) : nil
-    case "send":
-        guard rest.count >= 2 else { return nil }
-        return .send(number: rest[0], text: rest.dropFirst().joined(separator: " "))
-    case "delete":
-        let indices = rest.compactMap { Int($0) }.filter { $0 >= 0 }
-        guard !rest.isEmpty, indices.count == rest.count else { return nil }
-        var seen = Set<Int>()
-        return .delete(indices: indices.filter { seen.insert($0).inserted })  // each once, first kept
-    default:
-        return nil
-    }
-}
-
 let localTimeFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -199,6 +172,14 @@ func printMessagesJSON(_ messages: [SmsMessage]) {
         return
     }
     let data = try! JSONSerialization.data(withJSONObject: array, options: [.prettyPrinted, .sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+}
+
+func printUnblockedJSON(_ result: SmsUnblocked) {
+    let iso = ISO8601DateFormatter()
+    iso.timeZone = .current
+    let object = smsUnblockJSON(result, time: { iso.string(from: $0) })
+    let data = try! JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
     print(String(data: data, encoding: .utf8)!)
 }
 
@@ -240,6 +221,42 @@ func runSms(_ command: SmsCommand, service: SmsServing) -> Int32 {
             print("sms: \(failure.message)")
             return 1
         }
+    case .unblock(let seconds, let json):
+        // Ctrl-C, SIGTERM and SIGHUP let the current 1 s slice finish (restoring AT+CNMI=2,1,0,0,0 and storing any
+        // PDU already received), then end the verb by that signal; SIGTSTP is ignored so Ctrl-Z cannot suspend the
+        // process while AT+CNMI is 2,2.
+        signal(SIGPIPE, SIG_IGN)
+        signal(SIGTSTP, SIG_IGN)
+        let stopLock = NSLock()
+        var stopSignal: Int32? = nil
+        let watch = SignalWatch([SIGINT, SIGTERM, SIGHUP, SIGQUIT]) { sig in
+            stopLock.lock()
+            if stopSignal == nil { stopSignal = sig }
+            stopLock.unlock()
+        }
+        defer { watch.stop() }
+        let outcome = service.unblock(seconds: seconds, shouldStop: {
+            stopLock.lock()
+            defer { stopLock.unlock() }
+            return stopSignal != nil
+        })
+        stopLock.lock()
+        let caught = stopSignal
+        stopLock.unlock()
+        switch outcome {
+        case .success(let unblocked):
+            if json {
+                printUnblockedJSON(unblocked)
+            } else {
+                for line in smsUnblockLines(unblocked, seconds: seconds, time: localTime) { print(line) }
+            }
+            if let sig = caught { dieBySignal(sig) }
+            return 0
+        case .failure(let failure):
+            print("sms: \(failure.message)")
+            if let sig = caught { dieBySignal(sig) }
+            return 1
+        }
     }
 }
 
@@ -256,7 +273,7 @@ if verbs.isEmpty {
     exit(0)
 }
 
-let usage = "usage: RMNet activate | deactivate | status [--json] | sms list [--json] | sms send <number> <text> | sms delete <index>... | gps [seconds] [--keep-on] | \(modemUsage)"
+let usage = "usage: RMNet activate | deactivate | status [--json] | sms list [--json] | sms send <number> <text> | sms delete <index>... | sms unblock [seconds] [--json] | gps [seconds] [--keep-on] | \(modemUsage)"
 
 if verbs.first == "sms" {
     guard let smsCommand = parseSms(Array(verbs.dropFirst())) else {

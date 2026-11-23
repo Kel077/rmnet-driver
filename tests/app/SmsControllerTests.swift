@@ -24,6 +24,8 @@ enum Call: Equatable {
     case delete([Int])
     case send(String, String)
     case resend([Int])
+    case unblockSlice(start: Bool, finish: Bool)
+    case healCnmi
 }
 
 /// Records each call, then blocks it (on the controller's queue) until the test releases it with a result.
@@ -34,6 +36,8 @@ final class FakeService: SmsServing {
     private var listResults: [Result<SmsListing, SmsFailure>] = []
     private var deleteResults: [Result<Int, SmsFailure>] = []
     private var sendResults: [Result<SmsSent, SmsFailure>] = []
+    private var unblockResults: [Result<SmsUnblockSlice, SmsFailure>] = []
+    private var countResults: [Result<SmsStoreCount, SmsFailure>] = []
     private var inside = 0   // calls entered and not yet returned
     private var mostInside = 0
 
@@ -83,6 +87,20 @@ final class FakeService: SmsServing {
         return locked { sendResults.removeFirst() }
     }
 
+    func unblockSlice(start: Bool, finish: Bool) -> Result<SmsUnblockSlice, SmsFailure> {
+        enter(.unblockSlice(start: start, finish: finish))
+        return locked { unblockResults.removeFirst() }
+    }
+
+    func healCnmi() -> Result<SmsUnblockSlice, SmsFailure> {
+        enter(.healCnmi)
+        return locked { unblockResults.removeFirst() }
+    }
+
+    func countUnread() -> Result<SmsStoreCount, SmsFailure> {
+        locked { countResults.removeFirst() }
+    }
+
     func releaseList(_ result: Result<SmsListing, SmsFailure>) { locked { listResults.append(result) }; gate.signal() }
     func releaseDelete(_ result: Result<Int, SmsFailure>) { locked { deleteResults.append(result) }; gate.signal() }
     /// The parts sent (stored at no index known to the test), or the failure.
@@ -91,6 +109,11 @@ final class FakeService: SmsServing {
         gate.signal()
     }
     func releaseSent(_ result: Result<SmsSent, SmsFailure>) { locked { sendResults.append(result) }; gate.signal() }
+    func releaseUnblock(_ result: Result<SmsUnblockSlice, SmsFailure>) {
+        locked { unblockResults.append(result) }
+        gate.signal()
+    }
+    func queueCount(_ result: Result<SmsStoreCount, SmsFailure>) { locked { countResults.append(result) } }
 }
 
 // MARK: - Helpers
@@ -194,6 +217,7 @@ struct SmsControllerTests {
         resuming()
         composingAndStore()
         banner()
+        unblocking()
         print("smsui-test: \(checks) checks passed")
     }
 
@@ -586,5 +610,95 @@ struct SmsControllerTests {
         check(c.resultKind == .warning, "banner: not stored, a warning", "\(c.resultKind)")
         clock.advance(60)
         check(c.result.hasPrefix("Sent to +12025550100 in 1 part(s). It is not stored"), "banner: a warning stays", c.result)
+    }
+
+    // Manual Unblock, automatic unblocking when +CMTI without storage is seen, notice when the setting is off,
+    // healing AT+CNMI=2,2 on pulse, and quitting between or during slices.
+    static func unblocking() {
+        let mmsHex = "07912120550501F04404C9320000046211220292942B2C0605040B8423F0010601BE8C82987478008D9089178031323032353535303134342F545950453D504C4D4E00"
+        let smsHex = "07912120550501F0040B912120550561F400006211220293002B05C8329BFD06"
+        let mmsPart = StoredPdu(index: 10, status: .unread, hex: mmsHex)
+        let smsPart = StoredPdu(index: 11, status: .unread, hex: smsHex)
+
+        let fake = FakeService()
+        var autoOn = false
+        var notifyOn = true
+        let clock = Date(timeIntervalSince1970: 1_800_000_000)
+        var alerts: [MessageAlert] = []
+        var replies: [Bool] = []
+        let c = SmsController(service: fake,
+                              replyToQuit: { replies.append($0) },
+                              requestAttention: {},
+                              notifyEnabled: { notifyOn },
+                              autoUnblockEnabled: { autoOn },
+                              unblockWindow: 10,
+                              slicePause: 0.01,
+                              now: { clock },
+                              alert: { alerts.append($0) })
+
+        // Setting off: blockedSmsSeen marks incomingBlocked without calling the service; turning it on starts unblocking.
+        c.blockedSmsSeen()
+        check(c.incomingBlocked && fake.calls.isEmpty, "unblock: setting off shows notice without opening port")
+        autoOn = true
+        c.autoUnblockSettingChanged(true)
+        pump(until: { fake.calls == [.unblockSlice(start: true, finish: false)] && fake.blocked == 1 },
+             "unblock: turning setting on starts slice 1")
+        check(!c.incomingBlocked && c.running == .unblocking, "unblock: incomingBlocked cleared while running")
+        // Slice 1 receives MMS + SMS; slice 2 is quiet -> finalization slice restores 2,1 and counts unread in the background.
+        fake.queueCount(.success(SmsStoreCount(used: 2, received: 2, unread: 2)))
+        fake.releaseUnblock(.success(SmsUnblockSlice(parts: [mmsPart, smsPart])))
+        pump(until: { fake.calls.count == 2 && fake.blocked == 1 }, "unblock: follow-up slice 2 starts")
+        fake.releaseUnblock(.success(SmsUnblockSlice()))
+        pump(until: { fake.calls.count == 3 && fake.blocked == 1 }, "unblock: finalization slice restores CNMI=2,1")
+        fake.releaseUnblock(.success(SmsUnblockSlice()))
+        pump(until: { c.running == nil && alerts.count == 1 }, "unblock: finishes and posts alert")
+        check(c.result == "Unblocked incoming messages: stored 2 part(s) (1 MMS notification)." && !c.resultIsFailure,
+              "unblock: result banner sentence", c.result)
+        check(alerts == [.summary(unread: 2)], "unblock: unread count updated after automatic unblock", "\(alerts)")
+
+        // Pulse commands include AT+CNMI? when autoUnblock is on, or once on attach when off; CNMI=2,2 heals even when off.
+        notifyOn = false
+        check(c.pulseCommands(turn: 1) == ["AT+CNMI?"], "unblock: pulse reads AT+CNMI? with autoUnblock on")
+        autoOn = false
+        check(c.pulseCommands(turn: 1) == [], "unblock: pulse reads nothing with both off")
+        c.modemPresent(true)
+        check(c.pulseCommands(turn: 1) == ["AT+CNMI?"], "unblock: modem attach checks AT+CNMI? once")
+        c.pulseAnswers(.success(["AT+CNMI?": .lines(["+CNMI: 2,2,0,0,0"])]))
+        pump(until: { fake.calls.last == .healCnmi && fake.blocked == 1 }, "unblock: crashed CNMI=2,2 triggers healCnmi")
+        fake.releaseUnblock(.success(SmsUnblockSlice(restoredCnmi: true)))
+        pump(until: { c.running == nil }, "unblock: healCnmi finishes")
+        check(c.result == "Restored incoming message storage (AT+CNMI=2,1,0,0,0); no queued messages arrived.",
+              "unblock: healed CNMI reported", c.result)
+
+        // Quitting between two slices runs one finalization pass to restore AT+CNMI=2,1,0,0,0 before quitting.
+        let fake2 = FakeService()
+        var replies2: [Bool] = []
+        let c2 = SmsController(service: fake2, replyToQuit: { replies2.append($0) }, requestAttention: {},
+                               unblockWindow: 60, slicePause: 5.0, now: { clock })
+        c2.unblock()
+        pump(until: { fake2.blocked == 1 }, "unblock quit: slice 1 starts")
+        fake2.releaseUnblock(.success(SmsUnblockSlice()))
+        pump(until: { fake2.blocked == 0 && c2.running == .unblocking }, "unblock quit: waiting between slices")
+        check(c2.quitWhenFinished() == true, "unblock quit: between slices restores CNMI=2,1 before quitting")
+        pump(until: { fake2.calls.last == .unblockSlice(start: false, finish: true) && fake2.blocked == 1 },
+             "unblock quit: finalization slice starts")
+        fake2.releaseUnblock(.success(SmsUnblockSlice()))
+        pump(until: { replies2 == [true] && c2.running == nil }, "unblock quit: replies true after CNMI=2,1 restored")
+
+        // Quitting during an in-flight slice finishes that slice, restores CNMI=2,1, and quits.
+        let fake3 = FakeService()
+        var replies3: [Bool] = []
+        let c3 = SmsController(service: fake3, replyToQuit: { replies3.append($0) }, requestAttention: {},
+                               unblockWindow: 60, slicePause: 0.01, now: { clock })
+        c3.unblock()
+        pump(until: { fake3.blocked == 1 }, "unblock quit in-flight: slice 1 starts")
+        check(c3.quitWhenFinished() == true, "unblock quit in-flight: waits for active slice")
+        fake3.releaseUnblock(.success(SmsUnblockSlice()))
+        pump(until: { fake3.calls.last == .unblockSlice(start: false, finish: true) && fake3.blocked == 1 },
+             "unblock quit in-flight: finalization slice restores CNMI=2,1")
+        fake3.releaseUnblock(.success(SmsUnblockSlice()))
+        pump(until: { replies3 == [true] }, "unblock quit in-flight: replies true after CNMI=2,1 restored")
+        check(fake3.calls == [.unblockSlice(start: true, finish: false), .unblockSlice(start: false, finish: true)],
+              "unblock quit in-flight: no listening slice started after quit")
     }
 }

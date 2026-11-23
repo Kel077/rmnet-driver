@@ -9,9 +9,10 @@ import Foundation
 /// What is running on the service's queue; at most one call at a time.
 enum SmsActivity: Equatable {
     case listing
-    case counting   // the background count of unread messages (nothing on the screen shows it)
+    case counting     // the background count of unread messages (nothing on the screen shows it)
     case deleting
     case sending
+    case unblocking   // streaming queued incoming messages in short windows and storing them unread
 }
 
 /// The line the window shows above its screen while a quit waits for a call to the modem; "" otherwise.
@@ -80,6 +81,8 @@ final class SmsController: ObservableObject {
     @Published private(set) var sentAt: [Int: Date] = [:]
     /// The stored indices of the last listing whose send got no answer in this run: they may have gone (Not confirmed).
     @Published private(set) var unconfirmed: Set<Int> = []
+    /// Set when a storage-less `+CMTI:` was seen while automatic unblocking is turned off: Messages offers `Unblock`.
+    @Published private(set) var incomingBlocked = false
 
     let quitNotice = SmsQuitNotice()
     let unreadNotice = SmsUnreadNotice()
@@ -87,6 +90,9 @@ final class SmsController: ObservableObject {
     private let service: SmsServing
     private let backgroundService: SmsServing    // the background listing's: a busy port fails at once
     private let notifyEnabled: () -> Bool        // Settings' Notify about new messages
+    private let autoUnblockEnabled: () -> Bool   // Settings' Unblock incoming messages automatically
+    private let hasRescued: () -> Bool           // AtPort.hasRescuedDeliveries
+    private let now: () -> Date
     private let alert: (MessageAlert) -> Void    // posts a notification (MessageNotifier.swift)
     private var watch = NewMessageWatch()
     // What the last listing listed (each stored entry) and where from: a delete or a Retry sends them, to be checked
@@ -102,6 +108,20 @@ final class SmsController: ObservableObject {
     private let replyToQuit: (Bool) -> Void      // NSApp.reply(toApplicationShouldTerminate:)
     private let requestAttention: () -> Void     // NSApp.requestUserAttention(.criticalRequest)
     private var timer: Timer?
+    private var unblockTimer: Timer?
+    private var unblockManual = false
+    private var unblockHealOnly = false
+    private var unblockDeadline: Date? = nil
+    private var unblockParts: [StoredPdu] = []
+    private var unblockRestoredCnmi = false
+    private var unblockStreaming = false
+    private var unblockFinishing = false
+    private var sliceInFlight = false
+    private var pendingAutoUnblock = false
+    private var pendingHeal = false
+    private var checkCnmiOnce = false            // armed when a modem attaches, to heal any crashed AT+CNMI=2,2
+    private let unblockWindow: TimeInterval
+    private let unblockSlicePause: TimeInterval
     private var tabShown = false
     private var windowVisible = true
     private var confirmingDelete = false     // the delete confirmation is open: timer ticks skip
@@ -110,18 +130,26 @@ final class SmsController: ObservableObject {
     private var quitWaits = false            // a quit waits for the running call to finish
 
     static let refreshInterval: TimeInterval = 15
+    static let defaultUnblockWindow: TimeInterval = 95
+    static let defaultSlicePause: TimeInterval = 0.35
 
     private let resultTimer: (TimeInterval, @escaping () -> Void) -> Void
     private lazy var expiry = ResultExpiry(after: resultTimer, clear: { [weak self] in self?.setResult("", failure: false) })
 
-    /// `backgroundService`: the background listing's service (nil: `service`). `notifyEnabled` and `alert`: whether
-    /// to check for new messages in the background and announce them, and how (the tests' defaults: never).
+    /// `backgroundService`: the background listing's service (nil: `service`). `notifyEnabled`, `autoUnblockEnabled`
+    /// and `alert`: whether to check for new messages or unblock incoming ones in the background, and how (the tests'
+    /// defaults: never).
     init(service: SmsServing,
          queue: DispatchQueue = DispatchQueue(label: "io.rmnetdriver.RMNet.sms", qos: .userInitiated),
          replyToQuit: @escaping (Bool) -> Void,
          requestAttention: @escaping () -> Void,
          backgroundService: SmsServing? = nil,
          notifyEnabled: @escaping () -> Bool = { false },
+         autoUnblockEnabled: @escaping () -> Bool = { false },
+         hasRescued: @escaping () -> Bool = { false },
+         unblockWindow: TimeInterval = SmsController.defaultUnblockWindow,
+         slicePause: TimeInterval = SmsController.defaultSlicePause,
+         now: @escaping () -> Date = { Date() },
          alert: @escaping (MessageAlert) -> Void = { _ in },
          resultTimer: @escaping (TimeInterval, @escaping () -> Void) -> Void = mainRunLoopAfter) {
         self.resultTimer = resultTimer
@@ -131,10 +159,18 @@ final class SmsController: ObservableObject {
         self.requestAttention = requestAttention
         self.backgroundService = backgroundService ?? service
         self.notifyEnabled = notifyEnabled
+        self.autoUnblockEnabled = autoUnblockEnabled
+        self.hasRescued = hasRescued
+        self.unblockWindow = unblockWindow
+        self.unblockSlicePause = slicePause
+        self.now = now
         self.alert = alert
     }
 
-    deinit { timer?.invalidate() }
+    deinit {
+        timer?.invalidate()
+        unblockTimer?.invalidate()
+    }
 
     var listed: Bool { listedAt != nil }
     var sendEnabled: Bool { running == nil && !stopping && !composing && canSend(number: to, text: text) }
@@ -211,7 +247,23 @@ final class SmsController: ObservableObject {
     /// delete that did not, so that the owner sees its result line.
     func quitWhenFinished() -> Bool {
         stopping = true
+        pendingAutoUnblock = false
+        pendingHeal = false
+        unblockTimer?.invalidate()
+        unblockTimer = nil
         updateTimer()
+        if running == .unblocking && !sliceInFlight {
+            if !unblockStreaming {
+                running = nil
+                unblockDeadline = nil
+                return false
+            }
+            quitWaits = true
+            quitNotice.line = quitWaitLine(.unblocking)
+            unblockFinishing = true
+            runNextUnblockSlice(start: false, finish: true)
+            return true
+        }
         guard let now = running else { return false }
         quitWaits = true
         quitNotice.line = quitWaitLine(now)
@@ -264,7 +316,8 @@ final class SmsController: ObservableObject {
         case .failure(let failure):
             listFailure = failure.message
         }
-        _ = answeredQuit(succeeded: true)
+        if answeredQuit(succeeded: true) { return }
+        runPendingIfIdle()
     }
 
     /// A listing that succeeded: the messages (settled: what RMNet knows of its own sends), the store, the unread marks,
@@ -304,26 +357,224 @@ final class SmsController: ObservableObject {
         alert(a)
     }
 
-    // MARK: New messages in the background
+    // MARK: New messages and automatic unblocking in the background
 
-    /// The background turn's part (ModemPulse.swift): AT+CPMS? every other turn (about every 30 s, from the first),
-    /// while Notify about new messages is on, nothing runs, the app does not quit, and the Messages screen does not list
-    /// by itself (shown and seen: it lists every 15 s). With Notify about new messages off nothing is read, and the
-    /// count starts again when it is turned on.
-    func pulseCommands(turn: Int) -> [String] {
-        guard notifyEnabled() else {
-            if watch != NewMessageWatch() { watch = NewMessageWatch() }
-            if unreadNotice.onModem != 0 { unreadNotice.onModem = 0 }
-            return []
+    /// Told when a modem comes onto USB (so its first background turn checks `AT+CNMI?`) or leaves it.
+    func modemPresent(_ present: Bool) {
+        if present {
+            checkCnmiOnce = true
+        } else {
+            checkCnmiOnce = false
+            incomingBlocked = false
+            pendingAutoUnblock = false
+            pendingHeal = false
         }
-        guard !stopping, running == nil, !active, turn % 2 == 1 else { return [] }
-        return ["AT+CPMS?"]
     }
 
-    /// The store's count read (or why the port could not be used: the turn is skipped): the first, one that changed,
-    /// and every tenth while it stays the same, count the unread messages (countInBackground).
+    /// Told when Settings' "Unblock incoming messages automatically" changes: turning it on while a blocked queue is
+    /// waiting starts the unblock at once.
+    func autoUnblockSettingChanged(_ enabled: Bool) {
+        if enabled, incomingBlocked {
+            incomingBlocked = false
+            startUnblock(manual: false, healOnly: false)
+        }
+    }
+
+    /// Told when any `AtPort` read (in this app, or in a command-line `RMNet` verb via `blockedSmsNotification`) saw a
+    /// storage-less `+CMTI:` (`+CMTI: ,3` or `+CMTI: ,-1`) or rescued an unsolicited `+CMT` PDU.
+    func blockedSmsSeen() {
+        guard !stopping else { return }
+        if hasRescued() {
+            startUnblock(manual: false, healOnly: !autoUnblockEnabled())
+            return
+        }
+        if autoUnblockEnabled() {
+            incomingBlocked = false
+            startUnblock(manual: false, healOnly: false)
+        } else if running != .unblocking {
+            incomingBlocked = true
+        }
+    }
+
+    /// The window's `Unblock` action (toolbar or notice): streams queued incoming messages and stores them as unread.
+    func unblock() {
+        guard running == nil, !stopping else { return }
+        incomingBlocked = false
+        startUnblock(manual: true, healOnly: false)
+    }
+
+    private func startUnblock(manual: Bool, healOnly: Bool) {
+        guard !stopping else { return }
+        guard running == nil else {
+            if !manual {
+                if healOnly { pendingHeal = true } else { pendingAutoUnblock = true }
+            }
+            return
+        }
+        running = .unblocking
+        unblockManual = manual
+        unblockHealOnly = healOnly
+        unblockDeadline = healOnly ? nil : now().addingTimeInterval(unblockWindow)
+        unblockParts = []
+        unblockRestoredCnmi = false
+        unblockStreaming = false
+        unblockFinishing = false
+        if manual {
+            setResult("Unblocking incoming messages (waiting for the carrier, up to \(Int(unblockWindow)) s)…", failure: false, kind: .progress)
+        } else if !healOnly {
+            setResult("Unblocking incoming messages…", failure: false, kind: .progress)
+        }
+        runNextUnblockSlice(start: true, finish: false)
+    }
+
+    private func runNextUnblockSlice(start: Bool, finish: Bool) {
+        sliceInFlight = true
+        let service = self.service
+        let healOnly = self.unblockHealOnly
+        queue.async {
+            let result = healOnly ? service.healCnmi() : service.unblockSlice(start: start, finish: finish)
+            DispatchQueue.main.async { self.finishUnblockSlice(result, started: start && !healOnly, finished: finish || healOnly) }
+        }
+    }
+
+    private func finishUnblockSlice(_ outcome: Result<SmsUnblockSlice, SmsFailure>, started: Bool, finished: Bool) {
+        sliceInFlight = false
+        switch outcome {
+        case .failure(let failure):
+            unblockTimer?.invalidate()
+            unblockTimer = nil
+            if unblockStreaming && !finished {
+                unblockStreaming = false
+                unblockFinishing = true
+                let savedFailure = failure.message
+                let service = self.service
+                sliceInFlight = true
+                queue.async {
+                    _ = service.unblockSlice(start: false, finish: true)
+                    DispatchQueue.main.async {
+                        self.sliceInFlight = false
+                        self.unblockFinishing = false
+                        self.completeUnblockFailure(savedFailure)
+                    }
+                }
+                return
+            }
+            unblockStreaming = false
+            unblockFinishing = false
+            completeUnblockFailure(failure.message)
+        case .success(let slice):
+            unblockParts.append(contentsOf: slice.parts)
+            if slice.restoredCnmi { unblockRestoredCnmi = true }
+            if started { unblockStreaming = true }
+            if finished { unblockStreaming = false; unblockFinishing = false }
+
+            let settled = !unblockParts.isEmpty && slice.parts.isEmpty
+            let expired = unblockDeadline.map { now() >= $0 } ?? true
+            if unblockHealOnly || finished || stopping || settled || expired {
+                unblockTimer?.invalidate()
+                unblockTimer = nil
+                if unblockStreaming {
+                    unblockFinishing = true
+                    runNextUnblockSlice(start: false, finish: true)
+                    return
+                }
+                running = nil
+                let manual = unblockManual
+                unblockDeadline = nil
+                let summary = assembleUnblocked(unblockParts, restoredCnmi: unblockRestoredCnmi)
+                if manual || summary.stored > 0 || summary.restoredCnmi {
+                    setResult(smsUnblockSentence(summary), failure: false)
+                    if summary.stored > 0 { clearResultOnTyping = true }
+                } else if result == "Unblocking incoming messages…" {
+                    setResult("", failure: false)
+                }
+                if answeredQuit(succeeded: true) { return }
+                if active {
+                    refresh()
+                } else if summary.stored > 0 && notifyEnabled() {
+                    countInBackground()
+                } else {
+                    runPendingIfIdle()
+                }
+                return
+            }
+            let t = Timer(timeInterval: unblockSlicePause, repeats: false) { [weak self] _ in
+                guard let self else { return }
+                self.unblockTimer = nil
+                guard self.running == .unblocking, !self.stopping else { return }
+                self.runNextUnblockSlice(start: false, finish: false)
+            }
+            RunLoop.main.add(t, forMode: .common)
+            unblockTimer = t
+        }
+    }
+
+    private func completeUnblockFailure(_ message: String) {
+        running = nil
+        let manual = unblockManual
+        let hadParts = !unblockParts.isEmpty
+        unblockDeadline = nil
+        if manual || hadParts {
+            setResult(message, failure: true)
+        } else if result == "Unblocking incoming messages…" {
+            setResult("", failure: false)
+        }
+        if answeredQuit(succeeded: !manual) { return }
+        if hadParts {
+            if active { refresh() } else if notifyEnabled() { countInBackground() }
+        } else {
+            runPendingIfIdle()
+        }
+    }
+
+    private func runPendingIfIdle() {
+        guard running == nil, !stopping else { return }
+        if pendingAutoUnblock {
+            pendingAutoUnblock = false
+            pendingHeal = false
+            startUnblock(manual: false, healOnly: false)
+        } else if pendingHeal {
+            pendingHeal = false
+            startUnblock(manual: false, healOnly: true)
+        }
+    }
+
+    /// The background turn's part (ModemPulse.swift): every other turn (about every 30 s, from the first), while
+    /// nothing runs, the app does not quit, and the Messages screen does not list by itself (shown and seen: it lists
+    /// every 15 s). Reads `AT+CPMS?` while Notify about new messages is on, and `AT+CNMI?` while automatic unblocking
+    /// is on (or once after a modem attaches, to heal any `AT+CNMI` left at `2,2` by an earlier crash).
+    func pulseCommands(turn: Int) -> [String] {
+        let notify = notifyEnabled()
+        if !notify {
+            if watch != NewMessageWatch() { watch = NewMessageWatch() }
+            if unreadNotice.onModem != 0 { unreadNotice.onModem = 0 }
+        }
+        let checkCnmi = autoUnblockEnabled() || checkCnmiOnce || hasRescued()
+        guard notify || checkCnmi else { return [] }
+        guard !stopping, running == nil, !active, turn % 2 == 1 else { return [] }
+        var commands: [String] = []
+        if notify { commands.append("AT+CPMS?") }
+        if checkCnmi { commands.append("AT+CNMI?") }
+        return commands
+    }
+
+    /// The store's count and `AT+CNMI?` read (or why the port could not be used: the turn is skipped): an `AT+CNMI?`
+    /// not at `2,1` (or rescued `+CMT` PDUs) heals `AT+CNMI` and stores any pending deliveries; otherwise the count
+    /// checks unread messages when needed (countInBackground).
     func pulseAnswers(_ answers: Result<[String: PulseAnswer], ModemFailure>) {
-        guard notifyEnabled(), case .success(let a) = answers, let store = a["AT+CPMS?"] else { return }
+        guard case .success(let a) = answers else { return }
+        if let cnmi = a["AT+CNMI?"] {
+            checkCnmiOnce = false
+            if let parsed = parseCnmi(cnmi.lines), parsed != (2, 1) {
+                startUnblock(manual: false, healOnly: !autoUnblockEnabled())
+                return
+            }
+        }
+        if hasRescued() {
+            startUnblock(manual: false, healOnly: !autoUnblockEnabled())
+            return
+        }
+        guard notifyEnabled(), let store = a["AT+CPMS?"] else { return }
         if watch.storeCount(parseStorage(store.lines)?.used) { countInBackground() }
     }
 
@@ -346,7 +597,8 @@ final class SmsController: ObservableObject {
             if unreadNotice.onModem != count.unread { unreadNotice.onModem = count.unread }
             if let alert { announce(alert) }
         }
-        _ = answeredQuit(succeeded: true)
+        if answeredQuit(succeeded: true) { return }
+        runPendingIfIdle()
     }
 
     /// Deletes every stored part of `message`, if it is still listed and nothing else runs.
@@ -397,7 +649,7 @@ final class SmsController: ObservableObject {
             succeeded = false
         }
         if answeredQuit(succeeded: succeeded) { return }
-        if active { refresh() }
+        if active { refresh() } else { runPendingIfIdle() }
     }
 
     /// Sends the reply to the conversation shown, as `send` does, once; on success that conversation's reply is cleared.
@@ -507,7 +759,7 @@ final class SmsController: ObservableObject {
             succeeded = false
         }
         if answeredQuit(succeeded: succeeded) { return }
-        if active { refresh() }
+        if active { refresh() } else { runPendingIfIdle() }
     }
 
     /// The banner's X: the line is cleared, so it does not come back on another screen or a new window.
@@ -535,6 +787,6 @@ private func quitWaitLine(_ activity: SmsActivity) -> String {
     switch activity {
     case .sending: return "RMNet quits when the message being sent has finished."
     case .deleting: return "RMNet quits when the message being deleted has finished."
-    case .listing, .counting: return "RMNet quits when the current request to the modem has finished."
+    case .listing, .counting, .unblocking: return "RMNet quits when the current request to the modem has finished."
     }
 }
