@@ -81,7 +81,7 @@ app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build
 		build/modemnet-tests build/modemset-tests build/modemsvc-tests build/modemcli-tests build/modemui-tests \
 		build/quit-tests build/menubar-tests build/window-tests build/signal-tests build/throughput-tests \
 		build/shell-tests build/networkview-tests build/overview-tests build/imeihistory-tests build/simslot-tests \
-		build/messagealerts-tests
+		build/messagealerts-tests build/smsservice-tests build/conversations-tests
 	./build/app-tests
 	./build/sms-tests
 	./build/at-tests
@@ -104,6 +104,8 @@ app-test: build/app-tests build/sms-tests build/at-tests build/smsui-tests build
 	./build/imeihistory-tests
 	./build/simslot-tests
 	./build/messagealerts-tests
+	./build/smsservice-tests
+	./build/conversations-tests
 
 build/app-tests: app/StatusModel.swift tests/app/StatusModelTests.swift
 	@mkdir -p build
@@ -118,7 +120,7 @@ build/at-tests: app/AtPort.swift tests/app/AtPortTests.swift
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
 build/smsui-tests: app/SmsModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/MessageAlerts.swift \
-		app/SmsController.swift tests/app/SmsControllerTests.swift
+		app/SmsConversations.swift app/SmsController.swift tests/app/SmsControllerTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
@@ -155,7 +157,7 @@ build/modemui-tests: app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHist
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 
-build/quit-tests: app/SmsModel.swift app/MessageAlerts.swift app/SmsController.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift \
+build/quit-tests: app/SmsModel.swift app/MessageAlerts.swift app/SmsConversations.swift app/SmsController.swift app/ModemNetwork.swift app/ModemSettings.swift app/ImeiHistory.swift \
 		app/ModemController.swift app/QuitGate.swift tests/app/QuitGateTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
@@ -218,7 +220,17 @@ build/simslot-tests: app/ModemNetwork.swift app/ModemSettings.swift app/SimSlotW
 # New messages in the background: the count, the baseline, what is new and what a notification says; the background
 # turn shared over the AT port; the Messages controller's part, against a fake service.
 build/messagealerts-tests: app/SmsModel.swift app/ModemNetwork.swift app/ModemSettings.swift app/MessageAlerts.swift \
-		app/ModemPulse.swift app/SmsController.swift tests/app/MessageAlertsTests.swift
+		app/ModemPulse.swift app/SmsConversations.swift app/SmsController.swift tests/app/MessageAlertsTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+# Sending from the modem's store (AT+CMGW, AT+CMSS), Retry and the direct send, against a scripted port.
+build/smsservice-tests: app/AtPort.swift app/SmsModel.swift app/SmsService.swift tests/app/SmsServiceTests.swift
+	@mkdir -p build
+	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
+
+# The Messages screen's conversations: grouping by number, the order within one, previews and words.
+build/conversations-tests: app/SmsModel.swift app/SmsConversations.swift tests/app/SmsConversationsTests.swift
 	@mkdir -p build
 	xcrun swiftc -swift-version 5 -parse-as-library -o $@ $^
 

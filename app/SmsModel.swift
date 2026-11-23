@@ -1,11 +1,16 @@
-// The pure SMS message model: reading the AT text the modem answers in PDU mode, decoding
-// SMS-DELIVER PDUs, assembling multi-part messages, and encoding SMS-SUBMIT PDUs.
+// The pure SMS message model: reading the AT text the modem answers in PDU mode, decoding the
+// SMS-DELIVER PDUs it received and the SMS-SUBMIT PDUs stored to send (AT+CMGW, AT+CMSS), assembling
+// multi-part messages, and encoding SMS-SUBMIT PDUs.
 // Formats: 3GPP TS 23.040 (PDUs, addresses, user data header, time stamp), TS 23.038 (the GSM 7-bit
 // default alphabet and its extension table, septet packing, the data coding scheme), TS 27.005
 // (+CMGL, +CMGS, +CPMS). No I/O here; every function is total and never traps on any input.
 import Foundation
 
 enum SmsStatus: Int { case unread = 0, read = 1, unsent = 2, sent = 3 }
+
+/// Which way a message went: received (stored REC UNREAD or REC READ), or written by RMNet and sent (STO SENT) or not
+/// sent (STO UNSENT: written, and its AT+CMSS failed or did not run).
+enum SmsBox: String, Equatable { case received, sent, unsent }
 
 struct StoredPdu: Equatable { let index: Int; let status: SmsStatus; let hex: String }
 
@@ -15,21 +20,28 @@ struct SmsConcat: Equatable { let reference: Int; let total: Int; let sequence: 
 struct SmsPart: Equatable {
     let index: Int
     let status: SmsStatus
-    let sender: String     // "" when not readable
+    let sender: String     // the other party: who sent it, or for a stored SMS-SUBMIT whom it is for; "" when not readable
     let timestamp: Date?   // the service centre's time, nil when absent or invalid
     let text: String       // "" when not readable
     let concat: SmsConcat?
-    let readable: Bool     // false: not an SMS-DELIVER, or malformed
+    let readable: Bool     // false: neither an SMS-DELIVER nor an SMS-SUBMIT, or malformed
+
+    /// Stored to send (STO SENT or STO UNSENT), not received.
+    var outgoing: Bool { status == .sent || status == .unsent }
 }
 
 struct SmsMessage: Equatable {
     let indices: [Int]     // every stored index of the message, ascending
-    let unread: Bool       // any part was unread when listed
-    let sender: String
-    let timestamp: Date?
+    let unread: Bool       // any part was unread when listed (received messages only)
+    let sender: String     // the other party: the sender of a received message, the recipient of a sent one
+    let timestamp: Date?   // the service centre's time of a received message; nil for a sent one (SMS-SUBMIT has none)
     let text: String
     let missingParts: Int  // 0 when complete
     let readable: Bool
+    var box: SmsBox = .received
+    var unsentIndices: [Int] = []   // the stored parts still STO UNSENT, ascending (Retry sends them)
+
+    var outgoing: Bool { box != .received }
 }
 
 enum SmsEncoding { case gsm7, ucs2 }
@@ -48,10 +60,19 @@ struct SmsListing: Equatable {
     let total: Int?
 }
 
+/// A send that went: how many parts, and where they are stored as sent (none when the modem could not store them and
+/// they were sent directly: `stored` false).
+struct SmsSent: Equatable {
+    let parts: Int
+    var indices: [Int] = []
+    var stored = true
+}
+
 protocol SmsServing {
     func list() -> Result<SmsListing, SmsFailure>
-    func delete(indices: [Int]) -> Result<Int, SmsFailure>               // stored entries deleted
-    func send(to number: String, text: String) -> Result<Int, SmsFailure> // parts sent
+    func delete(indices: [Int]) -> Result<Int, SmsFailure>                   // stored entries deleted
+    func send(to number: String, text: String) -> Result<SmsSent, SmsFailure>
+    func resend(indices: [Int]) -> Result<SmsSent, SmsFailure>               // stored unsent parts, sent again
 }
 
 // MARK: - The GSM 7-bit default alphabet (TS 23.038 §6.2.1) and its extension table (§6.2.1.1)
@@ -447,6 +468,50 @@ func parseListing(_ lines: [String]) -> [StoredPdu] {
     return out
 }
 
+/// "+CMGW: <index>" after a message was written to the store (AT+CMGW).
+func parseStoreIndex(_ lines: [String]) -> Int? {
+    firstNumber(lines, "+CMGW:")
+}
+
+/// "+CMSS: <mr>[,<ackpdu>]" (mr 0-255) after a stored message was sent (AT+CMSS).
+func parseStoredSendReference(_ lines: [String]) -> Int? {
+    firstNumber(lines, "+CMSS:").flatMap { (0...255).contains($0) ? $0 : nil }
+}
+
+/// The status of "+CMGR: <stat>,[<alpha>],<length>" (AT+CMGR in PDU mode), and the PDU line after it.
+func parseReadEntry(_ lines: [String]) -> (status: SmsStatus, hex: String)? {
+    guard let i = lines.firstIndex(where: { trimmed($0).hasPrefix("+CMGR:") }),
+          let stat = firstNumber([lines[i]], "+CMGR:"), let status = SmsStatus(rawValue: stat),
+          let hex = lines[(i + 1)...].map(trimmed).first(where: isHexLine) else { return nil }
+    return (status, hex)
+}
+
+/// The storages of "+CPMS: "ME",u,t,"ME",u,t,"ME",u,t": <mem1> (listed and deleted) and <mem2> (written and sent
+/// from); nil without names.
+func parseStorageNames(_ lines: [String]) -> (read: String, write: String)? {
+    for raw in lines {
+        let line = trimmed(raw)
+        guard line.hasPrefix("+CPMS:") else { continue }
+        let fields = line.dropFirst("+CPMS:".count).split(separator: ",", omittingEmptySubsequences: false)
+            .map { trimmed(String($0)) }
+        guard fields.count >= 6, fields[0].hasPrefix("\""), fields[3].hasPrefix("\"") else { return nil }
+        return (fields[0].replacingOccurrences(of: "\"", with: ""), fields[3].replacingOccurrences(of: "\"", with: ""))
+    }
+    return nil
+}
+
+/// The first field of the first line starting `prefix`, as a non-negative number.
+private func firstNumber(_ lines: [String], _ prefix: String) -> Int? {
+    for raw in lines {
+        let line = trimmed(raw)
+        guard line.hasPrefix(prefix) else { continue }
+        let first = line.dropFirst(prefix.count).split(separator: ",", omittingEmptySubsequences: false).first
+        guard let f = first, let n = Int(trimmed(String(f))), n >= 0 else { return nil }
+        return n
+    }
+    return nil
+}
+
 /// "+CMGS: <mr>" (0-255) after a message was sent.
 func parseSendReference(_ lines: [String]) -> Int? {
     for raw in lines {
@@ -525,9 +590,15 @@ func displaySafe(_ s: String, keepLineEnds: Bool) -> String {
     return String(out)
 }
 
-/// The sender and the text of a readable part are display-safe (`displaySafe`).
+/// The sender and the text of a readable part are display-safe (`displaySafe`). An SMS-SUBMIT stored to send (STO SENT or
+/// STO UNSENT) reads as its recipient and text, with no time.
 func decodePart(_ stored: StoredPdu) -> SmsPart {
     guard let d = decodeDeliver(stored.hex) else {
+        if let submit = readSubmit(stored.hex) {
+            return SmsPart(index: stored.index, status: stored.status, sender: displaySafe(submit.number, keepLineEnds: false),
+                           timestamp: nil, text: displaySafe(submit.text, keepLineEnds: true), concat: submit.concat,
+                           readable: true)
+        }
         return SmsPart(index: stored.index, status: stored.status, sender: "", timestamp: nil, text: "",
                        concat: nil, readable: false)
     }
@@ -554,7 +625,13 @@ func readSubmit(_ hex: String) -> (number: String, text: String, concat: SmsConc
 
 // MARK: - Assembling multi-part messages
 
-private struct GroupKey: Hashable { let sender: String; let reference: Int; let total: Int }
+/// A message's box from its parts: received; or sent, unless a part is still unsent.
+private func box(of parts: [SmsPart]) -> SmsBox {
+    guard parts.contains(where: { $0.outgoing }) else { return .received }
+    return parts.contains(where: { $0.status == .unsent }) ? .unsent : .sent
+}
+
+private struct GroupKey: Hashable { let sender: String; let reference: Int; let total: Int; let outgoing: Bool }
 
 /// Parts further than this from a group's earliest part start another message.
 private let groupWindow: TimeInterval = 15 * 60
@@ -579,7 +656,8 @@ func assemble(_ parts: [SmsPart]) -> [SmsMessage] {
         } else {
             messages.append(SmsMessage(indices: [p.index], unread: p.status == .unread, sender: p.sender,
                                        timestamp: p.timestamp, text: p.text, missingParts: 0,
-                                       readable: p.readable))
+                                       readable: p.readable, box: box(of: [p]),
+                                       unsentIndices: p.status == .unsent ? [p.index] : []))
         }
     }
     // Time first (parts without a time after the others), then index; the rest only breaks exact ties.
@@ -599,7 +677,7 @@ func assemble(_ parts: [SmsPart]) -> [SmsMessage] {
     var groups: [PartGroup] = []
     for p in candidates {
         guard let c = p.concat else { continue }
-        let key = GroupKey(sender: p.sender, reference: c.reference, total: c.total)
+        let key = GroupKey(sender: p.sender, reference: c.reference, total: c.total, outgoing: p.outgoing)
         let home = groups.firstIndex { g in
             guard g.key == key else { return false }
             if let t = p.timestamp, let e = g.earliest, abs(t.timeIntervalSince(e)) > groupWindow { return false }
@@ -633,7 +711,9 @@ func assemble(_ parts: [SmsPart]) -> [SmsMessage] {
         let timestamp = g.members.compactMap { $0.timestamp }.min()
         messages.append(SmsMessage(indices: g.members.map { $0.index }.sorted(),
                                    unread: g.members.contains { $0.status == .unread }, sender: g.key.sender,
-                                   timestamp: timestamp, text: text, missingParts: missing, readable: true))
+                                   timestamp: timestamp, text: text, missingParts: missing, readable: true,
+                                   box: box(of: g.members),
+                                   unsentIndices: g.members.filter { $0.status == .unsent }.map { $0.index }.sorted()))
     }
     return messages.sorted { a, b in
         let ia = a.indices.first ?? 0, ib = b.indices.first ?? 0
@@ -892,6 +972,47 @@ func verificationCode(in text: String) -> String? {
         i = end
     }
     return groups.count == 1 ? groups[0] : nil
+}
+
+// MARK: - What `RMNet sms list` prints
+
+/// The headline, the store's warning, then each message: `[indices] unread|read <sender> <time>` for a received one,
+/// `[indices] sent to|unsent to <recipient> no time` for one RMNet stored to send, and its text indented below.
+func smsListLines(_ listing: SmsListing, time: (Date) -> String) -> [String] {
+    var lines = [listHeadline(count: listing.messages.count, used: listing.used, total: listing.total)]
+    let warning = storeWarning(used: listing.used, total: listing.total)
+    if !warning.isEmpty { lines.append("sms: \(warning)") }
+    for m in listing.messages {
+        let indices = "[" + m.indices.map(String.init).joined(separator: ",") + "]"
+        guard m.readable else {
+            lines.append("\(indices) not readable")
+            continue
+        }
+        let state: String
+        switch m.box {
+        case .received: state = m.unread ? "unread" : "read"
+        case .sent: state = "sent to"
+        case .unsent: state = "unsent to"
+        }
+        var head = "\(indices) \(state) \(m.sender) \(m.timestamp.map(time) ?? "no time")"
+        if m.missingParts > 0 { head += " (\(m.missingParts) part(s) missing)" }
+        lines.append(head)
+        if m.text.isEmpty { continue }
+        for line in m.text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
+            lines.append("  \(line)")
+        }
+    }
+    return lines
+}
+
+/// `sms list --json`: one object a message, the keys it always had and `status` (added): "received", "sent" or
+/// "unsent"; for the last two `sender` is the recipient and `time` is null.
+func smsListJSON(_ messages: [SmsMessage], time: (Date) -> String) -> [[String: Any]] {
+    messages.map { m in
+        ["indices": m.indices, "unread": m.unread, "sender": m.sender,
+         "time": m.timestamp.map(time) ?? NSNull(), "text": m.text,
+         "missingParts": m.missingParts, "readable": m.readable, "status": m.box.rawValue]
+    }
 }
 
 /// The confirmation before a delete: the sender, and how many stored parts go.

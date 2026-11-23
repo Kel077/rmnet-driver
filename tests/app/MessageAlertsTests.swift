@@ -54,8 +54,22 @@ final class ListingService: SmsServing {
         lists += 1
         return listing
     }
-    func delete(indices: [Int]) -> Result<Int, SmsFailure> { .success(indices.count) }
-    func send(to number: String, text: String) -> Result<Int, SmsFailure> { .success(1) }
+    var sends: [(number: String, text: String)] = []
+    var resends: [[Int]] = []
+    var deletes: [[Int]] = []
+    var sendIndex = 9
+    func delete(indices: [Int]) -> Result<Int, SmsFailure> {
+        deletes.append(indices)
+        return .success(indices.count)
+    }
+    func send(to number: String, text: String) -> Result<SmsSent, SmsFailure> {
+        sends.append((number, text))
+        return .success(SmsSent(parts: 1, indices: [sendIndex]))
+    }
+    func resend(indices: [Int]) -> Result<SmsSent, SmsFailure> {
+        resends.append(indices)
+        return .success(SmsSent(parts: indices.count, indices: indices))
+    }
 }
 
 func store(_ used: Int) -> Result<[String: PulseAnswer], ModemFailure> {
@@ -70,6 +84,7 @@ struct MessageAlertsTests {
         content()
         pulse()
         controller()
+        ownMessages()
         print("message alerts: \(checks) checks passed")
     }
 
@@ -269,5 +284,91 @@ struct MessageAlertsTests {
         // A notification's message selected, found by sender and time.
         c.select(SmsIdentity(later))
         equal(c.selection, later.key, "controller: the notification's message selected")
+    }
+
+    /// A reply, a Retry and a conversation deleted; the messages RMNet sends never announced, also when the store's
+    /// count goes up with them; a conversation shown is read.
+    static func ownMessages() {
+        let screen = ListingService()
+        var alerts: [MessageAlert] = []
+        let c = SmsController(service: screen, queue: DispatchQueue(label: "sms.own"), replyToQuit: { _ in },
+                              requestAttention: {}, backgroundService: screen, notifyEnabled: { true },
+                              alert: { alerts.append($0) })
+        // An hour ago: a reply sent now comes after it.
+        let first = SmsMessage(indices: [0], unread: true, sender: "+15555550100", timestamp: Date().addingTimeInterval(-3600),
+                               text: "Made-up question", missingParts: 0, readable: true)
+        screen.listing = .success(SmsListing(messages: [first], used: 1, total: 50))
+        c.pulseAnswers(store(1))
+        pump(until: { c.listed }, "own: the baseline")
+        equal(alerts, [.summary(unread: 1)], "own: the baseline summary")
+        equal(c.conversations.map { $0.id }, ["5555550100"], "own: one conversation")
+        equal(c.unreadNotice.count, 1, "own: unread")
+
+        // Showing the conversation reads it.
+        c.selectedConversation = "5555550100"
+        equal(c.unreadNotice.count, 0, "own: shown is read")
+        equal(c.shownConversation?.number, "+15555550100", "own: the shown conversation")
+
+        // A reply: sent to the conversation's number; its stored index gets the time; the text cleared.
+        check(!c.replyEnabled, "own: no reply text, no send")
+        c.replyText = "Made-up answer"
+        check(c.replyEnabled, "own: a reply can go")
+        c.sendReply()
+        pump(until: { c.running == nil && !screen.sends.isEmpty }, "own: the reply sent")
+        check(screen.sends.first?.number == "+15555550100" && screen.sends.first?.text == "Made-up answer",
+              "own: to the conversation's number")
+        check(c.sentAt[9] != nil, "own: the sent part's time kept")
+        equal(c.replyText, "", "own: the reply cleared")
+        equal(c.result, "Sent to +15555550100 in 1 part(s).", "own: the result line")
+
+        // The store's count went up with the sent message: listed, not announced.
+        let mine = SmsMessage(indices: [9], unread: false, sender: "+15555550100", timestamp: nil, text: "Made-up answer",
+                              missingParts: 0, readable: true, box: .sent)
+        screen.listing = .success(SmsListing(messages: [first, mine], used: 2, total: 50))
+        c.pulseAnswers(store(2))
+        pump(until: { c.messages.count == 2 }, "own: listed with the sent one")
+        settle()
+        equal(alerts.count, 1, "own: a sent message is never announced")
+        equal(c.conversations.first?.messages.last, mine, "own: the reply last in the conversation")
+
+        // An unsent one: Retry sends its stored parts again.
+        let unsent = SmsMessage(indices: [10, 11], unread: false, sender: "+15555550100", timestamp: nil, text: "Long",
+                                missingParts: 0, readable: true, box: .unsent, unsentIndices: [11])
+        screen.listing = .success(SmsListing(messages: [first, mine, unsent], used: 4, total: 50))
+        c.pulseAnswers(store(4))
+        pump(until: { c.messages.count == 3 }, "own: listed with the unsent one")
+        settle()
+        equal(alerts.count, 1, "own: an unsent message is never announced")
+        c.retry(unsent)
+        pump(until: { c.running == nil && !screen.resends.isEmpty }, "own: retried")
+        equal(screen.resends, [[11]], "own: only the unsent part again")
+        check(c.sentAt[11] != nil, "own: the retried part's time kept")
+
+        // The New Message sheet: its conversation shown after the send.
+        c.to = "+15555550199"
+        c.text = "Made-up new message"
+        screen.sendIndex = 12
+        c.send()
+        pump(until: { c.running == nil && screen.sends.count == 2 }, "own: a new message sent")
+        equal(c.selectedConversation, "5555550199", "own: its conversation shown")
+        equal(c.text, "", "own: the sheet's text cleared")
+
+        // Deleting a conversation: every stored part of every message in it.
+        guard let conversation = c.conversations.first(where: { $0.id == "5555550100" }) else {
+            check(false, "own: the conversation")
+            return
+        }
+        c.selectedConversation = "5555550100"
+        c.deleteConversation(conversation)
+        pump(until: { c.running == nil && !screen.deletes.isEmpty }, "own: the conversation deleted")
+        equal(screen.deletes.first.map { Set($0) }, Set([0, 9, 10, 11]), "own: every stored part")
+        check(c.selectedConversation == nil, "own: nothing shown after")
+
+        // A notification's message: its conversation shown.
+        screen.listing = .success(SmsListing(messages: [first], used: 1, total: 50))
+        c.refresh()
+        pump(until: { c.running == nil && c.messages.count == 1 }, "own: listed again")
+        c.select(SmsIdentity(first))
+        equal(c.selectedConversation, "5555550100", "own: a notification shows its conversation")
     }
 }

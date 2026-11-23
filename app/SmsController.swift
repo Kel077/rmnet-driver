@@ -56,6 +56,15 @@ final class SmsController: ObservableObject {
         }
     }
     @Published var composing = false  // an input method has text in the field that is not committed yet
+    /// The conversation shown (conversationKey of its number). Showing it is reading it: its unread marks go.
+    @Published var selectedConversation: String? = nil {
+        didSet { markShownConversationRead() }
+    }
+    @Published var replyText = ""      // the conversation's reply, not saved anywhere
+    @Published var replyComposing = false
+    /// When this run of RMNet sent each stored part (index → time), so a sent message has a time: the modem keeps none
+    /// for it. In memory only.
+    @Published private(set) var sentAt: [Int: Date] = [:]
 
     let quitNotice = SmsQuitNotice()
     let unreadNotice = SmsUnreadNotice()
@@ -101,6 +110,19 @@ final class SmsController: ObservableObject {
     var listed: Bool { listedAt != nil }
     var selectedMessage: SmsMessage? { messages.first { $0.key == selection } }
     var sendEnabled: Bool { running == nil && !stopping && !composing && canSend(number: to, text: text) }
+    /// The messages as conversations, the latest first (SmsConversations.swift).
+    var conversations: [SmsConversation] { RMNetConversations.build(messages, unread: unread, sentAt: sentAt) }
+    var shownConversation: SmsConversation? {
+        guard let key = selectedConversation else { return nil }
+        return conversations.first { $0.id == key }
+    }
+    /// The reply can go: a conversation with a number shown, a text, nothing running.
+    var replyEnabled: Bool {
+        guard running == nil, !stopping, !replyComposing, let number = shownConversation?.number else { return false }
+        return canSend(number: number, text: replyText)
+    }
+    var replyNote: String { composeNote(replyText, composing: replyComposing) }
+    var changeEnabled: Bool { running == nil && !stopping }
     var deleteEnabled: Bool { running == nil && !stopping && selectedMessage != nil }
     var refreshEnabled: Bool { running == nil && !stopping }
     /// The list's own line: when it was listed and how full the store is, or why the last listing failed.
@@ -228,6 +250,7 @@ final class SmsController: ObservableObject {
         unread = unreadMarks(listed: found, kept: unread)
         if let s = selection, !found.contains(where: { $0.key == s }) { selection = nil }
         if let s = selection { unread.remove(s) }
+        if active { markShownConversationRead() }
         announce(watch.listed(found, used: listing.used))
     }
 
@@ -278,7 +301,10 @@ final class SmsController: ObservableObject {
 
     /// Shows the message a notification was about, if it is still listed (its parts may have changed since).
     func select(_ identity: SmsIdentity) {
-        if let m = messages.first(where: { SmsIdentity($0) == identity }) { selection = m.key }
+        if let m = messages.first(where: { SmsIdentity($0) == identity }) {
+            selection = m.key
+            selectedConversation = conversationKey(m.sender)
+        }
     }
 
     /// Deletes every stored part of `message`, if it is still listed and nothing else runs.
@@ -321,27 +347,88 @@ final class SmsController: ObservableObject {
     }
 
     /// Sends the text to the number once; never retried.
+    /// Sends the reply to the conversation shown, as `send` does; on success the reply is cleared.
+    func sendReply() {
+        guard replyEnabled, let number = shownConversation?.number else { return }
+        startSend(to: number, body: replyText, reply: true)
+    }
+
+    /// Sends the stored parts of `message` that are not sent (Retry), once.
+    func retry(_ message: SmsMessage) {
+        guard running == nil, !stopping, !message.unsentIndices.isEmpty else { return }
+        running = .sending
+        setResult("Sending \(message.unsentIndices.count) stored part(s) to \(message.sender) again…", failure: false)
+        let service = self.service
+        let indices = message.unsentIndices
+        queue.async {
+            let result = service.resend(indices: indices)
+            DispatchQueue.main.async { self.finishSend(result, number: message.sender, reply: nil) }
+        }
+    }
+
+    /// Deletes every stored part of every message of `conversation`.
+    func deleteConversation(_ conversation: SmsConversation) {
+        guard !stopping else { return }
+        guard running == nil else {
+            setResult("The modem was busy with another request. Nothing was deleted; press Delete again.", failure: true)
+            return
+        }
+        let indices = conversation.messages.flatMap { $0.indices }
+        guard !indices.isEmpty else { return }
+        running = .deleting
+        setResult("Deleting \(indices.count) stored part(s)…", failure: false)
+        let service = self.service
+        queue.async {
+            let result = service.delete(indices: indices)
+            DispatchQueue.main.async {
+                if case .success = result, self.selectedConversation == conversation.id { self.selectedConversation = nil }
+                self.finishDelete(result)
+            }
+        }
+    }
+
+    private func markShownConversationRead() {
+        guard let c = shownConversation else { return }
+        for m in c.messages { unread.remove(m.key) }
+    }
+
+    /// Sends the New Message sheet's text to its number once; never retried.
     func send() {
         guard sendEnabled else { return }
-        let number = to, body = text
+        startSend(to: to, body: text, reply: false)
+    }
+
+    /// `reply`: true for the conversation's reply, false for the New Message sheet (whose conversation is then shown).
+    private func startSend(to number: String, body: String, reply: Bool) {
         let parts = partCount(body)
         running = .sending
         setResult("Sending \(parts) part(s) to \(number). This can take up to a minute per part.", failure: false)
         let service = self.service
         queue.async {
             let result = service.send(to: number, text: body)
-            DispatchQueue.main.async { self.finishSend(result, number: number) }
+            DispatchQueue.main.async { self.finishSend(result, number: number, reply: reply) }
         }
     }
 
-    private func finishSend(_ outcome: Result<Int, SmsFailure>, number: String) {
+    /// `reply` nil: a Retry. The parts' stored indices get the time they were sent (sentAt).
+    private func finishSend(_ outcome: Result<SmsSent, SmsFailure>, number: String, reply: Bool?) {
         running = nil
         let succeeded: Bool
         switch outcome {
-        case .success(let parts):
-            text = ""
-            setResult("Sent to \(number) in \(parts) part(s).", failure: false)
-            clearResultOnTyping = true
+        case .success(let sent):
+            let now = Date()
+            for index in sent.indices { sentAt[index] = now }
+            switch reply {
+            case true?: replyText = ""
+            case false?:
+                text = ""
+                selectedConversation = conversationKey(number)
+            case nil: break
+            }
+            setResult("Sent to \(number) in \(sent.parts) part(s)."
+                      + (sent.stored ? "" : " It is not stored on the modem: it writes messages to another storage than "
+                         + "the one it lists."), failure: false)
+            clearResultOnTyping = reply == false
             succeeded = true
         case .failure(let failure):
             setResult(failure.message, failure: true)

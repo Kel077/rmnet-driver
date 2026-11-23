@@ -187,34 +187,13 @@ let localTimeFormatter: DateFormatter = {
 func localTime(_ date: Date) -> String { localTimeFormatter.string(from: date) }
 
 func printMessages(_ listing: SmsListing) {
-    let messages = listing.messages
-    print(listHeadline(count: messages.count, used: listing.used, total: listing.total))
-    let warning = storeWarning(used: listing.used, total: listing.total)
-    if !warning.isEmpty { print("sms: \(warning)") }
-    for m in messages {
-        let indices = "[" + m.indices.map(String.init).joined(separator: ",") + "]"
-        guard m.readable else {
-            print("\(indices) not readable")
-            continue
-        }
-        var head = "\(indices) \(m.unread ? "unread" : "read") \(m.sender) \(m.timestamp.map(localTime) ?? "no time")"
-        if m.missingParts > 0 { head += " (\(m.missingParts) part(s) missing)" }
-        print(head)
-        if m.text.isEmpty { continue }
-        for line in m.text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
-            print("  \(line)")
-        }
-    }
+    for line in smsListLines(listing, time: localTime) { print(line) }
 }
 
 func printMessagesJSON(_ messages: [SmsMessage]) {
     let iso = ISO8601DateFormatter()
     iso.timeZone = .current
-    let array: [[String: Any]] = messages.map { m in
-        ["indices": m.indices, "unread": m.unread, "sender": m.sender,
-         "time": m.timestamp.map { iso.string(from: $0) } ?? NSNull(), "text": m.text,
-         "missingParts": m.missingParts, "readable": m.readable]
-    }
+    let array = smsListJSON(messages, time: { iso.string(from: $0) })
     if array.isEmpty {
         print("[]")
         return
@@ -242,8 +221,11 @@ func runSms(_ command: SmsCommand, service: SmsServing) -> Int32 {
         // multi-part send.
         for sig in [SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGQUIT] { signal(sig, SIG_IGN) }
         switch service.send(to: number, text: text) {
-        case .success(let parts):
-            print("sms: sent to \(number) in \(parts) part(s)")
+        case .success(let sent):
+            print("sms: sent to \(number) in \(sent.parts) part(s)")
+            if !sent.stored {
+                print("sms: not stored: the modem writes messages to another storage than the one it lists (AT+CPMS)")
+            }
             return 0
         case .failure(let failure):
             print("sms: \(failure.message)")

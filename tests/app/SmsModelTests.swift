@@ -37,6 +37,10 @@ func expectPart(_ hex: String, _ name: String, sender: String, text: String, tim
     check(p.concat == concat, "\(name): concatenation", "want \(String(describing: concat)), got \(String(describing: p.concat))")
 }
 
+func equal<T: Equatable>(_ got: T, _ want: T, _ name: String) {
+    check(got == want, name, "got \(got)\nwant \(want)")
+}
+
 func expectUnreadable(_ hex: String, _ name: String) {
     let p = decode(hex, index: 4, status: .unread)
     check(!p.readable && p.sender == "" && p.text == "" && p.timestamp == nil && p.concat == nil
@@ -498,8 +502,11 @@ struct SmsModelTests {
         // 0B 91 7238880900F1 recipient; two time stamps; 00 status.
         expectUnreadable("00" + "06" + "05" + "0B917238880900F1" + "99309251619580" + "99309251619580" + "00",
                          "status report (TP-MTI 2)")
-        // SMS-SUBMIT read as a stored entry (TP-MTI 1) is not a received message.
-        expectUnreadable("0001000B917238880900F100000AE8329BFD4697D9EC37", "SMS-SUBMIT (TP-MTI 1)")
+        // SMS-SUBMIT stored to send (TP-MTI 1, AT+CMGW): its recipient and text, no time.
+        let stored = decode("0001000B912120550521F300000AE8329BFD4697D9EC37", index: 4, status: .sent)
+        check(stored.readable && stored.sender == "+12025550123" && stored.text == "hellohello" && stored.timestamp == nil
+                && stored.outgoing && stored.status == .sent, "SMS-SUBMIT stored: recipient and text", "\(stored)")
+        check(!decode(classic, index: 1, status: .read).outgoing, "a received part is not outgoing")
         // The classic vector with DCS 0C: group 00xx, alphabet bits 11 = reserved.
         expectUnreadable("07917283010010F5040BC87238880900F1000C993092516195800AE8329BFD4697D9EC37",
                          "reserved alphabet")
@@ -806,6 +813,7 @@ struct SmsModelTests {
 
         windowHelperChecks()
         readingPaneHelpers()
+        storedSending()
 
         print("sms-test: \(checks) checks passed")
     }
@@ -840,5 +848,69 @@ struct SmsModelTests {
         for text in none {
             check(verificationCode(in: text) == nil, "no code: \(text)", "got \(String(describing: verificationCode(in: text)))")
         }
+    }
+
+    /// Messages RMNet stored to send: the listing with every status, their box, multi-part sent messages with an unsent
+    /// part, and the answers of AT+CMGW, AT+CMSS, AT+CMGR and AT+CPMS's storage names.
+    static func storedSending() {
+        // A sent and an unsent message among received ones; the same text sent to the same number as two parts.
+        guard case .success(let pdus) = encodeSubmit(to: "+15555550100", text: String(repeating: "made-up ", count: 25),
+                                                     reference: 7), pdus.count == 2,
+              case .success(let one) = encodeSubmit(to: "+15555550199", text: "Made-up reply", reference: 1) else {
+            check(false, "stored: the PDUs encode")
+            return
+        }
+        let delivered = "0004" + "0B912120550521F0" + "0000" + "62112201000000" + "0AE8329BFD4697D9EC37"
+        let lines = ["+CMGL: 0,1,,\(delivered.count / 2 - 1)", delivered,
+                     "+CMGL: 1,3,,\(one[0].tpduLength)", one[0].hex,
+                     "+CMGL: 2,3,,\(pdus[0].tpduLength)", pdus[0].hex,
+                     "+CMGL: 3,2,,\(pdus[1].tpduLength)", pdus[1].hex,
+                     "+CMGL: 4,2,,\(one[0].tpduLength)", one[0].hex]
+        let parsed = parseListing(lines)
+        equal(parsed.map { $0.status }, [.read, .sent, .sent, .unsent, .unsent], "stored: the statuses listed")
+        let messages = assemble(parsed.map(decodePart))
+        equal(messages.count, 4, "stored: received, sent, a two-part message, and an unsent one")
+        let received = messages.first { $0.indices == [0] }
+        check(received?.box == .received && received?.outgoing == false, "stored: received")
+        let sent = messages.first { $0.indices == [1] }
+        check(sent?.box == .sent && sent?.sender == "+15555550199" && sent?.text == "Made-up reply" && sent?.unread == false
+                && sent?.timestamp == nil && sent?.unsentIndices == [], "stored: sent", "\(String(describing: sent))")
+        let twoParts = messages.first { $0.indices == [2, 3] }
+        check(twoParts?.box == .unsent && twoParts?.unsentIndices == [3] && twoParts?.missingParts == 0
+                && twoParts?.text == String(repeating: "made-up ", count: 25), "stored: two parts, one unsent",
+              "\(String(describing: twoParts))")
+        let unsent = messages.first { $0.indices == [4] }
+        check(unsent?.box == .unsent && unsent?.unsentIndices == [4] && unsent?.unread == false, "stored: unsent")
+        // A sent part and a received part with the same key never merge.
+        check(messages.allSatisfy { m in m.box == .received || m.sender != "+12025550120" }, "stored: directions kept apart")
+
+        check(parseStoreIndex(["+CMGW: 5"]) == 5 && parseStoreIndex(["OK"]) == nil && parseStoreIndex(["+CMGW: x"]) == nil,
+              "parse: +CMGW")
+        check(parseStoredSendReference(["+CMSS: 12"]) == 12 && parseStoredSendReference(["+CMSS: 12,\"0011\""]) == 12
+                && parseStoredSendReference(["+CMSS: 300"]) == nil && parseStoredSendReference([]) == nil, "parse: +CMSS")
+        let read = parseReadEntry(["+CMGR: 2,,23", one[0].hex])
+        check(read?.status == .unsent && read?.hex == one[0].hex, "parse: +CMGR status and PDU")
+        check(parseReadEntry(["+CMGR: 3,,23"]) == nil, "parse: +CMGR without its PDU")
+        let names = parseStorageNames(["+CPMS: \"ME\",3,255,\"ME\",3,255,\"ME\",3,255"])
+        check(names?.read == "ME" && names?.write == "ME", "parse: CPMS names")
+        let mixed = parseStorageNames(["+CPMS: \"SM\",0,50,\"ME\",3,255,\"ME\",3,255"])
+        check(mixed?.read == "SM" && mixed?.write == "ME", "parse: CPMS names that differ")
+        check(parseStorageNames(["+CPMS: 3,255,3,255,3,255"]) == nil, "parse: CPMS without names")
+
+        // `sms list`: sent and unsent messages listed with their recipient; JSON's added status, the other keys kept.
+        let listing = SmsListing(messages: messages, used: 5, total: 255)
+        let printed = smsListLines(listing, time: { _ in "2026-11-22 10:00:00" })
+        check(printed.contains("[1] sent to +15555550199 no time") && printed.contains("[2,3] unsent to +15555550100 no time")
+                && printed.contains("[4] unsent to +15555550199 no time")
+                && printed.contains("[0] read +12025550120 2026-11-22 10:00:00"),
+              "sms list: the lines", printed.joined(separator: " | "))
+        let json = smsListJSON(messages, time: { _ in "t" })
+        check(JSONSerialization.isValidJSONObject(json), "sms list --json: valid")
+        let sentJSON = json.first { ($0["indices"] as? [Int]) == [1] }
+        equal(sentJSON?["status"] as? String, "sent", "sms list --json: status sent")
+        check(sentJSON?["time"] is NSNull && sentJSON?["sender"] as? String == "+15555550199", "sms list --json: no time, the recipient")
+        equal(json.first { ($0["indices"] as? [Int]) == [0] }?["status"] as? String, "received", "sms list --json: status received")
+        equal(Set(sentJSON?.keys.map { $0 } ?? []),
+              ["indices", "unread", "sender", "time", "text", "missingParts", "readable", "status"], "sms list --json: the keys")
     }
 }

@@ -23,6 +23,7 @@ enum Call: Equatable {
     case list
     case delete([Int])
     case send(String, String)
+    case resend([Int])
 }
 
 /// Records each call, then blocks it (on the controller's queue) until the test releases it with a result.
@@ -32,7 +33,7 @@ final class FakeService: SmsServing {
     private var log: [Call] = []
     private var listResults: [Result<SmsListing, SmsFailure>] = []
     private var deleteResults: [Result<Int, SmsFailure>] = []
-    private var sendResults: [Result<Int, SmsFailure>] = []
+    private var sendResults: [Result<SmsSent, SmsFailure>] = []
     private var inside = 0   // calls entered and not yet returned
     private var mostInside = 0
 
@@ -66,14 +67,24 @@ final class FakeService: SmsServing {
         return locked { deleteResults.removeFirst() }
     }
 
-    func send(to number: String, text: String) -> Result<Int, SmsFailure> {
+    func send(to number: String, text: String) -> Result<SmsSent, SmsFailure> {
         enter(.send(number, text))
+        return locked { sendResults.removeFirst() }
+    }
+
+    func resend(indices: [Int]) -> Result<SmsSent, SmsFailure> {
+        enter(.resend(indices))
         return locked { sendResults.removeFirst() }
     }
 
     func releaseList(_ result: Result<SmsListing, SmsFailure>) { locked { listResults.append(result) }; gate.signal() }
     func releaseDelete(_ result: Result<Int, SmsFailure>) { locked { deleteResults.append(result) }; gate.signal() }
-    func releaseSend(_ result: Result<Int, SmsFailure>) { locked { sendResults.append(result) }; gate.signal() }
+    /// The parts sent (stored at no index known to the test), or the failure.
+    func releaseSend(_ result: Result<Int, SmsFailure>) {
+        locked { sendResults.append(result.map { SmsSent(parts: $0) }) }
+        gate.signal()
+    }
+    func releaseSent(_ result: Result<SmsSent, SmsFailure>) { locked { sendResults.append(result) }; gate.signal() }
 }
 
 // MARK: - Helpers

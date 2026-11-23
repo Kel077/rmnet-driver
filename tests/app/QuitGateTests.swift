@@ -102,10 +102,12 @@ final class FakeSms: SmsServing {
         return .success(indices.count)
     }
 
-    func send(to number: String, text: String) -> Result<Int, SmsFailure> {
+    func send(to number: String, text: String) -> Result<SmsSent, SmsFailure> {
         calls.enter("send")
-        return calls.locked { sendOutcome }
+        return calls.locked { sendOutcome.map { SmsSent(parts: $0) } }
     }
+
+    func resend(indices: [Int]) -> Result<SmsSent, SmsFailure> { .failure(SmsFailure(message: "not used")) }
 
     func releaseSend(_ outcome: Result<Int, SmsFailure>) {
         calls.locked { sendOutcome = outcome }

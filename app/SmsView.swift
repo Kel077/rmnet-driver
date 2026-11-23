@@ -1,8 +1,11 @@
-// The window's Messages screen: the modem's text messages, newest first, as a list (how many and how many unread
-// above it; each row the sender, a one-line preview, how long ago, an unread dot) beside a reading pane (sender, time,
-// Copy Code for a one-time code, Copy Text, Delete…, the full text), with the store's use in the list's footer; Refresh, Delete… and New Message in the toolbar, and a sheet to write and send a message. SmsController
-// (SmsController.swift) holds the state and runs the service; every decision that is a pure function of values lives in
-// SmsModel.swift. Nothing here logs or stores message text or numbers.
+// The window's Messages screen, as conversations: the modem's messages, received and sent (SmsService.swift stores what
+// RMNet sends on the modem, AT+CMGW then AT+CMSS), grouped by the other party's number (SmsConversations.swift). The
+// list (how many conversations and how many unread above it; each row the number, the latest message's first line, how
+// long ago, the unread count) beside the conversation shown: received messages on the left, sent ones on the right with
+// Sent or Not sent (Retry, Delete), Copy Code for a one-time code, and a reply field at the bottom. The store's use is in
+// the list's footer; Refresh, Delete Conversation… and New Message (a sheet, to a new number) are in the toolbar.
+// SmsController (SmsController.swift) holds the state and runs the service; every decision that is a pure function of
+// values lives in SmsModel.swift and SmsConversations.swift. Nothing here logs or stores message text or numbers.
 import AppKit
 import SwiftUI
 
@@ -13,8 +16,9 @@ extension SmsMessage: Identifiable {
 struct SmsView: View {
     // The process's one controller, owned by the app delegate.
     @ObservedObject var controller: SmsController
-    @State private var confirming: SmsMessage? = nil  // the message the delete confirmation is about
-    @State private var writing = false                // the New Message sheet is open
+    @State private var confirmingMessage: SmsMessage? = nil              // the message the delete confirmation is about
+    @State private var confirmingConversation: SmsConversation? = nil    // the conversation it is about
+    @State private var writing = false                                   // the New Message sheet is open
 
     var body: some View {
         content
@@ -26,28 +30,41 @@ struct SmsView: View {
                         .disabled(!controller.refreshEnabled)
                 }
                 ToolbarItem(placement: .primaryAction) {
-                    Button { confirming = controller.selectedMessage } label: { Label("Delete…", systemImage: "trash") }
-                        .help("Delete…")
-                        .disabled(!controller.deleteEnabled)
+                    Button { confirmingConversation = controller.shownConversation } label: {
+                        Label("Delete Conversation…", systemImage: "trash")
+                    }
+                    .help("Delete Conversation…")
+                    .disabled(!controller.changeEnabled || controller.shownConversation == nil)
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Button { writing = true } label: { Label("New Message", systemImage: "square.and.pencil") }
                         .help("New Message")
                 }
             }
-            // The last send's or delete's result; only the next send or delete replaces it.
+            // The last send's, retry's or delete's result; only the next one replaces it.
             .resultBanner(controller.result, isFailure: controller.resultIsFailure,
                           inProgress: controller.running == .sending || controller.running == .deleting)
             .sheet(isPresented: $writing) { ComposeSheet(controller: controller) }
-            .onChange(of: confirming != nil) { _, open in controller.setConfirmingDelete(open) }
-            .confirmationDialog(confirming.map { deleteQuestion($0).title } ?? "",
-                                isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
-                                titleVisibility: .visible,
-                                presenting: confirming) { m in
+            .onChange(of: confirmingMessage != nil || confirmingConversation != nil) { _, open in
+                controller.setConfirmingDelete(open)
+            }
+            .confirmationDialog(confirmingMessage.map { deleteQuestion($0).title } ?? "",
+                                isPresented: Binding(get: { confirmingMessage != nil },
+                                                     set: { if !$0 { confirmingMessage = nil } }),
+                                titleVisibility: .visible, presenting: confirmingMessage) { m in
                 Button("Delete", role: .destructive) { controller.delete(m) }
                 Button("Cancel", role: .cancel) {}
             } message: { m in
                 Text(verbatim: deleteQuestion(m).message)
+            }
+            .confirmationDialog(confirmingConversation.map { deleteConversationQuestion($0).title } ?? "",
+                                isPresented: Binding(get: { confirmingConversation != nil },
+                                                     set: { if !$0 { confirmingConversation = nil } }),
+                                titleVisibility: .visible, presenting: confirmingConversation) { c in
+                Button("Delete Conversation", role: .destructive) { controller.deleteConversation(c) }
+                Button("Cancel", role: .cancel) {}
+            } message: { c in
+                Text(verbatim: deleteConversationQuestion(c).message)
             }
     }
 
@@ -55,31 +72,35 @@ struct SmsView: View {
         if controller.messages.isEmpty {
             emptyState
         } else {
+            let list = controller.conversations
             HStack(spacing: 0) {
                 VStack(spacing: 0) {
                     if let failure = controller.listFailure {
                         StaleListNotice(text: listLine(updated: controller.listedAt, failure: failure))
                     }
-                    ListHeading(count: controller.messages.count, unread: controller.unread.count)
+                    ListHeading(text: conversationCountLine(count: list.count, unread: list.reduce(0) { $0 + $1.unread }),
+                                unread: list.contains { $0.unread > 0 })
                     // Ages are counted from a clock that turns every 15 s, so they stay right between listings.
                     TimelineView(.periodic(from: .now, by: 15)) { context in
-                        List(controller.messages, selection: $controller.selection) { m in
-                            MessageRow(message: m, unread: controller.unread.contains(m.key), now: context.date)
+                        List(list, selection: $controller.selectedConversation) { c in
+                            ConversationRow(conversation: c, sentAt: controller.sentAt, now: context.date)
+                                .tag(c.id)
                         }
                         .listStyle(.inset)
                     }
                     ListFooter(controller: controller)
                 }
-                .frame(minWidth: 230, idealWidth: 280, maxWidth: 320)
+                .frame(minWidth: 240, idealWidth: 290, maxWidth: 330)
                 Divider()
-                ReadingPane(message: controller.selectedMessage, deleteEnabled: controller.deleteEnabled,
-                            delete: { confirming = controller.selectedMessage })
+                ConversationPane(controller: controller, conversation: controller.shownConversation,
+                                 deleteMessage: { confirmingMessage = $0 },
+                                 deleteConversation: { confirmingConversation = $0 })
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
 
-    /// No rows: the modem is not attached, the listing failed, there are no messages, or the first listing runs.
+    /// No messages: the modem is not attached, the listing failed, there are none, or the first listing runs.
     @ViewBuilder private var emptyState: some View {
         if let failure = controller.listFailure {
             if failure == describe(.modemNotAttached) {
@@ -100,8 +121,8 @@ struct SmsView: View {
 // MARK: - The list
 
 /// The sender as a title: the number or name the modem gave, "Unknown sender" when it gave none.
-private func senderTitle(_ m: SmsMessage) -> String {
-    m.sender.isEmpty ? "Unknown sender" : m.sender
+private func senderTitle(_ number: String) -> String {
+    number.isEmpty ? "Unknown sender" : number
 }
 
 /// The first letter of a model line in upper case, so it reads as a sentence on its own ("1 part missing").
@@ -109,10 +130,10 @@ private func sentence(_ s: String) -> String {
     s.prefix(1).uppercased() + s.dropFirst()
 }
 
-/// How long ago a message arrived, against `now` ("Now", "5 min. ago", "Yesterday", "4 days ago", "Last mo."); a time
-/// after `now` (the service centre's clock ahead of the Mac's) counts as now; "—" with no time.
-private func messageAge(_ time: Date?, now: Date) -> String {
-    guard let time else { return "—" }
+/// How long ago, against `now` ("Now", "5 min. ago", "Yesterday", "4 days ago"); a time after `now` (the service
+/// centre's clock ahead of the Mac's) counts as now; "" with no time.
+private func age(_ time: Date?, now: Date) -> String {
+    guard let time else { return "" }
     return sentence(ageFormatter.localizedString(for: min(time, now), relativeTo: now))
 }
 
@@ -124,63 +145,94 @@ private let ageFormatter: RelativeDateTimeFormatter = {
     return f
 }()
 
-/// The message's time in full ("Monday 16 November 2026 at 14:05"); "—" with no time.
-private func messageTime(_ time: Date?) -> String {
-    time.map { timeFormatter.string(from: $0) } ?? "—"
-}
-
-private let timeFormatter: DateFormatter = {
+/// A time in full ("Monday 16 November 2026 at 14:05").
+private let fullTime: DateFormatter = {
     let f = DateFormatter()
     f.locale = Locale(identifier: "en_US_POSIX")
     f.dateFormat = "EEEE d MMMM yyyy 'at' HH:mm"
     return f
 }()
 
-/// One message in the list: the unread dot, the sender, how long ago, and the text's first line; a note when the
-/// message is not readable or has parts missing.
-private struct MessageRow: View {
-    let message: SmsMessage
+/// A bubble's time: "14:05" today, "Mon 14:05" this week, "16 Nov 14:05" before.
+private func bubbleTime(_ date: Date, now: Date = Date()) -> String {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    let calendar = Calendar.current
+    if calendar.isDate(date, inSameDayAs: now) {
+        f.dateFormat = "HH:mm"
+    } else if let days = calendar.dateComponents([.day], from: date, to: now).day, days < 7 {
+        f.dateFormat = "EEE HH:mm"
+    } else {
+        f.dateFormat = "d MMM HH:mm"
+    }
+    return f.string(from: date)
+}
+
+/// Above the list: how many conversations, and how many messages are unread (blue when some are).
+private struct ListHeading: View {
+    let text: String
     let unread: Bool
+
+    var body: some View {
+        HStack(spacing: Spacing.xs) {
+            Text(verbatim: text)
+                .foregroundStyle(unread ? AnyShapeStyle(Color.blue) : AnyShapeStyle(.secondary))
+            Spacer(minLength: 0)
+        }
+        .font(.callout.weight(.semibold))
+        .padding(.horizontal, Spacing.l)
+        .padding(.top, Spacing.m)
+        .padding(.bottom, Spacing.xs)
+    }
+}
+
+/// A conversation in the list: its number, the latest message's first line (`You:` before a sent one, a red mark
+/// before one not sent), how long ago, and the unread count.
+private struct ConversationRow: View {
+    let conversation: SmsConversation
+    let sentAt: [Int: Date]
     let now: Date
 
     var body: some View {
-        let note = rowNote(message)
-        HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
-            Circle()
-                .fill(unread ? Color.blue : Color.clear)
-                .frame(width: 8, height: 8)
-                .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
-                .accessibilityLabel(Text(unread ? "Unread" : ""))
-                .accessibilityHidden(!unread)
+        let latest = conversation.latest
+        let time = latest.flatMap { messageTime($0, sentAt: sentAt) }
+        HStack(alignment: .top, spacing: Spacing.s) {
+            Avatar(number: conversation.number, size: 30)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
-                    Text(verbatim: senderTitle(message))
-                        .font(.body.weight(unread ? .bold : .semibold))
+                    Text(verbatim: senderTitle(conversation.number))
+                        .font(.body.weight(conversation.unread > 0 ? .bold : .semibold))
                         .lineLimit(1)
                     Spacer(minLength: Spacing.xs)
-                    Text(verbatim: messageAge(message.timestamp, now: now))
+                    Text(verbatim: age(time, now: now))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .layoutPriority(1)
-                        .help(messageTime(message.timestamp))
+                        .help(time.map { fullTime.string(from: $0) } ?? "")
                 }
-                Group {
-                    if message.text.isEmpty {
-                        Text(verbatim: note.isEmpty ? "No text" : sentence(note)).italic()
-                    } else {
-                        // One line: the text's line breaks become spaces.
-                        Text(verbatim: message.text.split(whereSeparator: \.isNewline).joined(separator: " "))
+                HStack(alignment: .firstTextBaseline, spacing: Spacing.xs) {
+                    if latest?.box == .unsent {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .foregroundStyle(.red)
+                            .accessibilityLabel(Text("Not sent"))
+                    }
+                    Text(verbatim: conversationPreview(conversation))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer(minLength: Spacing.xs)
+                    if conversation.unread > 0 {
+                        Text(verbatim: "\(conversation.unread)")
+                            .font(.caption.weight(.bold))
+                            .monospacedDigit()
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.blue))
+                            .accessibilityLabel(Text(verbatim: "\(conversation.unread) unread"))
                     }
                 }
                 .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                if !message.text.isEmpty && !note.isEmpty {
-                    Text(verbatim: sentence(note))
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
             }
         }
         .padding(.vertical, Spacing.xs)
@@ -188,27 +240,27 @@ private struct MessageRow: View {
     }
 }
 
-/// Above the list: how many messages it has, and how many are unread (blue).
-private struct ListHeading: View {
-    let count: Int
-    let unread: Int
+/// A round mark for a number: a person, or the first letter of a name (a carrier's).
+private struct Avatar: View {
+    let number: String
+    let size: CGFloat
 
     var body: some View {
-        HStack(spacing: Spacing.xs) {
-            Text(verbatim: "\(count) \(count == 1 ? "message" : "messages")")
-                .foregroundStyle(.secondary)
-            if unread > 0 {
-                Text(verbatim: "·").foregroundStyle(.tertiary)
-                Text(verbatim: "\(unread) unread").foregroundStyle(.blue)
+        let isName = !number.isEmpty && number.unicodeScalars.contains { CharacterSet.letters.contains($0) }
+        ZStack {
+            Circle().fill(.quaternary)
+            if isName, let first = number.first {
+                Text(verbatim: String(first).uppercased())
+                    .font(.system(size: size * 0.45, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            } else {
+                Image(systemName: "person.fill")
+                    .font(.system(size: size * 0.45))
+                    .foregroundStyle(.secondary)
             }
-            Spacer(minLength: 0)
         }
-        .font(.callout.weight(.semibold))
-        .padding(.horizontal, Spacing.l)
-        .padding(.top, Spacing.m)
-        .padding(.bottom, Spacing.xs)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Text(verbatim: messageCountLine(count: count, unread: unread)))
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
     }
 }
 
@@ -262,95 +314,188 @@ private struct ListFooter: View {
     }
 }
 
-// MARK: - The reading pane
 
-/// The selected message: who sent it and when, Copy Code (the one-time code in it, verificationCode), Copy Text and
-/// Delete… (the toolbar's), a note when it is not readable or incomplete, and its full text (selectable). With none
-/// selected, an empty state that says what to do.
-private struct ReadingPane: View {
-    let message: SmsMessage?
-    let deleteEnabled: Bool
-    let delete: () -> Void
+// MARK: - The conversation
+
+/// The conversation shown: its number with Delete Conversation…, its messages oldest first as bubbles (received on the
+/// left, sent on the right), and the reply field; with none shown, what to do.
+private struct ConversationPane: View {
+    @ObservedObject var controller: SmsController
+    let conversation: SmsConversation?
+    let deleteMessage: (SmsMessage) -> Void
+    let deleteConversation: (SmsConversation) -> Void
 
     var body: some View {
-        if let m = message {
-            let note = rowNote(m)
-            ScrollView {
-                VStack(alignment: .leading, spacing: Spacing.l) {
-                    HStack(alignment: .center, spacing: Spacing.m) {
-                        Image(systemName: "person.crop.circle.fill")
-                            .font(.system(size: 40))
-                            .foregroundStyle(.secondary)
-                            .accessibilityHidden(true)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(verbatim: senderTitle(m))
-                                .font(.title2.weight(.semibold))
-                                .textSelection(.enabled)
-                            Text(verbatim: messageTime(m.timestamp))
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: Spacing.s)
-                        Button(role: .destructive, action: delete) {
-                            Label("Delete…", systemImage: "trash")
-                        }
-                        .disabled(!deleteEnabled)
-                        .help("Delete this message from the modem")
-                    }
-                    if !m.text.isEmpty {
-                        HStack(spacing: Spacing.s) {
-                            if let code = verificationCode(in: m.text) {
-                                CopyButton(title: "Copy Code \(code)", symbol: "number", value: code, prominent: true)
-                            }
-                            CopyButton(title: "Copy Text", symbol: "doc.on.doc", value: m.text, prominent: false)
-                        }
-                    }
-                    Divider()
-                    if !note.isEmpty {
-                        WarningNote(text: sentence(note))
-                    }
-                    if !m.text.isEmpty {
-                        Text(verbatim: m.text)
-                            .font(.body)
+        if let c = conversation {
+            VStack(spacing: 0) {
+                HStack(alignment: .center, spacing: Spacing.m) {
+                    Avatar(number: c.number, size: 36)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(verbatim: senderTitle(c.number))
+                            .font(.title3.weight(.semibold))
                             .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                            .background(.fill.secondary, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        Text(verbatim: "\(c.messages.count) \(c.messages.count == 1 ? "message" : "messages")")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: Spacing.s)
+                    Button(role: .destructive) { deleteConversation(c) } label: {
+                        Label("Delete Conversation…", systemImage: "trash")
+                    }
+                    .disabled(!controller.changeEnabled)
+                }
+                .padding(.horizontal, Spacing.l)
+                .padding(.vertical, Spacing.m)
+                Divider()
+                ScrollViewReader { reader in
+                    ScrollView {
+                        LazyVStack(spacing: Spacing.m) {
+                            ForEach(c.messages) { m in
+                                Bubble(message: m, sentAt: controller.sentAt, changeEnabled: controller.changeEnabled,
+                                       retry: { controller.retry(m) }, delete: { deleteMessage(m) })
+                                    .id(m.key)
+                            }
+                        }
+                        .padding(Spacing.l)
+                    }
+                    .onAppear { reader.scrollTo(c.messages.last?.key, anchor: .bottom) }
+                    .onChange(of: c.messages.last?.key) { _, last in
+                        withAnimation { reader.scrollTo(last, anchor: .bottom) }
                     }
                 }
-                .padding(Spacing.xl)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                Divider()
+                ReplyField(controller: controller, number: c.number)
             }
         } else {
-            EmptyState(symbol: "text.bubble", title: "No message selected",
-                       message: "Select a message in the list to read it.")
+            EmptyState(symbol: "bubble.left.and.bubble.right", title: "No conversation selected",
+                       message: "Select a conversation in the list to read it, or start one with New Message.")
         }
     }
 }
 
-/// Copies `value` to the pasteboard; says Copied for a moment.
-private struct CopyButton: View {
-    let title: String
-    let symbol: String
-    let value: String
-    let prominent: Bool
-    @State private var copied = false
+/// One message: received on the left in gray, sent on the right in blue (dimmed while not sent); under it its time,
+/// or Sent and Not sent with Retry and Delete; Copy Code for a one-time code; a note for a part missing or a message
+/// that cannot be read. Its context menu copies the text or the code, and deletes it.
+private struct Bubble: View {
+    let message: SmsMessage
+    let sentAt: [Int: Date]
+    let changeEnabled: Bool
+    let retry: () -> Void
+    let delete: () -> Void
 
     var body: some View {
-        let button = Button {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(value, forType: .string)
-            copied = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
-        } label: {
-            Label(copied ? "Copied" : title, systemImage: copied ? "checkmark" : symbol)
-                .monospacedDigit()
+        let mine = message.outgoing
+        let note = rowNote(message)
+        let code = mine ? nil : verificationCode(in: message.text)
+        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+        HStack {
+            if mine { Spacer(minLength: 80) }
+            VStack(alignment: mine ? .trailing : .leading, spacing: 4) {
+                Text(verbatim: message.text.isEmpty ? (message.readable ? "No text" : "Not readable") : message.text)
+                    .italic(message.text.isEmpty)
+                    .foregroundStyle(mine ? AnyShapeStyle(Color.white) : AnyShapeStyle(.primary))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(shape.fill(mine ? AnyShapeStyle(Color.accentColor.opacity(message.box == .unsent ? 0.55 : 1))
+                                                : AnyShapeStyle(.fill.secondary)))
+                    .overlay {
+                        if message.box == .unsent { shape.strokeBorder(Color.red.opacity(0.7), lineWidth: 1) }
+                    }
+                    .contextMenu {
+                        Button("Copy Text") { copy(message.text) }
+                        if let code { Button("Copy Code \(code)") { copy(code) } }
+                        Divider()
+                        Button("Delete…", role: .destructive, action: delete)
+                            .disabled(!changeEnabled)
+                    }
+                if !note.isEmpty {
+                    Label(sentence(note), systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                HStack(spacing: Spacing.s) {
+                    if let code {
+                        Button { copy(code) } label: { Label("Copy Code \(code)", systemImage: "number") }
+                            .controlSize(.small)
+                            .monospacedDigit()
+                    }
+                    meta
+                }
+            }
+            if !mine { Spacer(minLength: 80) }
         }
-        if prominent {
-            button.buttonStyle(.borderedProminent)
+    }
+
+    /// The time of a received message; Sent (with the time when known) or Not sent, with Retry and Delete, for a sent one.
+    @ViewBuilder private var meta: some View {
+        if message.box == .unsent {
+            Label("Not sent", systemImage: "exclamationmark.circle.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.red)
+            Button("Retry", action: retry)
+                .controlSize(.small)
+                .disabled(!changeEnabled)
+                .help("Send the stored part(s) again")
+            Button("Delete", role: .destructive, action: delete)
+                .controlSize(.small)
+                .disabled(!changeEnabled)
+        } else if let words = sentStatusWords(message, sentAt: sentAt, time: { bubbleTime($0) }) {
+            Text(verbatim: words)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else if let time = message.timestamp {
+            Text(verbatim: bubbleTime(time))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help(fullTime.string(from: time))
+        }
+    }
+
+    private func copy(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+}
+
+/// The reply: the text (plain, as in the New Message sheet), its part count, and Send (Return sends; Option-Return is a
+/// new line). A number that cannot take a reply (a name, such as a carrier's) says so instead.
+private struct ReplyField: View {
+    @ObservedObject var controller: SmsController
+    let number: String
+
+    var body: some View {
+        if validNumber(number) {
+            VStack(alignment: .leading, spacing: Spacing.xs) {
+                HStack(alignment: .bottom, spacing: Spacing.s) {
+                    let edge = RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    PlainTextEditor(text: $controller.replyText, composing: $controller.replyComposing,
+                                    editable: controller.running != .sending)
+                        .frame(height: 54)
+                        .clipShape(edge)
+                        .overlay(edge.strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1))
+                        .accessibilityLabel(Text("Reply"))
+                    Button {
+                        controller.sendReply()
+                    } label: {
+                        Label("Send", systemImage: "arrow.up.circle.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(controller.replyEnabled ? .defaultAction : nil)
+                    .disabled(!controller.replyEnabled)
+                }
+                Text(verbatim: controller.replyText.isEmpty ? "Each message sent costs a carrier fee." : controller.replyNote)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(Spacing.m)
         } else {
-            button.buttonStyle(.bordered)
+            Text(verbatim: "\(senderTitle(number)) cannot take a reply.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(Spacing.m)
         }
     }
 }
